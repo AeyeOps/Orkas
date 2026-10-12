@@ -1,5 +1,114 @@
 import { createServer } from 'node:http';
-import { expect, test } from './fixtures/orkas';
+import { expect, OrkasTestApp, test as base } from './fixtures/orkas';
+
+// These journeys verify browser chrome and navigation, not GPU overlays.
+// Hidden native pages can otherwise emit Chromium mailbox errors.
+const test = base.extend({
+  orkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { softwareRendering: true });
+    try { await app.launch(); await use(app); } finally { await app.dispose(); }
+  },
+});
+
+test('scrolled browser tabs stay in place through page updates, activation and tab changes', async ({ orkas }) => {
+  const server = createServer((_req, res) => {
+    res.setHeader('Content-Type', 'text/html');
+    res.end('<title>Scroll fixture ready</title><h1>Ready</h1>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const page = orkas.page!;
+  try {
+    const cid = (await orkas.invoke<any>('conversations.create', { title: 'Browser tab scrolling' })).conversation.conversation_id;
+    await page.evaluate(async id => {
+      await (window as any).loadConversations();
+      (window as any).setView('conversation', id);
+      (window as any).ConversationInfo.openAndSetTab('browser');
+    }, cid);
+    const tabs = page.locator('.web-assist-tab');
+    await expect(tabs).toHaveCount(1);
+    for (let index = 0; index < 9; index++) {
+      expect(await orkas.invoke<any>('webAssist.addTab', { conversationId: cid })).toMatchObject({ ok: true });
+    }
+    await expect(tabs).toHaveCount(10);
+    const state = (await orkas.invoke<any>('webAssist.state')).state;
+    const tabId = state.active_tab_id;
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/ready`;
+    expect(await orkas.invoke<any>('webAssist.navigateTo', { tabId, url })).toMatchObject({ ok: true });
+    const active = page.locator(`.web-assist-tab[data-tab-id="${tabId}"]`);
+    await expect(active).toHaveText('Scroll fixture ready');
+    const nativeId = await orkas.electronApp!.evaluate(({ webContents }, url) => (
+      webContents.getAllWebContents().find(contents => contents.getURL() === url)!.id
+    ), url);
+    const strip = page.locator('.web-assist-tabs');
+    const scroll = () => strip.evaluate(node => node.scrollLeft);
+    const left = await strip.evaluate(node => {
+      node.scrollLeft = 240;
+      return node.scrollLeft;
+    });
+    expect(left).toBe(240); // Real overflow, away from either scroll boundary.
+    await orkas.electronApp!.evaluate(async ({ webContents }, id) => {
+      await webContents.fromId(id)!.executeJavaScript('document.title = "Scroll fixture updated"; void 0');
+    }, nativeId);
+    await expect(active).toHaveText('Scroll fixture updated');
+    expect(await scroll()).toBe(left);
+    // Observe several frames so a delayed layout/status update cannot undo it.
+    expect(await strip.evaluate(async node => {
+      const samples: number[] = [];
+      for (let frame = 0; frame < 10; frame++) {
+        await new Promise<void>(resolve => requestAnimationFrame(() => resolve()));
+        samples.push(node.scrollLeft);
+      }
+      return samples;
+    })).toEqual(Array(10).fill(left));
+
+    // A state update during a pointer gesture must retain the clicked target.
+    const targetId = await tabs.nth(3).getAttribute('data-tab-id');
+    const target = page.locator(`.web-assist-tab[data-tab-id="${targetId}"]`);
+    const box = (await target.boundingBox())!;
+    await page.mouse.move(box.x + 15, box.y + box.height / 2);
+    await page.mouse.down();
+    await orkas.electronApp!.evaluate(async ({ webContents }, id) => {
+      await webContents.fromId(id)!.executeJavaScript('document.title = "Scroll fixture clicked"; void 0');
+    }, nativeId);
+    await expect(active).toHaveText('Scroll fixture clicked');
+    await page.mouse.up();
+    await expect(target).toHaveAttribute('aria-selected', 'true');
+    await expect.poll(async () => (await orkas.invoke<any>('webAssist.state')).state.active_tab_id).toBe(targetId);
+    expect(await scroll()).toBe(left);
+
+    expect(await orkas.invoke<any>('webAssist.addTab', { conversationId: cid })).toMatchObject({ ok: true });
+    await expect(tabs).toHaveCount(11);
+    expect(await scroll()).toBe(left);
+    const lastId = await tabs.last().getAttribute('data-tab-id');
+    expect(await orkas.invoke<any>('webAssist.closeTab', { tabId: lastId })).toMatchObject({ ok: true });
+    await expect(tabs).toHaveCount(10);
+    expect(await scroll()).toBe(left);
+
+    // Keyboard focus survives unrelated page updates and still closes its tab.
+    const close = target.locator('.web-assist-tab-close');
+    await close.focus();
+    const focusedLeft = await scroll();
+    const firstId = await tabs.first().getAttribute('data-tab-id');
+    expect(await orkas.invoke<any>('webAssist.closeTab', { tabId: firstId })).toMatchObject({ ok: true });
+    await expect(tabs).toHaveCount(9);
+    await expect(close).toBeFocused();
+    expect(await scroll()).toBe(focusedLeft);
+    await orkas.electronApp!.evaluate(async ({ webContents }, id) => {
+      await webContents.fromId(id)!.executeJavaScript('document.title = "Scroll fixture focused"; void 0');
+    }, nativeId);
+    await expect(active).toHaveText('Scroll fixture focused');
+    await expect(close).toBeFocused();
+    expect(await scroll()).toBe(focusedLeft);
+    await close.press('Enter');
+    await expect(page.locator(`.web-assist-tab[data-tab-id="${targetId}"]`)).toHaveCount(0);
+    await expect(tabs).toHaveCount(8);
+    expect(await scroll()).toBe(focusedLeft);
+  } finally {
+    await orkas.invoke('webAssist.close', {});
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
 
 for (const kind of ['URL', 'search'] as const) {
   test(`browser address stays visible while a ${kind} waits for its first response`, async ({ orkas }) => {

@@ -98,33 +98,46 @@
 
   function renderTabs() {
     if (!tabsEl) return;
-    tabsEl.replaceChildren();
+    // Keep live nodes during status updates: clearing the strip can reset its
+    // scroll position and detach the focused or currently pressed tab.
+    const items = new Map(Array.from(tabsEl.children, (item) => [item.dataset.tabId, item]));
+    const tabs = tabsForConversation();
+    const liveIds = new Set(tabs.map((tab) => tab.tab_id));
+    for (const [id, item] of items) if (!liveIds.has(id)) item.remove();
     const selected = selectedTab();
-    for (const tab of tabsForConversation()) {
-      const item = document.createElement('div');
-      item.className = 'web-assist-tab';
+    let next = tabsEl.firstElementChild;
+    for (const tab of tabs) {
+      let item = items.get(tab.tab_id);
+      if (!item) {
+        item = document.createElement('div');
+        item.className = 'web-assist-tab';
+        item.dataset.tabId = tab.tab_id;
+        item.setAttribute('role', 'tab');
+
+        const title = document.createElement('span');
+        title.className = 'web-assist-tab-title';
+        item.appendChild(title);
+
+        const close = document.createElement('button');
+        close.type = 'button';
+        close.className = 'web-assist-tab-close';
+        close.dataset.closeTab = tab.tab_id;
+        close.innerHTML = icon('x', 'web-assist-tab-close-icon');
+        item.appendChild(close);
+      }
       item.classList.toggle('is-active', tab.tab_id === selected?.tab_id);
       item.classList.toggle('is-loading', tab.loading === true);
       item.classList.toggle('is-suspended', tab.suspended === true);
-      item.dataset.tabId = tab.tab_id;
-      item.setAttribute('role', 'tab');
       item.setAttribute('aria-selected', tab.tab_id === selected?.tab_id ? 'true' : 'false');
       item.tabIndex = tab.tab_id === selected?.tab_id ? 0 : -1;
 
-      const title = document.createElement('span');
-      title.className = 'web-assist-tab-title';
-      title.textContent = tabTitle(tab);
+      const title = item.querySelector('.web-assist-tab-title');
+      const text = tabTitle(tab);
+      if (title.textContent !== text) title.textContent = text;
       title.title = tab.suspended ? `${title.textContent} — ${label('web_assist.suspended', 'Inactive — reloads when opened')}` : title.textContent;
-      item.appendChild(title);
-
-      const close = document.createElement('button');
-      close.type = 'button';
-      close.className = 'web-assist-tab-close';
-      close.dataset.closeTab = tab.tab_id;
-      close.innerHTML = icon('x', 'web-assist-tab-close-icon');
-      setButtonCopy(close, 'web_assist.close_tab', 'Close tab');
-      item.appendChild(close);
-      tabsEl.appendChild(item);
+      setButtonCopy(item.querySelector('.web-assist-tab-close'), 'web_assist.close_tab', 'Close tab');
+      if (item !== next) tabsEl.insertBefore(item, next);
+      next = item.nextElementSibling;
     }
   }
 
