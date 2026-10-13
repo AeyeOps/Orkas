@@ -2017,6 +2017,13 @@ function _bindProjectTodos() {
   if (input && input.dataset.bound !== '1') {
     input.dataset.bound = '1';
     input.addEventListener('input', _updateProjectTodoEditor);
+    input.addEventListener('paste', (event) => {
+      if (_todoEditorPid === null) return;
+      const files = event.clipboardData?.files;
+      if (!files?.length) return;
+      event.preventDefault();
+      void _todoPickAndUploadFiles(files);
+    });
     input.addEventListener('keydown', (e) => {
       if (e.isComposing || e.keyCode === 229) return; // IME composition guard
       if (e.key === 'Escape') {
