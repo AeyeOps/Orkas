@@ -222,6 +222,64 @@ describe('features/connectors/oauth-dcr', () => {
       .toBe(false);
   });
 
+  it('skips a 200 discovery response that is not resource metadata and tries the next well-known path', async () => {
+    // Zapier MCP answers the path-suffixed probe with HTTP 200 and a JSON-RPC "not found" body.
+    const fetchMock = vi.fn(async (raw: string) => {
+      const url = String(raw);
+      if (url === 'https://mcp.example.com/api/mcp/mcp/.well-known/oauth-protected-resource') return jsonResponse({
+        jsonrpc: '2.0', id: null, error: { code: -32603, message: 'not found' },
+      });
+      if (url === 'https://mcp.example.com/.well-known/oauth-protected-resource/api/mcp/mcp') return jsonResponse({
+        resource: 'https://mcp.example.com/api/mcp/mcp', authorization_servers: ['https://mcp.example.com'],
+      });
+      if (url === 'https://mcp.example.com/.well-known/oauth-authorization-server') return jsonResponse({
+        issuer: 'https://mcp.example.com',
+        authorization_endpoint: 'https://mcp.example.com/oauth/authorize',
+        token_endpoint: 'https://mcp.example.com/oauth/token',
+        registration_endpoint: 'https://mcp.example.com/oauth/register',
+      });
+      if (url === 'https://mcp.example.com/oauth/register') return jsonResponse({ client_id: 'client-1' });
+      throw new Error(`unexpected request ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const pending = oauth.startCustomMcpOAuth('custom-example', 'https://mcp.example.com/api/mcp/mcp');
+    const outcome = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    expect(new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('resource'))
+      .toBe('https://mcp.example.com/api/mcp/mcp');
+    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+    await outcome;
+  });
+
+  it('skips a 200 authorization-server document without endpoints and tries the next discovery URL', async () => {
+    const fetchMock = vi.fn(async (raw: string) => {
+      const url = String(raw);
+      if (url.includes('oauth-protected-resource')) return jsonResponse({
+        resource: 'https://mcp.example.com/mcp', authorization_servers: ['https://login.example.com'],
+      });
+      if (url === 'https://login.example.com/.well-known/oauth-authorization-server') return jsonResponse({
+        error: 'not_found',
+      });
+      if (url === 'https://login.example.com/.well-known/openid-configuration') return jsonResponse({
+        issuer: 'https://login.example.com',
+        authorization_endpoint: 'https://login.example.com/authorize',
+        token_endpoint: 'https://login.example.com/token',
+        registration_endpoint: 'https://login.example.com/register',
+      });
+      if (url === 'https://login.example.com/register') return jsonResponse({ client_id: 'client-1' });
+      throw new Error(`unexpected request ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const pending = oauth.startCustomMcpOAuth('custom-example', 'https://mcp.example.com/mcp');
+    const outcome = expect(pending).rejects.toThrow();
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
+    expect(new URL(String(electronMock.openExternal.mock.calls[0][0])).origin).toBe('https://login.example.com');
+    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+    await outcome;
+  });
+
   it('rejects root metadata for a different tenant when custom issuer discovery falls back', async () => {
     const fetchMock = vi.fn(async (raw: string) => {
       const url = String(raw);

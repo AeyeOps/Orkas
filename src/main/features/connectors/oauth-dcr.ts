@@ -224,9 +224,28 @@ function _fetchDcr(label: string, url: string, init: RequestInit = {}): Promise<
   );
 }
 
+/** Some hosts answer unknown discovery paths with HTTP 200 and an error body (Zapier MCP returns a
+ *  JSON-RPC "not found" object), so a successful status alone does not make a candidate usable. */
+function _hasAuthorizationServers(body: unknown): boolean {
+  const servers = (body as ProtectedResourceMetadata | null)?.authorization_servers;
+  return Array.isArray(servers) && servers.length > 0 && servers.every(server => typeof server === 'string' && !!server);
+}
+
+function _hasAuthorizationEndpoints(body: unknown): boolean {
+  const meta = body as Partial<AuthServerMetadata> | null;
+  return typeof meta?.authorization_endpoint === 'string' && !!meta.authorization_endpoint
+    && typeof meta.token_endpoint === 'string' && !!meta.token_endpoint;
+}
+
 /** Fetch `<base>/.well-known/<name>`, falling back to root-level discovery if path-suffixed
- *  fails (per MCP authorization spec — providers can serve discovery at either location). */
-async function _fetchWellKnown<T>(mcpUrl: string, wellKnownName: string, strict = false): Promise<T> {
+ *  fails (per MCP authorization spec — providers can serve discovery at either location).
+ *  A 200 whose body fails `accept` counts as a miss, so the next candidate is still tried. */
+async function _fetchWellKnown<T>(
+  mcpUrl: string,
+  wellKnownName: string,
+  strict = false,
+  accept: (body: unknown) => boolean = () => true,
+): Promise<T> {
   const url = new URL(mcpUrl);
   // Path-suffixed first (e.g. https://mcp.notion.com/mcp/.well-known/oauth-protected-resource),
   // then root well-known with the MCP path appended (e.g. Atlassian's
@@ -240,7 +259,12 @@ async function _fetchWellKnown<T>(mcpUrl: string, wellKnownName: string, strict 
   for (const cand of Array.from(new Set(candidates))) {
     try {
       const r = await _fetchDcr(`DCR ${wellKnownName}`, cand, strict ? { redirect: 'error' } : {});
-      if (r.ok) return await r.json() as T;
+      if (r.ok) {
+        const body: unknown = await r.json();
+        if (accept(body)) return body as T;
+        lastErr = new Error(`DCR ${wellKnownName} metadata missing required fields`);
+        continue;
+      }
       lastErr = new Error(`DCR ${wellKnownName} metadata HTTP ${r.status}`);
     } catch (err) {
       lastErr = _fmtFetchErr(`DCR ${wellKnownName} metadata fetch failed`, err);
@@ -270,7 +294,16 @@ async function _fetchAuthServerMetadata(authServer: string, mcpUrl: string, stri
       lastErr = _fmtFetchErr('DCR auth server metadata fetch failed', err);
       continue;
     }
-    if (r.ok) return await r.json() as AuthServerMetadata;
+    if (r.ok) {
+      let body: unknown;
+      try { body = await r.json(); } catch (err) {
+        lastErr = _fmtFetchErr('DCR auth server metadata parse failed', err);
+        continue;
+      }
+      if (_hasAuthorizationEndpoints(body)) return body as AuthServerMetadata;
+      lastErr = new Error('auth server metadata missing authorization or token endpoint');
+      continue;
+    }
     lastErr = new Error(`auth server metadata HTTP ${r.status}`);
   }
   throw lastErr || new Error('failed to fetch auth server metadata');
@@ -304,7 +337,9 @@ async function _fetchChallengedResourceMetadata(mcpUrl: string): Promise<Protect
 async function _discoverAuthServer(mcpUrl: string, custom = false): Promise<{ meta: AuthServerMetadata; resource: string }> {
   let prm: ProtectedResourceMetadata;
   try {
-    prm = await _fetchWellKnown<ProtectedResourceMetadata>(mcpUrl, 'oauth-protected-resource', custom);
+    prm = await _fetchWellKnown<ProtectedResourceMetadata>(
+      mcpUrl, 'oauth-protected-resource', custom, _hasAuthorizationServers,
+    );
   } catch (error) {
     if (!custom) throw error;
     prm = await _fetchChallengedResourceMetadata(mcpUrl);
