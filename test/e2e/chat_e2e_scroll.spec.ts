@@ -36,6 +36,86 @@ async function historyScrollState(page: import('@playwright/test').Page): Promis
 }
 
 test.describe('conversation message-list scrolling', () => {
+  for (const [position, update] of [
+    ['bottom', 'activity'], ['bottom', 'receipt'],
+    ['reading', 'activity'], ['reading', 'receipt'],
+  ] as const) {
+    test(`keeps the viewport steady when an appended message moves upward (${position}, ${update})`, async ({ modelOrkas }, testInfo) => {
+      if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
+      const page = modelOrkas.page;
+      if (position === 'reading') {
+        await page.setViewportSize({ width: 1000, height: 700 });
+        await page.evaluate(() => (window as typeof window & { setLang: (lang: string) => void }).setLang('zh'));
+      }
+      await page.locator('#new-chat-btn').click();
+      await page.locator('#new-chat-input').fill('E2E establish the reorder scroll fixture.');
+      await page.locator('#new-chat-send-btn').click();
+      await expect(page.locator('#chat-history [data-role="final"]')).toContainText(
+        'Hello from the local E2E model.',
+        { timeout: 20_000 },
+      );
+      await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+
+      const before = await page.evaluate(async (position) => {
+        const runtime = window as typeof window & {
+          appendChatMessage: (message: object, autoScroll: boolean) => HTMLElement;
+          _markEarlierLiveMessagesForUser: (history: HTMLElement, user: HTMLElement) => void;
+        };
+        const history = document.getElementById('chat-history')!;
+        history.replaceChildren();
+        const paragraphs = (label: string, count: number) => Array.from(
+          { length: count }, (_, index) => `${label} paragraph ${index + 1}.`,
+        ).join('\n\n');
+        for (let index = 0; index < 6; index += 1) {
+          runtime.appendChatMessage({ role: 'user', content: paragraphs('Earlier message', 3), time: 1000 + index }, false);
+        }
+        const assistant = runtime.appendChatMessage({
+          role: 'assistant', content: paragraphs('Current reply', 10), time: 2000,
+        }, false);
+        assistant.dataset.placeholder = '1';
+        assistant.dataset.reorderFixture = 'reply';
+        const user = runtime.appendChatMessage({
+          role: 'user', content: paragraphs('Appended message', 18), time: 3000,
+        }, false);
+        user.dataset.reorderFixture = 'user';
+        runtime._markEarlierLiveMessagesForUser(history, user);
+        history.style.scrollBehavior = 'auto';
+        history.scrollTop = history.scrollHeight;
+        await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        if (position === 'reading') {
+          history.dispatchEvent(new WheelEvent('wheel', { deltaY: -100 }));
+          history.scrollTop -= 100;
+        }
+        await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        history.style.removeProperty('scroll-behavior');
+        return { top: history.scrollTop, userTop: user.getBoundingClientRect().top };
+      }, position);
+
+      const after = await page.evaluate(async (update) => {
+        const runtime = window as typeof window & {
+          _advanceStreamingMessageActivityPosition: (message: HTMLElement) => boolean;
+          _syncRenderedGroupMessageIdentity: (message: HTMLElement, record: object) => void;
+        };
+        const history = document.getElementById('chat-history')!;
+        const assistant = history.querySelector<HTMLElement>('[data-reorder-fixture="reply"]')!;
+        const user = history.querySelector<HTMLElement>('[data-reorder-fixture="user"]')!;
+        if (update === 'activity') runtime._advanceStreamingMessageActivityPosition(assistant);
+        else runtime._syncRenderedGroupMessageIdentity(assistant, { id: 'received-reply', ts: 4000 });
+        await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+        return {
+          userBeforeReply: user.nextElementSibling === assistant,
+          top: history.scrollTop,
+          userTop: user.getBoundingClientRect().top,
+        };
+      }, update);
+      await testInfo.attach('scroll-geometry', { body: JSON.stringify({ before, after }), contentType: 'application/json' });
+      await page.screenshot({ path: testInfo.outputPath(`reorder-${position}-${update}.png`) });
+      expect(after.userBeforeReply).toBe(true);
+      expect(Math.abs(after.top - before.top)).toBeLessThanOrEqual(1);
+      expect(after.userTop).toBeLessThan(before.userTop - 100);
+    });
+  }
+
   test('keeps the process rail pinned until the user explicitly scrolls it', async ({ modelOrkas }) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     const result = await modelOrkas.page.evaluate(() => {

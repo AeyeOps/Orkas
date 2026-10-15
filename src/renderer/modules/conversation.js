@@ -4106,7 +4106,6 @@ function _syncRenderedGroupMessageIdentity(el, message) {
     ));
     const parent = el.parentElement;
     if (parent && !_isTimestampPositionCorrect(parent, el)) {
-      parent.removeChild(el);
       _insertByTimestamp(parent, el);
     }
   }
@@ -11743,16 +11742,30 @@ function _appendBeforeSpacer(container, msg) {
  *  Bubbles without `data-ts` (legacy / history-load) are treated as
  *  earlier-than-anything new — new bubbles always append after them. */
 function _insertByTimestamp(container, msg) {
+  // A background reorder must not make Chromium follow the appended user
+  // bubble upward when the live reply crosses it. Preserve the viewport only
+  // for an existing row; new messages retain the ordinary sticky-follow path.
+  const previousTop = msg.parentElement === container ? container.scrollTop : null;
   const newTs = Number(msg.dataset.ts || 0);
   const children = container.querySelectorAll(':scope > .chat-message[data-ts]');
+  let reference = null;
   for (const existing of children) {
     const existingTs = Number(existing.dataset.ts || 0);
     if (existingTs > newTs) {
-      container.insertBefore(msg, existing);
-      return;
+      reference = existing;
+      break;
     }
   }
-  _appendBeforeSpacer(container, msg);
+  if (reference) container.insertBefore(msg, reference);
+  else _appendBeforeSpacer(container, msg);
+  if (previousTop != null) {
+    const prev = container.style.scrollBehavior;
+    container.style.scrollBehavior = 'auto';
+    _markProgrammaticStickyScroll(container);
+    container.scrollTop = previousTop;
+    if (prev) container.style.scrollBehavior = prev;
+    else container.style.removeProperty('scroll-behavior');
+  }
 }
 
 function _isTimestampPositionCorrect(container, msg) {
