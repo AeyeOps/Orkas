@@ -59,9 +59,7 @@ Orkas 是一个开源、本地优先的多智能体桌面应用。你描述目�
 
 macOS 和 Windows 提供安装包。基于 glibc 的 Linux x64/arm64 目前需从源码运行 —— 见 [快速开始](#快速开始)。
 
-- **macOS Apple 芯片** → [Orkas-mac-arm64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=arm64&download=1)
-- **macOS Intel** → [Orkas-mac-x64.dmg](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=mac&arch=x64&download=1)
-- **Windows x64** → [Orkas-Setup.exe](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&os=win&download=1)
+[下载 Orkas](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)
 
 ---
 
