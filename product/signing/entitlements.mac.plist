@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+  <dict>
+    <!-- V8 requires writable+executable memory for JIT. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <!-- Chromium still maps executable memory in a few paths that are not
+         covered by allow-jit alone. -->
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <!-- The bundled runtime and native modules (better-sqlite3, sharp,
+         onnxruntime, sqlite-vec, and the prepared node/python/ffmpeg/whisper
+         binaries) are not all signed by the same Team ID as the app, so the
+         hardened runtime must not enforce library validation. -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+  </dict>
+</plist>
