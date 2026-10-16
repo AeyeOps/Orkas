@@ -8479,6 +8479,7 @@ function _commitStreamingMarkdown(finalEl, prepared, suffixHtml = '') {
       finalEl.replaceChildren(body);
     }
   }
+  if (prepared.bodyClass) body.className = prepared.bodyClass;
   const reused = new Set(blocks.filter(block => block.nodes));
   const changed = [];
   blocks.forEach((block, i) => {
@@ -8521,8 +8522,9 @@ function _releaseStreamingMarkdown(finalEl) {
   delete finalEl._streamMarkdown;
 }
 
-function _paintStreamingMarkdownBlocks(msg, finalEl, display, { stickBottom, suffixHtml }) {
+function _paintStreamingMarkdownBlocks(msg, finalEl, display, { stickBottom, suffixHtml, bodyClass }) {
   const prepared = _prepareStreamingMarkdown(finalEl, display);
+  if (bodyClass) prepared.bodyClass = bodyClass;
   const dirtyMath = prepared.blocks.filter(block => !block.nodes && _streamMathSignatureForText(block.html));
   if (!dirtyMath.length || typeof typesetMathHtml !== 'function') {
     _invalidateStreamingMathPaint(msg);
@@ -12137,8 +12139,9 @@ function _setProcessCommentaryLineContent(line, text) {
   line.dataset.processText = body;
   if (typeof renderMarkdownFull === 'function') {
     if (typeof renderMarkdownBlocks === 'function' && typeof line.insertBefore === 'function') {
-      _commitStreamingMarkdown(line, _prepareStreamingMarkdown(line, body));
-      line.firstElementChild.className = 'stream-process-commentary-text markdown-body';
+      _paintStreamingMarkdownBlocks(line, line, body, {
+        stickBottom: false, suffixHtml: '', bodyClass: 'stream-process-commentary-text markdown-body',
+      });
     } else {
       line.innerHTML = `<div class="stream-process-commentary-text markdown-body">${_renderMessageMarkdown(body)}</div>`;
     }

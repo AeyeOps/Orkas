@@ -10,6 +10,32 @@ const index = fs.readFileSync(path.join(renderer, 'index.html'), 'utf8');
 const mathConfig = index.slice(index.indexOf('window.MathJax = {'), index.indexOf('</script>', index.indexOf('window.MathJax = {')));
 const capturedLogs = new WeakMap<Page, Array<{ level: string; message: string }>>();
 
+test('renders process commentary formulas and retains completed formulas as the prose grows', async ({ page }, testInfo) => {
+  await setup(page);
+  await page.evaluate(() => {
+    const w = window as any;
+    w.commentary = document.createElement('div');
+    w.msg.querySelector('.stream-process-body').appendChild(w.commentary);
+    w._setProcessCommentaryLineContent(w.commentary, 'First result: \\(x^2\\).');
+  });
+  const commentary = page.locator('.stream-process-commentary');
+  await expect(commentary.locator('mjx-container')).toHaveCount(1);
+  await expect(commentary.locator('.stream-process-commentary-text')).toContainText('First result:');
+  await page.evaluate(() => {
+    const w = window as any;
+    w.commentaryMath = w.commentary.querySelector('mjx-container');
+    w._setProcessCommentaryLineContent(w.commentary, 'First result: \\(x^2\\).\n\nSecond result: \\(y^3\\).');
+  });
+  await expect(commentary.locator('mjx-container')).toHaveCount(2);
+  expect(await page.evaluate(() => {
+    const w = window as any;
+    return w.commentaryMath.isConnected && w.commentary.querySelector('mjx-container') === w.commentaryMath;
+  })).toBe(true);
+  await expect(commentary).toContainText('Second result:');
+  await page.locator('.stream-process').evaluate((element) => { (element as HTMLDetailsElement).open = true; });
+  await commentary.screenshot({ path: testInfo.outputPath('process-formulas.png') });
+});
+
 test.afterEach(async ({ page }, testInfo) => {
   const logs = capturedLogs.get(page) || [];
   const fontWarnings = logs.filter(isFontFallbackNotice);
