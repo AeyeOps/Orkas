@@ -8,7 +8,7 @@ Orkas 是一个开源、本地优先的多智能体桌面应用。你描述目�
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
 [![Release](https://img.shields.io/github/v/release/Orkas-AI/Orkas?color=blue)](https://github.com/Orkas-AI/Orkas/releases)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Windows%20%7C%20Linux-blue)](https://orkas.ai?source=gh-orkas)
-[![Download](https://img.shields.io/badge/download-orkas.ai-black)](https://orkas.ai?source=gh-orkas)
+[![Download](https://img.shields.io/badge/download-orkas.ai-black)](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)
 [![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
 
 [English](./README.md) · [简体中文](./README.zh-CN.md)
