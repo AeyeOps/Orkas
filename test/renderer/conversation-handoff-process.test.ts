@@ -88,6 +88,7 @@ function loadRedundantCommanderRecord(): (record: unknown) => boolean {
     extractFunction('_isRoutingOnlyEventNames'),
     extractFunction('_isRoutingOnlyProcessItems'),
     extractFunction('_processItemsContainSuccessfulTerminalHandoff'),
+    extractFunction('_processItemsHavePublicCommentary'),
     `(${extractFunction('_isRedundantRoutingOnlyCommanderRecord')})`,
   ].join('\n');
   return vm.runInNewContext(combined, {});
@@ -288,6 +289,17 @@ describe('routing-only Commander history visibility', () => {
       text: 'Combined recommendation from both agents.',
       process: [dispatchItem],
     })).toBe(false);
+  });
+
+  it('preserves a commentary-only segment even when its tools only route', () => {
+    const isRedundant = loadRedundantCommanderRecord();
+    expect(isRedundant({ from: 'commander', text: '', process: [
+      { type: 'progress', text: 'I will delegate the requested work.',
+        event: { stream: 'assistant', data: { phase: 'commentary' } } }, dispatchItem,
+    ] })).toBe(false);
+    expect(isRedundant({ from: 'commander', text: '', process: [
+      { type: 'progress', text: ' ', event: { stream: 'assistant', data: { phase: 'commentary' } } }, dispatchItem,
+    ] })).toBe(true);
   });
 
   it('still drops empty and abort-only routing tails', () => {

@@ -114,7 +114,7 @@ async function withProjectInstructionsMutationLock<T>(
 export interface Project {
   project_id: string;
   name: string;
-  /** Reserved for future collaboration. Single-machine = active uid. */
+  /** Current account uid for private projects; Server owner uid for shared projects, or empty if unknown. */
   owner_uid: string;
   created_at: string;
   updated_at: string;
@@ -259,7 +259,8 @@ function _normaliseProject(raw: any, uid: string, pid: string): Project {
   return {
     project_id: typeof raw.project_id === 'string' ? raw.project_id : pid,
     name: typeof raw.name === 'string' ? raw.name : '',
-    owner_uid: typeof raw.owner_uid === 'string' && raw.owner_uid ? raw.owner_uid : uid,
+    // Local profile ownership remains independent of hosted membership.
+    owner_uid: uid,
     created_at: typeof raw.created_at === 'string' ? raw.created_at : now,
     updated_at: typeof raw.updated_at === 'string' ? raw.updated_at : now,
   };
@@ -374,8 +375,9 @@ export async function listProjects(uid: string): Promise<ProjectWithStats[]> {
     convCount: conversationCounts.get(project.project_id) || 0,
   } : null);
   const projects = entries.filter((entry): entry is { project: Project; convCount: number } => entry !== null);
-  // Display-name order is shared by the sidebar and every picker backed by
-  // `projects.list`. Numeric comparison keeps names such as Project 2 before
+  // Shared projects lead; display-name order within each group is shared by
+  // the sidebar and every picker backed by `projects.list`.
+  // Numeric comparison keeps names such as Project 2 before
   // Project 10; project_id is a deterministic fallback for malformed legacy
   // data that collates to the same display name.
   const locale = getLocaleMeta(getCurrentLang()).intlLocale;

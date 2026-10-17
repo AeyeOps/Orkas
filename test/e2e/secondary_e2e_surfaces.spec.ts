@@ -1,5 +1,5 @@
 import type { Page } from '@playwright/test';
-import { expect, test } from './fixtures/orkas';
+import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
 async function openDataSettings(page: Page): Promise<void> {
   await page.locator('#settings-btn').click();
@@ -131,22 +131,8 @@ test.describe('secondary user surfaces', () => {
     await expect(persistedSection.locator('.memory-empty')).toBeVisible();
   });
 
-  test('opens the external-only coding-CLI dialog from the AI Team header', async ({ appPage }) => {
-    await appPage.locator('#agents-btn').click();
-    await appPage.locator('#agents-connect-cli-btn').click();
-
-    await expect(appPage.locator('#agent-modal')).toHaveClass(/\bopen\b/);
-    await expect(appPage.locator('#agent-modal [data-agent-panel="external"]')).toHaveClass(/\bis-active\b/);
-    await expect(appPage.locator('#agent-modal-title')).toHaveText('Connect an agent');
-    await expect(appPage.locator('#agent-modal-tabs')).toBeHidden();
-    await expect(appPage.locator('#agent-modal-ext-cli-select')).toBeVisible();
-
-    await appPage.locator('#agent-modal .modal-actions .btn').first().click();
-    await expect(appPage.locator('#agent-modal')).not.toHaveClass(/\bopen\b/);
-  });
-
   test('opens Marketplace from Agents and switches every catalog tab', async ({ appPage }) => {
-    await appPage.locator('#agents-btn').click();
+    await openSidebarEntry(appPage, '#agents-btn');
     await appPage.locator('#agents-more-btn').click();
     await expect(appPage.locator('#panel-marketplace')).toHaveClass(/\bactive\b/);
 
@@ -167,6 +153,23 @@ test.describe('secondary user surfaces', () => {
 
     await appPage.locator('[data-mp-close]').click();
     await expect(appPage.locator('#panel-agents')).toHaveClass(/\bactive\b/);
+  });
+
+  test('opens the external-only coding-CLI dialog from the AI Team header', async ({ appPage }) => {
+    // The page the sidebar's coding-agent card used to open, now reached from
+    // the AI Team header: the CLI panel alone, with no tab bar exposing the
+    // in-process create form.
+    await openSidebarEntry(appPage, '#agents-btn');
+    await appPage.locator('#agents-connect-cli-btn').click();
+
+    await expect(appPage.locator('#agent-modal')).toHaveClass(/\bopen\b/);
+    await expect(appPage.locator('#agent-modal [data-agent-panel="external"]')).toHaveClass(/\bis-active\b/);
+    await expect(appPage.locator('#agent-modal-title')).toHaveText('Connect an agent');
+    await expect(appPage.locator('#agent-modal-tabs')).toBeHidden();
+    await expect(appPage.locator('#agent-modal-ext-cli-select')).toBeVisible();
+
+    await appPage.locator('#agent-modal .modal-actions .btn').first().click();
+    await expect(appPage.locator('#agent-modal')).not.toHaveClass(/\bopen\b/);
   });
 
 });

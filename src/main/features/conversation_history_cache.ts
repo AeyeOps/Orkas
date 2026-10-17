@@ -17,18 +17,20 @@ import { isMainThread } from 'node:worker_threads';
 import { historyRequest } from './conversation-history-client';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { userConversationHistoryCacheDir } from '../paths';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef } from '../util/log-redact';
-import { persistToolResult } from '../util/tool-result-cap';
-import { readJson, readJsonlPageWithOffsets, readJsonlWindow, writeJson } from '../storage';
+import { persistToolResult, TOOL_RESULT_REF_HASH_HEX } from '../util/tool-result-cap';
+import { readJson, readJsonlPageWithOffsets, readJsonlWindow, readJsonlWindowAtMatch, writeJson } from '../storage';
 import type { JsonlPage, JsonlRecordWithOffset, JsonlWindow } from '../storage';
 import type { GroupMessage } from './group_chat/visibility';
+import { normalizeNativeMessageDisplay } from './group_chat/message-display';
+import { DEFER_PROCESS_ITEMS, PROCESS_PAGE_REBUILD, PROCESS_PAGE_BYTES, processTextChunks, storeProcessPages, processSummary, readProcessPage, processPageReference } from './conversation-process-cache';
 
 const log = createLogger('conversation-history-cache');
-const CACHE_VERSION = 4;
+const CACHE_VERSION = 6;
 const MAX_INLINE_PROCESS_OUTPUT_BYTES = 1024;
 const MAX_FAILURE_OUTPUT_PREVIEW_CHARS = 600;
 const SOURCE_TAIL_FINGERPRINT_BYTES = 4 * 1024;
@@ -117,7 +119,9 @@ function cachePaths(userId: string, sourceFile: string): CachePaths {
   const entryDir = path.join(userConversationHistoryCacheDir(userId), key);
   return {
     entryDir,
-    latestPageFile: path.join(entryDir, 'latest-page.json'),
+    // Never parse an older, potentially hundreds-of-megabytes projection just
+    // to discover its version. A new filename makes invalidation cheap.
+    latestPageFile: path.join(entryDir, 'latest-page-v6.json'),
     toolResultsDir: path.join(entryDir, 'tool-results'),
   };
 }
@@ -182,6 +186,33 @@ function serializedProcessOutput(output: unknown): string | null {
   }
 }
 
+/** Same durable content address as ordinary results, with bounded write buffers. */
+function persistLargeHistoryOutput(directory: string, toolName: string, output: string): string {
+  const hash = createHash('sha256').update(toolName).update('\0');
+  for (const chunk of processTextChunks(output)) hash.update(chunk);
+  const safeTool = toolName.replace(/[^a-zA-Z0-9_-]+/g, '_').slice(0, 48) || 'tool';
+  const destination = path.join(directory, `${safeTool}.${hash.digest('hex').slice(0, TOOL_RESULT_REF_HASH_HEX)}.txt`);
+  fs.mkdirSync(directory, { recursive: true });
+  if (fs.existsSync(destination)) return destination;
+  const temporary = `${destination}.${randomUUID()}.tmp`;
+  try {
+    const fd = fs.openSync(temporary, 'wx', 0o600);
+    try {
+      for (const chunk of processTextChunks(output)) {
+        const buffer = Buffer.from(chunk);
+        let written = 0;
+        while (written < buffer.length) {
+          const count = fs.writeSync(fd, buffer, written, buffer.length - written);
+          if (count <= 0) throw new Error('History result write did not advance');
+          written += count;
+        }
+      }
+    } finally { fs.closeSync(fd); }
+    fs.renameSync(temporary, destination);
+    return destination;
+  } finally { fs.rmSync(temporary, { force: true }); }
+}
+
 function spillProcessOutput(
   data: Record<string, unknown>,
   stream: string,
@@ -220,7 +251,9 @@ function spillProcessOutput(
 
   const toolName = String(data.name || data.tool || data.toolName || 'tool');
   try {
-    const resultPath = persistToolResult(toolResultsDir, toolName, output);
+    const resultPath = Buffer.byteLength(output) > PROCESS_PAGE_BYTES
+      ? persistLargeHistoryOutput(toolResultsDir, toolName, output)
+      : persistToolResult(toolResultsDir, toolName, output);
     delete next.output;
     if (stream === 'cli') next.outputPath = resultPath;
     else {
@@ -304,6 +337,7 @@ export function projectConversationHistoryRecord(
   record: GroupMessage,
   toolResultsDir: string,
 ): GroupMessage {
+  record = normalizeNativeMessageDisplay(record);
   if (!Array.isArray(record.process) || !record.process.length) return record;
   const process = record.process
     .map((item) => projectProcessItem(item, toolResultsDir))
@@ -319,6 +353,52 @@ export function projectConversationHistoryRecords(
 ): GroupMessage[] {
   const { toolResultsDir } = cachePaths(userId, sourceFile);
   return records.map((record) => projectConversationHistoryRecord(record, toolResultsDir));
+}
+
+function projectHistoryRecord(userId: string, sourceFile: string, record: GroupMessage): GroupMessage {
+  record = normalizeNativeMessageDisplay(record);
+  const { entryDir, toolResultsDir } = cachePaths(userId, sourceFile);
+  if (Array.isArray(record.process) && record.process.length > DEFER_PROCESS_ITEMS) {
+    let part;
+    try {
+      part = storeProcessPages(entryDir, record.process, item => {
+        const projected = projectProcessItem(item, toolResultsDir);
+        return projected === null ? [] : [projected as NonNullable<GroupMessage['process']>[number]];
+      });
+    }
+    catch {
+      // First paint must not depend on derived-cache write availability.
+      // Keep the complete canonical trail addressable for a later retry.
+      part = { ref: processPageReference(record.process), count: record.process.length };
+      log.warn('conversation process cache unavailable', { failure_stage: 'process_cache' });
+    }
+    return { ...record, process: processSummary(record.process), process_parts: [{ ...part, message_id: record.id }] };
+  }
+  return projectConversationHistoryRecord(record, toolResultsDir);
+}
+
+function projectHistoryRecords(userId: string, sourceFile: string, records: GroupMessage[]): GroupMessage[] {
+  return records.map(record => projectHistoryRecord(userId, sourceFile, record));
+}
+
+export async function readConversationProcessPage(
+  userId: string, sourceFile: string, processRef: string, processCursor = 0, messageId?: string,
+): Promise<{ items: NonNullable<GroupMessage['process']>; nextCursor: number | null }> {
+  if (isMainThread) return historyRequest({ kind: 'process-page', userId, sourceFile, processRef, processCursor, messageId });
+  const { entryDir, toolResultsDir } = cachePaths(userId, sourceFile);
+  let page;
+  try { page = await readProcessPage(entryDir, processRef, processCursor); }
+  catch (error) {
+    // Cache clearing is reversible even while its disclosure is mounted.
+    // Rebuild once from the named canonical message, never from a supplied path.
+    if (!['ENOENT', PROCESS_PAGE_REBUILD].includes((error as NodeJS.ErrnoException).code || '') || !messageId) throw error;
+    const window = await readConversationHistoryWindowAtMessage(userId, sourceFile, messageId, 1);
+    if (!window?.records.some(record => record.process_parts?.some(part => 'ref' in part && part.ref === processRef))) {
+      throw new Error('Process history changed');
+    }
+    page = await readProcessPage(entryDir, processRef, processCursor);
+  }
+  return { ...page, items: page.items.map(item => projectProcessItem(item, toolResultsDir)).filter(item => item !== null) as NonNullable<GroupMessage['process']> };
 }
 
 async function sourceTailHash(sourceFile: string, size: number): Promise<string> {
@@ -440,7 +520,7 @@ async function coldLatestPage(
   const startedAt = Date.now();
   const page = await readJsonlPageWithOffsets<GroupMessage>(sourceFile, wanted, identity.size);
   const readFinishedAt = Date.now();
-  const projected = projectConversationHistoryRecords(
+  const projected = projectHistoryRecords(
     userId,
     sourceFile,
     page.entries.map(({ record }) => record),
@@ -487,7 +567,7 @@ async function extendLatestPage(
     cached.source.size,
     identity.size,
   );
-  const projected = projectConversationHistoryRecords(
+  const projected = projectHistoryRecords(
     userId,
     sourceFile,
     appended.map(({ record }) => record),
@@ -532,6 +612,8 @@ async function buildLatestPage(
     if (sameSourceSnapshot(next.source, snapshotIdentity(after))) {
       await fsp.mkdir(files.entryDir, { recursive: true });
       await writeJson(files.latestPageFile, next);
+      await fsp.rm(path.join(files.entryDir, 'latest-page.json'), { force: true });
+      await fsp.rm(path.join(files.entryDir, 'latest-page-v5.json'), { force: true });
       return next;
     }
     // A message landed while the page was being projected. Keep the valid
@@ -573,7 +655,7 @@ async function latestPage(
   // Stabilization/cache failures must not make history unavailable.
   const page = await readJsonlPageWithOffsets<GroupMessage>(sourceFile, wanted);
   return {
-    records: projectConversationHistoryRecords(
+    records: projectHistoryRecords(
       userId,
       sourceFile,
       page.entries.map(({ record }) => record),
@@ -599,7 +681,7 @@ export async function readConversationHistoryPage(
   }
   const page = await readJsonlPageWithOffsets<GroupMessage>(sourceFile, wanted, before ?? undefined);
   return {
-    records: projectConversationHistoryRecords(
+    records: projectHistoryRecords(
       userId,
       sourceFile,
       page.entries.map(({ record }) => record),
@@ -624,9 +706,19 @@ export async function readConversationHistoryWindow(
   userId: string, sourceFile: string, start: number, limit = 10, after = 0,
 ): Promise<JsonlWindow<GroupMessage>> {
   if (isMainThread) return historyRequest({ kind: 'window', userId, sourceFile, start, limit, after });
-  const { toolResultsDir } = cachePaths(userId, sourceFile);
   return readJsonlWindow<GroupMessage>(sourceFile, start, limit,
-    record => projectConversationHistoryRecord(record, toolResultsDir), after);
+    record => projectHistoryRecord(userId, sourceFile, record), after);
+}
+
+/** Project the page holding a message id. The worker finds it and reads the
+ * page in one pass, so a quoted reference never parses history on main. */
+export async function readConversationHistoryWindowAtMessage(
+  userId: string, sourceFile: string, messageId: string, limit = 10,
+): Promise<(JsonlWindow<GroupMessage> & { start: number; index: number }) | null> {
+  if (isMainThread) return historyRequest({ kind: 'window-at-message', userId, sourceFile, messageId, limit });
+  return readJsonlWindowAtMatch<GroupMessage>(sourceFile,
+    record => String(record?.id || '') === messageId && !record?.deleted_at, limit,
+    record => projectHistoryRecord(userId, sourceFile, record));
 }
 
 /** Active turns have no complete disk snapshot yet. Clone one record at a time

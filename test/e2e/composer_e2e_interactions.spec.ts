@@ -3,6 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
 import { expect, test } from './fixtures/orkas';
+import { currentTurnSnapshots, lastUserRequestText, quotedSnapshots } from '../helpers/reference-context';
 
 test.describe('persistent sidebar', () => {
   test('keeps the open-source footer focused on local Settings', async ({ appPage }) => {
@@ -30,7 +31,7 @@ test.describe('new chat composer', () => {
       '.composer-model-menu-group[data-model-group="official"]',
     );
     await expect(officialGroup.locator('.composer-model-menu-group-label'))
-      .toHaveText('Official models');
+      .toHaveText('Orkas built-in models');
     const officialRows = officialGroup.locator('.composer-model-menu-item');
     await expect(officialRows).toHaveCount(2);
     await expect(officialRows.locator('.composer-model-menu-title-name'))
@@ -45,7 +46,7 @@ test.describe('new chat composer', () => {
       '.composer-model-menu-group[data-model-group="custom"]',
     );
     await expect(customGroup.locator('.composer-model-menu-group-label'))
-      .toHaveText('User-configured models');
+      .toHaveText('Bring your own API Key');
     await appPage.keyboard.press('Escape');
 
     await appPage.locator('#settings-btn').click();
@@ -285,7 +286,7 @@ test.describe('new chat composer', () => {
     await expect(modelGroup).toHaveCount(1);
     await expect(modelGroup).toHaveAttribute('data-model-group', 'custom');
     await expect(modelGroup.locator('.composer-model-menu-group-label'))
-      .toHaveText('User-configured models');
+      .toHaveText('Bring your own API Key');
     await expect(modelGroup.locator('.composer-model-menu-item'))
       .toHaveCount(entriesBefore.entries.length);
 
@@ -615,7 +616,7 @@ test.describe('new chat composer', () => {
     expect(orkas.readCliState().invocations).toHaveLength(0);
   });
 
-  test('resets multi-recipient sends to Commander and retains a later single CLI for follow-ups', async ({ cliOrkas }, testInfo) => {
+  test('resets multi-recipient sends to Commander and retains a later single CLI for follow-ups', async ({ cliModelOrkas: cliOrkas }, testInfo) => {
     const page = cliOrkas.page!;
     const recipients = [];
     for (const name of ['ComposerAlpha', 'ComposerBeta']) {
@@ -642,7 +643,9 @@ test.describe('new chat composer', () => {
     await expectComposerText(input, '@ComposerAlpha 你好， @ComposerBeta check the request');
     await expect(page.locator('#new-chat-recipient-name')).toHaveText('ComposerAlpha, ComposerBeta');
     await expect(page.locator('.skill-picker-item[data-id="__commander__"]')).toHaveAttribute('aria-checked', 'false');
-    await expect(page.locator('[data-composer-model-chip="new-chat"]')).toBeDisabled();
+    // Two named actors make a planned send (D29); planning runs on the
+    // selected model, so its control stays available even for CLI-only sends.
+    await expect(page.locator('[data-composer-model-chip="new-chat"]')).toBeEnabled();
     // Closing the panel restores the updated cursor; typed text stays after the chosen group.
     await page.locator(`.skill-picker-item[data-id="${recipients[1].agent_id}"]`).press('Escape');
     await expect(editor).toBeFocused();
@@ -679,6 +682,13 @@ test.describe('new chat composer', () => {
     await followup.press('Enter');
     await expect.poll(replies, { timeout: 30_000 }).toEqual([1, 2]);
     await expect(page.locator('#chat-recipient-name')).toHaveText('ComposerBeta');
+    // The planner may keep a mentioned actor as context only; the floor then
+    // follows the one actor that actually received work (D29).
+    cliOrkas.setDispatchPlanReplies([JSON.stringify({
+      tasks: [{ key: 't1', assignee: 'a1', part: 'check the sources too', after: [] }],
+      references: ['a2'],
+      question: null,
+    })]);
     await followup.fill('@ComposerBeta @ComposerBeta check the sources too @ComposerAlpha');
     await followup.press('Enter');
     await expect.poll(replies, { timeout: 30_000 }).toEqual([1, 3]);
@@ -849,18 +859,7 @@ test.describe('new chat composer', () => {
       await appPage.locator(`.new-chat-scenario-chip[data-scenario="${item.id}"]`).click();
       await expectComposerText(input, item.prompt);
       await expect(appPage.locator('#new-chat-recipient-name'), item.id).toHaveText(item.agentName);
-      await expect.poll(
-        () => input.evaluate((element) => ({
-          agentId: (element as HTMLDivElement).dataset.commanderAgentId,
-          entryPoint: (element as HTMLDivElement).dataset.commanderEntryPoint,
-          resourceId: (element as HTMLDivElement).dataset.commanderResourceId,
-        })),
-        { message: `${item.id} quick-start attribution` },
-      ).toEqual({
-        agentId: item.agentId,
-        entryPoint: 'quick_start',
-        resourceId: item.id,
-      });
+
     }
   });
 
@@ -874,15 +873,21 @@ test.describe('new chat composer', () => {
       const composer = rect('.new-chat-input-area');
       const quickPanel = rect('#new-chat-scenarios');
       const quickCard = rect('.new-chat-scenario-chip');
+      const below = document.querySelector<HTMLElement>('.home-below')!;
+      const belowStyle = getComputedStyle(below);
       const landing = rect('.new-chat-center');
       const landingChildren = [
         '.new-chat-header',
         '.new-chat-input-wrapper',
-        '#new-chat-scenarios',
+        '.home-below',
       ];
 
       return {
-        widths: [header.width, composer.width, quickPanel.width],
+        widths: [header.width, composer.width],
+        belowWidth: below.getBoundingClientRect().width,
+        quickPanelWidth: quickPanel.width,
+        belowContentWidth: below.clientWidth - parseFloat(belowStyle.paddingLeft) - parseFloat(belowStyle.paddingRight),
+        quickPanelFits: quickPanel.left >= below.getBoundingClientRect().left && quickPanel.right <= below.getBoundingClientRect().right,
         greetingFontSize: getComputedStyle(document.querySelector('.new-chat-greeting')!).fontSize,
         greetingTextAlign: getComputedStyle(document.querySelector('.new-chat-header')!).textAlign,
         composerHeight: composer.height,
@@ -935,6 +940,10 @@ test.describe('new chat composer', () => {
 
     expect(Math.min(...layout.widths)).toBeGreaterThanOrEqual(895);
     expect(Math.max(...layout.widths)).toBeLessThanOrEqual(902);
+    expect(layout.belowWidth).toBeGreaterThanOrEqual(900);
+    expect(layout.belowWidth).toBeLessThanOrEqual(910);
+    expect(Math.abs(layout.quickPanelWidth - layout.belowContentWidth)).toBeLessThanOrEqual(1);
+    expect(layout.quickPanelFits).toBe(true);
     expect(layout.greetingFontSize).toBe('32px');
     expect(layout.greetingTextAlign).toBe('center');
     expect(layout.composerHeight).toBeLessThanOrEqual(150);
@@ -948,25 +957,29 @@ test.describe('new chat composer', () => {
     expect(layout.quickCardContentFits).toBe(true);
     expect(layout.ossEntryOnHeaderRow).toBe(true);
     expect(layout.landingStartsInBounds).toBe(true);
-    expect(layout.flexShrink).toEqual(['0', '0', '0']);
+    // The region below the composer is the one block that gives way in a
+    // short window (P15).
+    expect(layout.flexShrink).toEqual(['0', '0', '1']);
 
     await appPage.setViewportSize({ width: 1280, height: 600 });
     const shortViewport = await appPage.evaluate(() => {
       const landing = document.querySelector('.new-chat-center')!;
-      const header = document.querySelector('.new-chat-header')!;
+      const below = document.querySelector('.home-below')!;
       const landingRect = landing.getBoundingClientRect();
-      const headerRect = header.getBoundingClientRect();
-      const overflows = landing.scrollHeight > landing.clientHeight;
-      const startsInBounds = headerRect.top >= landingRect.top;
+      const startsInBounds = document.querySelector('.new-chat-header')!.getBoundingClientRect().top >= landingRect.top;
+      // The composer stays on the first screen; the region below it scrolls
+      // on its own, falling back to the page only below its minimum.
+      const composerVisible = document.querySelector('.new-chat-input-area')!.getBoundingClientRect().bottom
+        <= landingRect.bottom;
+      const overflows = below.scrollHeight > below.clientHeight || landing.scrollHeight > landing.clientHeight;
+      below.scrollTop = below.scrollHeight;
       landing.scrollTop = landing.scrollHeight;
-      const quickPanelRect = document.querySelector('#new-chat-scenarios')!.getBoundingClientRect();
-      return {
-        overflows,
-        startsInBounds,
-        endIsReachable: quickPanelRect.bottom <= landingRect.bottom + 0.5,
-      };
+      const cards = below.querySelectorAll('.new-chat-scenario-chip');
+      const lastCard = cards[cards.length - 1].getBoundingClientRect();
+      const visibleBottom = Math.min(below.getBoundingClientRect().bottom, landing.getBoundingClientRect().bottom);
+      return { overflows, startsInBounds, composerVisible, endIsReachable: lastCard.bottom <= visibleBottom + 0.5 };
     });
-    expect(shortViewport).toEqual({ overflows: true, startsInBounds: true, endIsReachable: true });
+    expect(shortViewport).toEqual({ overflows: true, startsInBounds: true, composerVisible: true, endIsReachable: true });
 
     await appPage.setViewportSize({ width: 1080, height: 800 });
     await expect.poll(() => appPage.locator('.quick-grid').evaluate((element) => (

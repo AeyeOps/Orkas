@@ -600,6 +600,51 @@ describe('unread task reply indicators', () => {
     });
   });
 
+  it('lists unread runs newest first with the outcome of their latest terminal for the home', () => {
+    const persisted = new Map([['task_unread_v1_u1', JSON.stringify({
+      // Written before outcomes were kept: no status or entry point.
+      unread: [{ cid: 'legacy-task', projectId: '', finishedAt: 50 }],
+      read: [],
+    })]]);
+    const context = loadUnreadRenderer(persisted);
+    const changes: string[] = [];
+    context.CustomEvent = class { type: string; constructor(type: string) { this.type = type; } };
+    context.window.dispatchEvent = (event: any) => { changes.push(event.type); return true; };
+    context.conversations.push({ conversation_id: 'chat-task', project_id: 'p1' });
+    const terminal = (cid: string, status: string, at: number, entry: string) => context._handleTaskTerminalUnread({
+      type: 'terminal', conversation_id: cid, status, finished_at_ms: at, entry_point: entry,
+    });
+
+    expect(terminal('chat-task', 'waiting_input', 100, 'chat_send')).toBe(true);
+    expect(terminal('auto-run', 'failed', 300, 'automation')).toBe(true);
+    // The newest terminal decides what the home says; an older replay does not.
+    expect(terminal('chat-task', 'completed', 200, 'conversation')).toBe(true);
+    expect(terminal('chat-task', 'failed', 150, 'chat_send')).toBe(true);
+    expect(terminal('odd-entry', 'stopped', 120, 'Not An Entry!')).toBe(true);
+
+    const expected = [
+      { cid: 'auto-run', projectId: null, finishedAt: 300, status: 'failed', entryPoint: 'automation' },
+      { cid: 'chat-task', projectId: 'p1', finishedAt: 200, status: 'completed', entryPoint: 'conversation' },
+      { cid: 'odd-entry', projectId: null, finishedAt: 120, status: 'stopped' },
+      { cid: 'legacy-task', projectId: '', finishedAt: 50 },
+    ];
+    expect(JSON.parse(JSON.stringify(context.window.TaskUnread.list()))).toEqual(expected);
+    expect(changes.length).toBeGreaterThanOrEqual(4);
+    expect(new Set(changes)).toEqual(new Set(['task-unread-change']));
+
+    // Outcomes survive a relaunch.
+    const relaunched = loadUnreadRenderer(persisted);
+    relaunched._restoreUnreadTaskState();
+    expect(JSON.parse(JSON.stringify(relaunched.window.TaskUnread.list()))).toEqual(expected);
+
+    // Opening one removes it from the list and announces the change.
+    changes.length = 0;
+    context._markConversationRead('auto-run', { readAt: 400 });
+    expect(context.window.TaskUnread.list().map((row: any) => row.cid))
+      .toEqual(['chat-task', 'odd-entry', 'legacy-task']);
+    expect(changes).toEqual(['task-unread-change']);
+  });
+
   it('ships small red right-of-copy mounts only on sidebar surfaces', () => {
     const html = fs.readFileSync(path.join(__dirname, '../../src/renderer/index.html'), 'utf8');
     const projects = fs.readFileSync(

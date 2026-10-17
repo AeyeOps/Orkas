@@ -85,14 +85,6 @@ const ConversationInfo = (() => {
     return idx >= 0 ? base.slice(idx + 1).toLowerCase() : '';
   }
 
-  function _savedAppSourceKind(path, resourceKind) {
-    if (resourceKind === 'dir') return 'directory';
-    const ext = _extForName(path);
-    if (ext === 'html' || ext === 'htm') return 'html';
-    if (ext === 'css') return 'css';
-    if (ext === 'js' || ext === 'mjs') return 'javascript';
-    return 'file';
-  }
 
   function _savedAppSaveFailure(value, fallbackType = 'operation') {
     const rawCode = String((value && (value.error_code || value.code)) || '').toLowerCase();
@@ -123,20 +115,8 @@ const ConversationInfo = (() => {
     return { error_type: errorType, error_code: errorCode };
   }
 
-  function _logSavedAppSaveResult(startedAt, result, path, resourceKind, failure = {}) {
-    const payload = {
-      result,
-      surface: 'conversation_info',
-      kind: _savedAppSourceKind(path, resourceKind),
-      duration_ms: Math.max(0, Date.now() - startedAt),
-    };
-    if (result !== 'success') Object.assign(payload, failure);
-    if (result === 'failure') {
-      _infoLog.warn('conversation info app save failed', {
-        error_type: payload.error_type,
-        error_code: payload.error_code,
-      });
-    }
+  function _logSavedAppSaveFailure(failure) {
+    _infoLog.warn('conversation info app save failed', { error_type: failure.error_type, error_code: failure.error_code });
   }
 
   function _dirName(p) {
@@ -233,36 +213,9 @@ const ConversationInfo = (() => {
     return 'unsupported';
   }
 
-  function _fileKindForLog(name) {
-    const ext = _extForName(name);
-    if (ext === 'html' || ext === 'htm') return 'html';
-    if (ext === 'md' || ext === 'markdown') return 'markdown';
-    const kind = _kindForName(name);
-    if (kind === 'docx' || kind === 'spreadsheet' || kind === 'presentation') return 'office';
-    if (kind === 'legacy_office') return 'unsupported';
-    return kind;
-  }
 
-  function _logLibraryImportResult(startedAt, result, absPath, response, failure = {}) {
-    const payload = {
-      result,
-      surface: 'conversation_info',
-      kind: _fileKindForLog(absPath),
-      duration_ms: Math.max(0, Date.now() - startedAt),
-    };
-    if (result === 'success') {
-      payload.scope = response && response.scope === 'project'
-        ? 'project'
-        : (response && response.scope === 'global' ? 'global' : 'unknown');
-    } else {
-      Object.assign(payload, failure);
-    }
-    if (result === 'failure') {
-      _infoLog.warn('conversation info library import failed', {
-        error_type: payload.error_type,
-        error_code: payload.error_code,
-      });
-    }
+  function _logLibraryImportFailure(failure) {
+    _infoLog.warn('conversation info library import failed', { error_type: failure.error_type, error_code: failure.error_code });
   }
 
   function _fileOperationPolicy() {
@@ -1037,7 +990,7 @@ const ConversationInfo = (() => {
     let canSaveApp = false;
     try {
       const inspected = await window.orkas.invoke('savedApps.inspectBundleFromPath', _fileActionPayload(absPath, targetCid));
-      canSaveApp = !!(inspected && inspected.ok !== false && inspected.canSave);
+      canSaveApp = !!(inspected && inspected.ok !== false && (inspected.canSave || inspected.reason === 'app_bundle_root'));
     } catch (_) { canSaveApp = false; }
     const addItem = entryKind === 'file' && _canAddEntryToChat(name || absPath)
       ? `<div class="ctx-row-menu-item" data-action="add-to-chat">${escapeHtml(addLabel)}</div>`
@@ -1089,15 +1042,10 @@ const ConversationInfo = (() => {
   async function _revealEntry(absPath, cidOverride) {
     try {
       const res = await window.orkas.invoke('workspace.revealPath', _fileActionPayload(absPath, cidOverride));
-      if (!res || !res.ok) {
-        await uiAlert(_label('conversation_info.file_reveal_failed', 'Could not show in folder: {reason}', {
-          reason: (res && res.error) || 'failed',
-        }));
-      }
-    } catch (err) {
-      await uiAlert(_label('conversation_info.file_reveal_failed', 'Could not show in folder: {reason}', {
-        reason: String(err && err.message || err),
-      }));
+      // Host reasons can carry local paths or internal errors; show only localized recovery copy.
+      if (!res || !res.ok) await uiAlert(_label('conversation_info.file_reveal_failed', 'Could not open the folder. The file may have been moved or deleted.'));
+    } catch (_) {
+      await uiAlert(_label('conversation_info.file_reveal_failed', 'Could not open the folder. The file may have been moved or deleted.'));
     }
   }
 
@@ -1119,38 +1067,26 @@ const ConversationInfo = (() => {
   async function _addEntryToLibrary(absPath, cidOverride) {
     const targetCid = cidOverride || _cid;
     if (!_canAddEntryToLibrary(absPath, _isProjectConversation(targetCid))) return;
-    const startedAt = Date.now();
+
     let res;
     try {
       res = await window.orkas.invoke('library.importProduced', _fileActionPayload(absPath, cidOverride));
     } catch (err) {
-      _logLibraryImportResult(
-        startedAt,
-        'failure',
-        absPath,
-        null,
-        _libraryImportFailure(err, 'ipc'),
-      );
+      _logLibraryImportFailure(_libraryImportFailure(err, 'ipc'));
       await uiAlert(_label('conversation_info.file_add_to_library_failed', 'Add to Library failed: {reason}', {
         reason: String(err && err.message || err),
       }));
       return;
     }
     if (!res || !res.ok) {
-      _logLibraryImportResult(
-        startedAt,
-        'failure',
-        absPath,
-        res,
-        _libraryImportFailure(res, 'operation'),
-      );
+      _logLibraryImportFailure(_libraryImportFailure(res, 'operation'));
       await uiAlert(_label('conversation_info.file_add_to_library_failed', 'Add to Library failed: {reason}', {
         reason: String((res && res.error) || 'failed'),
       }));
       return;
     }
 
-    _logLibraryImportResult(startedAt, 'success', absPath, res);
+
     try {
       const libraryLabel = res.scope === 'project'
         ? _label('contexts.transfer.project_library', 'Project Library')
@@ -1174,15 +1110,15 @@ const ConversationInfo = (() => {
     }
   }
 
-  async function _saveEntryAsApp(absPath, cidOverride, resourceKind = 'file') {
-    const startedAt = Date.now();
+  async function _saveEntryAsApp(absPath, cidOverride) {
+
     let res;
     try {
       res = await window.orkas.invoke('savedApps.saveFromPath', _fileActionPayload(absPath, cidOverride));
     } catch (err) {
-      _logSavedAppSaveResult(startedAt, 'failure', absPath, resourceKind, _savedAppSaveFailure(err, 'ipc'));
+      _logSavedAppSaveFailure(_savedAppSaveFailure(err, 'ipc'));
       try {
-        await uiAlert(_label('apps.save_failed', 'Could not save the app') + ': ' + String(err && err.message || err));
+        await uiAlert(_label('apps.save_failed', 'Could not save the app'));
       } catch (_) {
         _infoLog.warn('conversation info app save presentation failed', {
           error_type: 'presentation',
@@ -1191,10 +1127,17 @@ const ConversationInfo = (() => {
       }
       return;
     }
+    if (window.OrkasCommercialEntry?.isFailure(res)) {
+      await window.OrkasCommercialEntry.show();
+      return;
+    }
     if (!res || res.ok === false) {
-      _logSavedAppSaveResult(startedAt, 'failure', absPath, resourceKind, _savedAppSaveFailure(res, 'operation'));
+      _logSavedAppSaveFailure(_savedAppSaveFailure(res, 'operation'));
       try {
-        await uiAlert(_label('apps.save_failed', 'Could not save the app') + ': ' + String((res && res.error) || 'failed'));
+        const message = res?.error === 'app_bundle_root'
+          ? _label('apps.save_root_folder_required', 'Move the HTML and its resources into a separate folder, then save as an app again.')
+          : _label('apps.save_failed', 'Could not save the app');
+        await uiAlert(message);
       } catch (_) {
         _infoLog.warn('conversation info app save presentation failed', {
           error_type: 'presentation',
@@ -1204,7 +1147,7 @@ const ConversationInfo = (() => {
       return;
     }
 
-    _logSavedAppSaveResult(startedAt, 'success', absPath, resourceKind);
+
     try {
       const message = _label('apps.saved_toast', 'Saved to Apps');
       if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
@@ -1259,7 +1202,7 @@ const ConversationInfo = (() => {
 
   async function _runFileMenuAction(action, absPath, displayName, kind, options = {}) {
     if (action === 'reveal') return _revealEntry(absPath, options.cid);
-    if (action === 'save-as-app') return _saveEntryAsApp(absPath, options.cid, kind);
+    if (action === 'save-as-app') return _saveEntryAsApp(absPath, options.cid);
     if (action === 'add-to-library') return _addEntryToLibrary(absPath, options.cid);
     if (action === 'add-to-chat') return _addEntryToChat(absPath, kind, options.cid);
     if (action === 'delete') return _deleteEntry(absPath, displayName, kind, options);
@@ -1411,6 +1354,19 @@ const ConversationInfo = (() => {
     _renderBody();
     return true;
   }
+  function closeBrowserForTask(ownerCid) {
+    if (!ownerCid) return false;
+    if (ownerCid !== _cid) {
+      const saved = _panelStateByCid.get(ownerCid);
+      if (!saved?.open || saved.tab !== 'browser') return false;
+      _panelStateByCid.set(ownerCid, { ...saved, open: false });
+      return true;
+    }
+    // Model page closure must preserve the user's Files/Attachments selection.
+    if (!_open || _activeTab !== 'browser') return false;
+    _setOpen(false);
+    return true;
+  }
   function openFileMenu(anchorBtn, absPath, displayName, options = {}) {
     return _openFileMenu(anchorBtn, absPath, displayName, 'file', options);
   }
@@ -1425,6 +1381,7 @@ const ConversationInfo = (() => {
     close,
     toggle,
     openAndSetTab,
+    closeBrowserForTask,
     openFileMenu,
   };
 })();

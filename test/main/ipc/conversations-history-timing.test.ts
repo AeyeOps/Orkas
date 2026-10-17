@@ -26,6 +26,8 @@ function setup() {
     chats: {
       getConversationMetadata: vi.fn(async () => { clock = 100; return { project_id: null }; }),
       getMessagesPage: vi.fn(() => history),
+      getMessagesPageAtIndex: vi.fn(() => history),
+      getMessagesPageAtMessageId: vi.fn(async () => null),
     },
     groupChat: { runtimeStatus: vi.fn(() => runtime), displaySnapshot: vi.fn(async () => ({ sequence: 7, turns: [] })) },
   };
@@ -84,5 +86,83 @@ describe('conversation history latency diagnostics', () => {
     expect((await request).history).toEqual([]);
     expect(s.info).not.toHaveBeenCalled();
     expect(s.context.groupChat.displaySnapshot).not.toHaveBeenCalled();
+  });
+});
+
+// A quoted reference knows only the stable id of its original message. The
+// renderer asks for the page around that id, which the history worker finds
+// and reads in one pass (never a scan on main); the index-based anchor remains
+// the search/turn-navigation contract and must not pay for an id scan.
+function anchorSetup(found: boolean, indexedId = 'm23') {
+  const latest = { history: [{ id: 'latest' }], nextCursor: 40, followingCursor: null };
+  const indexed = {
+    history: [{ id: indexedId }], historyIndexes: [23], nextCursor: 10, followingCursor: 30, pageStart: 20,
+  };
+  const quoted = {
+    history: [{ id: 'm23' }], historyIndexes: [41], nextCursor: 35, followingCursor: 50, pageStart: 40, messageIndex: 41,
+  };
+  const context = {
+    performance: { now: () => 0 },
+    safeId: () => true,
+    conversationProjectHint: () => null,
+    isAgentEnabled: () => true,
+    log: { info: vi.fn() },
+    chats: {
+      getConversationMetadata: vi.fn(async () => ({ project_id: null })),
+      getMessagesPage: vi.fn(async () => latest),
+      getMessagesPageAtIndex: vi.fn(async () => indexed),
+      getMessagesPageAtMessageId: vi.fn(async () => (found ? quoted : null)),
+    },
+    groupChat: { runtimeStatus: vi.fn(async () => ({ processing: false })), displaySnapshot: vi.fn() },
+  };
+  const handler = vm.runInNewContext(`(${handlerSource})`, context);
+  return { context, handler, latest, indexed, quoted };
+}
+
+describe('conversation history anchored on a quoted message id', () => {
+  it('positions the page on the quoted message with one id read when only its id is known', async () => {
+    const s = anchorSetup(true);
+    const result = await s.handler({ cid: 'c1', around_message_id: 'm23' }, { userId: 'u1' });
+    expect(s.context.chats.getMessagesPageAtMessageId).toHaveBeenCalledExactlyOnceWith('u1', 'c1', 'm23', 10, null);
+    expect(s.context.chats.getMessagesPageAtIndex).not.toHaveBeenCalled();
+    expect(s.context.chats.getMessagesPage).not.toHaveBeenCalled();
+    expect(result).toMatchObject({
+      history: s.quoted.history,
+      page_start: 40,
+      history_indexes: [41],
+      next_cursor: 35,
+      following_cursor: 50,
+    });
+  });
+
+  it('falls back to the latest page when the quoted message no longer exists', async () => {
+    const s = anchorSetup(false);
+    const result = await s.handler({ cid: 'c1', around_message_id: 'gone' }, { userId: 'u1' });
+    expect(s.context.chats.getMessagesPageAtIndex).not.toHaveBeenCalled();
+    expect(s.context.chats.getMessagesPage).toHaveBeenCalledOnce();
+    expect(result.history).toEqual(s.latest.history);
+    expect(result).not.toHaveProperty('page_start');
+    expect(result).not.toHaveProperty('history_indexes');
+  });
+
+  it('keeps an indexed anchor on its direct page read without scanning for the id', async () => {
+    const s = anchorSetup(true);
+    const result = await s.handler(
+      { cid: 'c1', around_index: 23, around_message_id: 'm23' }, { userId: 'u1' },
+    );
+    expect(s.context.chats.getMessagesPageAtMessageId).not.toHaveBeenCalled();
+    expect(s.context.chats.getMessagesPageAtIndex).toHaveBeenCalledExactlyOnceWith('u1', 'c1', 23, 10, null);
+    expect(result).toMatchObject({ page_start: 20, history_indexes: [23] });
+  });
+
+  // Sync can rewrite or reorder the source after a search index was taken.
+  it('repairs a stale indexed anchor with one id read', async () => {
+    const s = anchorSetup(true, 'someone-else');
+    const result = await s.handler(
+      { cid: 'c1', around_index: 23, around_message_id: 'm23' }, { userId: 'u1' },
+    );
+    expect(s.context.chats.getMessagesPageAtIndex).toHaveBeenCalledExactlyOnceWith('u1', 'c1', 23, 10, null);
+    expect(s.context.chats.getMessagesPageAtMessageId).toHaveBeenCalledExactlyOnceWith('u1', 'c1', 'm23', 10, null);
+    expect(result).toMatchObject({ history: s.quoted.history, page_start: 40, history_indexes: [41] });
   });
 });

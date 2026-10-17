@@ -16,7 +16,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 
 import { SRC_ROOT } from './paths';
-import { buildLanguageDirectiveText } from './prompts/chat_prompt_composer';
+import { buildLanguageDirectiveText, buildHostTurnLanguageDirectiveText } from './prompts/chat_prompt_composer';
 
 export type Lang = 'ar' | 'zh' | 'zh-tw' | 'en' | 'fr' | 'de' | 'hi' | 'id' | 'it' | 'ja' | 'ko' | 'pt' | 'pt-pt' | 'ru' | 'es' | 'es-419' | 'th' | 'tr' | 'vi';
 
@@ -225,6 +225,10 @@ export function getCurrentLang(): Lang {
 export function buildLanguageDirective(lang: Lang = _current): string {
   const name = getLocaleMeta(lang).llmName;
   return buildLanguageDirectiveText(name);
+}
+
+export function buildHostTurnLanguageDirective(lang: Lang, continuation = false): string {
+  return buildHostTurnLanguageDirectiveText(getLocaleMeta(lang).llmName, continuation);
 }
 
 // ── Lookup ───────────────────────────────────────────────────────────────

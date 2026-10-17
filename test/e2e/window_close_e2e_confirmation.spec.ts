@@ -36,6 +36,7 @@ test('cancel keeps a task streaming; confirming close also protects a task in th
   await native.evaluate(win => win.close());
   await expect.poll(() => app.evaluate(() => (globalThis as any).closeDialogCalls.length)).toBe(2);
   expect(page.isClosed()).toBe(false);
+  await modelOrkas.prepareForNativeShutdown();
   const closed = page.waitForEvent('close');
   await app.evaluate(() => {
     setTimeout(() => (globalThis as any).confirmWindowClose({ response: 1, checkboxChecked: false }), 0);

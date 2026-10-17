@@ -1,8 +1,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { expect } from './fixtures/orkas';
+import { openSidebarEntry, expect } from './fixtures/orkas';
 import { test } from './fixtures/web-app-eval';
-import { exerciseProductInventory, exerciseFlashcards, exerciseSnake } from './fixtures/app-template-journeys';
+import { exerciseProductInventory, exerciseFlashcards, exerciseSnake, exerciseConverter } from './fixtures/app-template-journeys';
 
 // Frozen outputs from the same Chinese starter and Codex model on 2026-09-15.
 // The first output has a real inline-transform defect; the second uses a valid
@@ -42,7 +42,7 @@ for (const scenario of ['list-repaired', 'labeled-list', 'submit-label', 'filter
     if (isList) orkas.createWorkspaceFile('web-app/orkas-app.json', readFileSync(path.join(fixtures, 'orkas-app.json'), 'utf8'));
     const saved = await orkas.invoke<{ ok: boolean; id: string }>('savedApps.saveFromPath', { path: entry, title: scenario });
     expect(saved.ok).toBe(true);
-    await orkas.page.locator('#apps-btn').click();
+    await openSidebarEntry(orkas.page, '#apps-btn');
     const preview = await orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${saved.id}"]`).click());
     try {
       const frame = preview.locator('.saved-app-viewer-frame').contentFrame();
@@ -58,6 +58,48 @@ for (const scenario of ['list-repaired', 'labeled-list', 'submit-label', 'filter
     } finally {
       await orkas.closePreview(preview);
     }
+  });
+}
+
+// Frozen outputs from the focused 2026-10-13 run. These controls protect the
+// user journey across stock units, readonly results, modal entry and pressed
+// difficulty buttons; replay and intentional mutations never count as live passes.
+for (const scenario of ['products', 'products-wrong-stock', 'converter', 'converter-wrong-result',
+  'flashcards', 'flashcards-broken-unmaster', 'game', 'game-broken-pause'] as const) {
+  test(`generated layout oracle ${scenario}`, async ({ sdkOrkas: orkas }, info) => {
+    const id = scenario.split('-')[0];
+    let html = readFileSync(path.join(__dirname, 'fixtures/app-template-live-20261013', id, 'index.html'), 'utf8');
+    const mutate = (before: string, after: string) => {
+      expect(html).toContain(before);
+      html = html.replace(before, after);
+    };
+    if (scenario === 'products-wrong-stock') mutate("p.quantity.toLocaleString('zh-CN')", "(p.quantity===0?10:p.quantity).toLocaleString('zh-CN')");
+    if (scenario === 'converter-wrong-result') mutate('output.value=fmt(result);', 'output.value=fmt(result+1);');
+    if (scenario === 'flashcards-broken-unmaster') mutate('card.mastered=isMastered;', 'if(!isMastered)return;card.mastered=isMastered;');
+    if (scenario === 'game-broken-pause') mutate("clearInterval(timer);timer=null;state='paused';", "state='paused';");
+    const entry = orkas.createWorkspaceFile('generated-layout/index.html', html);
+    const saved = await orkas.invoke<{ ok: boolean; id: string }>('savedApps.saveFromPath', { path: entry, title: scenario });
+    expect(saved.ok).toBe(true);
+    await openSidebarEntry(orkas.page, '#apps-btn');
+    let preview = await orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${saved.id}"]`).click());
+    const reopen = async () => {
+      await orkas.closePreview(preview);
+      preview = await orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${saved.id}"]`).click());
+      return preview.locator('.saved-app-viewer-frame').contentFrame();
+    };
+    try {
+      const frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+      const journey = id === 'products' ? exerciseProductInventory(frame, reopen)
+        : id === 'converter' ? exerciseConverter(frame)
+        : id === 'flashcards' ? exerciseFlashcards(frame, preview, name => info.outputPath(name))
+        : exerciseSnake(frame, preview);
+      if (scenario === 'products-wrong-stock') await expect(journey).rejects.toThrow('toBe');
+      else if (scenario === 'converter-wrong-result') await expect(journey).rejects.toThrow('toBeCloseTo');
+      else if (scenario === 'flashcards-broken-unmaster') await expect(journey).rejects.toThrow('Returning a card to review must clear mastery');
+      else if (scenario === 'game-broken-pause') await expect(journey).rejects.toThrow('Paused snake must stop moving');
+      else await journey;
+      expect(orkas.modelRequests).toHaveLength(0);
+    } finally { await orkas.closePreview(preview); }
   });
 }
 
@@ -81,7 +123,7 @@ for (const scenario of ['products', 'products-broken-save', 'flashcards', 'flash
     if (id === 'products') orkas.createWorkspaceFile('web-app/orkas-app.json', readFileSync(path.join(dir, 'orkas-app.json'), 'utf8'));
     const saved = await orkas.invoke<{ ok: boolean; id: string }>('savedApps.saveFromPath', { path: entry, title: scenario });
     expect(saved.ok).toBe(true);
-    await orkas.page.locator('#apps-btn').click();
+    await openSidebarEntry(orkas.page, '#apps-btn');
     let preview = await orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${saved.id}"]`).click());
     const reopen = async () => {
       await orkas.closePreview(preview);

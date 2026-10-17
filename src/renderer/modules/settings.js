@@ -371,6 +371,49 @@ function _settingsRecycleAvailable() {
 }
 
 const _settingsRecycleExpandedIds = new Set();
+let _settingsRecycleBatches = [];
+let _settingsRecycleBusy = false;
+
+function _settingsRecycleAutomationKey(item) {
+    const path = String(item?.path || '').replace(/\\/g, '/');
+    const root = /^cloud\/(?:projects\/[^/]+\/)?auto_tasks\/[^/]+(?=\/|$)/.exec(path);
+    return root ? root[0] : String(item?.id || item?.title || '');
+  }
+
+function _settingsRecycleDetailRows(batch) {
+    const displayItems = _settingsRecycleDisplayItems(batch);
+    const rows = [];
+    const seen = new Set();
+    for (const item of displayItems) {
+      const automation = _settingsRecycleCategoryKey(item?.category) === 'auto_task';
+      const title = automation
+        ? String(item?.title || '').trim() || t('settings.recycle.display_unknown')
+        : _settingsRecycleItemTitle(item);
+      const category = _settingsRecycleCategoryLabel(item?.category);
+      const pathValue = String(item?.path || '').replace(/^cloud\//, '');
+      const key = automation ? _settingsRecycleAutomationKey(item) : `${category}\n${title}\n${pathValue}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      rows.push({ category, title, path: pathValue, automation,
+        detail: automation ? String(item?.detail || '').trim() : '',
+        tooltip: [String(item?.title || '').trim(), automation ? item?.id : '', pathValue].filter(Boolean).join('\n'),
+      });
+    }
+    if (!rows.length) {
+      for (const item of Array.isArray(batch?.items) ? batch.items : []) {
+        const pathValue = String(item?.path || '').replace(/^cloud\//, '');
+        if (!pathValue || seen.has(pathValue)) continue;
+        seen.add(pathValue);
+        rows.push({
+          category: _settingsRecycleCategoryLabel('file'),
+          title: _settingsRecyclePathTitle(pathValue),
+          path: pathValue,
+        });
+      }
+    }
+    return rows;
+  }
+
 
 function _settingsRecycleCategoryKey(category) {
   const value = String(category || '').replace(/[^A-Za-z0-9_]/g, '');
@@ -447,32 +490,42 @@ function _settingsRecycleListJoin(items) {
 }
 
 function _settingsRecycleTitle(batch) {
-  const groups = new Map();
-  for (const item of _settingsRecycleDisplayItems(batch)) {
-    const title = String(item?.title || '').trim();
-    if (!title) continue;
-    const category = _settingsRecycleCategoryKey(item?.category);
-    const titles = groups.get(category) || [];
-    if (!titles.includes(title)) titles.push(title);
-    groups.set(category, titles);
+    const displayItems = _settingsRecycleDisplayItems(batch);
+    const groups = new Map();
+    const taskIds = new Set();
+    for (const item of displayItems) {
+      const title = String(item?.title || '').trim();
+      if (!title) continue;
+      const category = _settingsRecycleCategoryKey(item?.category);
+      if (category === 'auto_task') {
+        const key = _settingsRecycleAutomationKey(item);
+        if (taskIds.has(key)) continue;
+        taskIds.add(key);
+      }
+      const text = title;
+      const list = groups.get(category) || [];
+      if (category === 'auto_task' || !list.includes(text)) list.push(text);
+      groups.set(category, list);
+    }
+    if (groups.size > 0) {
+      const groupJoiner = t('settings.recycle.display_group_joiner');
+      const separator = groupJoiner === 'settings.recycle.display_group_joiner' ? '；' : groupJoiner;
+      return Array.from(groups.entries()).map(([category, titles]) => {
+        const label = t(`settings.recycle.display_${category}`);
+        if (category === 'auto_task' && titles.length > 1) {
+          return t('settings.recycle.automation_count').replace('{count}', String(titles.length));
+        }
+        return t('settings.recycle.display_group')
+          .replace('{type}', label)
+          .replace('{items}', _settingsRecycleListJoin(titles.length > 3 ? [...titles.slice(0, 3), `+${titles.length - 3}`] : titles));
+      }).join(separator);
+    }
+    const label = String(batch?.label || batch?.display_title || '').trim();
+    if (label) return label;
+    const previews = Array.isArray(batch?.paths_preview) ? batch.paths_preview : [];
+    const names = previews.map(_settingsRecyclePathTitle).filter(Boolean);
+    return names.length ? _settingsRecycleListJoin(names) : t('settings.recycle.display_unknown');
   }
-  if (groups.size > 0) {
-    const joinerKey = t('settings.recycle.display_group_joiner');
-    const joiner = joinerKey === 'settings.recycle.display_group_joiner' ? '；' : joinerKey;
-    return Array.from(groups.entries()).map(([category, titles]) => {
-      const visibleTitles = titles.slice(0, 3);
-      if (titles.length > visibleTitles.length) visibleTitles.push(`+${titles.length - visibleTitles.length}`);
-      return t('settings.recycle.display_group')
-        .replace('{type}', t(`settings.recycle.display_${category}`))
-        .replace('{items}', _settingsRecycleListJoin(visibleTitles));
-    }).join(joiner);
-  }
-  const direct = String(batch?.label || batch?.display_title || '').trim();
-  if (direct) return direct;
-  const paths = Array.isArray(batch?.paths_preview) ? batch.paths_preview : [];
-  return _settingsRecycleListJoin(paths.map(_settingsRecyclePathTitle))
-    || t('settings.recycle.display_unknown');
-}
 
 function _settingsRecycleCategoryLabel(category) {
   const key = _settingsRecycleCategoryKey(category);
@@ -491,42 +544,27 @@ function _settingsRecycleItemTitle(item) {
 }
 
 function _settingsRecycleDetailsHtml(batch) {
-  const rows = [];
-  const seen = new Set();
-  for (const item of _settingsRecycleDisplayItems(batch)) {
-    const title = _settingsRecycleItemTitle(item);
-    const category = _settingsRecycleCategoryLabel(item?.category);
-    const pathValue = String(item?.path || '').replace(/^cloud\//, '');
-    const key = `${category}\n${title}\n${pathValue}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    rows.push({ category, title, path: pathValue });
+    const rows = _settingsRecycleDetailRows(batch);
+    if (!rows.length) return '';
+    return `
+      <div class="settings-recycle-details">
+        ${rows.map((row) => `
+          <div class="settings-recycle-detail-row${row.automation ? ' is-auto-task' : ''}" title="${escapeHtml(row.tooltip || row.title)}">
+            ${row.automation ? `
+              <div class="settings-recycle-main">
+                <div class="settings-recycle-detail-title">${escapeHtml(row.title)}</div>
+                ${row.detail ? `<div class="settings-recycle-meta">${escapeHtml(row.detail)}</div>` : ''}
+              </div>
+            ` : `
+              <span class="settings-recycle-detail-category">${escapeHtml(row.category)}</span>
+              <span class="settings-recycle-detail-title">${escapeHtml(row.title)}</span>
+              ${row.path ? `<span class="settings-recycle-detail-path" title="${escapeHtml(row.path)}">${escapeHtml(row.path)}</span>` : ''}
+            `}
+          </div>
+        `).join('')}
+      </div>
+    `;
   }
-  if (!rows.length) {
-    for (const item of Array.isArray(batch?.items) ? batch.items : []) {
-      const pathValue = String(item?.path || '').replace(/^cloud\//, '');
-      if (!pathValue || seen.has(pathValue)) continue;
-      seen.add(pathValue);
-      rows.push({
-        category: _settingsRecycleCategoryLabel('file'),
-        title: _settingsRecyclePathTitle(pathValue),
-        path: pathValue,
-      });
-    }
-  }
-  if (!rows.length) return '';
-  return `
-    <div class="settings-recycle-details">
-      ${rows.map((row) => `
-        <div class="settings-recycle-detail-row">
-          <span class="settings-recycle-detail-category">${escapeHtml(row.category)}</span>
-          <span class="settings-recycle-detail-title">${escapeHtml(row.title)}</span>
-          ${row.path ? `<span class="settings-recycle-detail-path" title="${escapeHtml(row.path)}">${escapeHtml(row.path)}</span>` : ''}
-        </div>
-      `).join('')}
-    </div>
-  `;
-}
 
 function _settingsRecycleRowHtml(batch) {
   const id = escapeHtml(String(batch?.id || ''));
@@ -553,30 +591,54 @@ function _settingsRecycleRowHtml(batch) {
   `;
 }
 
-async function _settingsRefreshRecycleBin() {
+function _settingsRenderRecycleBin() {
   const body = document.getElementById('settings-recycle-body');
-  if (!body || !_settingsRecycleAvailable()) return;
+  if (!body) return;
+  const rows = _settingsRecycleBatches;
+  body.innerHTML = `<div class="settings-recycle-toolbar">
+    <button class="btn btn-sm btn-danger" type="button" data-recycle-clear ${!rows.length || _settingsRecycleBusy ? 'disabled' : ''}>${escapeHtml(t('settings.recycle.clear'))}</button>
+    </div><div class="settings-recycle-scroll" data-recycle-source="local">${rows.length ? rows.map(_settingsRecycleRowHtml).join('') : '<div class="settings-empty">' + escapeHtml(t('settings.recycle.empty')) + '</div>'}</div>`;
+}
+
+async function _settingsRefreshRecycleBin() {
+  if (!_settingsRecycleAvailable()) return;
   try {
     const res = await window.orkas.recycleBin.list();
-    const batches = Array.isArray(res?.batches) ? res.batches : [];
-    // This build does not create remote-deletion batches. Keep older batches
-    // readable, but present every snapshot through one local recycle-bin
-    // surface instead of exposing the hosted product's source split.
-    const rowsHtml = batches.length
-      ? batches.map(_settingsRecycleRowHtml).join('')
-      : `<div class="settings-empty">${escapeHtml(t('settings.recycle.empty'))}</div>`;
-    body.innerHTML = `
-      <div class="settings-recycle-scroll" data-recycle-source="local">
-        ${rowsHtml}
-      </div>
-    `;
-  } catch (err) {
-    _settingsLog.warn('recycle bin refresh failed', {
-      error: (err && err.message) || String(err),
-    });
-    body.innerHTML = `<div class="settings-empty">${escapeHtml(t('settings.recycle.empty'))}</div>`;
-  }
+    if (res?.ok === false || !Array.isArray(res?.batches)) throw new Error('recycle_list_failed');
+    _settingsRecycleBatches = res.batches;
+  } catch (_) { _settingsLog.warn('recycle bin refresh failed', { code: 'recycle_list_failed' }); }
+  _settingsRenderRecycleBin();
 }
+
+// Shared local-data actions use this refresh hook without the hosted sync module.
+window.initRecycleBin = async function () {
+  _settingsBindRecycleBinOnce();
+  await _settingsRefreshRecycleBin();
+};
+
+async function _settingsClearRecycleBin() {
+  if (_settingsRecycleBusy || !_settingsRecycleBatches.length || !_settingsRecycleAvailable()) return;
+  const ids = _settingsRecycleBatches.map(batch => String(batch.id));
+  _settingsRecycleBusy = true;
+  _settingsRenderRecycleBin();
+  try {
+    if (!await uiConfirmDanger({ title: t('settings.recycle.clear_title'),
+      message: t('settings.recycle.clear_confirm').replace('{source}', t('settings.recycle.title')).replace('{count}', String(ids.length)),
+      dangerLabel: t('settings.recycle.clear') })) return;
+    const body = document.getElementById('settings-recycle-body');
+    if (body) body.innerHTML = '<div role="status">' + escapeHtml(t('settings.recycle.clearing').replace('{done}', '0').replace('{total}', String(ids.length))) + '</div>';
+    for (const id of ids) {
+      const result = await window.orkas.recycleBin.delete(id);
+      if (result?.ok === false || result?.deleted !== true) throw new Error('recycle_delete_failed');
+      _settingsRecycleExpandedIds.delete(id);
+    }
+    if (typeof uiToast === 'function') uiToast(t('settings.recycle.cleared'), { variant: 'success' });
+  } catch (_) {
+    _settingsLog.warn('recycle bin clearing failed', { code: 'recycle_delete_failed' });
+    if (typeof uiToast === 'function') uiToast(t('settings.recycle.clear_failed'), { variant: 'error' });
+  } finally { _settingsRecycleBusy = false; await _settingsRefreshRecycleBin(); }
+}
+
 
 function _settingsBindRecycleBinOnce() {
   if (_settingsState.recycleBound) return;
@@ -584,6 +646,8 @@ function _settingsBindRecycleBinOnce() {
   if (!body) return;
   _settingsState.recycleBound = true;
   body.addEventListener('click', async (event) => {
+    if (_settingsRecycleBusy) return;
+    if (event.target?.closest?.('[data-recycle-clear]')) { await _settingsClearRecycleBin(); return; }
     const viewButton = event.target?.closest?.('[data-recycle-view]');
     if (viewButton) {
       const id = viewButton.getAttribute('data-recycle-view') || '';
@@ -598,6 +662,8 @@ function _settingsBindRecycleBinOnce() {
     const deleting = button.hasAttribute('data-recycle-delete');
     const id = button.getAttribute(deleting ? 'data-recycle-delete' : 'data-recycle-restore') || '';
     if (!id) return;
+    _settingsRecycleBusy = true;
+    try {
     const confirmed = deleting && typeof uiConfirmDanger === 'function'
       ? await uiConfirmDanger({
           title: t('settings.recycle.delete_title'),
@@ -608,7 +674,7 @@ function _settingsBindRecycleBinOnce() {
           message: t(deleting ? 'settings.recycle.delete_confirm' : 'settings.recycle.restore_confirm'),
           okLabel: t(deleting ? 'settings.recycle.delete' : 'settings.recycle.restore'),
         });
-    if (!confirmed) return;
+    if (!confirmed) { _settingsRecycleBusy = false; _settingsRenderRecycleBin(); return; }
     button.disabled = true;
     try {
       if (deleting) {
@@ -616,7 +682,28 @@ function _settingsBindRecycleBinOnce() {
         if (!res?.deleted) throw new Error(t('settings.recycle.delete_not_found'));
         _settingsRecycleExpandedIds.delete(id);
       } else {
-        await window.orkas.recycleBin.restore(id);
+        const result = await window.orkas.recycleBin.restore(id);
+        if (!result || result.ok === false
+          || !Object.prototype.hasOwnProperty.call(result, 'restored')
+          || !Number.isFinite(Number(result.restored))) {
+          throw new Error(t('settings.recycle.restore_failed'));
+        }
+        const failed = Math.max(0, Number(result.failed)
+          || (Array.isArray(result.failed_paths) ? result.failed_paths.length : 0));
+        const changedValue = Number(result.changed);
+        const changed = Number.isFinite(changedValue) ? Math.max(0, changedValue)
+          : Math.max(0, Number(result.restored) || 0)
+            + Math.max(0, Number(result.skipped)
+              || (Array.isArray(result.skipped_paths) ? result.skipped_paths.length : 0))
+            + Math.max(0, Number(result.reactivated)
+              || (Array.isArray(result.reactivated_paths) ? result.reactivated_paths.length : 0));
+        if (typeof uiToast === 'function') {
+          const key = failed > 0 ? 'settings.recycle.restore_partial'
+            : changed <= 0 ? 'settings.recycle.restore_no_changes' : 'settings.recycle.restored';
+          uiToast(t(key).replace('{count}', String(failed > 0 ? failed : changed)), {
+            variant: failed > 0 || changed <= 0 ? 'warning' : 'success',
+          });
+        }
         // The restore has committed; refresh failures must not report that it failed.
         await Promise.all([
           _settingsSafeCall('restored Agents refresh', typeof loadAgents === 'function' ? () => loadAgents(true) : null),
@@ -636,8 +723,10 @@ function _settingsBindRecycleBinOnce() {
       }
     } finally {
       button.disabled = false;
+      _settingsRecycleBusy = false;
       await _settingsRefreshRecycleBin();
     }
+    } finally { _settingsRecycleBusy = false; _settingsRenderRecycleBin(); }
   });
 }
 
@@ -902,6 +991,7 @@ function _settingsSyncLanguageRadio() {
 // re-render sections whose text is written by JS (so their content
 // isn't refreshed by applyDomI18n's data-i18n sweep).
 window.addEventListener('i18n-change', () => {
+  _settingsRenderRecycleBin();
   void _settingsRefreshOperatorPolicy();
   _settingsSyncLanguageRadio();
   _settingsRenderLocalExec();
@@ -1070,7 +1160,6 @@ async function _settingsRefreshProviders() {
 async function _settingsRefreshEntries() {
   const res = await window.orkas.invoke('auth.listEntries', { includeUnavailable: true });
   _settingsState.entries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
-  if (typeof trackModelConfigSnapshot === 'function') trackModelConfigSnapshot(_settingsState.entries);
   _settingsRenderOrkasApiCard();
   _settingsEmitModelEntriesChanged();
 }

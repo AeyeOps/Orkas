@@ -22,6 +22,14 @@ let _ipcErrorSentCount = 0;
 //   - opts.stream: boolean (this call yields an SSE-style stream)
 //   - opts.wrapAsUpdates: wrap the whole body under `updates` key
 const _IPC_ROUTES = [
+  ['POST', '/api/conversations/cleanup/preview', 'conversations.cleanup.preview'],
+  ['POST', '/api/conversations/cleanup/page', 'conversations.cleanup.page'],
+  ['POST', '/api/conversations/cleanup/remove', 'conversations.cleanup.remove'],
+  ['POST', '/api/local-agents/account-usage', 'localAgents.accountUsage'],
+  ['POST', '/api/conversations/artifacts/edit-target', 'conversations.artifacts.editTarget'],
+  ['POST', '/api/conversations/artifacts/data-impact', 'conversations.artifacts.dataImpact'],
+  ['POST', '/api/conversations/artifacts/export-data', 'conversations.artifacts.exportData'],
+  ['POST', '/api/conversations/artifacts/save', 'conversations.artifacts.save'],
   ['GET', '/api/projects/tasks/attachments/abs-path', 'projects.tasks.attachments.absPath'],
   ['POST', '/api/connectors/account-choice-response', 'connectors.account_choice_response'],
   // Exact routes
@@ -75,6 +83,7 @@ const _IPC_ROUTES = [
   ['POST',   /^\/api\/conversations\/([^/]+)\/rename$/,    'conversations.rename',       ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/move$/,      'conversations.move',         ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/history$/,   'conversations.history',      ['cid']],
+  ['GET',    /^\/api\/conversations\/([^/]+)\/process$/,   'conversations.processPage',  ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/turns$/,     'conversations.turns',        ['cid']],
   ['GET',    /^\/api\/conversations\/([^/]+)\/files$/,     'conversations.files.list',   ['cid']],
   ['POST',   /^\/api\/conversations\/([^/]+)\/send$/,      'groupChat.send',             ['cid']],

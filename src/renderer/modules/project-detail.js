@@ -2,8 +2,8 @@
 // Drives `#panel-project`: shows the project composer, task panes, and a
 // right-side rail for project agents + files.
 //
-// Header carries Rename / Delete. The "Back" button
-// was intentionally removed — the sidebar IS the back navigation.
+// Header carries the title and a menu with Rename and Delete.
+// The sidebar provides back navigation.
 //
 // Add picker and project-file viewer are centered modals (`.modal-overlay`)
 // so they don't get clipped by the project panel's scrolling regions.
@@ -89,6 +89,7 @@ const _projectLibraryExpanded = new Set();
 const _projectLibrarySelected = new Set();
 let _projectLibrarySelectionAnchor = null;
 const _projectLibraryDrafts = new Map();
+let _projectLibraryRevision = 0;
 let _projectKbStatusRefreshTimer = null;
 let _projectKbReconcileInFlight = false;
 let _projectKbReconciledLoadSeq = -1;
@@ -113,7 +114,9 @@ function _setProjectDetailBusy(busy) {
 
 /** Called by boot.js setView('project', pid) on entry. */
 async function loadProjectDetail(pid) {
+  _closeProjectDriverHint();
   const loadSeq = ++_projectDetailLoadSeq;
+  const libraryRevision = _projectLibraryRevision;
   const account = typeof currentUserId === 'string' ? currentUserId : '';
   const isCurrent = () => loadSeq === _projectDetailLoadSeq && pid === _projectDetailPid
     && account === (typeof currentUserId === 'string' ? currentUserId : '');
@@ -135,9 +138,12 @@ async function loadProjectDetail(pid) {
   }
   if (prevPid !== _projectDetailPid || !_projectDetailMeta) {
     _projectTodos = [];
+    _projectTodoMembers = [];
+    _projectTodoMemberScope = '';
     _setTodoLoadError(false);
     _renderProjectTodosList();
     _projectMemory = [];
+    _projectMemoryFull = false;
     _projectMemoryEditor = null;
     _projectMemoryLoadSeq += 1;
     _projectKbStatusByName = {};
@@ -217,7 +223,7 @@ async function loadProjectDetail(pid) {
       _renderProjectInstructions();
     }).catch(() => { /* the batch below owns the load failure */ });
     filesCall.then((res) => {
-      if (!isCurrent() || !res?.ok || !_projectDetailMeta) return;
+      if (!isCurrent() || !res?.ok || !_projectDetailMeta || libraryRevision !== _projectLibraryRevision) return;
       _projectDetailMeta.files = Array.isArray(res.tree) ? res.tree : [];
       _renderProjectFiles(_projectDetailMeta.files);
       _bindProjectFileRows();
@@ -235,7 +241,8 @@ async function loadProjectDetail(pid) {
     if (!getRes?.ok || !listRes?.ok || !filesRes?.ok) {
       throw new Error((getRes && getRes.error) || (listRes && listRes.error) || (filesRes && filesRes.error) || 'load_failed');
     }
-    const fileTree = Array.isArray(filesRes.tree) ? filesRes.tree : [];
+    const fileTree = libraryRevision === _projectLibraryRevision
+      ? (Array.isArray(filesRes.tree) ? filesRes.tree : []) : (_projectDetailMeta?.files || []);
     const flatFiles = _flattenProjectLibraryFiles(fileTree);
     _projectKbStatusByName = _buildProjectKbStatusMap(flatFiles, kbRes?.ok ? (kbRes.files || []) : []);
     _projectDetailMeta = {
@@ -301,14 +308,7 @@ function _renderProjectAgents() {
 function _renderProjectDetail({ hydrateSecondary = true, refreshMemory = hydrateSecondary } = {}) {
   if (!_projectDetailMeta) { _renderProjectDetailEmpty(); return; }
   const { project, files } = _projectDetailMeta;
-  const renameBtn = document.getElementById('project-action-rename');
-  const deleteBtn = document.getElementById('project-action-delete');
   const addAgentBtn = document.getElementById('project-add-agent-btn');
-  if (renameBtn) renameBtn.hidden = false;
-  if (deleteBtn) {
-    deleteBtn.hidden = false;
-    deleteBtn.setAttribute('data-i18n', 'project.action.delete');
-  }
   if (addAgentBtn) addAgentBtn.hidden = false;
 
   const titleEl = document.getElementById('project-detail-title');
@@ -421,6 +421,7 @@ async function _ensureProjectAutoTabLoaded(pid) {
 }
 
 function _syncProjectDetailTabState() {
+  if (_projectDetailActiveTab !== 'todo') _closeProjectDriverHint();
   const tabs = document.querySelectorAll('.project-detail-tab');
   const panels = document.querySelectorAll('.project-detail-tab-panel');
   for (const tab of tabs) {
@@ -433,6 +434,10 @@ function _syncProjectDetailTabState() {
   for (const panel of panels) {
     panel.hidden = (panel.dataset.projectPanel !== _projectDetailActiveTab);
     panel.setAttribute('role', 'tabpanel');
+  }
+  // The tab row carries only the active tab's tools.
+  for (const tools of document.querySelectorAll('[data-project-tools]')) {
+    tools.hidden = tools.dataset.projectTools !== _projectDetailActiveTab;
   }
 }
 
@@ -706,9 +711,7 @@ function _onProjectAdvance(payload) {
   const pid = payload && payload.projectId;
   if (!conv || !conv.conversation_id) return;
   if (typeof conversations === 'undefined' || !Array.isArray(conversations)) return;
-  const idx = conversations.findIndex((c) => c && c.conversation_id === conv.conversation_id);
-  if (idx >= 0) conversations[idx] = { ...conversations[idx], ...conv };
-  else conversations.unshift(conv);
+  _cacheCreatedConversation(conv);
   if (typeof renderConversationList === 'function') renderConversationList();
   if (currentView === 'project' && _projectDetailMeta && pid === _projectDetailPid) {
     _renderProjectAllTasks();
@@ -832,18 +835,21 @@ let _projectMemoryLoadSeq = 0;
 let _projectMemoryLoadedPid = '';
 let _projectMemoryEditor = null; // { mode:'add'|'edit', oldText:string } | null
 let _projectMemoryMutating = false;
+let _projectMemoryFull = false; // the store refuses new entries until the AI consolidates it
 
 async function _loadProjectMemory(pid) {
   const loadSeq = ++_projectMemoryLoadSeq;
   _projectMemoryLoadedPid = '';
   const account = typeof currentUserId === 'string' ? currentUserId : '';
-  if (!pid) { _projectMemory = []; _renderProjectMemoryList(); return; }
+  if (!pid) { _projectMemory = []; _projectMemoryFull = false; _renderProjectMemoryList(); return; }
   let nextMemory = [];
+  let nextFull = false;
   let loaded = false;
   try {
     const res = await window.orkas.invoke('memory.list', { target: 'project', projectId: pid });
     loaded = !!res?.ok && Array.isArray(res.entries);
     nextMemory = loaded ? res.entries : [];
+    nextFull = loaded && !!res.usage?.full;
   } catch (err) {
     _projectDetailLog.warn('load project memory failed', err);
     nextMemory = [];
@@ -851,6 +857,7 @@ async function _loadProjectMemory(pid) {
   if (loadSeq !== _projectMemoryLoadSeq || pid !== _projectDetailPid
       || account !== (typeof currentUserId === 'string' ? currentUserId : '')) return;
   _projectMemory = nextMemory;
+  _projectMemoryFull = nextFull;
   _projectMemoryLoadedPid = loaded ? pid : '';
   _renderProjectMemoryList();
 }
@@ -907,6 +914,8 @@ function _renderProjectMemoryList() {
   // the goals-and-rules panel makes.
   const headEl = document.getElementById('project-memory-section-head');
   if (headEl) headEl.hidden = !shown;
+  const fullEl = document.getElementById('project-memory-full');
+  if (fullEl) fullEl.hidden = !(shown && _projectMemoryFull);
 }
 
 function _updateProjectMemoryEditor() {
@@ -955,6 +964,9 @@ function _projectMemoryFailure(value, invoked = false) {
   if (message.includes('empty content')) {
     return { error_type: 'validation', error_code: 'memory_content_empty' };
   }
+  if (message.startsWith('memory full')) {
+    return { error_type: 'validation', error_code: 'memory_full' };
+  }
   if (message.includes('old_text is required')) {
     return { error_type: 'validation', error_code: 'memory_entry_selector_missing' };
   }
@@ -996,13 +1008,20 @@ async function _mutateProjectMemory(channel, payload) {
     if (!res || res.ok === false) {
       const failure = _projectMemoryFailure(res);
       _projectDetailLog.warn('project memory mutate rejected', failure);
-      if (typeof uiAlert === 'function') uiAlert(t('project.memory.failed'));
+      if (failure.error_code === 'memory_full') {
+        _projectMemoryFull = true;
+        _renderProjectMemoryList();
+      }
+      if (typeof uiAlert === 'function') {
+        uiAlert(t(failure.error_code === 'memory_full' ? 'memory.error_full' : 'project.memory.failed'));
+      }
       return { ok: false, failure };
     }
     if (pid !== _projectDetailPid) return { ok: true, failure: null };
     try {
       if (Array.isArray(res.entries)) {
         _projectMemory = res.entries;
+        _projectMemoryFull = !!res.usage?.full;
         _renderProjectMemoryList();
       } else {
         await _loadProjectMemory(pid);
@@ -1160,7 +1179,16 @@ function _todoAttachAccept() {
 
 async function _loadProjectTodos(pid) {
   const loadSeq = ++_projectTodoLoadSeq;
-  if (!pid) { _projectTodos = []; _renderProjectTodosList(); return; }
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  const isCurrent = () => loadSeq === _projectTodoLoadSeq && pid === _projectDetailPid
+    && account === (typeof currentUserId === 'string' ? currentUserId : '');
+  if (!pid) {
+    _projectTodos = [];
+    _projectTodoMembers = [];
+    _projectTodoMemberScope = '';
+    _renderProjectTodosList();
+    return;
+  }
   let nextTodos = [];
   try {
     const res = await window.orkas.invoke('projects.tasks.list', { projectId: pid });
@@ -1169,18 +1197,23 @@ async function _loadProjectTodos(pid) {
     if (pid === _projectDetailPid && loadSeq === _projectTodoLoadSeq) _setTodoLoadError(false);
   } catch (err) {
     _projectDetailLog.warn('load project todos failed');
-    if (pid === _projectDetailPid && loadSeq === _projectTodoLoadSeq) _setTodoLoadError(true);
+    if (isCurrent()) _setTodoLoadError(true);
     return;
   }
   // Ignore responses superseded by a mutation/newer refresh as well as
   // responses that belong to a project the user has already left.
-  if (loadSeq !== _projectTodoLoadSeq || pid !== _projectDetailPid) return;
+  if (!isCurrent()) return;
   _projectTodos = nextTodos;
   _renderProjectTodosList();
 }
 
 // Disclosure preferences are presentation-only and never rewrite task records.
 const _todoCollapsed = new Map();
+const _todoExpanded = new Set();
+function _todoContentKey(tid, context) {
+  return JSON.stringify([typeof currentUserId === 'string' ? currentUserId : '',
+    context.global ? 'global' : 'project', context.pid || '', tid]);
+}
 function _todoBoardStatus(status) {
   return _PROJECT_TODO_STATUSES.includes(status) ? status : 'todo';
 }
@@ -1193,15 +1226,54 @@ function _todoContextHasScope(context) {
   return !!context && (context.global === true || !!context.pid);
 }
 
+// Capture immediately before a paint, so scrolling during an async reload is
+// retained. Keep only the mounted board's positions; never carry them across
+// accounts, projects or grouping modes. Browsers clamp after content shrinks.
+function _captureTodoScroll(host) {
+  const boards = new Map();
+  for (const board of host.querySelectorAll?.('.todo-board') || []) {
+    const columns = new Map();
+    for (const body of board.querySelectorAll('.todo-column-body')) {
+      columns.set(body.parentElement.dataset.status, [body.scrollTop, body.scrollLeft]);
+    }
+    boards.set(board.dataset.todoScrollKey, { top: board.scrollTop, left: board.scrollLeft, columns });
+  }
+  return { top: host.scrollTop, left: host.scrollLeft, boards };
+}
+
+function _restoreTodoScroll(host, snapshot) {
+  let matched = false;
+  for (const board of host.querySelectorAll?.('.todo-board') || []) {
+    const previous = snapshot.boards.get(board.dataset.todoScrollKey);
+    if (!previous) continue;
+    matched = true;
+    board.scrollTop = previous.top;
+    board.scrollLeft = previous.left;
+    for (const body of board.querySelectorAll('.todo-column-body')) {
+      const position = previous.columns.get(body.parentElement.dataset.status);
+      if (!position) continue;
+      [body.scrollTop, body.scrollLeft] = position;
+    }
+  }
+  if (matched) {
+    host.scrollTop = snapshot.top;
+    host.scrollLeft = snapshot.left;
+  }
+}
+
 function _renderTodoBoard(tasks, context, scope) {
   const board = document.createElement('div');
   board.className = 'todo-board';
+  board.dataset.todoScrollKey = JSON.stringify([
+    typeof currentUserId === 'string' ? currentUserId : '', scope,
+  ]);
   for (const status of _PROJECT_TODO_STATUSES) {
     const items = tasks.filter((task) => task?.id && _todoBoardStatus(task.status) === status);
     const key = scope + ':' + status;
     const collapsed = _todoCollapsed.has(key) ? _todoCollapsed.get(key) : status === 'done';
     const column = document.createElement('section');
-    column.className = 'todo-column is-' + status;
+    // `is-collapsed` lets the project board narrow a collapsed lane to a strip.
+    column.className = 'todo-column is-' + status + (collapsed ? ' is-collapsed' : '');
     column.dataset.status = status;
     const header = document.createElement('div');
     header.className = 'todo-column-head';
@@ -1209,7 +1281,7 @@ function _renderTodoBoard(tasks, context, scope) {
     toggle.type = 'button';
     toggle.className = 'todo-collapse';
     toggle.setAttribute('aria-expanded', String(!collapsed));
-    toggle.innerHTML = '<span class="project-todo-status-dot"></span><span>'
+    toggle.innerHTML = '<span class="project-todo-status-dot"></span><span class="todo-collapse-label">'
       + escapeHtml(t('project.todo.status_' + status)) + '</span><span class="project-detail-tab-count">'
       + items.length + '</span>'
       + (typeof uiIconHtml === 'function' ? uiIconHtml('chevron-down', 'todo-disclosure-chevron') : '');
@@ -1220,6 +1292,7 @@ function _renderTodoBoard(tasks, context, scope) {
       body.hidden = !body.hidden;
       _todoCollapsed.set(key, body.hidden);
       toggle.setAttribute('aria-expanded', String(!body.hidden));
+      column.classList.toggle('is-collapsed', body.hidden);
     });
     header.appendChild(toggle);
     for (const task of items) {
@@ -1250,22 +1323,26 @@ function _renderProjectTodosList() {
   if (countEl) countEl.textContent = String(tasks.length);
   const listEl = document.getElementById('project-todo-list');
   if (!listEl) return;
+  const scroll = _captureTodoScroll(listEl);
   listEl.innerHTML = '';
   listEl.style.display = '';
   const context = _projectTodoContext();
   // The board always renders its four columns; each column carries its own
   // empty hint, so there is no list-level empty element.
   listEl.appendChild(_renderTodoBoard(tasks, context, 'project:' + _projectDetailPid));
+  _restoreTodoScroll(listEl, scroll);
 }
 
 function _renderTodoCard(task, context) {
   const status = task.status || 'todo';
   const row = document.createElement('div');
-  row.className = 'project-todo-item' + (status === 'done' ? ' is-done' : '');
+  const expanded = _todoExpanded.has(_todoContentKey(task.id, context));
+  row.className = 'project-todo-item' + (status === 'done' ? ' is-done' : '')
+    + (expanded ? ' is-expanded' : '');
   row.dataset.tid = task.id;
   row.dataset.status = status;
 
-  // The status chip and menu use the same four workflow states.
+  // Keep the same status chip on project and account boards.
   const statusSel = document.createElement('button');
   statusSel.type = 'button';
   statusSel.className = 'btn btn-sm project-todo-status-select is-' + status;
@@ -1278,7 +1355,8 @@ function _renderTodoCard(task, context) {
     + (typeof uiIconHtml === 'function' ? uiIconHtml('chevron-down', 'project-todo-status-caret') : '');
   const content = document.createElement('button');
   content.type = 'button';
-  content.dataset.action = 'todo-edit';
+  content.dataset.action = 'todo-toggle-content';
+  content.setAttribute('aria-expanded', String(expanded));
   content.className = 'project-todo-title';
   content.textContent = task.content || '';
   row.appendChild(content);
@@ -1295,9 +1373,9 @@ function _renderTodoCard(task, context) {
   row.appendChild(menuBtn);
   row.dataset.pid = context.pid || '';
   row.dataset.todoScope = context.global ? 'global' : 'project';
-  const metaRow = context.showProject ? document.createElement('div') : null;
-  if (metaRow) metaRow.className = 'todo-card-meta';
-  const appendMeta = (element) => (metaRow || row).appendChild(element);
+  const metaRow = document.createElement('div');
+  metaRow.className = 'todo-card-meta';
+  const appendMeta = (element) => metaRow.appendChild(element);
   if (context.showProject && context.project) {
     const project = document.createElement(context.pid ? 'button' : 'span');
     if (context.pid) {
@@ -1306,7 +1384,7 @@ function _renderTodoCard(task, context) {
     }
     project.className = 'todo-card-project';
     const projectIcon = typeof uiIconHtml === 'function'
-      ? uiIconHtml('folder', 'todo-card-project-icon')
+      ? uiIconHtml(typeof projectIconName === 'function' ? projectIconName(context.project) : 'folder', 'todo-card-project-icon')
       : '';
     project.innerHTML = projectIcon
       + `<span class="todo-card-project-name">${escapeHtml(context.project.name)}</span>`;
@@ -1344,8 +1422,8 @@ function _renderTodoCard(task, context) {
   }
 
   // Assignment chip: (re)assign the task to one of the project's bound agents
-  // or clear it. Global tasks use the account registry. Assigned → the owner's avatar + name (always visible);
-  // unassigned → a faint icon revealed on row hover. Click opens the menu
+  // or clear it. Global tasks use the account registry. Both assigned and
+  // unassigned Agents show an icon and label. Click opens the menu
   // built in _openTodoAssignMenu; the write goes through projects.tasks.update
   // (owner_agent + owner_agent_id), the same fields the agent/LLM path uses.
   {
@@ -1376,9 +1454,11 @@ function _renderTodoCard(task, context) {
         : '×';
     } else {
       assign.classList.add('is-empty');
-      assign.innerHTML = typeof uiIconHtml === 'function'
-        ? uiIconHtml('users', 'project-todo-assign-icon')
+      const emptyIcon = typeof uiIconHtml === 'function'
+        ? `<span class="project-todo-agent-icon">${uiIconHtml('users', 'project-todo-assign-icon')}</span>`
         : '+';
+      assign.innerHTML = emptyIcon
+        + `<span class="project-todo-assign-name">${escapeHtml(t('todo.unassigned'))}</span>`;
       assign.title = t('project.todo.assign');
     }
     assign.setAttribute('aria-label', assign.title);
@@ -1465,8 +1545,7 @@ async function _loadTodoEditorAgents(task) {
     if (seq !== _todoEditorAgentLoadSeq || generation !== _todoEditorGeneration || pid !== _todoEditorPid) return;
     const agents = pid ? res?.agentDetails : res?.agents;
     if (res?.ok === false || !Array.isArray(agents)) throw new Error('load_failed');
-    _todoEditorAgents = agents.filter((a) => a?.agent_id && (pid || a.enabled !== false))
-      .sort((a, b) => String(a.name || a.agent_id).localeCompare(String(b.name || b.agent_id)));
+    _todoEditorAgents = _todoAssignableAgents(agents.filter((a) => a?.agent_id && (pid || a.enabled !== false)));
     const owner = _findProjectAgent(task?.owner_agent_id, task?.owner_agent, _todoEditorAgents);
     const value = owner?.agent_id || ownerValue;
     const next = [{ value: '', label: t('todo.unassigned') },
@@ -1533,6 +1612,10 @@ async function _previewTodoAttachment(pid, taskId, name, sourceElement) {
   if (pid === null || !taskId || !name || typeof openChatFileViewer !== 'function') return;
   try {
     const result = await window.orkas.invoke('projects.tasks.attachments.absPath', { projectId: pid, taskId, name });
+    if (result?.error === 'loading') {
+      if (typeof uiToast === 'function') uiToast(t('common.loading'));
+      return;
+    }
     if (!result?.ok || !result.path) throw new Error('attachment_unavailable');
     await openChatFileViewer(result.path, name, { projectId: pid || null, cid: null, readOnly: true, sourceElement });
   } catch (_) {
@@ -1854,23 +1937,36 @@ async function _setTodoStatus(tid, status, context = _projectTodoContext()) {
   }
 }
 
-// Look up an owner's avatar/name from the project's bound-agent details so the
-// chip can render a real avatar. Falls back to null (chip shows the stored
-// owner_agent name) if the owner is no longer a bound member.
+function _todoCommanderAgent() {
+  const avatar = typeof _commanderAvatarFallback === 'function' ? _commanderAvatarFallback()
+    : { icon: 'crown', color: 'gold' };
+  return { agent_id: 'commander', name: t('chat.recipient_commander'), enabled: true, ...avatar };
+}
+
+function _todoAssignableAgents(list = []) {
+  return [_todoCommanderAgent(), ...list.filter((a) => a?.agent_id && a.agent_id !== 'commander')
+    .slice().sort((a, b) => String(a.name || a.agent_id).localeCompare(String(b.name || b.agent_id)))];
+}
+
+// Commander is always available. Other owners resolve from the scope's agent
+// details; missing owners keep their stored display name on the chip.
 function _findProjectAgent(agentId, name, list = _projectDetailMeta?.agentDetails || []) {
+  if (agentId === 'commander' || (!agentId && (name === 'commander' || name === 'Commander'))) {
+    return _todoCommanderAgent();
+  }
   if (agentId) {
     const byId = list.find((a) => a && a.agent_id === agentId);
     if (byId) return byId;
   }
   if (name) {
-    const byName = list.find((a) => a && a.name === name);
+    const byName = list.find((a) => a && a.agent_id !== 'commander' && a.name === name);
     if (byName) return byName;
   }
   return null;
 }
 
 // Assign / reassign / clear the owner of a task. Owners must be project-bound
-// agents, or available account agents for global tasks; an empty
+// agents, available account agents for global tasks, or Commander; an empty
 // owner clears both fields. Passing agent=null unassigns.
 async function _assignTodoAgent(tid, agent, context = _projectTodoContext()) {
   if (!_todoContextHasScope(context)) return;
@@ -1897,13 +1993,16 @@ let _projectTodoRunning = false;
 // global assistant, then open it so the user can follow the work. Completion
 // and review decisions belong to the executor, not this navigation action.
 async function _runTodoTask(tid, context = _projectTodoContext()) {
-  if (_projectTodoRunning || !context) return;
+  const task = (context?.tasks || []).find((item) => item.id === tid);
+  if (_projectTodoRunning || !task || task.status === 'done') return;
   if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) return;
   _projectTodoRunning = true;
   const startedAt = Date.now();
   let ok = false;
   let cid = '';
   let conversation = null;
+  let reused = false;
+  let busy = false;
   try {
     const res = await window.orkas.invoke('projects.tasks.run', {
       projectId: context.pid,
@@ -1912,19 +2011,29 @@ async function _runTodoTask(tid, context = _projectTodoContext()) {
     ok = !!(res && res.ok);
     cid = (res && res.cid) || '';
     conversation = (res && res.conversation) || null;
+    reused = !!(res && res.reused);
+    busy = !ok && !!(res && res.error === 'conversation_busy' && cid);
   } catch (err) {
     _projectDetailLog.warn('project todo run failed', err);
   } finally {
     _projectTodoRunning = false;
+  }
+  if (busy) {
+    // Its conversation is still working: take the user there instead of
+    // starting a second run in parallel.
+    if (typeof setView === 'function') setView('conversation', cid);
+    if (typeof uiAlert === 'function') uiAlert(t('project.todo.run_busy'));
+    return;
   }
   if (!ok) {
     _projectLogFailure('project_todo_run', { error_type: 'run_failed' });
     if (typeof uiAlert === 'function') uiAlert(t('project.todo.run_failed'));
     return;
   }
-  // Surface the new conversation in the list, then open it.
-  if (conversation && typeof conversations !== 'undefined' && Array.isArray(conversations)) {
-    conversations.unshift(conversation);
+  // Surface a newly created conversation in the list, then open it. A run in
+  // the to-do's own conversation is already listed.
+  if (!reused && conversation && typeof conversations !== 'undefined' && Array.isArray(conversations)) {
+    _cacheCreatedConversation(conversation);
     if (typeof renderConversationList === 'function') renderConversationList();
   }
   if (typeof loadProjects === 'function') loadProjects(true);
@@ -1958,23 +2067,17 @@ function _openTodoRowMenu(evt, tid, context = _projectTodoContext()) {
 function _openTodoAssignMenu(evt, tid, context = _projectTodoContext()) {
   if (!_todoContextHasScope(context) || typeof showContextMenu !== 'function') return;
   const task = (context.tasks || []).find((x) => x && x.id === tid);
-  const agents = (context.agents || []).filter((a) => a && a.agent_id)
-    .slice().sort((a, b) => String(a.name || a.agent_id).localeCompare(String(b.name || b.agent_id)));
+  const agents = _todoAssignableAgents(context.agents);
+  const currentId = task?.owner_agent_id || _findProjectAgent('', task?.owner_agent, agents)?.agent_id;
   const items = [];
   for (const a of agents) {
-    const isCurrent = !!task && (
-      (task.owner_agent_id && task.owner_agent_id === a.agent_id)
-      || (!task.owner_agent_id && task.owner_agent && task.owner_agent === a.name)
-    );
+    const isCurrent = currentId === a.agent_id;
     items.push({
       label: a.name || a.agent_id,
       avatar: { icon: a.icon, color: a.color, seed: a.agent_id },
       trailingIcon: isCurrent ? 'check' : undefined,
       onClick: () => (isCurrent ? undefined : _assignTodoAgent(tid, a, context)),
     });
-  }
-  if (!agents.length) {
-    items.push({ label: t(context.global ? 'ai_select.empty' : 'project.todo.assign_no_agents'), disabled: true });
   }
   showContextMenu(evt, items);
 }
@@ -2104,48 +2207,167 @@ function _bindTodoListActions(listEl, resolveContext) {
     else if (e.target.closest('[data-action="todo-menu"]')) _openTodoRowMenu(e, tid, context);
     else if (e.target.closest('[data-action="todo-assign"]')) _openTodoAssignMenu(e, tid, context);
     else if (e.target.closest('[data-action="todo-status"]')) _openTodoStatusMenu(e, tid, context);
-    else if (e.target.closest('[data-action="todo-edit"]')) {
-      _openProjectTodoEditor(context.tasks.find((task) => task.id === tid), context);
+    else if (e.target.closest('[data-action="todo-toggle-content"]')
+      || !e.target.closest('button, a, input, select, textarea, [role="button"]')) {
+      const key = _todoContentKey(tid, context);
+      const expanded = !_todoExpanded.has(key);
+      if (expanded) _todoExpanded.add(key);
+      else _todoExpanded.delete(key);
+      row.classList.toggle('is-expanded', expanded);
+      row.querySelector('.project-todo-title')?.setAttribute('aria-expanded', String(expanded));
     }
   });
 }
 
 let _projectDriverMutating = false;
+let _projectDriverLoadSeq = 0;
+let _projectDriverShownPid = '';
 
-function _setProjectDriverToggleState(enabled) {
+let _closeProjectDriverHint = () => {};
+let _todoDriverHintBound = false;
+
+function _bindProjectDriverHint() {
+  if (_todoDriverHintBound) return;
+  _todoDriverHintBound = true;
+  // One body-level tooltip and one delegated binding serve static project
+  // controls and account controls replaced during backlog refreshes.
+  const tooltip = document.createElement('div');
+  tooltip.id = 'project-driver-tooltip';
+  tooltip.className = 'project-driver-tooltip';
+  tooltip.setAttribute('role', 'tooltip');
+  tooltip.dataset.i18n = 'project.driver.toggle_hint';
+  tooltip.hidden = true;
+  document.body.appendChild(tooltip);
+  let button = null;
+  let pinned = false;
+  let leaveTimer;
+  const close = () => {
+    clearTimeout(leaveTimer);
+    pinned = false;
+    tooltip.hidden = true;
+    button = null;
+  };
+  _closeProjectDriverHint = close;
+  const position = () => {
+    if (tooltip.hidden) return;
+    if (!button.checkVisibility()) { close(); return; }
+    const rect = button.getBoundingClientRect();
+    tooltip.style.maxHeight = '';
+    const placement = _dropdownVerticalPlacement(rect, tooltip.offsetHeight, window.innerHeight, { gap: 4 });
+    const left = document.documentElement.dir === 'rtl' ? rect.left : rect.right - tooltip.offsetWidth;
+    tooltip.style.left = Math.max(8, Math.min(left, window.innerWidth - tooltip.offsetWidth - 8)) + 'px';
+    tooltip.style.top = placement.top + 'px';
+    tooltip.style.maxHeight = placement.availableHeight + 'px';
+  };
+  const show = (anchor) => {
+    if (anchor !== button) { close(); button = anchor; }
+    clearTimeout(leaveTimer);
+    tooltip.textContent = t('project.driver.toggle_hint');
+    tooltip.hidden = false;
+    position();
+  };
+  const leave = () => {
+    clearTimeout(leaveTimer);
+    // Allow crossing the small gap to read the tooltip itself.
+    leaveTimer = setTimeout(() => {
+      if (!tooltip.hidden && !pinned && document.activeElement !== button
+          && !button.matches(':hover') && !tooltip.matches(':hover')) close();
+    }, 100);
+  };
+  document.addEventListener('mouseover', event => {
+    const anchor = event.target.closest?.('.project-driver-hint');
+    if (anchor && !anchor.contains(event.relatedTarget)) show(anchor);
+    if (tooltip.contains(event.target)) clearTimeout(leaveTimer);
+  });
+  document.addEventListener('mouseout', event => {
+    if (button?.contains(event.target) || tooltip.contains(event.target)) leave();
+  });
+  document.addEventListener('focusin', event => {
+    const anchor = event.target.closest?.('.project-driver-hint');
+    if (anchor) show(anchor);
+  });
+  document.addEventListener('focusout', event => {
+    if (button?.contains(event.target)) leave();
+  });
+  document.addEventListener('click', event => {
+    const anchor = event.target.closest?.('.project-driver-hint');
+    if (anchor) {
+      if (pinned && button === anchor) close();
+      else { show(anchor); pinned = true; }
+    } else if (!tooltip.hidden && !tooltip.contains(event.target)) close();
+  });
+  document.addEventListener('keydown', event => {
+    if (event.isComposing || event.keyCode === 229 || event.key !== 'Escape' || tooltip.hidden) return;
+    close();
+  });
+  window.addEventListener('resize', position);
+  document.addEventListener('scroll', position, true);
+  window.addEventListener('i18n-change', () => {
+    if (!tooltip.hidden) { tooltip.textContent = t('project.driver.toggle_hint'); position(); }
+  });
+}
+
+function _todoDriverDeviceName(config, device) {
+  if (!config?.enabled) return '';
+  const local = config.device_id && config.device_id === device?.id;
+  if (local) return t('auto.device_current');
+  return String(config.device_name || config.device_id || '').trim();
+}
+
+function _setProjectDriverToggleState(config, device) {
   const btn = document.getElementById('project-driver-toggle');
   if (!btn) return;
+  const enabled = !!config?.enabled;
   btn.hidden = false;
   btn.setAttribute('aria-pressed', enabled ? 'true' : 'false');
+  const suffix = document.getElementById('project-driver-device');
+  if (suffix) {
+    const name = _todoDriverDeviceName(config, device);
+    suffix.textContent = name ? ' · ' + name : '';
+  }
 }
 
 async function _loadProjectDriver(pid) {
-  if (!pid || !document.getElementById('project-driver-toggle')) return;
+  const btn = document.getElementById('project-driver-toggle');
+  if (!pid || !btn) return;
+  if (_projectDriverMutating) {
+    if (pid !== _projectDriverShownPid) _setProjectDriverToggleState(null);
+    return;
+  }
+  const seq = ++_projectDriverLoadSeq;
+  btn.disabled = true;
+  if (pid !== _projectDriverShownPid) _setProjectDriverToggleState(null);
   try {
     const res = await window.orkas.invoke('projects.driver.get', { projectId: pid });
-    if (pid !== _projectDetailPid) return;
-    _setProjectDriverToggleState(!!(res && res.config && res.config.enabled));
+    if (pid !== _projectDetailPid || seq !== _projectDriverLoadSeq) return;
+    _setProjectDriverToggleState(res?.config, res?.device);
+    _projectDriverShownPid = pid;
+    btn.disabled = false;
   } catch (err) {
     _projectDetailLog.warn('load project driver failed', err);
   }
 }
 
 function _bindProjectDriver() {
+  if (document.getElementById('project-driver-hint')) _bindProjectDriverHint();
   const btn = document.getElementById('project-driver-toggle');
   if (!btn || btn.dataset.bound === '1') return;
   btn.dataset.bound = '1';
   btn.addEventListener('click', async () => {
     const pid = _projectDetailPid;
-    if (!pid || _projectDriverMutating) return;
+    if (!pid || _projectDriverMutating || btn.disabled) return;
     const next = btn.getAttribute('aria-pressed') !== 'true';
     _projectDriverMutating = true;
+    btn.disabled = true;
+    ++_projectDriverLoadSeq;
     const startedAt = Date.now();
     let ok = false;
     try {
       const res = await window.orkas.invoke('projects.driver.set', { projectId: pid, enabled: next });
       ok = !!(res && res.ok !== false);
       if (ok && pid === _projectDetailPid) {
-        _setProjectDriverToggleState(!!(res.config && res.config.enabled));
+        _setProjectDriverToggleState(res.config, res.device);
+        _projectDriverShownPid = pid;
         // The driver runs silently in the background; confirm the toggle and
         // say what "on" means so the user isn't left guessing.
         if (typeof uiToast === 'function') {
@@ -2158,6 +2380,8 @@ function _bindProjectDriver() {
       if (typeof uiAlert === 'function') uiAlert(t('project.todo.failed'));
     } finally {
       _projectDriverMutating = false;
+      if (pid === _projectDetailPid) btn.disabled = false;
+      else void _loadProjectDriver(_projectDetailPid);
     }
     if (!ok) _projectLogFailure('project_driver_toggle', { enabled: next, error_type: 'set_failed' });
   });
@@ -2609,6 +2833,11 @@ function _renderProjectFileNodes(nodes, depth = 0) {
         </div>
       `;
     }
+    if (f.pending) return `<div class="skill-tree-node skill-tree-file muted" style="padding-left:${indent}px">
+      <span class="skill-tree-caret skill-tree-caret-empty"></span>
+      <span class="skill-tree-icon icon-file">${_projectFileIconHtml(name, f.kind)}</span>
+      <span class="skill-tree-label">${label}</span>
+    </div>`;
     const chip = _projectKbStatusChipHtml(rel);
     const ext = _projectFileExt(name).replace(/^\./, '');
     const active = _projectLibraryActiveName === rel ? ' active' : '';
@@ -3220,6 +3449,9 @@ async function _reprocessProjectFile(name) {
 async function _deleteProjectFile(name) {
   if (!_projectDetailPid || !name) return;
   const projectId = _projectDetailPid;
+  const account = typeof currentUserId === 'string' ? currentUserId : '';
+  const isCurrent = () => projectId === _projectDetailPid
+    && account === (typeof currentUserId === 'string' ? currentUserId : '');
   const row = _findProjectFileRow(name);
   const isDir = !!_findProjectDirRow(name);
   const kind = isDir ? 'dir' : (row?.dataset?.projectFileKind || '');
@@ -3228,6 +3460,7 @@ async function _deleteProjectFile(name) {
     ? t('contexts.dir.del_confirm', { name: _projectBasename(name) })
     : t('contexts.file.del_confirm', { name: _projectBasename(name) });
   if (!(await uiConfirm(prompt))) return;
+  if (!isCurrent()) return;
   const startedAt = performance.now();
   let res;
   try {
@@ -3244,14 +3477,26 @@ async function _deleteProjectFile(name) {
     return;
   }
   try {
+    if (!isCurrent()) return;
+    // The local delete is committed. Update this rail immediately and reject
+    // older tree responses, without reloading unrelated project cards.
+    _projectLibraryRevision += 1;
+    const removed = (rel) => rel === name || rel.startsWith(`${name}/`);
+    const prune = (nodes) => nodes.filter(node => !removed(_projectLibraryRel(node)))
+      .map(node => node.type === 'dir' ? { ...node, children: prune(node.children || []) } : node);
+    if (_projectDetailMeta) _projectDetailMeta.files = prune(_projectDetailMeta.files || []);
+    for (const key of Array.from(_projectLibraryDrafts.keys())) {
+      if (removed(key)) _projectLibraryDrafts.delete(key);
+    }
+    for (const key of Array.from(_projectLibraryExpanded)) {
+      if (removed(key)) _projectLibraryExpanded.delete(key);
+    }
     if (_projectLibraryActiveName === name || _projectLibraryActiveName.startsWith(`${name}/`)) {
-      for (const key of Array.from(_projectLibraryDrafts.keys())) {
-        if (key === name || key.startsWith(`${name}/`)) _projectLibraryDrafts.delete(key);
-      }
       _clearProjectLibraryViewer();
     }
-    _projectLibraryExpanded.delete(name);
-    if (projectId === _projectDetailPid) await loadProjectDetail(projectId);
+    _renderProjectFiles(_projectDetailMeta?.files || []);
+    _bindProjectFileRows();
+    if (typeof hydrateUiIcons === 'function') hydrateUiIcons(document.getElementById('project-files-list'));
   } catch (err) {
     _projectDetailLog.warn('refresh after project file delete failed', err);
   }
@@ -4030,7 +4275,7 @@ async function _submitProjectChat() {
   const raw = submittedDraft.text().trim();
   const draftCid = _projectChatDraftCid(projectId);
   const quotes = (typeof _getQuotes === 'function') ? _getQuotes(draftCid).slice() : [];
-  if (!raw && !quotes.length) return;
+  if (_composerSendIsEmpty(raw, 'project', quotes, _chatAttachList(draftCid))) return;
   const requestText = raw || t('chat.reference_default_prompt');
   const pendingUseSelections = (typeof getChatUseSelections === 'function')
     ? getChatUseSelections('project')
@@ -4039,11 +4284,6 @@ async function _submitProjectChat() {
     ? _recipientSnapshotForSend('project')
     : null;
   const recipientType = recipient && recipient.kind ? recipient.kind : 'commander';
-  // D23: capture the send's serial/parallel choice before the composer is
-  // cleared — the shape is read from the live textarea.
-  const multiDispatch = (typeof _composerEffectiveDispatchMode === 'function')
-    ? _composerEffectiveDispatchMode('project')
-    : null;
   let draftItems = (typeof _chatAttachList === 'function')
     ? _chatAttachList(draftCid)
     : [];
@@ -4169,7 +4409,7 @@ async function _submitProjectChat() {
       });
     }
     if (typeof uiAlert === 'function') {
-      await uiAlert(t('chat.attach_adopt_failed', { reason: adoptionError }));
+      await uiAlert(t('chat.attach_sync_failed'));
     }
     if (btn) btn.disabled = false;
     releaseAttachmentSend();
@@ -4180,7 +4420,7 @@ async function _submitProjectChat() {
   }
   releaseAttachmentSend();
   if (createdConversation) {
-    conversations.unshift(createdConversation);
+    _cacheCreatedConversation(createdConversation, createdConversation.title);
     renderConversationList();
     if (typeof loadProjects === 'function') loadProjects(true);
   }
@@ -4189,10 +4429,12 @@ async function _submitProjectChat() {
 
   const ownsDraft = submittedDraft.matches();
   const openCreated = ownsDraft && navigationEpoch === _composerNavigationEpoch;
+  if (typeof composerDiscardStoredDraft === 'function') {
+    composerDiscardStoredDraft(input, projectId, submittedDraft);
+  }
   if (ownsDraft) {
     composerSetText(input, '');
     if (typeof _draftHadRecipient !== 'undefined') _draftHadRecipient.delete('project');
-    if (typeof _updateComposerSeqToggle === 'function') _updateComposerSeqToggle('project');
   }
   if (recipient) {
     _recipientByCid[convId] = recipient.defaultRecipient || recipient;
@@ -4213,7 +4455,6 @@ async function _submitProjectChat() {
       ...(_adopted.length ? { attachments: _adopted } : {}),
       ...(useSelections.length ? { use_selections: useSelections } : {}),
       ...(references.length ? { references } : {}),
-      ...(multiDispatch ? { multi_dispatch: multiDispatch } : {}),
     };
     if (typeof _rememberSentComposerSnapshot === 'function') {
       _rememberSentComposerSnapshot(convId, {
@@ -4351,7 +4592,7 @@ async function _openAddPicker() {
             ${descHtml}
 
           </div>
-          <button type="button" class="btn btn-sm" data-action="pick" aria-label="Add">+</button>
+          <button type="button" class="btn btn-sm" data-action="pick" aria-label="Add">${_projectUiIconHtml('plus')}</button>
         </div>
       `;
     }).join('');
@@ -4388,7 +4629,7 @@ async function _openAddPicker() {
           }
         } catch (err) {
           btn.disabled = false;
-          btn.textContent = '+';
+          btn.innerHTML = _projectUiIconHtml('plus');
           const failure = _projectDetailFailure(err, 'binding_add_failed');
           _projectLogFailure('project_binding_add', { binding_kind: k, ...failure });
           _projectDetailLog.warn('add binding failed', err);
@@ -4421,7 +4662,22 @@ async function _openAddPicker() {
   setTimeout(() => searchEl.focus(), 0);
 }
 
-// ── Header actions: Rename / Delete ────────────────────────────────────
+// ── Header actions: "⋯" menu with Rename / Delete ──────────────────────
+
+function _projectHeaderMenuItems() {
+  if (!_projectDetailPid || !_projectDetailMeta?.project) return [];
+  return [
+    { label: t('project.action.rename'), onClick: () => _onRenameAction() },
+    { label: t('project.action.delete'), onClick: () => _onDeleteAction() },
+  ];
+}
+
+function _openProjectHeaderMenu(button) {
+  if (typeof showContextMenu !== 'function' || !button) return;
+  const rect = button.getBoundingClientRect();
+  // Anchored under the button; the menu flips left at the window edge.
+  showContextMenu({ clientX: rect.right, clientY: rect.bottom + 4 }, _projectHeaderMenuItems());
+}
 
 function _onRenameAction() {
   if (!_projectDetailMeta) return;
@@ -4495,18 +4751,16 @@ function _exitRenameMode() {
   _setProjectDetailRenameMode(false);
 }
 
+// While renaming, "Done" commits and the "⋯" menu steps aside.
 function _setProjectDetailRenameMode(on) {
   const titleEl = document.getElementById('project-detail-title');
   const inputEl = document.getElementById('project-detail-title-input');
-  const renameBtn = document.getElementById('project-action-rename');
-  const deleteBtn = document.getElementById('project-action-delete');
+  const doneBtn = document.getElementById('project-action-rename');
+  const moreBtn = document.getElementById('project-action-more');
   if (titleEl) titleEl.style.display = on ? 'none' : '';
   if (inputEl) inputEl.style.display = on ? '' : 'none';
-  if (renameBtn) {
-    renameBtn.textContent = on ? t('project.action.done') : t('project.action.rename');
-    renameBtn.setAttribute('data-rename-mode', on ? '1' : '0');
-  }
-  if (deleteBtn) deleteBtn.style.display = on ? 'none' : '';
+  if (doneBtn) doneBtn.hidden = !on;
+  if (moreBtn) moreBtn.hidden = on;
 }
 
 function _isProjectDetailRenameMode() {
@@ -4569,11 +4823,10 @@ function _initProjectDetailBindings() {
     e.stopPropagation();
     const inputEl = document.getElementById('project-detail-title-input');
     if (_isProjectDetailRenameMode() && inputEl) _commitRename(inputEl.value);
-    else _onRenameAction();
   });
-  document.getElementById('project-action-delete')?.addEventListener('click', (e) => {
+  document.getElementById('project-action-more')?.addEventListener('click', (e) => {
     e.stopPropagation();
-    _onDeleteAction();
+    _openProjectHeaderMenu(e.currentTarget);
   });
   document.getElementById('project-library-root-menu-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();

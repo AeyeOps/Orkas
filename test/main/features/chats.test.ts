@@ -77,11 +77,18 @@ describe('chats › createConversation', () => {
 
   it('caps the initial title by display width', async () => {
     const chats = await loadChats();
-    const english = await chats.createConversation(TEST_UID, { title: 'a'.repeat(70) });
-    const chinese = await chats.createConversation(TEST_UID, { title: '长'.repeat(40) });
+    const english = await chats.createConversation(TEST_UID, { title: 'a'.repeat(120) });
+    const chinese = await chats.createConversation(TEST_UID, { title: '长'.repeat(60) });
 
-    expect(english.title).toBe('a'.repeat(60));
-    expect(chinese.title).toBe('长'.repeat(30));
+    expect(english.title).toBe('a'.repeat(101));
+    expect(chinese.title).toBe('长'.repeat(50));
+  });
+
+  it('stores a full auto title, ellipsis included, past the shared 60-unit name limit', async () => {
+    const chats = await loadChats();
+    const auto = chats.autoTitle(`请帮我${'设计'.repeat(40)}`);
+    const conv = await chats.createConversation(TEST_UID, { title: auto });
+    expect(conv.title).toBe(`${'设计'.repeat(25)}…`);
   });
 
   // Project membership wiring. Project conversations live in the project's
@@ -370,6 +377,28 @@ describe('chats › message history tombstones', () => {
     ]);
   });
 
+  // A quoted reference knows only its message id. Its page must be the same
+  // page, cursors and source indexes the index-anchored read returns, found
+  // past malformed lines and a tombstoned copy of the same id.
+  it('reads the page around a quoted message id exactly like its index page', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'quoted target' });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    const rows = Array.from({ length: 35 }, (_, i) => JSON.stringify(
+      i === 4 ? { id: 'm27', from: 'user', text: 'deleted copy', deleted_at: '2026-07-10T11:00:00' }
+        : { id: `m${i}`, ts: `2026-07-10T10:${String(i).padStart(2, '0')}:00`, from: i % 2 ? 'commander' : 'user', text: `message ${i}` },
+    ));
+    rows.splice(9, 0, '{malformed');
+    fs.writeFileSync(file, rows.join('\n') + '\n');
+
+    const quoted = await chats.getMessagesPageAtMessageId(TEST_UID, conv.conversation_id, 'm27', 10);
+    const indexed = await chats.getMessagesPageAtIndex(TEST_UID, conv.conversation_id, 27, 10);
+
+    expect(quoted).toEqual({ ...indexed, messageIndex: 27 });
+    expect(quoted!.history.map((row) => row.id)).toContain('m27');
+    expect(await chats.getMessagesPageAtMessageId(TEST_UID, conv.conversation_id, 'gone', 10)).toBeNull();
+  });
+
   it('keeps an explicit global history read out of a duplicate project root', async () => {
     const chats = await loadChats();
     const projects = await import('../../../src/main/features/projects');
@@ -444,8 +473,8 @@ describe('chats › conversation turn navigation index', () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID, { title: 'legacy turn index' });
     const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
-    const longUser = `## [Useful link](https://example.com) ${'用'.repeat(60)}`;
-    const longReply = `> ${'答'.repeat(110)}`;
+    const longUser = `## [Useful link](https://example.com) ${'用'.repeat(120)}`;
+    const longReply = `> ${'答'.repeat(260)}`;
     fs.writeFileSync(file, [
       JSON.stringify({ role: 'user', content: longUser }),
       '{malformed',
@@ -455,9 +484,9 @@ describe('chats › conversation turn navigation index', () => {
 
     const first = await chats.getConversationTurnPage(TEST_UID, conv.conversation_id);
     expect(first.total).toBe(1);
-    expect(Array.from(first.turns[0].userPreview)).toHaveLength(40);
+    expect(Array.from(first.turns[0].userPreview)).toHaveLength(100);
     expect(first.turns[0].userPreview).toContain('Useful link');
-    expect(Array.from(first.turns[0].assistantPreview)).toHaveLength(80);
+    expect(Array.from(first.turns[0].assistantPreview)).toHaveLength(240);
     expect(first.turns[0].assistantPreview).not.toContain('hidden dispatch');
     expect(first.turns[0].messageIndex).toBe(0);
     // Worker-local diagnostic redaction is covered by conversation-turn-index.test.ts.
@@ -469,7 +498,7 @@ describe('chats › conversation turn navigation index', () => {
     expect(fs.existsSync(indexFile)).toBe(true);
     const persisted = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
     expect(persisted).toMatchObject({
-      version: 2,
+      version: 3,
       recordCount: 3,
       tailHash: expect.stringMatching(/^[a-f0-9]{64}$/),
     });
@@ -495,9 +524,8 @@ describe('chats › conversation turn navigation index', () => {
       assistantPreview: 'second reply · extra detail',
     });
     expect(JSON.parse(fs.readFileSync(indexFile, 'utf8')).recordCount).toBe(6);
-    await expect(chats.findMessageIndexById(
-      TEST_UID, conv.conversation_id, 'u2',
-    )).resolves.toBe(3);
+    expect((await chats.getMessagesPageAtMessageId(TEST_UID, conv.conversation_id, 'u2'))?.messageIndex)
+      .toBe(3);
   });
 
   it('falls back to a full rebuild when a same-inode source prefix is rewritten', async () => {
@@ -785,7 +813,7 @@ describe('chats › renameConversation', () => {
 
     const renamed = await chats.renameConversation(TEST_UID, conv.conversation_id, raw);
 
-    expect(renamed?.title).toBe('长'.repeat(30));
+    expect(renamed?.title).toBe('长'.repeat(50));
     expect(renamed?.title_manually_set).toBe(true);
   });
 
@@ -898,7 +926,7 @@ describe('chats › index repair', () => {
       .map((c) => c.conversation_id)).toEqual([collapsedConv.conversation_id]);
   });
 
-  it('always includes tasks active since the renderer day start, even under collapsed projects', async () => {
+  it.each([1, 47, 49])('includes collapsed-project tasks across a %s-hour recent calendar window', async (lookbackHours) => {
     const chats = await loadChats();
     const projects = await import('../../../src/main/features/projects');
     const collapsed = await projects.createProject(TEST_UID, 'Collapsed');
@@ -923,7 +951,9 @@ describe('chats › index repair', () => {
       collapsedOld.conversation_id,
     );
     chats.invalidateConversationCaches(TEST_UID);
-    const activeSinceMs = Date.now() - 60 * 60 * 1000;
+    // Late yesterday/today windows approach 48h; a one-hour DST fallback
+    // can extend the two local days to 49h.
+    const activeSinceMs = Date.now() - lookbackHours * 60 * 60 * 1000;
 
     // Negative control: without the day-start filter the collapsed project
     // contributes nothing, so the Today aggregate would miss a live task.
@@ -949,7 +979,7 @@ describe('chats › index repair', () => {
     expect(startup.unprojected_pagination).toEqual({ total: 2, next_offset: null });
   });
 
-  it('rejects renderer active-since values outside a plausible local day', async () => {
+  it('rejects renderer active-since values outside a plausible recent calendar window', async () => {
     const chats = await loadChats();
     const projects = await import('../../../src/main/features/projects');
     const collapsed = await projects.createProject(TEST_UID, 'Collapsed');
@@ -959,7 +989,7 @@ describe('chats › index repair', () => {
       projectId: collapsed.project.project_id,
     });
 
-    for (const activeSinceMs of [0, Date.now() + 60 * 60 * 1000]) {
+    for (const activeSinceMs of [0, Date.now() - 51 * 60 * 60 * 1000, Date.now() + 60 * 60 * 1000]) {
       const startup = await chats.listStartupConversations(TEST_UID, {
         expandedProjectIds: [],
         activeSinceMs,
@@ -1496,6 +1526,23 @@ describe('chats › index repair', () => {
 });
 
 describe('chats › deleteConversation', () => {
+  it('keeps history and the live index when the maintenance guard rejects current metadata', async () => {
+    const chats = await loadChats();
+    const conv = await chats.createConversation(TEST_UID, { title: 'Protected during preview' });
+    await chats.setConversationPinned(TEST_UID, conv.conversation_id, true);
+    const history = path.join(tmpDir, TEST_UID, 'cloud', 'chats', `${conv.conversation_id}.jsonl`);
+    fs.writeFileSync(history, '{"content":"keep"}\n');
+    const guard = vi.fn(async (current: any) => !current.pinned_at);
+    expect(await chats.deleteConversation(TEST_UID, conv.conversation_id, null, guard)).toBe(false);
+    expect(guard).toHaveBeenCalledWith(expect.objectContaining({ pinned_at: expect.any(String) }));
+    expect(fs.readFileSync(history, 'utf8')).toContain('keep');
+    expect(await chats.getConversationMetadata(TEST_UID, conv.conversation_id)).not.toBeNull();
+    expect((await chats.listCleanupConversationRows(TEST_UID)).map(row => row.conversation_id)).toContain(conv.conversation_id);
+    await chats.setConversationPinned(TEST_UID, conv.conversation_id, false);
+    expect(await chats.deleteConversation(TEST_UID, conv.conversation_id, null, guard)).toBe(true);
+    expect(fs.existsSync(history)).toBe(false);
+    expect(await chats.listCleanupConversationRows(TEST_UID)).toEqual([]);
+  });
   it('purges retained member outputs after a model-state reset removed the session JSONL', async () => {
     const chats = await loadChats();
     const conv = await chats.createConversation(TEST_UID);

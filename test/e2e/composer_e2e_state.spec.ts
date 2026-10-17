@@ -4,6 +4,78 @@ import { analyzeWebAppLogs } from './fixtures/web-app-log-analysis';
 
 const modifier = process.platform === 'darwin' ? 'Meta' : 'Control';
 
+test('project navigation restores separate drafts before detail loading and cannot undo another project’s text', async ({}, info) => {
+  const app = new OrkasTestApp(info, { configuredModel: false });
+  try {
+    await app.launch();
+    const a = await app.invoke<any>('projects.create', { name: 'Draft project A' });
+    const b = await app.invoke<any>('projects.create', { name: 'Draft project B' });
+    const ids = [a.project.project_id, b.project.project_id];
+    const page = app.page!;
+    await page.evaluate(id => (window as any).setView('project', id), ids[0]);
+    await expect(page.locator('#project-detail-title')).toHaveText('Draft project A');
+    const input = page.locator('#project-chat-input');
+    await input.fill('中文 A\nunsent draft');
+    const immediate = await page.evaluate(id => {
+      const w = window as any;
+      w.setView('project', id);
+      return w.composerText('project-chat-input');
+    }, ids[1]);
+    expect(immediate).toBe('');
+    await expect(page.locator('#project-detail-title')).toHaveText('Draft project B');
+    await input.press(`${modifier}+z`);
+    expect(await page.evaluate(() => (window as any).composerText('project-chat-input'))).toBe('');
+    await input.fill('B draft');
+    await page.evaluate(async id => { await (window as any).loadProjectDetail(id); }, ids[1]);
+    expect(await page.evaluate(() => (window as any).composerText('project-chat-input'))).toBe('B draft');
+    await page.evaluate(id => (window as any).setView('project', id), ids[0]);
+    await expect.poll(() => page.evaluate(() => (window as any).composerText('project-chat-input'))).toBe('中文 A\nunsent draft');
+    await input.press(`${modifier}+z`);
+    expect(await page.evaluate(() => (window as any).composerText('project-chat-input'))).toBe('中文 A\nunsent draft');
+    await page.locator('#new-chat-btn').click();
+    await page.evaluate(id => (window as any).setView('project', id), ids[1]);
+    await expect.poll(() => page.evaluate(() => (window as any).composerText('project-chat-input'))).toBe('B draft');
+  } finally { await app.dispose(); }
+});
+
+test('a delayed project send consumes its own draft and preserves another project’s new input', async ({}, info) => {
+  const app = new OrkasTestApp(info, { modelStub: true });
+  try {
+    await app.launch();
+    const a = await app.invoke<any>('projects.create', { name: 'Send project A' });
+    const b = await app.invoke<any>('projects.create', { name: 'Send project B' });
+    const ids = [a.project.project_id, b.project.project_id];
+    const page = app.page!;
+    await page.evaluate(id => (window as any).setView('project', id), ids[0]);
+    await expect(page.locator('#project-detail-title')).toHaveText('Send project A');
+    await page.locator('#project-chat-input').fill('Request for project A');
+    await page.evaluate(() => {
+      const w = window as any;
+      const original = w._chatAttachSnapshotForSend;
+      w._chatAttachSnapshotForSend = async (...args: any[]) => {
+        await new Promise(resolve => { w.releaseProjectSend = resolve; });
+        return original(...args);
+      };
+      w.delayedProjectSend = w._submitProjectChat();
+    });
+    await page.evaluate(id => (window as any).setView('project', id), ids[1]);
+    await expect(page.locator('#project-detail-title')).toHaveText('Send project B');
+    await page.locator('#project-chat-input').fill('B remains unsent');
+    await page.evaluate(async () => {
+      const w = window as any;
+      w.releaseProjectSend(); await w.delayedProjectSend;
+    });
+    await expect(page.locator('#project-detail-title')).toHaveText('Send project B');
+    expect(await page.evaluate(() => (window as any).composerText('project-chat-input'))).toBe('B remains unsent');
+    await page.evaluate(id => (window as any).setView('project', id), ids[0]);
+    await expect.poll(() => page.evaluate(() => (window as any).composerText('project-chat-input'))).toBe('');
+    const listed = await app.invoke<any>('conversations.list');
+    const sent = listed.conversations.filter((item: any) => item.title === 'Request for project A');
+    expect(sent).toHaveLength(1);
+    expect(sent[0].project_id).toBe(ids[0]);
+  } finally { await app.dispose(); }
+});
+
 let previousKeepLogs: string | undefined;
 test.beforeEach(() => {
   previousKeepLogs = process.env.ORKAS_E2E_KEEP_LOGS;

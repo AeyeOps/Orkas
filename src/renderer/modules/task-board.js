@@ -274,12 +274,33 @@ function _taskBoardStatusLabel(status) {
   }
 }
 
+const _TASK_BOARD_ENDED_WITHOUT_DONE = new Set(['failed', 'stopped', 'cancelled']);
+
+// Dependency ids as a list (D29). Snapshots written before D29 stored a
+// single id string.
+function _taskBoardDeps(task) {
+  if (!task || !task.after) return [];
+  return (Array.isArray(task.after) ? task.after : [task.after])
+    .filter((id) => typeof id === 'string' && id);
+}
+
+// Locale-aware "A, B and C" for the waiting chip.
+function _taskBoardJoinNames(names) {
+  try {
+    const lang = typeof getLang === 'function' ? getLang() : 'en';
+    return new Intl.ListFormat(lang, { style: 'long', type: 'conjunction' }).format(names);
+  } catch (_) {
+    return names.join(', ');
+  }
+}
+
 // Send now is meaningful only for a user-authored queued task whose exact
-// assignee currently exposes a live-turn ingress. Commander-created child
-// contracts intentionally remain cancel-only.
+// assignee currently exposes a live-turn ingress. Commander-created queued
+// contracts remain cancel-only; the user's queued update
+// can also guide a Commander-dispatched Agent's steerable live turn.
 function _taskBoardCanSendNow(cid, task) {
   if (!cid || !task || task.status !== 'queued' || task.created_by !== 'user') return false;
-  if (task.after) return false; // chained starts stay ordered (§4.8)
+  if (_taskBoardDeps(task).length) return false; // dependent starts stay ordered (§4.8)
   if (typeof _latestActiveTurns === 'undefined') return false;
   const turns = _latestActiveTurns.get(cid);
   return Array.isArray(turns) && turns.some((turn) => (
@@ -386,16 +407,22 @@ function _taskBoardRender(cid) {
           ? `<span class="chat-queue-skill chat-queue-dep" title="${escapeHtml(origin)}">${escapeHtml(t('chat.task_dispatched'))}</span>`
           : '';
         const preview = escapeHtml(String(task.instruction || '').replace(/\s+/g, ' ')).slice(0, 160);
-        // Chain dependency as read-only row information (D18/D24): a queued row
-        // that waits on a predecessor names it inline. The predecessor may
-        // already be terminal (snapshot still in the map) during the moments
-        // before this row flips running.
+        // Dependencies as read-only row information (D18/D24/D29): a queued row
+        // names the predecessors it still waits on; finished ones drop off.
+        // A predecessor may already be terminal (snapshot still in the map)
+        // during the moments before this row flips running.
         let depChip = '';
-        if (task.status === 'queued' && task.after) {
-          const prev = _taskBoardMapFor(cid).get(task.after);
-          const prevName = prev ? _taskBoardAssigneeLabel(cid, prev) : String(task.after).slice(0, 6);
-          const prevPreview = prev ? String(prev.instruction || '').replace(/\s+/g, ' ').slice(0, 80) : '';
-          depChip = `<span class="chat-queue-skill chat-queue-dep" title="${escapeHtml(prevPreview)}">${escapeHtml(t('chat.task_waiting_on', { name: prevName }))}</span>`;
+        const waitingOn = task.status === 'queued'
+          ? _taskBoardDeps(task).filter((id) => {
+            const prev = _taskBoardMapFor(cid).get(id);
+            return !prev || prev.status !== 'done';
+          })
+          : [];
+        if (waitingOn.length) {
+          const prevs = waitingOn.map((id) => _taskBoardMapFor(cid).get(id));
+          const names = waitingOn.map((id, i) => (prevs[i] ? _taskBoardAssigneeLabel(cid, prevs[i]) : String(id).slice(0, 6)));
+          const previews = prevs.filter(Boolean).map((prev) => String(prev.instruction || '').replace(/\s+/g, ' ').slice(0, 80));
+          depChip = `<span class="chat-queue-skill chat-queue-dep" title="${escapeHtml(previews.join('\n'))}">${escapeHtml(t('chat.task_waiting_on', { name: _taskBoardJoinNames(names) }))}</span>`;
         }
         // queued → cancel before it runs; running → stop ONLY this execution
         // (per-task abort; the header Stop remains the whole-conversation one);
@@ -588,7 +615,15 @@ async function _taskBoardResumeBlocked(cid, taskId) {
       // State events may beat the command acknowledgement. Only advance a
       // still-blocked snapshot; never overwrite an already running or
       // completed task with this acknowledgement's earlier queued state.
-      if (task && task.status === 'blocked') m.set(taskId, { ...task, status: 'queued', after: undefined });
+      // Run-anyway drops only predecessors that ended without done (D29);
+      // unfinished ones keep gating, mirroring the main-process rule.
+      if (task && task.status === 'blocked') {
+        const keep = _taskBoardDeps(task).filter((id) => {
+          const dep = m.get(id);
+          return !!dep && (dep.status === 'done' || !_TASK_BOARD_ENDED_WITHOUT_DONE.has(dep.status));
+        });
+        m.set(taskId, { ...task, status: 'queued', after: keep.length ? keep : undefined });
+      }
       _taskBoardRender(cid);
       // Run-anyway STARTS an execution from a bare invoke — no send stream is
       // attached, so the released task's task_state/turn events would have no

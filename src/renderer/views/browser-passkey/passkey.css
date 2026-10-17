@@ -1,0 +1,37 @@
+body { background: var(--surface); }
+.passkey-dialog {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  max-width: none;
+  max-height: none;
+  border-radius: 0;
+  box-shadow: none;
+  overflow: auto;
+  padding: 20px;
+}
+.passkey-dialog .modal-header { margin-bottom: 20px; min-height: 0; }
+.passkey-body { flex: 1; min-height: 0; }
+.passkey-instructions { display: flex; gap: 12px; align-items: flex-start; }
+.passkey-instructions .ui-icon { width: 20px; height: 20px; margin-top: 2px; color: var(--text-2); }
+.passkey-instructions h2 { font-size: 13px; font-weight: 600; line-height: 1.6; }
+.passkey-instruction { color: var(--text); font-size: 13px; line-height: 1.5; text-wrap: pretty; }
+.passkey-visual {
+  display: grid;
+  place-items: center;
+  width: 264px;
+  height: 264px;
+  margin: 24px auto 0;
+  background: var(--surface);
+}
+.passkey-visual img { display: block; width: 264px; height: 264px; }
+.passkey-dialog:not([data-phase="scan"]) .passkey-visual { height: 200px; margin-top: 16px; }
+.passkey-visual [hidden] { display: none; }
+.passkey-waiting { display: flex; align-items: center; flex-direction: column; gap: 20px; color: var(--text-2); }
+.passkey-phone { width: 56px; height: 56px; }
+.passkey-status { margin-top: 8px; font-size: 13px; text-align: center; }
+.passkey-nearby { margin-top: 4px; color: var(--muted); font-size: 12px; line-height: 1.5; text-align: center; text-wrap: pretty; }
+.passkey-dialog .modal-actions { flex: none; margin-top: 16px; }
+.passkey-dialog .modal-actions .btn { min-width: 64px; }

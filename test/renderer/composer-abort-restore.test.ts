@@ -302,6 +302,8 @@ describe('stop and settlement wiring', () => {
 
     expect(clear).toHaveBeenCalledWith('conv-a');
     expect([...watermarks]).toEqual([['conv-other', 20]]);
-    expect([...offViewDirty]).toEqual(['conv-other']);
+    // Composer state is retired, but a background transcript must still fetch
+    // its saved terminal reply when the user returns to it.
+    expect([...offViewDirty]).toEqual(['conv-a', 'conv-other']);
   });
 });

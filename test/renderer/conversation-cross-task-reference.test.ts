@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { conversationCacheSource } from './conversation-cache-test-source';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -19,6 +20,30 @@ const projectDetailSource = fs.readFileSync(
 const indexSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/index.html'), 'utf8');
 
 describe('conversation cross-task message reference UI', () => {
+  it('keeps one target task and its newer metadata when creation is already visible during a quote handoff', async () => {
+    const current = { conversation_id: 'target', title: 'Renamed target', project_id: 'p-new',
+      created_at: '2026-05-15T09:00:00Z', updated_at: '2026-05-15T09:01:00Z', processing: true };
+    const payload = { msgId: 'source-message', text: 'Quoted message' };
+    const context = vm.createContext({
+      conversations: [current],
+      _addQuote: vi.fn(), _closeReferenceTargetPicker: vi.fn(), _exitMessageSelection: vi.fn(),
+      setView: vi.fn(), renderConversationList: vi.fn(), _renderQuotePreview: vi.fn(),
+      document: { getElementById: () => null },
+    });
+    vm.runInContext(conversationCacheSource + '\n' + conversationSource.slice(
+      conversationSource.indexOf('async function _transferSelectedReferences('),
+      conversationSource.indexOf('function _referenceTargetProject('),
+    ), context);
+    await context._transferSelectedReferences('target', [payload], { fresh: true,
+      conversation: { conversation_id: 'target', title: 'Creation title', project_id: 'p-old',
+        created_at: '2026-05-15T09:00:00Z', updated_at: '2026-05-15T09:00:00Z' },
+    });
+    expect(context.conversations).toEqual([current]);
+    expect(context._addQuote).toHaveBeenCalledExactlyOnceWith('target', payload);
+    expect(context.setView).toHaveBeenCalledExactlyOnceWith('conversation', 'target', { skipLoad: true });
+    expect(context._exitMessageSelection).toHaveBeenCalledOnce();
+  });
+
   it('exposes secondary actions after the quote without an overflow menu', () => {
     expect(conversationSource).toContain('<span class="chat-bubble-direct-actions">${quoteButton}</span>');
     expect(conversationSource).toContain('${secondaryActions}');
@@ -79,29 +104,41 @@ describe('conversation cross-task message reference UI', () => {
     expect(conversationSource).toContain("setView('conversation', targetCid");
     expect(conversationSource).toContain("setView('new-chat')");
     expect(conversationSource).toContain("setView('project', projectId)");
-    expect(conversationSource).toContain('_stageReferencesForNewTask(payloads, sourceProjectId)');
+    expect(conversationSource).toContain('_stageReferencesForNewTask(payloads, picker.projectId)');
+    expect(conversationSource).toContain("_stageReferencesForNewTask(payloads, '')");
+    expect(conversationSource).toContain('_stageReferencesForNewTask(payloads, target.dataset.createProjectId)');
     expect(conversationSource).not.toContain('function _createReferenceTargetTask');
     expect(conversationSource).not.toContain('_transferSelectedReferences(targetCid, payloads);\n  sendInCurrentConversation');
   });
 
-  it('inherits project scope for new tasks and shows only the five most recent tasks by default', () => {
-    expect(conversationSource).toContain("const sourceProjectId = _projectIdForConversation(currentCid)");
+  it('lets the user pick the new-task owner and browse every task of a scope in batches', () => {
+    expect(conversationSource).not.toContain('const sourceProjectId = _projectIdForConversation(currentCid)');
     expect(conversationSource).toContain('return projectId ? `projchat-${projectId}` : DRAFT_CID');
     expect(conversationSource).toContain("const res = await apiFetch('/api/conversations/list')");
     expect(conversationSource).toContain('const [targetConversations] = await Promise.all(loads)');
     expect(conversationSource).toContain('Array.isArray(targetConversations) ? targetConversations : []');
-    expect(conversationSource).toContain('const tasks = needle ? matches.slice(0, 80) : matches.slice(0, 5)');
+    expect(conversationSource).not.toContain('matches.slice(0, 80)');
+    expect(conversationSource).not.toContain('matches.slice(0, 5)');
+    expect(conversationSource).toContain('const shown = matches.slice(0, picker.limit)');
+    expect(conversationSource).toContain('picker.limit += _REFERENCE_TARGET_PAGE_SIZE');
+    expect(conversationSource).toContain("if (picker.scope === 'global') return !conv.project_id");
+    expect(conversationSource).toContain("if (picker.scope === 'project') return conv.project_id === picker.projectId");
     expect(conversationSource).toContain('_referenceTargetActivity(b).localeCompare(_referenceTargetActivity(a))');
     expect(conversationSource).toContain("String(conv.title || '').toLowerCase().includes(needle)");
     expect(conversationSource).not.toContain('_referenceTargetAreaLabel(conv).toLowerCase().includes(needle)');
   });
 
-  it('keeps search inside the existing-task section and uses compact picker typography', () => {
-    const existingStart = conversationSource.indexOf('class="chat-reference-existing"');
+  it('places new-task above search in the browse pane and uses compact picker typography', () => {
+    const browseStart = conversationSource.indexOf('class="chat-reference-browse"');
+    const newTaskStart = conversationSource.indexOf('class="chat-reference-new-task"');
     const searchStart = conversationSource.indexOf('class="chat-reference-target-search-wrap"');
-    expect(existingStart).toBeGreaterThanOrEqual(0);
-    expect(searchStart).toBeGreaterThan(existingStart);
-    expect(styleSource).toContain('width: min(468px, calc(100vw - 40px));');
+    expect(browseStart).toBeGreaterThanOrEqual(0);
+    expect(newTaskStart).toBeGreaterThan(browseStart);
+    expect(searchStart).toBeGreaterThan(newTaskStart);
+    expect(conversationSource.indexOf('class="chat-reference-scopes"')).toBeLessThan(browseStart);
+    expect(styleSource).toContain('width: min(744px, calc(100vw - 40px));');
+    expect(styleSource).toContain('grid-template-columns: 184px minmax(0, 1fr);');
+    expect(styleSource).toContain('.chat-reference-create[hidden] { display: none; }');
     expect(styleSource).toContain('.chat-reference-target-header h2');
     expect(styleSource).toContain('font-size: 13px;');
     expect(styleSource).toContain('height: 38px;');

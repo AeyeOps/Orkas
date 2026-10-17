@@ -29,7 +29,8 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { app, BrowserWindow, Menu, Notification, type Tray, ipcMain, nativeImage, net, protocol, session, shell } from 'electron';
+import { app, BrowserWindow, Menu, Notification, type Tray, ipcMain, nativeImage, net, powerSaveBlocker, protocol, session, shell } from 'electron';
+import { installWindowPresentationEvents } from './util/window-presentation';
 // Side-effect import: at module-load time this resolves the install
 // container, runs the one-shot PC/data → <container>/data migration, and
 // sets process.env.ORKAS_WORKSPACE_ROOT. Must be the FIRST project import
@@ -215,10 +216,11 @@ import type { BuiltinMarketplaceSeedResult } from './features/builtin_marketplac
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
-import { appResource } from './features/web_apps/host';
+import { appResource, hasIsolatedBrowserStorage } from './features/web_apps/host';
 import * as clientConfigFeature from './features/client_config';
 import * as connectorsFeature from './features/connectors';
 import * as windowState from './features/window_state';
+import { startIdleSleepGuard } from './features/idle_sleep_guard';
 import { installWindowCloseConfirmation } from './features/window_close_confirmation';
 import * as taskNotifications from './features/task_notifications';
 import * as taskUnreadTray from './features/task_unread_tray';
@@ -304,6 +306,7 @@ function createWindow(): BrowserWindow {
     }),
   });
   mainWindows.add(win);
+  installWindowPresentationEvents(win);
   win.on('focus', () => taskUnreadTray.refreshTaskUnreadTray());
   installWindowCloseConfirmation(win, hasActiveWork, () => isQuitting);
   windowState.watchWindowState(win);
@@ -421,7 +424,9 @@ function openConversationFromTaskNotification(
   else send();
 }
 
-function registerIpc(): void {
+/** `prepareShutdown` is the work a normal quit runs in `before-quit`; exits
+ *  that bypass it (`app.exit`) run it themselves. */
+function registerIpc(prepareShutdown: () => Promise<void>): void {
   ipc.register();
   // Subscribe before opening the renderer. The deferred driver scheduler must
   // not determine whether foreground or early background writes are visible.
@@ -471,6 +476,11 @@ function registerIpc(): void {
       if (!fs.existsSync(appAsar) || !mainLoadedFromAsar) {
         throw new Error(`launch smoke main process was not loaded from app.asar: ${appAsar}`);
       }
+      // Keep renderer readiness independent of the subsequent Library work.
+      // Only this packaged, isolated smoke path writes synthetic Library data.
+      const readyElapsedMs = Math.max(0, Date.now() - launchStartedAtMs);
+      const { runPackagedLibrarySmoke } = await import('./features/library_smoke');
+      const library = await runPackagedLibrarySmoke();
       const record = {
         status: 'ready',
         appIsPackaged: app.isPackaged,
@@ -482,7 +492,8 @@ function registerIpc(): void {
         version: app.getVersion(),
         platform: process.platform,
         arch: process.arch,
-        readyElapsedMs: Math.max(0, Date.now() - launchStartedAtMs),
+        readyElapsedMs,
+        library,
         readyAt: new Date().toISOString(),
       };
       const marker = path.resolve(PACKAGED_LAUNCH_SMOKE_FILE);
@@ -564,7 +575,7 @@ function registerIpc(): void {
       });
       child.unref();
       log.info('relaunch via shell script');
-      await openLifecycleTracking?.flushQuit();
+      await prepareShutdown();
       app.exit(0);
       return { ok: true };
     });
@@ -1337,12 +1348,16 @@ function registerChatAppProtocol(): void {
           log.warn('chat-app/saved: bad URL (need appId)', { error_code: 'invalid_route' });
           return new Response('bad request', { status: 400 });
         }
+        const uid = users.getActiveUserId();
+        if (await savedApps.resolveSavedAppType(uid, appId) === 'web') {
+          return Response.json((await import('./features/web_apps/commercial-entry')).commercialWebAppFailure(), { status: 403 });
+        }
+        if (hasIsolatedBrowserStorage(uid, { appId })) return new Response('Application origin required', { status: 403 });
         if (savedRelPath === chatArtifacts.BRIDGE_RELPATH) {
           return _withArtifactCors(new Response(chatArtifacts.BRIDGE_JS, {
             headers: { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'private, max-age=60' },
           }));
         }
-        const uid = users.getActiveUserId();
         const resolved = savedApps.resolveSavedAppFilePath(uid, appId, savedRelPath);
         if (!resolved.ok) {
           const code = (resolved as { code?: string }).code;
@@ -1366,6 +1381,11 @@ function registerChatAppProtocol(): void {
         return new Response('bad request', { status: 400 });
       }
 
+      const uid = users.getActiveUserId();
+      if (await savedApps.resolveArtifactAppType(uid, cid, artifactId) === 'web') {
+        return Response.json((await import('./features/web_apps/commercial-entry')).commercialWebAppFailure(), { status: 403 });
+      }
+      if (hasIsolatedBrowserStorage(uid, { cid, artifactId })) return new Response('Application origin required', { status: 403 });
       // Reserved virtual path: the runtime bridge script (not on disk).
       if (relPath === chatArtifacts.BRIDGE_RELPATH) {
         return _withArtifactCors(new Response(chatArtifacts.BRIDGE_JS, {
@@ -1373,7 +1393,6 @@ function registerChatAppProtocol(): void {
         }));
       }
 
-      const uid = users.getActiveUserId();
       const resolved = chatArtifacts.resolveArtifactFilePath(uid, cid, artifactId, relPath);
       if (!resolved.ok) {
         // Cast in the error branch — `strictNullChecks: false` keeps the
@@ -1400,6 +1419,36 @@ const gotLock = IS_PACKAGED_LAUNCH_SMOKE || app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
+
+  // Normal quit and explicit exit share the same local-resource drain.
+  let shutdownFlushed = false;
+  let shutdownFlushPromise: Promise<void> | null = null;
+  const flushForShutdown = (): Promise<void> => {
+    if (shutdownFlushPromise) return shutdownFlushPromise;
+    shutdownFlushPromise = (async () => {
+      const lifecycleFlush = openLifecycleTracking?.flushQuit();
+      try { await searchFeature.flushAll(); }
+      catch (err) { createLogger('search').warn('final flush failed', { error: (err as Error).message }); }
+      try {
+        const kb = await import('./features/kb_vector');
+        kb.closeAllKb();
+      } catch (err) { createLogger('kb_vector').warn('close failed', { error: (err as Error).message }); }
+      try {
+        const kbEmbed = await import('./features/kb_embed');
+        kbEmbed.closeEmbedder();
+      } catch (err) { createLogger('kb_embed').warn('close failed', { error: logErrorSummary(err) }); }
+      try {
+        const images = await import('./util/sharp-runtime');
+        images.closeImageRuntime();
+      } catch { createLogger('image-runtime').warn('image runtime shutdown failed'); }
+      const webAssistSessions = await import('./features/web_assist_session');
+      await webAssistSessions.flushWebAssistSessions();
+      await sweepOfficeResidents('quit');
+      await lifecycleFlush;
+    })().finally(() => { shutdownFlushed = true; });
+    return shutdownFlushPromise;
+  };
+
   // Account login is stripped, but connector OAuth still returns through the OS protocol. Keep
   // this connector-only receiver outside the removed account protocol module.
   registerConnectorProtocol();
@@ -1450,7 +1499,7 @@ if (!gotLock) {
     session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
       callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
     });
-    registerIpc();
+    registerIpc(flushForShutdown);
     const stopTaskNotifications = taskNotifications.startTaskNotifications({
       getActiveUserId: () => users.getActiveUserId(),
       isEnabled: () => appConfig.getTaskNotificationsEnabled(),
@@ -1511,6 +1560,9 @@ if (!gotLock) {
     });
     const stopTaskTerminalUi = subscribeTaskTerminals(emitTaskTerminalToRenderer);
     app.once('before-quit', stopTaskTerminalUi);
+    // Running Agent work keeps the machine out of idle sleep; an idle app holds nothing.
+    const idleSleepGuard = startIdleSleepGuard({ blocker: powerSaveBlocker, hasActiveWork });
+    app.once('before-quit', idleSleepGuard.stop);
     clientConfigFeature.clientConfig.subscribeAll((keys) => {
       ipc.broadcastToRenderer('client-config:changed', { keys });
     });
@@ -1643,6 +1695,11 @@ if (!gotLock) {
     registerDeferred('marketplace:reconcile', () => runMarketplaceInstallReconcile('startup'));
 
     registerDeferred('boot:maintenance-sweeps', () => runBootMaintenanceSweeps(), 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
+    registerDeferred('browser:http-cache', async (signal) => {
+      const { sweepWebAssistCache } = await import('./features/web_assist_cache');
+      const result = await sweepWebAssistCache(users.getActiveUserId(), signal);
+      log.info('HTTP cache maintenance finished', result);
+    }, 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
     registerDeferred('search:reconcile', (signal) => searchFeature.reconcileActive(signal), 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
     registerDeferred('kb:reconcile', async (signal) => {
       // Picks up files dropped into contexts/ via Finder while the app was
@@ -1676,9 +1733,10 @@ if (!gotLock) {
       const mod = await import('./features/sessions_sweep');
       await mod.sweepSessions(users.getActiveUserId(), signal);
     }, 'serial', BOOT_POST_STARTUP_DELAY_MS, idleDisk);
-    registerDeferred('memory:loop', async () => {
-      const memoryMaintenance = await import('./features/memory-maintenance');
-      memoryMaintenance.startMemoryMaintenanceLoop(users.getActiveUserId());
+    // Automatic memory maintenance is retired; remove its local leftovers.
+    registerDeferred('memory:retired-state-cleanup', async () => {
+      const memoryWrites = await import('./features/memory-writes');
+      await memoryWrites.removeRetiredMemoryMaintenanceState(users.getActiveUserId());
     }, 'serial', BOOT_POST_STARTUP_DELAY_MS);
     registerDeferred('reflection:loop', () => {
       reflectionOrchestrator.startReflectionLoop(users.getActiveUserId());
@@ -1696,39 +1754,10 @@ if (!gotLock) {
     if (process.platform !== 'darwin') app.quit();
   });
 
-  // Repeated quit events share one flush, including the Open lifecycle request.
-  let shutdownFlushed = false;
-  let shutdownFlushPromise: Promise<void> | null = null;
   app.on('before-quit', async (e) => {
     isQuitting = true;
     if (shutdownFlushed) return;
     e.preventDefault();
-    if (shutdownFlushPromise) return;
-    shutdownFlushPromise = (async () => {
-      const lifecycleFlush = openLifecycleTracking?.flushQuit();
-      try { await searchFeature.flushAll(); }
-      catch (err) { createLogger('search').warn('final flush failed', { error: (err as Error).message }); }
-      try {
-        const kb = await import('./features/kb_vector');
-        kb.closeAllKb();
-      } catch (err) { createLogger('kb_vector').warn('close failed', { error: (err as Error).message }); }
-      try {
-        const kbEmbed = await import('./features/kb_embed');
-        kbEmbed.closeEmbedder();
-      } catch (err) { createLogger('kb_embed').warn('close failed', { error: logErrorSummary(err) }); }
-      try {
-        const images = await import('./util/sharp-runtime');
-        images.closeImageRuntime();
-      } catch { createLogger('image-runtime').warn('image runtime shutdown failed'); }
-      const webAssistSessions = await import('./features/web_assist_session');
-      await webAssistSessions.flushWebAssistSessions();
-      await sweepOfficeResidents('quit');
-      await lifecycleFlush;
-    })();
-    try { await shutdownFlushPromise; }
-    finally {
-      shutdownFlushed = true;
-      app.quit();
-    }
+    try { await flushForShutdown(); } finally { app.quit(); }
   });
 }

@@ -84,6 +84,76 @@ describe('conversation entry assistance', () => {
     expect((await context.resolveConversationAssistanceForTurn('u1', cid)).guidance).toBe('');
   });
 
+  it('tells the Commander only the count and ids of open to-dos saved from this conversation', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const projectTasks = await import('../../../src/main/features/project_tasks');
+    const context = await import('../../../src/main/features/conversation_assistance_context');
+    const conv = await chats.createConversation('u1', { title: 'launch prep' });
+    const other = await chats.createConversation('u1', { title: 'elsewhere' });
+    const cid = conv.conversation_id;
+    // A long to-do must not grow the per-turn context.
+    const body = `Draft the pricing page\n${'SECRET_DETAIL '.repeat(250)}`;
+    const save = async (content: string, linkTo: string) => {
+      const created = await projectTasks.createTask('u1', '', { content });
+      if (!created.ok) throw new Error(created.error);
+      await projectTasks.recordTaskExecution('u1', '', created.task.id, linkTo);
+      return created.task.id;
+    };
+    const first = await save(body, cid);
+    const done = await save('Ship it', cid);
+    expect((await projectTasks.updateTask('u1', '', done, { status: 'done' })).ok).toBe(true);
+    await save('Unrelated', other.conversation_id);
+
+    const { guidance } = await context.resolveConversationAssistanceForTurn('u1', cid);
+    expect(guidance).toContain('## Keeping work going');
+    expect(guidance).toContain('## Open to-dos from this conversation');
+    expect(guidance).toContain(`Host facts: 1 open to-do(s) were saved from this conversation: ${first}.`);
+    expect(guidance).not.toContain(done);
+    expect(guidance).not.toContain('Draft the pricing page');
+    expect(guidance).not.toContain('SECRET_DETAIL');
+    expect(guidance).not.toContain('Unrelated');
+    expect(guidance).not.toMatch(/\$(count|ids)\b/);
+    // The other conversation's turn sees only its own to-do.
+    expect((await context.resolveConversationAssistanceForTurn('u1', other.conversation_id)).guidance)
+      .toContain('Host facts: 1 open to-do(s)');
+
+    // Beyond three, the count stays exact and the listing is marked as cut.
+    for (const n of [1, 2, 3]) await save(`Next step ${n}`, cid);
+    const many = (await context.resolveConversationAssistanceForTurn('u1', cid)).guidance;
+    expect(many).toContain('Host facts: 4 open to-do(s)');
+    expect(many.match(/t_[a-f0-9]{12}/g)).toHaveLength(3);
+    expect(many).toContain(', ….');
+
+    // Finishing them removes the block; the follow-up guidance is unchanged.
+    for (const task of await projectTasks.listTasks('u1', '')) {
+      if (task.origin_cid === cid && task.status !== 'done') {
+        expect((await projectTasks.updateTask('u1', '', task.id, { status: 'done' })).ok).toBe(true);
+      }
+    }
+    expect((await context.resolveConversationAssistanceForTurn('u1', cid)).guidance).toBe(
+      fs.readFileSync(path.join(__dirname, '../../../src/main/prompts/followup_offer_guidance.md'), 'utf8').trim(),
+    );
+  });
+
+  it('reads open to-dos from the project scope once the conversation is filed', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const projectTasks = await import('../../../src/main/features/project_tasks');
+    const context = await import('../../../src/main/features/conversation_assistance_context');
+    const pid = ((await projects.createProject('u1', 'Backlog')) as { project: any }).project.project_id;
+    const conv = await chats.createConversation('u1', { title: 'run' });
+    expect((await chats.moveConversationToProject('u1', conv.conversation_id, pid)).ok).toBe(true);
+    const created = await projectTasks.createTask('u1', pid, { content: 'Write the migration' });
+    if (!created.ok) throw new Error(created.error);
+    // Project to-dos link on their first run, not at creation.
+    expect((await context.resolveConversationAssistanceForTurn('u1', conv.conversation_id)).guidance).toBe('');
+    await projectTasks.recordTaskExecution('u1', pid, created.task.id, conv.conversation_id);
+    const { guidance } = await context.resolveConversationAssistanceForTurn('u1', conv.conversation_id);
+    expect(guidance).not.toContain('## Keeping work going');
+    expect(guidance).toContain(`saved from this conversation: ${created.task.id}.`);
+    expect(guidance).not.toContain('Write the migration');
+  });
+
   it('stops offering a project once the conversation has one or is on its way', async () => {
     const chats = await import('../../../src/main/features/chats');
     const projects = await import('../../../src/main/features/projects');

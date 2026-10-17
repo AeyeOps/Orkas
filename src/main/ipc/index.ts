@@ -19,6 +19,7 @@ import { app, ipcMain, dialog, BrowserWindow, type WebContents } from 'electron'
 
 import * as users from '../features/users';
 import * as chats from '../features/chats';
+import * as taskCleanup from '../features/task_cleanup';
 import * as projects from '../features/projects';
 import * as projectFiles from '../features/project_files';
 import * as projectTasks from '../features/project_tasks';
@@ -79,7 +80,8 @@ import {
 import { invokeHandlers as webAssistHandlers } from './web_assist';
 import { bindWebAssistConversation } from '../features/web_assist';
 import { invokeHandlers as memoryHandlers } from './memory';
-import { safeId } from '../storage';
+import { safeId, writeJson } from '../storage';
+import { commercialWebAppFailure, isCommercialWebAppFailure } from '../features/web_apps/commercial-entry';
 import { createLogger, logFromRenderer } from '../logger';
 import {
   cancelConfirmation as cancelDeleteConfirmation,
@@ -1022,6 +1024,39 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { conversation: conv };
   },
 
+  // Home page: titles and ownership for a handful of unread finished runs that
+  // may sit outside the renderer's startup slice. Index rows only, never
+  // messages; deleted or unknown ids come back as `missing`.
+  'conversations.getMany': async ({ cids } = {}, ctx) => {
+    const ids = Array.isArray(cids)
+      ? [...new Set(cids.filter((cid) => typeof cid === 'string' && safeId(cid)))].slice(0, 25) as string[]
+      : [];
+    const conversations: Array<{ conversation_id: string; title: string; project_id: string; origin_auto_task_id: string }> = [];
+    const missing: string[] = [];
+    for (const cid of ids) {
+      const row = await chats.getConversationMetadata(ctx.userId, cid);
+      if (!row) { missing.push(cid); continue; }
+      conversations.push({
+        conversation_id: cid,
+        title: row.title || '',
+        project_id: row.project_id || '',
+        origin_auto_task_id: row.origin_auto_task_id || '',
+      });
+    }
+    return { conversations, missing };
+  },
+
+  'conversations.processPage': async (args, ctx) => {
+    const { cid, ref, message_id } = args;
+    const cursor = Number(args.cursor ?? 0);
+    if (!safeId(cid) || !safeId(message_id) || typeof ref !== 'string' || !/^[a-f0-9]{64}$/.test(ref)
+        || !Number.isSafeInteger(cursor) || cursor < 0) throw new Error('Invalid process page');
+    const conv = await chats.getConversationMetadata(ctx.userId, cid, conversationProjectHint(args));
+    if (!conv) throw new Error('conversation not found');
+    const page = await chats.getConversationProcessPage(ctx.userId, cid, ref, cursor, message_id, conv.project_id ?? null);
+    return { items: page.items, next_cursor: page.nextCursor };
+  },
+
   'conversations.history': async (args, ctx) => {
     const startedAt = performance.now();
     const { cid, limit = 10, before, after, around_index, around_message_id } = args;
@@ -1046,18 +1081,36 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const readStartedAt = performance.now();
     let historyMs = 0;
     let runtimeMs = 0;
-    const pagePromise = hasAroundIndex
-      ? chats.getMessagesPageAtIndex(
-        ctx.userId, cid, requestedAroundIndex, requestedLimit, resolvedProjectId)
-      : Number.isSafeInteger(requestedAfter) && requestedAfter >= 0
-      ? chats.getMessagesPageAfter(ctx.userId, cid, requestedAfter, requestedLimit, resolvedProjectId)
-      : chats.getMessagesPage(
+    // Search and turn navigation anchor on a known source index. A quoted
+    // message reference knows only the stable message id: the history worker
+    // finds it and reads its page in one pass. An id that no longer exists
+    // reads the latest page and the renderer reports the missing original.
+    let anchorIndex = hasAroundIndex ? requestedAroundIndex : null;
+    const pagePromise = (async () => {
+      if (anchorIndex === null && requestedAroundMessageId) {
+        const quoted = await chats.getMessagesPageAtMessageId(
+          ctx.userId, cid, requestedAroundMessageId, requestedLimit, resolvedProjectId,
+        );
+        if (quoted) {
+          anchorIndex = quoted.messageIndex;
+          return quoted;
+        }
+      }
+      if (anchorIndex !== null) {
+        return chats.getMessagesPageAtIndex(
+          ctx.userId, cid, anchorIndex, requestedLimit, resolvedProjectId);
+      }
+      if (Number.isSafeInteger(requestedAfter) && requestedAfter >= 0) {
+        return chats.getMessagesPageAfter(ctx.userId, cid, requestedAfter, requestedLimit, resolvedProjectId);
+      }
+      return chats.getMessagesPage(
         ctx.userId,
         cid,
         requestedLimit,
         Number.isSafeInteger(requestedBefore) && requestedBefore >= 0 ? requestedBefore : undefined,
         resolvedProjectId,
       );
+    })();
     const [runtime, initialPage] = await Promise.all([
       groupChat.runtimeStatus(ctx.userId, cid, resolvedProjectId).then((result) => {
         runtimeMs = Math.round(performance.now() - readStartedAt);
@@ -1071,20 +1124,17 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     let page = initialPage;
     if (hasAroundIndex && requestedAroundMessageId
         && !page.history.some((message) => message.id === requestedAroundMessageId)) {
-      const repairedIndex = await chats.findMessageIndexById(
-        ctx.userId, cid, requestedAroundMessageId, resolvedProjectId,
+      // Sync rewrote or reordered the source since the index was taken.
+      const repaired = await chats.getMessagesPageAtMessageId(
+        ctx.userId, cid, requestedAroundMessageId, requestedLimit, resolvedProjectId,
       );
-      if (repairedIndex !== null) {
-        page = await chats.getMessagesPageAtIndex(
-          ctx.userId, cid, repairedIndex, requestedLimit, resolvedProjectId,
-        );
-      }
+      if (repaired) page = repaired;
     }
     const totalMs = Math.round(performance.now() - startedAt);
     if (totalMs >= 1000) {
       log.info('slow conversation history read', {
         metadata_ms: metadataMs, history_ms: historyMs, runtime_ms: runtimeMs,
-        total_ms: totalMs, rows: page.history.length, anchored: hasAroundIndex,
+        total_ms: totalMs, rows: page.history.length, anchored: anchorIndex !== null,
       });
     }
     return {
@@ -1093,7 +1143,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       ...(args.live === '1' ? { live_display: await groupChat.displaySnapshot(ctx.userId, cid, resolvedProjectId) } : {}),
       next_cursor: page.nextCursor,
       following_cursor: 'followingCursor' in page ? page.followingCursor : null,
-      ...(hasAroundIndex && 'pageStart' in page && 'historyIndexes' in page ? {
+      ...(anchorIndex !== null && 'pageStart' in page && 'historyIndexes' in page ? {
         page_start: page.pageStart,
         history_indexes: page.historyIndexes,
       } : {}),
@@ -1136,6 +1186,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   'conversations.create': async ({ title = '', projectId = '', assistance } = {}, ctx) => {
+    if (assistance?.kind === 'app_creation' && ['web', 'cloud'].includes(assistance.appType)) return commercialWebAppFailure();
     const normalizedAssistance = chats.normalizeConversationAssistance(assistance);
     const validatedAssistance = assistance === undefined ? undefined
       : normalizedAssistance?.kind === 'app_creation' ? normalizedAssistance
@@ -1167,6 +1218,19 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const ok = await chats.deleteConversation(ctx.userId, cid, conversationProjectHint(args));
     if (!ok) await recycleBin.deleteRecycleBatch(ctx.userId, batch.id).catch(() => {});
     return { deleted: ok };
+  },
+
+  'conversations.cleanup.preview': async (args, ctx) => {
+    if (args.expectedUserId !== ctx.userId) throw new Error('cleanup_account_changed');
+    return taskCleanup.preview(ctx.userId, args);
+  },
+  'conversations.cleanup.page': async (args, ctx) => {
+    if (args.expectedUserId !== ctx.userId) throw new Error('cleanup_account_changed');
+    return taskCleanup.page(ctx.userId, args.token, args.offset);
+  },
+  'conversations.cleanup.remove': async (args, ctx) => {
+    if (args.expectedUserId !== ctx.userId) throw new Error('cleanup_account_changed');
+    return taskCleanup.remove(ctx.userId, args.token, args.cid);
   },
 
   // Roll back a conversation that was created for a first message but
@@ -1370,6 +1434,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     };
   },
 
+  // Home page: the most recently updated unfinished to-dos across every scope,
+  // plus the total so the page can link to the full list.
+  'projects.tasks.listOpen': async ({ limit } = {}, ctx) => {
+    const count = Math.min(20, Math.max(1, Math.round(Number(limit) || 3)));
+    return projectTasks.listOpenTasks(ctx.userId, count);
+  },
+
   'projects.tasks.create': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id, depends_on } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
     if (content !== undefined && typeof content !== 'string') throw new Error('invalid content');
@@ -1383,18 +1454,18 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { task: r.task, alreadyExists: r.alreadyExists };
   },
 
-  'projects.tasks.update': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id, result_ref } = {}, ctx) => {
+  'projects.tasks.update': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
-    const r = await projectTasks.updateTask(ctx.userId, scopeProjectId, taskId, { content, title, detail, status, owner_agent, owner_agent_id, result_ref });
+    const r = await projectTasks.updateTask(ctx.userId, scopeProjectId, taskId, { content, title, detail, status, owner_agent, owner_agent_id });
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { task: r.task };
   },
 
-  'projects.tasks.complete': async ({ projectId, taskId, resultRef } = {}, ctx) => {
+  'projects.tasks.complete': async ({ projectId, taskId } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
-    const r = await projectTasks.completeTask(ctx.userId, scopeProjectId, taskId, resultRef);
+    const r = await projectTasks.completeTask(ctx.userId, scopeProjectId, taskId);
     if (!r.ok) throw new Error((r as { error: string }).error);
     return { task: r.task };
   },
@@ -1424,8 +1495,13 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const scopeProjectId = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || !taskId) throw new Error('invalid taskId');
     const r = await projectDriverRunner.runTaskNow(ctx.userId, scopeProjectId, taskId);
+    // The to-do's own conversation is still working: report it so the renderer
+    // can take the user there instead of starting a second run.
+    if (!r.ok && r.error === 'conversation_busy' && r.cid) {
+      return { ok: false, error: 'conversation_busy', cid: r.cid };
+    }
     if (!r.ok) throw new Error(r.error || 'run_failed');
-    return { ok: true, cid: r.cid, conversation: r.conversation };
+    return { ok: true, cid: r.cid, conversation: r.conversation, reused: !!r.reused };
   },
 
   // Task attachments — files the task carries into the conversation it starts.
@@ -1440,7 +1516,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     const pid = todoProjectScope(projectId);
     if (typeof taskId !== 'string' || typeof name !== 'string') return { ok: false, error: 'not_found' };
     const file = await projectTasks.resolveTaskAttachmentPath(ctx.userId, pid, taskId, name);
-    return file ? { ok: true, path: file } : { ok: false, error: 'not_found' };
+    if (file) return { ok: true, path: file };
+    return { ok: false, error: 'not_found' };
   },
 
   'projects.tasks.attachments.upload': async ({ projectId, taskId, name, dataBase64 } = {}, ctx) => {
@@ -1475,7 +1552,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'projects.driver.get': async ({ projectId } = {}, ctx) => {
     const scopeProjectId = todoProjectScope(projectId);
     if (scopeProjectId && !safeId(scopeProjectId)) throw new Error('invalid projectId');
-    return { config: await projectDriver.readConfig(ctx.userId, scopeProjectId) };
+    return { config: await projectDriver.readConfig(ctx.userId, scopeProjectId), device: projectDriver.getCurrentDevice() };
   },
 
   'projects.driver.set': async ({ projectId, enabled, maxAdvancesPerDay } = {}, ctx) => {
@@ -1491,7 +1568,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       void projectDriverRunner.advanceProjectIfDue(ctx.userId, scopeProjectId)
         .catch(() => { /* the periodic tick will retry */ });
     }
-    return { config };
+    return { config, device: projectDriver.getCurrentDevice() };
   },
 
   'projects.files.list': async ({ projectId }, ctx) => {
@@ -1503,7 +1580,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'projects.files.tree': async ({ projectId }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
-    return { tree: await projectFiles.listProjectFileTree(ctx.userId, projectId) };
+    return { tree: await projectFiles.listProjectFileTreeForDisplay(ctx.userId, projectId) };
   },
 
   'projects.files.mkdir': async ({ projectId, path: relPath }, ctx) => {
@@ -1934,7 +2011,6 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     use_selections,
     references,
     steer_active_turn,
-    multi_dispatch,
     retry_message_id,
   }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
@@ -1960,9 +2036,6 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
         ? { commander_mention_display } : {}),
       ...(steer_active_turn === true ? { steerActiveTurn: true } : {}),
-      ...(multi_dispatch === 'parallel' || multi_dispatch === 'serial'
-        ? { multi_dispatch }
-        : {}),
       ...(hasTitleText ? { title_text: titleText } : {}),
       ...(atts.length ? { attachments: atts } : {}),
       ...(useSelections.length ? { use_selections: useSelections } : {}),
@@ -2206,11 +2279,25 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // Copy a chat artifact into the persistent "My Apps" pool
   // (`<uid>/cloud/saved_apps/<appId>/`). Surfaced as the artifact card's
   // `⋯` → "保存".
-  'conversations.artifacts.save': async ({ cid, artifactId }, ctx) => {
+  'conversations.artifacts.editTarget': async ({ cid }, ctx) => {
     if (!safeId(cid)) throw new Error('invalid cid');
-    const r = await savedApps.saveFromArtifact(ctx.userId, String(cid), String(artifactId || ''));
-    if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to save app');
+    return { target: await savedApps.getEditTarget(ctx.userId, String(cid)) };
+  },
+  'conversations.artifacts.save': async ({ cid, artifactId, mode, recovery }, ctx) => {
+    if (!safeId(cid)) throw new Error('invalid cid');
+    if (mode !== undefined && mode !== 'new' && mode !== 'update') throw new Error('invalid save mode');
+    const r = await savedApps.saveFromArtifact(ctx.userId, String(cid), String(artifactId || ''), mode || 'new',recovery);
+    if (isCommercialWebAppFailure(r)) return r;
+    if (!r.ok) return { ok: false, code: (r as { error: string }).error };
     return { ok: true, id: (r as { id: string }).id, title: (r as { title: string }).title };
+  },
+
+  'conversations.artifacts.dataImpact': async ({cid,artifactId},ctx)=>savedApps.appDataImpact(ctx.userId,String(cid),String(artifactId)),
+  'conversations.artifacts.exportData': async ({cid,artifactId},ctx)=>{
+    const impact=await savedApps.appDataImpact(ctx.userId,String(cid),String(artifactId));if(!impact.ok)return impact;
+    const result=await dialog.showSaveDialog({defaultPath:'app-data.sqlite',filters:[{name:'SQLite',extensions:['sqlite']}]});
+    if(result.canceled||!result.filePath)return {ok:true,canceled:true};if(users.getActiveUserId()!==ctx.userId)return {ok:false,code:'E_CLOSED'};
+    return savedApps.exportAppData(ctx.userId,String(cid),String(artifactId),result.filePath);
   },
 
   'savedApps.inspectBundleFromPath': async (payload, ctx) => {
@@ -2238,13 +2325,20 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       sourceCid: payload?.cid,
       fenceRoots: await _ipcFileSandboxAllowedRoots(ctx.userId, payload),
     });
-    if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to save app');
+    if (!r.ok && (r as { error?: string }).error === 'app_bundle_root') return r;
+    if (isCommercialWebAppFailure(r)) return r;
+    if (!r.ok) { const code = (r as { error?: string }).error || 'app_save_failed'; throw Object.assign(new Error(code), { code }); }
     return r;
   },
 
   // ── Saved apps ("My Apps" — user-kept copies of create_artifact bundles) ──
-  'savedApps.list': async (_payload, ctx) => ({ apps: savedApps.listSavedApps(ctx.userId) }),
+  // First paint reads disk only. Presentation is not authority: opening, editing,
+  // sharing and deletion still resolve the app type at their owning boundaries.
+  'savedApps.list': async (payload, ctx) => ({ apps: payload?.localOnly === true
+    ? savedApps.listSavedApps(ctx.userId) : await savedApps.listResolvedSavedApps(ctx.userId) }),
   'savedApps.openExternal': async ({ appId }, ctx) => {
+    const type = await savedApps.resolveSavedAppType(ctx.userId, String(appId || ''));
+    if (type === 'web') return commercialWebAppFailure();
     const r = savedApps.resolveSavedAppIndex(ctx.userId, String(appId || ''));
     if (!r.ok) throw new Error((r as { error?: string }).error || 'app not found');
     const absPath = (r as { absPath: string }).absPath;
@@ -2269,6 +2363,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // navigates to it + pre-fills a draft.
   'savedApps.openForEditing': async ({ appId }, ctx) => {
     const r = await savedApps.openForEditing(ctx.userId, String(appId || ''));
+    if ((r as { code?: string }).code === 'E_COMMERCIAL_REQUIRED') return r;
     if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to open the app for editing');
     return {
       ok: true,
@@ -2279,17 +2374,27 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
   'savedApps.rename': async ({ appId, title }, ctx) => {
     const r = savedApps.renameSavedApp(ctx.userId, String(appId || ''), title);
-    if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to rename');
+    if (!r.ok) { const code = (r as { error?: string }).error || 'app_rename_failed'; throw Object.assign(new Error(code), { code }); }
     return { ok: true, title: (r as { title: string }).title };
   },
   'savedApps.delete': async ({ appId }, ctx) => {
-    await recycleBin.createAppRecycleBatchForCloudEntry(
+    const batch = await recycleBin.createAppRecycleBatchForCloudEntry(
       ctx.userId,
       `cloud/saved_apps/${String(appId || '')}`,
       'saved_app',
     );
-    const r = savedApps.deleteSavedApp(ctx.userId, String(appId || ''));
-    if (!r.ok) throw new Error((r as { error?: string }).error || 'failed to delete');
+    let r: Awaited<ReturnType<typeof savedApps.deleteSavedApp>>;
+    try { r = await savedApps.deleteSavedApp(ctx.userId, String(appId || '')); }
+    catch { r = { ok: false, error: 'app_delete_failed' }; }
+    if (!r.ok) {
+      // A failed delete leaves the app in place; drop its now-duplicate recycle copy.
+      if (batch) {
+        try { await recycleBin.deleteRecycleBatch(ctx.userId, batch.id); }
+        catch (error) { log.warn('saved app recycle batch rollback failed', { error: logErrorRef(error) }); }
+      }
+      const code = (r as { error?: string }).error || 'app_delete_failed';
+      throw Object.assign(new Error(code), { code });
+    }
     return { ok: true };
   },
 
@@ -3638,7 +3743,6 @@ const streamHandlers: Record<string, StreamHandler> = {
     use_selections,
     references,
     retry_message_id,
-    multi_dispatch,
     client_msg_id,
   }, ctx, signal) {
     if (!safeId(cid)) {
@@ -3716,9 +3820,6 @@ const streamHandlers: Record<string, StreamHandler> = {
               userId: ctx.userId, cid, text,
               ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
                 ? { commander_mention_display } : {}),
-              ...(multi_dispatch === 'parallel' || multi_dispatch === 'serial'
-                ? { multi_dispatch }
-                : {}),
               ...(typeof client_msg_id === 'string' && client_msg_id.trim()
                 ? { client_msg_id: client_msg_id.trim().slice(0, 64) }
                 : {}),
@@ -4149,7 +4250,7 @@ export function register(): void {
     const controller = new AbortController();
     const state: StreamState = { cancelled: false, controller, sender: event.sender };
     activeStreams.set(requestId, state);
-    log.info(`streamStart channel=${channel} requestId=${requestId} cid=${payload?.cid || payload?.id || payload?.agent_id || ''}`);
+    if(channel!=='webApps.call')log.info(`streamStart channel=${channel} requestId=${requestId} cid=${payload?.cid || payload?.id || payload?.agent_id || ''}`);
     try {
       const ctx = await resolveContext(event.sender);
       for await (const ev of handler(payload || {}, ctx, controller.signal)) {
@@ -4163,7 +4264,7 @@ export function register(): void {
     } finally {
       activeStreams.delete(requestId);
       rememberSettledStream(requestId, event.sender);
-      log.info(`streamDone channel=${channel} requestId=${requestId} cancelled=${state.cancelled}`);
+      if(channel!=='webApps.call')log.info(`streamDone channel=${channel} requestId=${requestId} cancelled=${state.cancelled}`);
       out({ type: 'done' });
     }
   });

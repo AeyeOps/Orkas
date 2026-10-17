@@ -171,9 +171,10 @@ async function _finishConversationProjectMove(projectId, name, agentIds) {
     : t('chat.conv_moved', { name }));
 }
 
-function _convProjectIcon() {
+function _convProjectIcon(project) {
   if (typeof window !== 'undefined' && typeof window.uiIconHtml === 'function') {
-    return window.uiIconHtml('folder', 'conv-project-pick-icon');
+    const name = typeof window.projectIconName === 'function' ? window.projectIconName(project) : 'folder';
+    return window.uiIconHtml(name, 'conv-project-pick-icon');
   }
   return '';
 }
@@ -198,7 +199,7 @@ function _openConversationProjectPicker(projects, agents = []) {
     const rows = projects.map((project) => `
       <button type="button" class="conv-project-pick-row" role="option" aria-selected="false"
               data-project-id="${escapeHtml(project.project_id)}">
-        ${_convProjectIcon()}
+        ${_convProjectIcon(project)}
         <span class="conv-project-pick-name">${escapeHtml(project.name || project.project_id)}</span>
       </button>
     `).join('');

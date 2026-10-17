@@ -64,6 +64,19 @@ function loadProjectDetailScript() {
 }
 
 describe('Project Library indexing recovery', () => {
+  it('keeps available files usable without per-file background download notices', () => {
+    const { context } = loadProjectDetailScript();
+    const html = context._renderProjectFileNodes([
+      { type: 'file', name: 'available.txt', relPath: 'available.txt', kind: 'text' },
+      { type: 'file', name: 'incoming.txt', relPath: 'incoming.txt', kind: 'text', pending: true },
+    ]);
+    expect(html).toContain('data-project-file="available.txt"');
+    expect(html).toContain('data-action="project-file-menu"');
+    expect(html).toContain('incoming.txt');
+    expect(html).not.toContain('common.loading');
+    expect(html).not.toContain('data-project-file="incoming.txt"');
+  });
+
   it('explains oversized saved text after an event and a status refresh without offering a futile retry', () => {
     const { context } = loadProjectDetailScript();
     const status = {

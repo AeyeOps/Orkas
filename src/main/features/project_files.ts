@@ -82,6 +82,7 @@ export interface ProjectFileInfo {
   name: string;
   relPath: string;
   type: 'file';
+  pending?: boolean;
   path: string;
   bytes: number;
   kind: ProjectFileKind;
@@ -384,6 +385,11 @@ export async function listProjectFileTree(userId: string, projectId: string): Pr
   finally {
     if (_projectTreeInFlight.get(key) === run) _projectTreeInFlight.delete(key);
   }
+}
+
+/** UI placeholders are separate from the usable Library/tool inventory. */
+export async function listProjectFileTreeForDisplay(userId: string, projectId: string): Promise<ProjectLibraryNode[]> {
+  return listProjectFileTree(userId, projectId);
 }
 
 export async function listProjectFiles(userId: string, projectId: string): Promise<ProjectFileInfo[]> {

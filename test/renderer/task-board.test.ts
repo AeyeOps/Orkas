@@ -144,6 +144,7 @@ describe('renderer task board › Send now eligibility', () => {
   function canSend(task: unknown, activeTurns: unknown[]): boolean {
     return vm.runInNewContext(
       `const _latestActiveTurns = new Map([['c1', ${JSON.stringify(activeTurns)}]]);
+       ${extractFunction('_taskBoardDeps')};
        ${extractFunction('_taskBoardCanSendNow')};
        _taskBoardCanSendNow('c1', ${JSON.stringify(task)});`,
       { Map },
@@ -157,8 +158,11 @@ describe('renderer task board › Send now eligibility', () => {
     expect(canSend(task, [{ actor: 'agentA', steerable: false }])).toBe(false);
     expect(canSend({ ...task, created_by: 'commander' }, [{ actor: 'agentA', steerable: true }])).toBe(false);
     expect(canSend({ ...task, status: 'running' }, [{ actor: 'agentA', steerable: true }])).toBe(false);
-    // A chained row keeps its start order (§4.8) — folding would jump it.
+    // A dependent row keeps its start order (§4.8) — folding would jump it,
+    // whether the snapshot carries a legacy single id or a D29 list.
     expect(canSend({ ...task, after: 't0' }, [{ actor: 'agentA', steerable: true }])).toBe(false);
+    expect(canSend({ ...task, after: ['t0', 't1'] }, [{ actor: 'agentA', steerable: true }])).toBe(false);
+    expect(canSend({ ...task, after: [] }, [{ actor: 'agentA', steerable: true }])).toBe(true);
   });
 
   it('wires the eligible row action to the backend task promotion endpoint', () => {
@@ -167,6 +171,20 @@ describe('renderer task board › Send now eligibility', () => {
     expect(source).toContain('data-act="task-send-now"');
     expect(source).toContain('/tasks/send-now`');
     expect(source).toContain("'chat.queue_send_now'");
+  });
+
+  it('shows Send now on a user correction while the same Agent runs a Commander-dispatched task', () => {
+    const { context, list, board } = boardHarness();
+    context._latestActiveTurns = new Map([['c1', [{ actor: 'agentA', steerable: true }]]]);
+    board.onEvent('c1', { task: { task_id: 'child', assignee: 'agentA', created_by: 'commander',
+      status: 'running', instruction: 'Implement the feature.' } });
+    board.onEvent('c1', { task: { task_id: 'correction', assignee: 'agentA', created_by: 'user',
+      status: 'queued', instruction: 'Discuss the plan first.' } });
+    const queuedRow = list.innerHTML.split('data-task-id="correction"')[1];
+    expect(queuedRow).toContain('data-act="task-send-now"');
+    expect(queuedRow).toContain('data-act="task-edit"');
+    expect(queuedRow).toContain('data-act="task-cancel"');
+    expect(list.innerHTML.match(/data-act="task-send-now"/g)).toHaveLength(1);
   });
 
   it('keeps the row locked after acceptance, but restores it when promotion fails', async () => {
@@ -243,6 +261,17 @@ describe('renderer task board › assignee label', () => {
     expect(html).toContain('data-act="task-cancel"');
     expect(html).not.toMatch(/data-act="task-(reassign|after)"/);
     expect(html).not.toMatch(/<select|<input|contenteditable/);
+  });
+
+  it('names every unfinished predecessor of a multi-dependency row and drops finished ones (D29)', () => {
+    const html = renderBoardRows([
+      { task_id: 'a1', status: 'running', assignee: 'agentA', instruction: 'draft A', created_at: '2026-01-01T00:00:00Z' },
+      { task_id: 'b1', status: 'done', assignee: 'agentB', instruction: 'draft B', created_at: '2026-01-01T00:00:01Z' },
+      { task_id: 'c1', status: 'running', assignee: 'agentC', instruction: 'draft C', created_at: '2026-01-01T00:00:02Z' },
+      { task_id: 'merge', status: 'queued', assignee: 'agentD', instruction: 'merge drafts', after: ['a1', 'b1', 'c1'], created_at: '2026-01-01T00:00:03Z' },
+    ]);
+    expect(html).toContain('chat.task_waiting_on:agentA and agentC');
+    expect(html).not.toContain('agentB and');
   });
 });
 

@@ -88,23 +88,6 @@ function _autoResultFailure(error, fallback, fallbackType = 'operation') {
   };
 }
 
-function _autoAttachmentPayload(files, source) {
-  const list = Array.from(files || []);
-  let totalBytes = 0;
-  for (const file of list) {
-    const bytes = Number((file && (file.size || file.bytes)) || 0);
-    if (Number.isFinite(bytes) && bytes > 0) totalBytes += bytes;
-  }
-  const sourceType = ['drop', 'internal_drop', 'paste', 'picker'].includes(source)
-    ? source
-    : 'unknown';
-  return {
-    source: sourceType,
-    file_count: list.length,
-    total_bytes: totalBytes,
-    mode: _autoEditingTaskId ? 'edit' : 'create',
-  };
-}
 
 const AUTO_ATTACH_ACCEPT = (typeof CHAT_ATTACH_ACCEPT !== 'undefined' && Array.isArray(CHAT_ATTACH_ACCEPT))
   ? CHAT_ATTACH_ACCEPT
@@ -818,28 +801,9 @@ function _closeAutoRowMenu(restoreFocus = false) {
   if (restoreFocus && anchor && anchor.isConnected) anchor.focus();
 }
 
-function _autoCreateActionLogger(action) {
-  let done = false;
-  return (result, errorCode = '') => {
-    if (done) return;
-    done = true;
-    const payload = {
-      result,
-      action,
-    };
-    if (result !== 'success') {
-      const failure = _autoResultFailure(errorCode, 'action_failed', 'ipc');
-      payload.error_code = failure.error_code;
-      payload.error_type = failure.error_type;
-    }
-    if (result === 'failure') {
-      _autoLogFailure('auto_task_action', {
-        action,
-        error_type: payload.error_type,
-        error_code: payload.error_code,
-      });
-    }
-  };
+function _autoLogActionFailure(action, errorCode) {
+  const failure = _autoResultFailure(errorCode, 'action_failed', 'ipc');
+  _autoLogFailure('auto_task_action', { action, ...failure });
 }
 
 function _openAutoRowMenu(anchorBtn, task, opts) {
@@ -881,37 +845,33 @@ function _openAutoRowMenu(anchorBtn, task, opts) {
         }
       } else if (action === 'toggle-enabled') {
         const next = !task.enabled;
-        const logResult = _autoCreateActionLogger('toggle');
         try {
           const res = await window.orkas.invoke('autoTasks.setEnabled', { taskId: task.id, enabled: next });
           if (res && res.ok && res.task) {
-            logResult('success');
             Object.assign(task, res.task);
             const row = document.querySelector(`.auto-row[data-task-id="${task.id}"]`);
             if (row) row.classList.toggle('is-disabled', !next);
             if (opts && typeof opts.afterChange === 'function') opts.afterChange();
           } else {
-            logResult('failure', 'update_failed');
+            _autoLogActionFailure('toggle', 'update_failed');
           }
         } catch (err) {
-          logResult('failure', 'invoke_failed');
+          _autoLogActionFailure('toggle', 'invoke_failed');
           _autoLog.warn('toggle failed', err);
         }
       } else if (action === 'edit') {
         if (opts && typeof opts.onEdit === 'function') opts.onEdit(task);
       } else if (action === 'delete') {
         if (!(await uiConfirm(t('auto.delete_confirm')))) return;
-        const logResult = _autoCreateActionLogger('delete');
         try {
           const res = await window.orkas.invoke('autoTasks.delete', { taskId: task.id });
           if (res && res.deleted) {
-            logResult('success');
             if (opts && typeof opts.afterChange === 'function') opts.afterChange();
           } else {
-            logResult('failure', 'delete_failed');
+            _autoLogActionFailure('delete', 'delete_failed');
           }
         } catch (err) {
-          logResult('failure', 'invoke_failed');
+          _autoLogActionFailure('delete', 'invoke_failed');
           await uiAlert(t('auto.delete_failed', { reason: (err && err.message) || err }));
         }
       }
@@ -986,6 +946,7 @@ function _autoRenderList() {
   const onEdit = (task) => openAutoTaskDialog({ task });
   const afterChange = () => loadAutoList(true);
   const projects = typeof _projectsCache !== 'undefined' && Array.isArray(_projectsCache) ? _projectsCache : [];
+  const projectsById = new Map(projects.map((project) => [project.project_id, project]));
   const groups = _autoGroupTasks(_autoTasks, projects);
   if (!groups.some((group) => group.projectId === _autoActiveScope)) _autoActiveScope = groups[0].projectId;
   const switcher = document.createElement('nav');
@@ -998,7 +959,9 @@ function _autoRenderList() {
     chip.className = 'todo-scope-chip';
     chip.dataset.projectId = group.projectId;
     chip.setAttribute('aria-pressed', String(group.projectId === _autoActiveScope));
-    chip.innerHTML = _autoUiIcon('folder', 'todo-scope-chip-icon')
+    const iconName = typeof window.projectIconName === 'function'
+      ? window.projectIconName(projectsById.get(group.projectId)) : 'folder';
+    chip.innerHTML = _autoUiIcon(iconName, 'todo-scope-chip-icon')
       + `<span class="todo-scope-chip-name">${escapeHtml(name)}</span>`
       + `<span class="todo-scope-chip-count">${group.tasks.length}</span>`;
     chip.addEventListener('click', () => {
@@ -1376,6 +1339,7 @@ function _autoDatePickerMount(el, config = {}) {
     const edge = 8;
     const width = Math.min(296, Math.max(240, window.innerWidth - edge * 2));
     const left = Math.max(edge, Math.min(rect.left, window.innerWidth - width - edge));
+    popover.dataset.uiOverlay = '';
     popover.style.position = 'fixed';
     popover.style.left = `${left}px`;
     popover.style.width = `${width}px`;
@@ -1842,17 +1806,15 @@ async function _autoPrepareUploadFiles(fileList) {
   return { prepared, rejected };
 }
 
-async function _autoUploadFiles(files, source = 'drop') {
+async function _autoUploadFiles(files) {
   const list = Array.from(files || []);
   if (!list.length) return;
-  const payload = _autoAttachmentPayload(list, source);
   const taskId = await _ensureAutoDraftId();
   if (!taskId) {
     await uiAlert(t('auto.save_failed', { reason: 'no_draft_id' }));
     return;
   }
   const { prepared, rejected } = await _autoPrepareUploadFiles(list);
-  const rejectedCount = rejected.length;
   if (!prepared.length) {
     if (rejected.length) await _autoAlertAttachmentFailures(rejected);
     return;
@@ -1877,7 +1839,6 @@ async function _autoUploadFiles(files, source = 'drop') {
   }
   _autoSetAttachmentItems(current);
 
-  let uploadFailed = 0;
   await Promise.all(placeholders.map(async (ph) => {
     try {
       const dataBase64 = _arrayBufferToBase64(ph.buf);
@@ -1896,7 +1857,7 @@ async function _autoUploadFiles(files, source = 'drop') {
         });
       } else {
         _autoReplaceAttachmentByTempId(ph.tempId, null);
-        uploadFailed += 1;
+
         rejected.push(t('chat.attach_upload_fail', {
           name: ph.file.name,
           reason: t('chat.attach_upload_generic_fail'),
@@ -1904,7 +1865,7 @@ async function _autoUploadFiles(files, source = 'drop') {
       }
     } catch (err) {
       _autoReplaceAttachmentByTempId(ph.tempId, null);
-      uploadFailed += 1;
+
       _autoLog.warn('upload failed', err);
       rejected.push(t('chat.attach_upload_fail', {
         name: ph.file.name,
@@ -1912,9 +1873,6 @@ async function _autoUploadFiles(files, source = 'drop') {
       }));
     }
   }));
-  const uploadedCount = Math.max(0, placeholders.length - uploadFailed);
-  const failedCount = rejected.length;
-  const result = failedCount ? (uploadedCount ? 'partial_failure' : 'failure') : 'success';
   if (rejected.length) await _autoAlertAttachmentFailures(rejected);
 }
 
@@ -1948,19 +1906,17 @@ function _bindAutoDropAttach() {
       ? _chatAttachInternalDragItems(e.dataTransfer)
       : [];
     if (internalFiles.length) {
-      _autoImportPaths(internalFiles, 'internal_drop');
+      _autoImportPaths(internalFiles);
       return;
     }
-    _autoUploadFiles(e.dataTransfer.files, 'drop');
+    _autoUploadFiles(e.dataTransfer.files);
   });
   area.dataset.autoDropBound = '1';
 }
 
-async function _autoImportPaths(entries, source = 'internal_drop') {
+async function _autoImportPaths(entries) {
   const files = Array.isArray(entries) ? entries.filter((it) => it && it.path) : [];
   if (!files.length) return;
-  const startedAt = performance.now();
-  const payload = _autoAttachmentPayload(files, source);
   const taskId = await _ensureAutoDraftId();
   if (!taskId) {
     await uiAlert(t('auto.save_failed', { reason: 'no_draft_id' }));
@@ -1988,10 +1944,8 @@ async function _autoImportPaths(entries, source = 'internal_drop') {
     });
     placeholders.push({ tempId, path: item.path, name: displayName });
   }
-  const rejectedCount = rejected.length;
   _autoSetAttachmentItems(current);
 
-  let uploadFailed = 0;
   await Promise.all(placeholders.map(async (ph) => {
     try {
       const data = await window.orkas.invoke('autoTasks.attachments.import', {
@@ -2011,20 +1965,17 @@ async function _autoImportPaths(entries, source = 'internal_drop') {
       });
     } catch (err) {
       _autoReplaceAttachmentByTempId(ph.tempId, null);
-      uploadFailed += 1;
+
       rejected.push(t('chat.attach_upload_fail', {
         name: ph.name,
         reason: (err && err.message) || t('chat.attach_upload_generic_fail'),
       }));
     }
   }));
-  const uploadedCount = Math.max(0, placeholders.length - uploadFailed);
-  const result = rejected.length ? (uploadedCount ? 'partial_failure' : 'failure') : 'success';
   if (rejected.length) await _autoAlertAttachmentFailures(rejected);
 }
 
 async function _autoAttachLibraryFile(ref) {
-  const startedAt = performance.now();
   const scope = ref && ref.scope === 'project' ? 'project' : 'global';
   const rel = String(ref && ref.rel || '');
   const projectId = _autoValidProjectId(ref && ref.projectId || '');
@@ -2085,8 +2036,6 @@ async function _autoAttachLibraryFile(ref) {
 }
 
 async function _autoPickAndUploadFiles() {
-  const startedAt = performance.now();
-  const payload = _autoAttachmentPayload([], 'picker');
   const taskId = await _ensureAutoDraftId();
   if (!taskId) {
     await uiAlert(t('auto.save_failed', { reason: 'no_draft_id' }));
@@ -2108,13 +2057,6 @@ async function _autoPickAndUploadFiles() {
   }
   const names = Array.isArray(data && data.items) ? data.items : [];
   const failed = Array.isArray(data && data.failed) ? data.failed : [];
-  const fileCount = names.length + failed.length;
-  const result = fileCount === 0
-    ? 'failure'
-    : (failed.length ? (names.length ? 'partial_failure' : 'failure') : 'success');
-  const failure = result === 'success'
-    ? null
-    : _autoResultFailure(failed[0] && failed[0].error, 'upload_failed', 'operation');
   for (const name of names) {
     _autoPushReadyAttachment(name, { displayName: name });
   }
@@ -2660,6 +2602,8 @@ if (typeof window !== 'undefined') {
     await loadAutoList(true);
     const task = _autoTasks.find((candidate) => candidate && candidate.id === id);
     if (!task) return false;
+    _autoActiveScope = task.project_id || '';
+    _autoRenderList();
     openAutoTaskDialog({ task });
     return true;
   };
@@ -2670,7 +2614,7 @@ if (typeof window !== 'undefined') {
     const addBtn = document.getElementById('auto-add-btn');
     if (addBtn && addBtn.dataset.bound !== '1') {
       addBtn.dataset.bound = '1';
-      addBtn.addEventListener('click', () => openAutoTaskDialog({}));
+      addBtn.addEventListener('click', () => openAutoTaskDialog({ initialProjectId: _autoActiveScope || '' }));
     }
   };
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', bindAutoAddButton, { once: true });

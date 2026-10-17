@@ -103,7 +103,7 @@ function createHarness(options: {
   const monitorEvent = vi.fn();
   const labels: Record<string, string> = {
     'conversation_info.file_reveal_action': 'Show in folder',
-    'conversation_info.file_reveal_failed': 'Could not open folder: {reason}',
+    'conversation_info.file_reveal_failed': 'Could not open the folder. The file may have been moved or deleted.',
     'conversation_info.file_add_to_chat_action': 'Add to chat',
     'conversation_info.file_add_to_library_action': 'Add to Library',
     'conversation_info.file_add_to_library_done': 'Added to {library}',
@@ -319,13 +319,16 @@ describe('shared file actions for inline audio', () => {
     expect(onDeleted).not.toHaveBeenCalled();
   });
 
-  it.each(['response', 'rejection'])('reports a reveal %s failure and allows another attempt', async failure => {
-    const harness = createHarness({ importResult: {} });
+  it.each(['response', 'rejection'])('reports a reveal %s failure with only localized copy and allows another attempt', async failure => {
+    const en = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales/en.json'), 'utf8')) as Record<string, string>;
+    const harness = createHarness({ importResult: {}, labels: en });
     const menu = await harness.openFileMenu(filePath);
-    if (failure === 'response') harness.invoke.mockResolvedValueOnce({ ok: false, error: 'unavailable' });
-    else harness.invoke.mockRejectedValueOnce(new Error('unavailable'));
+    // Raw host reasons can carry local paths and internal error text.
+    const reason = 'ENOENT: /Users/test/private/voice.mp3';
+    if (failure === 'response') harness.invoke.mockResolvedValueOnce({ ok: false, error: reason });
+    else harness.invoke.mockRejectedValueOnce(new Error(reason));
     await menu.click('reveal');
-    expect(harness.uiAlert).toHaveBeenCalledExactlyOnceWith('Could not open folder: unavailable');
+    expect(harness.uiAlert).toHaveBeenCalledExactlyOnceWith('Could not open the folder. The file may have been moved or deleted.');
     await (await harness.openFileMenu(filePath)).click('reveal');
     expect(harness.invoke.mock.calls.filter(([channel]) => channel === 'workspace.revealPath')).toHaveLength(2);
   });

@@ -85,9 +85,41 @@ function loadConversation(overrides: Record<string, any> = {}) {
   const proxied = withNoopFallback(context);
   vm.createContext(proxied);
   vm.runInContext(composerAccessorSource, proxied);
+  vm.runInContext(fs.readFileSync(path.join(rendererRoot, 'modules/strip-structural-blocks.js'), 'utf8'), proxied);
   vm.runInContext(conversationSource, proxied);
   return { context: proxied, revoked, elements };
 }
+
+describe('empty addressed composer requests', () => {
+  it.each(['new-chat', 'conversation', 'project'].flatMap((entry) =>
+    ['@commander', '@Orkas Codex', '@Orkas Codex @QuoteReviewer'].map((text) => ({ entry, text }))))(
+    'keeps $text in the $entry draft without starting a send', async ({ entry, text }) => {
+    let modelChecks = 0;
+    let requests = 0;
+    const { context, elements } = loadConversation({
+      ensureModelConfigured: () => { modelChecks += 1; return false; },
+      apiFetch: async () => { requests += 1; throw new Error('An empty request must not reach transport'); },
+    });
+    if (entry === 'project') {
+      vm.runInContext(fs.readFileSync(path.join(rendererRoot, 'modules/project-detail.js'), 'utf8'), context);
+      vm.runInContext("_projectDetailPid = 'p_empty'", context);
+    }
+    vm.runInContext("currentCid = 'c_empty'", context);
+    context._agentsCache = [{ agent_id: 'codex', name: 'Orkas Codex' }, { agent_id: 'reviewer', name: 'QuoteReviewer' }];
+    if (entry === 'project') {
+      vm.runInContext("_composerAgentScopes.set('project', { pid: 'p_empty', ids: new Set(['codex', 'reviewer']) })", context);
+    }
+    const id = entry === 'conversation' ? 'chat-input' : `${entry}-chat-input`;
+    const inputId = entry === 'new-chat' ? 'new-chat-input' : id;
+    elements[inputId] = stubEl({ value: text });
+    Object.assign(context, { _getQuotes: () => [], _chatAttachList: () => [], getChatUseSelections: () => [] });
+    await (entry === 'project' ? context._submitProjectChat()
+      : entry === 'conversation' ? context.handleChatSubmit() : context.handleNewChatSubmit());
+    expect(modelChecks).toBe(0);
+    expect(requests).toBe(0);
+    expect(elements[inputId].value).toBe(text);
+  });
+});
 
 describe('chat attachment blob URL lifecycle', () => {
   it('revokes blob preview URLs on the plain after-send clear (no deleteFiles)', async () => {
@@ -107,6 +139,72 @@ describe('chat attachment blob URL lifecycle', () => {
 });
 
 describe('new-chat submit re-entrancy gate', () => {
+  it.each(['new-chat', 'project'])('keeps one %s task when a list refresh runs during attachment adoption', async (entry) => {
+    let releaseAdoption!: (value: any) => void;
+    let reachedAdoption!: () => void;
+    const adoptionStarted = new Promise<void>((resolve) => { reachedAdoption = resolve; });
+    const original = { conversation_id: 'c_adopt_race', title: 'Initial title',
+      created_at: '2026-05-15T09:00:00Z', updated_at: '2026-05-15T09:00:00Z',
+      ...(entry === 'project' ? { project_id: 'p_race' } : {}) };
+    const current = { ...original, title: 'Title changed while waiting', title_manually_set: true,
+      updated_at: '2026-05-15T09:01:00Z', last_active_at: '2026-05-15T09:01:00Z', processing: true };
+    const sends: any[] = [];
+    let creates = 0;
+    const { context, elements } = loadConversation({
+      ensureModelConfigured: () => true,
+      apiFetch: async (url: string) => {
+        if (url.endsWith('/create')) {
+          creates += 1;
+          return { json: async () => ({ ok: true, conversation: { ...original } }) };
+        }
+        if (url.endsWith('/adopt')) {
+          reachedAdoption();
+          return new Promise((resolve) => { releaseAdoption = resolve; });
+        }
+        if (url.startsWith('/api/conversations/list')) return { json: async () => ({
+          ok: true, conversations: [current], unprojected_pagination: { total: 1, next_offset: null },
+          total: 1, next_offset: null,
+        }) };
+        throw new Error(`Unexpected fixture request: ${url}`);
+      },
+    });
+    if (entry === 'project') {
+      vm.runInContext(fs.readFileSync(path.join(rendererRoot, 'modules/project-detail.js'), 'utf8'), context);
+      vm.runInContext("_projectDetailPid = 'p_race'", context);
+    }
+    Object.assign(context, {
+      currentView: entry === 'project' ? 'project' : 'new-chat',
+      _chatAttachTryBeginSend: () => () => {},
+      _chatAttachSnapshotForSend: async () => ({ ok: true, items: [{ name: 'brief.pdf', status: 'ready' }] }),
+      _recipientSnapshotForSend: () => ({ kind: 'commander' }),
+      _getQuotes: () => [], _referenceSnapshotsForQuotes: () => [],
+      transformWithChatUse: (text: string) => text, transformChatUseTokens: (text: string) => text,
+      applyRecipientPrefix: (text: string) => text,
+      _titleSeedWithoutRoutingMentions: (text: string) => text,
+      _commanderMentionDisplayForSend: () => ({}),
+      _autoTitle: (text: string) => text,
+      getChatUseSelections: () => [], consumeChatUseSelections: () => [],
+      renderConversationList() {}, loadProjects() {}, setView() {}, setChatRecipient() {},
+      _renderRecipientChip() {}, _saveRecipientMap() {},
+      unresolvedOssTemplatePlaceholder: () => false,
+      sendInConversation: async (...args: any[]) => { sends.push(args); },
+    });
+    elements[entry === 'project' ? 'project-chat-input' : 'new-chat-input'] = stubEl({ value: 'Review the brief' });
+    const submit = entry === 'project' ? context._submitProjectChat() : context.handleNewChatSubmit();
+    await adoptionStarted;
+    await context.loadConversations();
+    releaseAdoption({ json: async () => ({ ok: true,
+      items: [{ sourceName: 'brief.pdf', targetName: 'brief (1).pdf' }],
+    }) });
+    await submit;
+    expect(creates).toBe(1);
+    expect(context.conversations).toEqual([current]);
+    expect(sends).toHaveLength(1);
+    expect(sends[0].slice(0, 3)).toEqual(['c_adopt_race', 'Review the brief', {
+      title_text: 'Review the brief', attachments: ['brief (1).pdf'],
+    }]);
+  });
+
   it('a second submit during the create round trip does not create a second conversation', async () => {
     const createCalls: string[] = [];
     let resolveCreate: (v: any) => void = () => {};
@@ -179,13 +277,11 @@ describe('conversation send ownership across navigation', () => {
     context._recipientSnapshotForSend = () => ({ kind: 'agent', id: context.currentCid, name: context.currentCid });
     context._commanderMentionDisplayForSend = () => ({});
     context._applyRecipientPrefixWithSnapshot = (text: string, recipient: any) => `@${recipient.id} ${text}`;
-    context._composerEffectiveDispatchMode = () => undefined;
     context.transformWithChatUse = (text: string) => text;
     context.isConvPending = () => phase === 'busy-response';
     context._clearDraft = (cid: string) => { clearedDrafts.push(cid); };
     context._clearQuotes = () => {};
     context.autoGrow = () => {};
-    context._updateComposerSeqToggle = () => {};
     context._rememberSentComposerSnapshot = () => {};
     context.sendInConversation = async (cid: string, content: string, extra: any) => {
       sends.push({ cid, content, extra });

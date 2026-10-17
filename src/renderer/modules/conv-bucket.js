@@ -27,20 +27,36 @@ function timeBucket(iso, now) {
   return 'older';
 }
 
-// Rows whose sidebar activity falls in today's local bucket, in input order.
-// Feeds the "Today's Tasks" section with the same `last_active_at` reading as
-// the bucketed lists, so a row is never under "Today" in one list and missing
-// from the aggregate.
-function selectTodayConversations(rows, now) {
+// Rows whose sidebar activity falls in today's or yesterday's local bucket, in
+// input order. Feeds the sidebar "Recent Tasks" section with the same
+// `last_active_at` reading as the bucketed lists, so a row is never under
+// "Today"/"Yesterday" in one list and missing from the aggregate. Using the
+// calendar buckets (not a rolling 48h) keeps the section stable within a day:
+// it only changes when a conversation gets a new message or when the local date
+// rolls over, which is when the list already re-renders.
+const _RECENT_BUCKETS = new Set(['today', 'yesterday']);
+
+function selectRecentConversations(rows, now) {
   const out = [];
   for (const c of Array.isArray(rows) ? rows : []) {
     if (!c || !c.conversation_id) continue;
     const iso = c.last_active_at || c.updated_at || c.created_at || '';
-    if (timeBucket(iso, now) === 'today') out.push(c);
+    if (_RECENT_BUCKETS.has(timeBucket(iso, now))) out.push(c);
   }
   return out;
 }
 
+// Local start of yesterday: the lower bound the startup slice must load so
+// rows under collapsed projects reach the Recent Tasks section.
+function recentConversationsSince(now) {
+  const d = new Date(now || new Date());
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - 1);
+  return d;
+}
+
 if (typeof module !== 'undefined' && typeof module.exports === 'object') {
-  module.exports = { timeBucket, selectTodayConversations, _BUCKET_ORDER };
+  module.exports = {
+    timeBucket, selectRecentConversations, recentConversationsSince, _BUCKET_ORDER,
+  };
 }

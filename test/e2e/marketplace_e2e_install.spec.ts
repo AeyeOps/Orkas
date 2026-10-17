@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures/orkas';
+import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
 type SkillSummary = {
   id: string;
@@ -27,7 +27,7 @@ test.describe('Marketplace install lifecycle', () => {
       sort_order: 10,
     })]);
 
-    await page.locator('#agents-btn').click();
+    await openSidebarEntry(page, '#agents-btn');
     await page.locator('#agents-more-btn').click();
     await expect(page.locator('#panel-marketplace')).toHaveClass(/\bactive\b/);
     await expect(page.locator('.marketplace-chip[data-mp-cat="general"]')).toHaveText('General');
@@ -77,7 +77,7 @@ test.describe('Marketplace install lifecycle', () => {
     if (!marketplaceOrkas.page) throw new Error('Orkas renderer is unavailable');
     const page = marketplaceOrkas.page;
 
-    await page.locator('#agents-btn').click();
+    await openSidebarEntry(page, '#agents-btn');
     await page.locator('#agents-more-btn').click();
     await page.locator('[data-mp-tab="skill"]').click();
 

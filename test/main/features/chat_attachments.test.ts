@@ -31,7 +31,8 @@ beforeEach(async () => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.useRealTimers();
-  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
+  else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -46,6 +47,32 @@ function cloudAttDir(cid: string): string {
 function draftAttDir(cid: string): string {
   return path.join(tmpDir, UID, 'local', 'chat_attachment_drafts', cid);
 }
+
+describe('cleanup attachment draft protection', () => {
+  it('keeps an unsent attachment across restart and admits only fully committed files', async () => {
+    const m = await loadMod();
+    fs.mkdirSync(attDir(), { recursive: true });
+    fs.writeFileSync(path.join(attDir(), 'draft.txt'), 'unsent');
+    const chats = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(chats, { recursive: true });
+    fs.writeFileSync(path.join(chats, `${CID}.jsonl`), JSON.stringify({ attachments: ['different.txt'] }) + '\n');
+    expect(await m.hasPendingAttachmentsForCleanup(UID, CID)).toBe(true);
+    fs.appendFileSync(path.join(chats, `${CID}.jsonl`), JSON.stringify({ attachments: ['draft.txt'] }) + '\n');
+    expect(await m.hasPendingAttachmentsForCleanup(UID, CID)).toBe(false);
+  });
+  it('retains unknown large histories without reading them and accepts generated media references', async () => {
+    const m = await loadMod();
+    fs.mkdirSync(attDir(), { recursive: true });
+    fs.writeFileSync(path.join(attDir(), 'result.png'), PNG_1X1);
+    const chats = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(chats, { recursive: true });
+    const history = path.join(chats, `${CID}.jsonl`);
+    fs.writeFileSync(history, JSON.stringify({ text: `![result](chat-media://cid/${CID}/result.png)` }) + '\n');
+    expect(await m.hasPendingAttachmentsForCleanup(UID, CID)).toBe(false);
+    fs.writeFileSync(history, ' '.repeat(4 * 1024 * 1024 + 1));
+    expect(await m.hasPendingAttachmentsForCleanup(UID, CID)).toBe(true);
+  });
+});
 
 async function loadMod() {
   return import('../../../src/main/features/chat_attachments');
@@ -808,6 +835,86 @@ describe('chat_attachments › purgeByCid', () => {
 describe('chat_attachments › adoptDraftAttachments', () => {
   const DRAFT = 'main_chat';
 
+  it('adopts the intact draft after a transient Windows lock releases on the event loop', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, DRAFT, 'note.txt', Buffer.from('draft survives the lock'));
+    const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+    const actualPromises = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    let locked = true;
+    let attempts = 0;
+    const checkLock = (from: fs.PathLike) => {
+      if (String(from) !== draftAttDir(DRAFT)) return;
+      attempts += 1;
+      if (locked) {
+        setTimeout(() => { locked = false; }, 0);
+        throw Object.assign(new Error('transient Windows directory lock'), { code: 'EPERM' });
+      }
+    };
+    vi.resetModules();
+    vi.doMock('node:fs', () => ({ ...actualFs, renameSync: (from, to) => {
+      checkLock(from);
+      return actualFs.renameSync(from, to);
+    } }));
+    vi.doMock('node:fs/promises', () => ({ ...actualPromises, rename: async (from, to) => {
+      checkLock(from);
+      return actualPromises.rename(from, to);
+    } }));
+    try {
+      const lockedModule = await loadMod();
+      const result = await lockedModule.adoptDraftAttachments(UID, DRAFT, CID);
+      expect(result).toMatchObject({ ok: true, count: 1, items: [{ sourceName: 'note.txt', targetName: 'note.txt' }] });
+      expect(attempts).toBeGreaterThan(1);
+      expect(locked).toBe(false);
+      expect(fs.readFileSync(path.join(cloudAttDir(CID), 'note.txt'), 'utf8')).toBe('draft survives the lock');
+      expect(fs.existsSync(draftAttDir(DRAFT))).toBe(false);
+    } finally {
+      vi.doUnmock('node:fs');
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+    }
+  });
+
+  it('leaves the complete draft recoverable when the Windows lock persists', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, DRAFT, 'note.txt', Buffer.from('recoverable draft'));
+    const actualPromises = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    let attempts = 0;
+    vi.resetModules();
+    vi.doMock('node:fs/promises', () => ({ ...actualPromises, rename: async (from, to) => {
+      if (String(from) === draftAttDir(DRAFT)) {
+        attempts += 1;
+        throw Object.assign(new Error('persistent Windows directory lock'), { code: 'EPERM' });
+      }
+      return actualPromises.rename(from, to);
+    } }));
+    try {
+      const lockedModule = await loadMod();
+      expect(await lockedModule.adoptDraftAttachments(UID, DRAFT, CID)).toMatchObject({ ok: false });
+      expect(attempts).toBeGreaterThan(1);
+      expect(fs.readdirSync(draftAttDir(DRAFT))).toEqual(['note.txt']);
+      expect(fs.readFileSync(path.join(draftAttDir(DRAFT), 'note.txt'), 'utf8')).toBe('recoverable draft');
+      expect(fs.existsSync(cloudAttDir(CID))).toBe(false);
+    } finally {
+      vi.doUnmock('node:fs/promises');
+      vi.resetModules();
+    }
+  });
+
+  it('consumes a shared draft only once across concurrent adoptions', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, DRAFT, 'note.txt', Buffer.from('one complete attachment'));
+    const results = await Promise.all([
+      m.adoptDraftAttachments(UID, DRAFT, CID),
+      m.adoptDraftAttachments(UID, DRAFT, 'other-conversation'),
+    ]);
+    expect(results.every((result) => result.ok)).toBe(true);
+    expect(results.map((result) => result.ok ? result.count : -1).sort()).toEqual([0, 1]);
+    const destinations = [CID, 'other-conversation'].filter((cid) => fs.existsSync(cloudAttDir(cid)));
+    expect(destinations).toHaveLength(1);
+    expect(fs.readFileSync(path.join(cloudAttDir(destinations[0]), 'note.txt'), 'utf8')).toBe('one complete attachment');
+    expect(fs.existsSync(draftAttDir(DRAFT))).toBe(false);
+  });
+
   it('renames draft dir to target cid when target does not exist', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, DRAFT, 'note.txt', Buffer.from('hi'));
@@ -815,7 +922,7 @@ describe('chat_attachments › adoptDraftAttachments', () => {
     expect(fs.existsSync(draftAttDir(DRAFT))).toBe(true);
     expect(fs.existsSync(cloudAttDir(DRAFT))).toBe(false);
 
-    const r = m.adoptDraftAttachments(UID, DRAFT, CID);
+    const r = await m.adoptDraftAttachments(UID, DRAFT, CID);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.count).toBe(2);
@@ -826,7 +933,7 @@ describe('chat_attachments › adoptDraftAttachments', () => {
 
   it('returns count=0 without error when draft dir is absent', async () => {
     const m = await loadMod();
-    const r = m.adoptDraftAttachments(UID, DRAFT, CID);
+    const r = await m.adoptDraftAttachments(UID, DRAFT, CID);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.count).toBe(0);
@@ -835,7 +942,7 @@ describe('chat_attachments › adoptDraftAttachments', () => {
   it('rejects same src == dst', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, DRAFT, 'a.txt', Buffer.from('x'));
-    const r = m.adoptDraftAttachments(UID, DRAFT, DRAFT);
+    const r = await m.adoptDraftAttachments(UID, DRAFT, DRAFT);
     expect(r.ok).toBe(false);
   });
 
@@ -843,7 +950,7 @@ describe('chat_attachments › adoptDraftAttachments', () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, CID, 'kept.txt', Buffer.from('kept'));
     await m.uploadAttachment(UID, DRAFT, 'new.txt', Buffer.from('fresh'));
-    const r = m.adoptDraftAttachments(UID, DRAFT, CID);
+    const r = await m.adoptDraftAttachments(UID, DRAFT, CID);
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(fs.existsSync(path.join(cloudAttDir(CID), 'kept.txt'))).toBe(true);
@@ -863,12 +970,13 @@ describe('chat_attachments › adoptDraftAttachments', () => {
       String(from).startsWith(draftAttDir(DRAFT) + path.sep)
       && String(to).startsWith(cloudAttDir(CID) + path.sep)
     );
-    const renameSync = vi.fn((from: fs.PathLike, to: fs.PathLike) => {
+    const actualPromises = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    const rename = vi.fn(async (from: fs.PathLike, to: fs.PathLike) => {
       if (isForwardMove(from, to)) {
         forwardMove += 1;
-        if (forwardMove === 2) throw new Error('forced rename failure');
+        if (forwardMove === 2) throw Object.assign(new Error('forced cross-device move'), { code: 'EXDEV' });
       }
-      return actualFs.renameSync(from, to);
+      return actualPromises.rename(from, to);
     });
     const copyFileSync = vi.fn((from: fs.PathLike, to: fs.PathLike, mode?: number) => {
       if (isForwardMove(from, to) && forwardMove === 2) {
@@ -877,17 +985,19 @@ describe('chat_attachments › adoptDraftAttachments', () => {
       return actualFs.copyFileSync(from, to, mode);
     });
     vi.resetModules();
-    vi.doMock('node:fs', () => ({ ...actualFs, renameSync, copyFileSync }));
+    vi.doMock('node:fs', () => ({ ...actualFs, copyFileSync }));
+    vi.doMock('node:fs/promises', () => ({ ...actualPromises, rename }));
 
     try {
       const moduleWithFailingMove = await loadMod();
-      const result = moduleWithFailingMove.adoptDraftAttachments(UID, DRAFT, CID);
+      const result = await moduleWithFailingMove.adoptDraftAttachments(UID, DRAFT, CID);
 
       expect(result.ok).toBe(false);
       expect(fs.readdirSync(draftAttDir(DRAFT)).sort()).toEqual(['first.txt', 'second.txt']);
       expect(fs.readdirSync(cloudAttDir(CID))).toEqual(['kept.txt']);
     } finally {
       vi.doUnmock('node:fs');
+      vi.doUnmock('node:fs/promises');
       vi.resetModules();
     }
   });
@@ -897,7 +1007,7 @@ describe('chat_attachments › adoptDraftAttachments', () => {
     await m.uploadAttachment(UID, CID, 'same-name.txt', Buffer.from('existing conversation file'));
     await m.uploadAttachment(UID, DRAFT, 'same-name.txt', Buffer.from('new draft file'));
 
-    const r = m.adoptDraftAttachments(UID, DRAFT, CID);
+    const r = await m.adoptDraftAttachments(UID, DRAFT, CID);
 
     expect(r.ok).toBe(true);
     if (!r.ok) return;
@@ -1651,10 +1761,16 @@ describe('chat_attachments › HTML preview assets', () => {
   // file viewer. Unlike the media route, nothing is served until the viewer
   // grants the page's folder, and hidden or outside files never are.
   let prevHome: string | undefined;
-  beforeEach(() => { prevHome = process.env.HOME; });
+  let prevUserProfile: string | undefined;
+  beforeEach(() => {
+    prevHome = process.env.HOME;
+    prevUserProfile = process.env.USERPROFILE;
+  });
   afterEach(() => {
     if (prevHome === undefined) delete process.env.HOME;
     else process.env.HOME = prevHome;
+    if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = prevUserProfile;
   });
 
   async function setup() {
@@ -1718,10 +1834,12 @@ describe('chat_attachments › HTML preview assets', () => {
     const { mod, sandbox, page } = await setup();
     fs.writeFileSync(path.join(sandbox, 'index.html'), '<!doctype html>');
     process.env.HOME = sandbox;
+    if (process.platform === 'win32') process.env.USERPROFILE = sandbox;
+    expect(os.homedir()).toBe(sandbox);
     expect(mod.grantLocalHtmlPreviewAssets(path.join(sandbox, 'index.html'))).toMatchObject({ ok: false, code: 'forbidden' });
     process.env.HOME = path.join(page, 'assets');
+    if (process.platform === 'win32') process.env.USERPROFILE = process.env.HOME;
     expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'index.html'))).toMatchObject({ ok: false, code: 'forbidden' });
-    process.env.HOME = prevHome;
     expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'style.css'))).toMatchObject({ ok: false, code: 'bad_input' });
     expect(mod.grantLocalHtmlPreviewAssets(path.join(page, 'gone.html'))).toMatchObject({ ok: false, code: 'not_found' });
     expect(mod.resolveLocalHtmlPreviewAssetPath(path.join(page, 'style.css'))).toMatchObject({ ok: false, code: 'forbidden' });

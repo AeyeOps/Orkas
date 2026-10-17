@@ -103,6 +103,9 @@ function boot() {
     setFloor: (agentId: string) => vm.runInContext(
       `_serverFloorByCid.set('${CID}', '${agentId}')`, context,
     ),
+    snapshot: (state: Record<string, unknown>) => vm.runInContext(
+      `_rememberServerFloor('${CID}', ${JSON.stringify(state)})`, context,
+    ),
     stickyPick: () => vm.runInContext(`_recipientByCid['${CID}'] || null`, context),
     hasPendingWrite: () => vm.runInContext(`_floorSyncByCid.has('${CID}')`, context),
     pickOnChip: (agent: { id: string; name: string }) => vm.runInContext(
@@ -181,4 +184,19 @@ describe('composer chip / server floor reconciliation', () => {
     expect(app.chipEl.textContent).toBe(AGENT_B.name);
     expect(app.activeRecipient()).toMatchObject({ kind: 'agent', id: AGENT_B.id });
   });
+  it('restores a waiting form owner from backend state and ignores an older reset', async () => {
+    const app = boot();
+    app.snapshot({ active_recipient: AGENT_A.id, active_recipient_revision: 2 });
+    await app.reconcile();
+    expect(app.chipEl.textContent).toBe(AGENT_A.name);
+    expect(app.activeRecipient()).toMatchObject({ kind: 'agent', id: AGENT_A.id });
+    app.snapshot({ active_recipient_revision: 1 });
+    await app.reconcile();
+    expect(app.chipEl.textContent).toBe(AGENT_A.name);
+    app.snapshot({ active_recipient_revision: 3 });
+    await app.reconcile();
+    expect(app.chipEl.textContent).toBe('chat.recipient_commander');
+    expect(app.activeRecipient()).toMatchObject({ kind: 'commander' });
+  });
+
 });

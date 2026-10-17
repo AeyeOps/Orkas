@@ -8,6 +8,7 @@ import { makeMinimalPptx, makeMinimalXlsx } from '../../fixtures/make-minimal-of
 let tmpDir: string;
 let prevWs: string | undefined;
 
+
 const enqueueCalls: Array<{ userId: string; projectId: string; name: string; op: string }> = [];
 
 vi.mock('../../../src/main/features/projects', () => ({

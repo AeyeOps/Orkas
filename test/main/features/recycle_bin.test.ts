@@ -80,6 +80,31 @@ afterEach(async () => {
 });
 
 describe('global recycle bin', () => {
+  it('permanently deletes only the selected archive while preserving live data and other accounts', async () => {
+    const paths = await import('../../../src/main/paths');
+    const recycle = await import('../../../src/main/features/recycle_bin');
+    const relPath = 'cloud/contexts/note.txt';
+    const seed = async (uid: string, text: string) => {
+      const source = path.join(paths.userCloudRoot(uid), 'contexts', 'note.txt');
+      await fsp.mkdir(path.dirname(source), { recursive: true });
+      await fsp.writeFile(source, text);
+      const batch = await recycle.createAppRecycleBatchForCloudEntry(uid, relPath, 'context');
+      if (!batch) throw new Error('archive creation failed');
+      return { source, batch };
+    };
+    const selected = await seed(UID, 'selected original');
+    const retained = await seed(UID, 'current live content');
+    const other = await seed('other-account', 'other account content');
+
+    expect(await recycle.deleteRecycleBatch(UID, selected.batch.id)).toEqual({ deleted: true });
+    expect(fs.existsSync(path.join(paths.userRecycleDir(UID), selected.batch.id))).toBe(false);
+    expect((await recycle.listRecycleBatches(UID)).map(batch => batch.id)).toEqual([retained.batch.id]);
+    expect(await fsp.readFile(selected.source, 'utf8')).toBe('current live content');
+    expect((await recycle.listRecycleBatches('other-account')).map(batch => batch.id)).toEqual([other.batch.id]);
+    expect(await fsp.readFile(other.source, 'utf8')).toBe('other account content');
+    expect(await recycle.deleteRecycleBatch(UID, selected.batch.id)).toEqual({ deleted: false });
+  });
+
   it.each(['app-file', 'app-directory', 'sync-file'] as const)(
     'rejects an ancestor symlink before a %s archive can import outside data',
     async (entry) => {

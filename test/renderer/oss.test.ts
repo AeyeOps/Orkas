@@ -154,31 +154,10 @@ describe('oss.js', () => {
     expect(calls.setView).toEqual([]);
   });
 
-  it('prefillCommander keeps only structured Commander attribution', () => {
-    const { context, el } = loadOss();
-    const applied = context.prefillCommander('Use X for [task].', {
-      entry_point: 'oss_tool',
-      resource_id: 'project-x',
-      position: 4,
-      source: 'commander_home',
-      recipient_type: 'commander',
-    });
-
-    expect(applied).toBe(true);
-    expect(el('new-chat-input').dataset).toMatchObject({
-      commanderEntryPoint: 'oss_tool',
-      commanderResourceId: 'project-x',
-      commanderPosition: '4',
-      commanderSource: 'commander_home',
-      commanderRecipientType: 'commander',
-    });
-  });
-
   it('does not treat bracketed content in an existing task as an OSS placeholder', () => {
     const { context, el } = loadOss();
     const applied = context.prefillCommander(
       'Use Project X for this task: keep [sample] in the copy.',
-      { entry_point: 'oss_tool', resource_id: 'project-x' },
       { trackPlaceholder: false },
     );
 
@@ -195,7 +174,7 @@ describe('oss.js', () => {
     };
     const quickStartInput = {
       value: 'Build a landing page with $& in the example copy.',
-      dataset: { commanderEntryPoint: 'quick_start' },
+      dataset: {},
     };
     const enhanced = context._ossPromptForComposer(project, quickStartInput);
     expect(enhanced).toContain('Build a landing page with $& in the example copy.');
@@ -203,7 +182,7 @@ describe('oss.js', () => {
 
     const existingOssInput = {
       value: enhanced,
-      dataset: { commanderEntryPoint: 'oss_tool' },
+      dataset: { ossTemplateDraft: '1' },
     };
     expect(context._ossPromptForComposer(project, existingOssInput))
       .toContain('[describe your task here]');
@@ -593,4 +572,22 @@ describe('oss.js', () => {
       expect(context.ossDescFor({})).toBe('');
     }
   });
+});
+
+it('keeps application logging free of retired statistics wrappers and their success-only payloads', () => {
+  const retired = /\b(?:_logManageResult|_logOpenResult|_logCreateAction|_logSavedAppSaveResult|_logLibraryImportResult|_artifactSaveSourceView|_logArtifactSaveResult|_savedAppSourceKind|_fileKindForLog|_trackRendererFeatureLoad|_autoCreateActionLogger|_autoAttachmentPayload|_logWorkspaceOpenFolderResult)\b/;
+  for (const module of ['saved-apps.js', 'chat-artifact.js', 'conversation-info.js', 'lazy-features.js', 'auto.js', 'user-workspace.js']) {
+    const source = fs.readFileSync(path.resolve(process.cwd(), 'src/renderer/modules', module), 'utf8');
+    expect(source, module).not.toMatch(retired);
+  }
+});
+
+it('keeps private creation and execution analytics out of the local executors', () => {
+  for (const file of ['src/main/features/agent_creation_telemetry.ts', 'bin/execution-error-diagnostics.cjs', 'bin/execution-error-diagnostics.d.cts']) {
+    expect(fs.existsSync(path.resolve(process.cwd(), file)), file).toBe(false);
+  }
+  for (const file of ['src/main/features/project_setup_tool.ts', 'src/main/features/auto_tasks_tool.ts', 'src/core-agent/src/agent/runner.ts']) {
+    expect(fs.readFileSync(path.resolve(process.cwd(), file), 'utf8'), file)
+      .not.toMatch(/\b(?:reportAgentCreation|onAgentCreationTelemetry|onInternalToolError|reportInternalToolError|captureErrorDiagnostic|priorErrorDiagnostic)\b/);
+  }
 });

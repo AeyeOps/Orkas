@@ -36,7 +36,9 @@ function _messageText(raw: any): string {
  * address for every user turn. This machine-local derived index is deliberately
  * compact and rebuildable: it never enters sync or the conversation metadata.
  */
-const CONVERSATION_TURN_INDEX_VERSION = 2;
+// Bump when stored previews change shape or budget: an index built by an
+// older version is rebuilt once from the source transcript on its next read.
+const CONVERSATION_TURN_INDEX_VERSION = 3;
 const CONVERSATION_TURN_FINGERPRINT_BYTES = 4 * 1024;
 interface ConversationTurnIndexSource {
   owner: string;

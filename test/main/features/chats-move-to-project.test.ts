@@ -326,6 +326,7 @@ describe('chats › moveConversationToProject', () => {
       const other = await chats.createConversation(UID, { title: 'unrelated', projectId: PID });
       const cid = conv.conversation_id;
       seedConversationBytes(cid);
+      await (await import('../../../src/main/features/search/indexer')).flushAll();
       const result = spawnSync(process.execPath, ['-r', 'tsx/cjs', '-e', `
         const fs = require('node:fs');
         const slash = file => file.split(require('node:path').sep).join('/');
@@ -446,6 +447,39 @@ describe('chats › moveConversationToProject', () => {
 
 });
 
+// Sync checks every disk, remote and index path against unresolved move
+// records on each pass. The once-built matcher must answer exactly like the
+// plain per-record lists, whether or not every recorded path names the
+// conversation, and must not match a look-alike that merely contains its id.
+describe('conversation relocation › unresolved path matcher', () => {
+  it('matches exactly the paths the per-record lists cover', async () => {
+    const relocation = await import('../../../src/main/util/conversation-relocate');
+    const cid = 'c0a1b2c3d4e5';
+    const unresolved = [
+      { cid, exact: [`cloud/chats/${cid}.jsonl`, `cloud/projects/p1/chats/${cid}.jsonl`],
+        prefixes: [`cloud/chats/${cid}/`, `cloud/sessions/gmember-${cid}-`] },
+      // A record whose paths do not all name its conversation is never gated.
+      { cid: 'c9f8e7d6c5b4', exact: ['cloud/legacy/moved.json'], prefixes: ['cloud/legacy/dir/'] },
+    ];
+    const reference = (relPath: string) => unresolved.some((item) => item.exact.includes(relPath)
+      || item.prefixes.some((prefix) => relPath.startsWith(prefix)));
+    const paths = [
+      `cloud/chats/${cid}.jsonl`, `cloud/chats/${cid}/state.json`, `cloud/projects/p1/chats/${cid}.jsonl`,
+      `cloud/sessions/gmember-${cid}-agent.jsonl`, `cloud/sessions/gmember-other-${cid}.jsonl`,
+      `cloud/chats/${cid}.jsonl.bak`, `cloud/chats/${cid}`, `cloud/projects/p2/chats/${cid}.jsonl`,
+      'cloud/legacy/moved.json', 'cloud/legacy/dir/a/b.json', 'cloud/legacy/dir', 'cloud/legacy/moved.json2',
+      'cloud/contexts/notes.md', '',
+    ];
+    const matches = relocation.unresolvedRelocationMatcher(unresolved);
+    for (const relPath of paths) {
+      expect(matches(relPath), relPath).toBe(reference(relPath));
+      expect(relocation.matchesUnresolvedRelocation(unresolved, relPath), relPath).toBe(reference(relPath));
+    }
+    expect(paths.filter(reference)).toHaveLength(6);
+    expect(relocation.unresolvedRelocationMatcher([])('cloud/chats/x.jsonl')).toBe(false);
+  });
+});
+
 describe('chats › moveConversationOutOfProject', () => {
   it('brings every location back to the root and leaves nothing in the project', async () => {
     const chats = await import('../../../src/main/features/chats');
@@ -513,6 +547,9 @@ describe('chats › moveConversationOutOfProject', () => {
     seedConversationBytes(cid);
     expect((await chats.moveConversationToProject(UID, cid, PID)).ok).toBe(true);
 
+    // The child represents the sole writer after the original host exits.
+    // Close its search worker before resetting that host's module graph.
+    await (await import('../../../src/main/features/search/indexer')).flushAll();
     const result = spawnSync(process.execPath, ['-r', 'tsx/cjs', '-e', `
       const fs = require('node:fs');
       const slash = file => file.split(require('node:path').sep).join('/');

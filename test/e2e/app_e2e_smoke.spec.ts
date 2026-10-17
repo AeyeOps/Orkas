@@ -1,7 +1,8 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { expect, OrkasTestApp, test } from './fixtures/orkas';
+import { openSidebarEntry, expect, OrkasTestApp, test } from './fixtures/orkas';
+
 
 test.describe('desktop shell', () => {
   test('keeps background launches and second-instance activation off the desktop across relaunch', async ({}, testInfo) => {
@@ -151,7 +152,9 @@ test.describe('desktop shell', () => {
     }
   });
 
-  test('opens the selected project and agent details', async ({ appPage, orkas }) => {
+  test('opens the selected project and agent details', async ({ marketplaceOrkas: orkas }) => {
+    const appPage = orkas.page;
+    if (!appPage) throw new Error('Orkas renderer is unavailable');
     await orkas.invoke('projects.create', { name: 'E2E Visual Project' });
     await orkas.invoke('agents.create', {
       name: 'E2EVisualAgent',
@@ -164,7 +167,7 @@ test.describe('desktop shell', () => {
     }).click();
     await expect(appPage.locator('#project-detail-title')).toHaveText('E2E Visual Project');
 
-    await appPage.locator('#agents-btn').click();
+    await openSidebarEntry(appPage, '#agents-btn');
     const agentCard = appPage.locator('.agent-card', { hasText: 'E2EVisualAgent' });
     await expect(agentCard).toBeVisible();
     await agentCard.click();
@@ -172,7 +175,7 @@ test.describe('desktop shell', () => {
   });
 
   test('selects a one-time automation date with the keyboard', async ({ appPage }) => {
-    await appPage.locator('#auto-btn').click();
+    await openSidebarEntry(appPage, '#auto-btn');
     await appPage.locator('#auto-add-btn').click();
 
     await expect(appPage.locator('input[type="date"]')).toHaveCount(0);
@@ -207,7 +210,7 @@ test.describe('desktop shell', () => {
       ] as const;
 
       for (const [buttonId, panelId] of destinations) {
-        await appPage.locator(`#${buttonId}`).click();
+        await openSidebarEntry(appPage, `#${buttonId}`);
         await expect(appPage.locator(`#${buttonId}`)).toHaveClass(/\bactive\b/);
         await expect(appPage.locator(`#${panelId}`)).toHaveClass(/\bactive\b/);
         await expect(appPage.locator(`#${panelId}`)).toBeVisible();

@@ -16,6 +16,10 @@ export async function requestElectronQuit(app: ElectronApplication): Promise<voi
   if (process.platform !== 'darwin' && app.windows().length === 0) {
     const child = app.process();
     if (child.exitCode !== null || child.signalCode !== null) return;
+    // Playwright owns the Node inspector connection. A naturally quitting
+    // Electron process can wait for that connection to detach before exiting.
+    await app.close();
+    if (child.exitCode !== null || child.signalCode !== null) return;
     await new Promise<void>(resolve => child.once('exit', () => resolve()));
     return;
   }
@@ -35,6 +39,9 @@ export async function requestElectronQuit(app: ElectronApplication): Promise<voi
         'electronApplication.evaluate: Execution context was destroyed, most likely because of a navigation.';
       if (!closed && !inspectorDisposed) throw error;
     }
+    // Complete the public Playwright close path after requesting deferred quit:
+    // it detaches the inspector and still waits for the actual process close.
+    await app.close();
     await completion;
   } finally {
     app.off('close', onClose);
@@ -66,7 +73,8 @@ export async function closeElectronFixture(app: OwnedApplication, tracePath: str
       options.phase?.(name, 'failed');
     } finally { clearTimeout(timer); }
   };
-  await step('trace-stop', options.traceTimeoutMs ?? 5_000, () => app.context().tracing.stop({ path: tracePath }));
+  // Multi-locale journeys can produce large snapshot archives on low-tier hosts.
+  await step('trace-stop', options.traceTimeoutMs ?? 15_000, () => app.context().tracing.stop({ path: tracePath }));
   await step('application-close', options.closeTimeoutMs ?? 20_000, () => app.close());
   if (child.exitCode === null && child.signalCode === null) {
     await step('owned-process-cleanup', 6_000, () => new Promise<void>((resolve, reject) => {

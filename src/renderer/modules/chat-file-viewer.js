@@ -723,7 +723,7 @@ async function _refreshSaveAppButton(path) {
   try {
     const inspected = await window.orkas.invoke('savedApps.inspectBundleFromPath', _viewerFileActionPayload(path));
     if (!_isViewerOpen() || _viewerCurrentPath !== path) return;
-    const canSave = !!(inspected && inspected.ok !== false && inspected.canSave);
+    const canSave = !!(inspected && inspected.ok !== false && (inspected.canSave || inspected.reason === 'app_bundle_root'));
     _setSaveAppVisible(canSave);
   } catch {
     if (!_isViewerOpen() || _viewerCurrentPath !== path) return;
@@ -735,7 +735,6 @@ async function _refreshSaveAppButton(path) {
 async function _onSaveAppClick() {
   const p = _viewerCurrentPath;
   if (!p || !_viewerSaveAppBtn || _viewerSaveAppBtn.disabled) return;
-  const startedAt = Date.now();
   if (_viewerDirty) {
     const message = _viewerLabel('apps.save_from_file_dirty', 'Save the file changes before saving it as an app.');
     await _viewerShowAlert(message, 'file_preview_save_app_presentation');
@@ -755,19 +754,25 @@ async function _onSaveAppClick() {
     res = await window.orkas.invoke('savedApps.saveFromPath', _viewerFileActionPayload(p));
   } catch (err) {
     const failure = _viewerStableFailure(err, 'saved_app_save_failed', 'ipc');
-    const reason = String(err && err.message || err);
     _viewerLogFailure('file_preview_save_app', failure);
-    const prefix = _viewerLabel('apps.save_failed', 'Could not save the app');
-    await _viewerShowAlert(`${prefix}: ${reason}`, 'file_preview_save_app_presentation');
+    // Raw errors may hold local paths; the failure is logged by code only.
+    await _viewerShowAlert(_viewerLabel('apps.save_failed', 'Could not save the app'), 'file_preview_save_app_presentation');
     _scheduleSaveAppButtonRestore(p, original);
+    return;
+  }
+  if (window.OrkasCommercialEntry?.isFailure(res)) {
+    _scheduleSaveAppButtonRestore(p, original);
+    await window.OrkasCommercialEntry.show();
     return;
   }
   if (!res || res.ok === false) {
     const failure = _viewerStableFailure(res, 'saved_app_save_failed', 'operation');
-    const reason = String((res && res.error) || 'failed');
     _viewerLogFailure('file_preview_save_app', failure);
-    const prefix = _viewerLabel('apps.save_failed', 'Could not save the app');
-    await _viewerShowAlert(`${prefix}: ${reason}`, 'file_preview_save_app_presentation');
+    // Raw errors may hold local paths; the failure is logged by code only.
+    const message = res?.error === 'app_bundle_root'
+      ? _viewerLabel('apps.save_root_folder_required', 'Move the HTML and its resources into a separate folder, then save as an app again.')
+      : _viewerLabel('apps.save_failed', 'Could not save the app');
+    await _viewerShowAlert(message, 'file_preview_save_app_presentation');
     _scheduleSaveAppButtonRestore(p, original);
     return;
   }
@@ -1421,7 +1426,9 @@ async function openChatFileViewer(absPath, displayName, opts) {
   if (window.OrkasPreviewWindows) {
     if (!(await _ensureViewerFileExists(absPath, opts?.cid, opts?.projectId))) return;
     if (_kindOf(absPath) === 'image') return window.OrkasPreviewWindows.image(_chatMediaLocalUrl(absPath), displayName || absPath.split(/[\\/]/).pop(), { ...opts, absPath });
-    return window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: displayName || absPath.split(/[\\/]/).pop(), options: window.OrkasPreviewWindows.options(opts) });
+    const result = await window.OrkasPreviewWindows.open({ kind: 'file', path: absPath, title: displayName || absPath.split(/[\\/]/).pop(), options: window.OrkasPreviewWindows.options(opts) });
+    if (window.OrkasCommercialEntry?.isFailure(result)) await window.OrkasCommercialEntry.show();
+    return result;
   }
   const cid = (opts && opts.cid) || null;
   const projectId = (opts && opts.projectId) || null;

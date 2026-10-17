@@ -1,19 +1,36 @@
 import { describe, expect, it } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { LOCALES } from '../../src/main/i18n';
 
 const root = path.join(__dirname, '../..');
 const read = (relativePath: string) => fs.readFileSync(path.join(root, relativePath), 'utf8');
 
 describe('conversation load-more control', () => {
-  it('uses quantity-free copy in every supported locale', () => {
+  it('offers to show more conversations in every supported locale', () => {
     const expected = {
-      zh: '加载更多',
-      en: 'Load more',
-      ja: 'さらに読み込む',
-      pt: 'Carregar mais',
+      zh: '显示更多',
+      'zh-tw': '顯示更多',
+      en: 'Show more',
+      fr: 'Afficher plus',
+      de: 'Mehr anzeigen',
+      hi: 'और दिखाएँ',
+      id: 'Tampilkan lebih banyak',
+      it: 'Mostra altro',
+      ja: 'さらに表示',
+      ko: '더 보기',
+      pt: 'Mostrar mais',
+      'pt-pt': 'Mostrar mais',
+      ru: 'Показать ещё',
+      es: 'Mostrar más',
+      'es-419': 'Mostrar más',
+      th: 'แสดงเพิ่มเติม',
+      tr: 'Daha fazla göster',
+      vi: 'Hiển thị thêm',
+      ar: 'عرض المزيد',
     };
 
+    expect(Object.keys(expected).sort()).toEqual(LOCALES.map(locale => locale.code).sort());
     for (const [locale, label] of Object.entries(expected)) {
       const messages = JSON.parse(read(`src/renderer/locales/${locale}.json`));
       expect(messages['sidebar.load_more_conversations']).toBe(label);
@@ -23,8 +40,12 @@ describe('conversation load-more control', () => {
   it('provides responsive, focus, disabled, and loading styles', () => {
     const styles = read('src/renderer/style.css');
 
-    expect(styles).toMatch(/\.conversation-list-load-more\s*\{[\s\S]*?width:\s*calc\(100% - 16px\)/);
-    expect(styles).toMatch(/\.conversation-list-load-more\s*\{[\s\S]*?border:\s*0;/);
+    // Accept shared selector lists while keeping each property in its owning rule.
+    const rule = Array.from(styles.replace(/\/\*[\s\S]*?\*\//g, '').matchAll(/([^{}]+)\{([^{}]*)\}/g))
+      .find(match => match[1].split(',').some(selector => selector.trim() === '.conversation-list-load-more'));
+    expect(rule, 'the load-more selector must own its base declarations').toBeDefined();
+    expect(rule![2]).toMatch(/width:\s*calc\(100% - 16px\)/);
+    expect(rule![2]).toMatch(/border:\s*0;/);
     expect(styles).toContain('.conversation-list-load-more:focus-visible');
     expect(styles).toContain('.conversation-list-load-more:disabled');
     expect(styles).toContain('.conversation-list-load-more[aria-busy="true"]::before');

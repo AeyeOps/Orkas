@@ -1591,6 +1591,14 @@ function _renderAgentDetailMemory(agent, editing = false) {
   if (canEditMemory) _wireAgentMemoryControls(section, agent);
 }
 
+// A full store is refused with model-facing guidance; users get the
+// localized full message, which does not ask them to clean up entries.
+function _agentMemoryFailureText(res, fallback) {
+  const error = String((res && res.error) || '');
+  if (/^memory full/i.test(error)) return t('memory.error_full');
+  return error || fallback;
+}
+
 async function _agentMemoryAdd(agent, text) {
   if (_isCommanderAgent(agent)) {
     return window.orkas.invoke('memory.add', { target: 'agent', agentId: _COMMANDER_AGENT_ID, content: text });
@@ -1625,7 +1633,7 @@ function _wireAgentMemoryControls(host, agent) {
       try {
         const res = await _agentMemoryAdd(agent, text);
         if (!res || res.ok === false) {
-          uiAlert((res && res.error) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
+          uiAlert(_agentMemoryFailureText(res, _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました')));
           return;
         }
         await loadAgents(true);
@@ -1649,7 +1657,7 @@ function _wireAgentMemoryControls(host, agent) {
       try {
         const res = await _agentMemoryUpdate(agent, oldText, text);
         if (!res || res.ok === false) {
-          uiAlert((res && res.error) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
+          uiAlert(_agentMemoryFailureText(res, _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました')));
           return;
         }
         await loadAgents(true);
@@ -1676,7 +1684,7 @@ function _wireAgentMemoryControls(host, agent) {
       try {
         const res = await _agentMemoryRemove(agent, text);
         if (!res || res.ok === false) {
-          uiAlert((res && res.error) || _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました'));
+          uiAlert(_agentMemoryFailureText(res, _agentLabel('agents.memory_update_failed', '记忆更新失败', 'Memory update failed', 'メモリ更新に失敗しました')));
           return;
         }
         await loadAgents(true);
@@ -1732,6 +1740,7 @@ function _renderAgentDetail(agent, editing, { refreshCliOptions = false } = {}) 
   // it duplicated information the dropdown already exposes.
   _renderAgentDetailRuntime(agent);
   _renderAgentDetailCliSettings(agent, { refresh: refreshCliOptions });
+  void renderCliAccountUsage(agent);
   _renderAgentDetailProjectDir(agent);
   const localizedDesc = _agentSummary(agent, lang);
   descEl.textContent = localizedDesc;
@@ -1936,6 +1945,8 @@ async function _renderAgentDetailRuntime(agent) {
   const section = document.getElementById('agents-detail-runtime-section');
   const slot = document.getElementById('agents-detail-runtime');
   if (!slot || !section) return;
+  const previousRuntimeKey = slot.dataset.runtimeKey;
+  const previousUpgradeControl = slot.querySelector('.local-cli-upgrade-control');
   slot.innerHTML = '';
 
   // In-process agents: section stays hidden. No selector, no
@@ -2023,6 +2034,10 @@ async function _renderAgentDetailRuntime(agent) {
   const mount = document.createElement('div');
   mount.className = 'ai-select agents-detail-runtime-select';
   slot.appendChild(mount);
+  if (typeof window.createLocalCliUpgradeControl === 'function') {
+    slot.appendChild(previousRuntimeKey === runtimeKey && previousUpgradeControl
+      ? previousUpgradeControl : window.createLocalCliUpgradeControl({ type: currentType }));
+  }
   _aiSelectMount(mount, {
     options, value: `cli:${currentType}`,
     onChange: async (next) => {
@@ -2318,10 +2333,11 @@ async function _renderAgentDetailCliSettings(agent, { refresh = false, cacheOnly
         ? t('agents.cli_settings_partial')
         : t('agents.cli_settings_unavailable'),
     )}</div>`;
-  // A listed row already names its resolution in the picker, so the note is
-  // left for a saved override the catalog does not list at all.
+  // Claude Code shows model information in the picker only. Other CLIs keep
+  // the note for a saved override the catalog does not list at all.
   const selectedModelIsListed = models.some(model => String(model?.id || '') === currentModel);
-  const observedModelNote = observedModelForCurrentSelection
+  const observedModelNote = runtime.cli !== 'claude'
+    && observedModelForCurrentSelection
     && !selectedModelIsListed
     && observedModelForCurrentSelection !== currentModel
     ? `<div class="agents-detail-cli-note agents-detail-cli-model-observed">${escapeHtml(
@@ -4797,3 +4813,20 @@ function bindAgentPickers() {
   }
 
 }
+
+window.addEventListener('local-cli-upgraded', async (event) => {
+  _agentCliRuntimeOptionsCache.clear();
+  _agentCliRuntimeSnapshots.clear();
+  const id = _selectedAgent?.id;
+  if (!id) return;
+  try {
+    const response = await window.orkas.invoke('agents.get', { agent_id: id });
+    const agent = response?.agent;
+    if (_selectedAgent?.id !== id || agent?.runtime?.cli !== event.detail?.type) return;
+    await loadLocalCliEntries({ force: true });
+    if (_selectedAgent?.id !== id) return;
+    void _renderAgentDetailRuntime(agent);
+    void _renderAgentDetailCliSettings(agent, { refresh: true });
+    void renderCliAccountUsage(agent, { force: true });
+  } catch (_) { /* next detail entry revalidates independently */ }
+});

@@ -7,9 +7,10 @@
 import { describe, it, expect } from 'vitest';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const convBucket = require('../../src/renderer/modules/conv-bucket.js');
-const { timeBucket, selectTodayConversations } = convBucket as {
+const { timeBucket, selectRecentConversations, recentConversationsSince } = convBucket as {
   timeBucket: (iso: string, now?: Date) => 'today' | 'yesterday' | 'last7' | 'last30' | 'older';
-  selectTodayConversations: (rows: unknown, now?: Date) => Array<Record<string, unknown>>;
+  selectRecentConversations: (rows: unknown, now?: Date) => Array<Record<string, unknown>>;
+  recentConversationsSince: (now?: Date) => Date;
 };
 
 // 2026-05-15T14:30:00 local — anchor every fixture against this; today
@@ -92,21 +93,24 @@ describe('timeBucket — older + degenerate inputs', () => {
   });
 });
 
-// The sidebar "Today's Tasks" aggregate must agree with the "Today" bucket
-// header of every list it mirrors: same activity field precedence, same local
-// midnight boundary, projected and unprojected rows alike.
-describe('selectTodayConversations — Today aggregate membership', () => {
-  it('keeps today rows from any project and drops yesterday rows at the exact boundary', () => {
+// The sidebar "Recent Tasks" aggregate must agree with the "Today" and
+// "Yesterday" bucket headers of every list it mirrors: same activity field
+// precedence, same local midnight boundaries, projected and unprojected rows
+// alike.
+describe('selectRecentConversations — Recent Tasks membership', () => {
+  it('keeps today and yesterday rows from any project and drops older rows at the exact boundary', () => {
     const rows = [
       { conversation_id: 'unprojected-today', last_active_at: offsetFromTodayStart(10 * 60 * 60 * 1000) },
       { conversation_id: 'projected-today', project_id: 'p1', last_active_at: offsetFromTodayStart(0) },
       { conversation_id: 'yesterday-late', project_id: 'p2', last_active_at: offsetFromTodayStart(-1) },
+      { conversation_id: 'yesterday-start', last_active_at: offsetFromTodayStart(-DAY) },
+      { conversation_id: 'day-before-late', project_id: 'p3', last_active_at: offsetFromTodayStart(-DAY - 1) },
       { conversation_id: 'no-timestamps' },
       { title: 'no id', last_active_at: NOW.toISOString() },
       null,
     ];
-    expect(selectTodayConversations(rows, NOW).map((c) => c.conversation_id))
-      .toEqual(['unprojected-today', 'projected-today']);
+    expect(selectRecentConversations(rows, NOW).map((c) => c.conversation_id))
+      .toEqual(['unprojected-today', 'projected-today', 'yesterday-late', 'yesterday-start']);
   });
 
   it('reads last_active_at before updated_at and created_at, exactly like the bucket headers', () => {
@@ -117,12 +121,26 @@ describe('selectTodayConversations — Today aggregate membership', () => {
       { conversation_id: 'created', created_at: offsetFromTodayStart(60_000) },
       { conversation_id: 'stale', updated_at: offsetFromTodayStart(-2 * DAY), created_at: offsetFromTodayStart(-3 * DAY) },
     ];
-    expect(selectTodayConversations(rows, NOW).map((c) => c.conversation_id))
+    expect(selectRecentConversations(rows, NOW).map((c) => c.conversation_id))
       .toEqual(['bumped', 'created']);
   });
 
+  it('drops yesterday rows once the local date rolls over', () => {
+    const rows = [{ conversation_id: 'yesterday', last_active_at: offsetFromTodayStart(-60_000) }];
+    expect(selectRecentConversations(rows, NOW).map((c) => c.conversation_id)).toEqual(['yesterday']);
+    const tomorrow = new Date(NOW.getTime() + DAY);
+    expect(selectRecentConversations(rows, tomorrow)).toEqual([]);
+  });
+
   it('tolerates a missing or non-array cache', () => {
-    expect(selectTodayConversations(undefined, NOW)).toEqual([]);
-    expect(selectTodayConversations({} as unknown, NOW)).toEqual([]);
+    expect(selectRecentConversations(undefined, NOW)).toEqual([]);
+    expect(selectRecentConversations({} as unknown, NOW)).toEqual([]);
+  });
+
+  it('loads the startup slice from the local start of yesterday', () => {
+    const since = recentConversationsSince(NOW);
+    expect(since.getTime()).toBe(new Date(offsetFromTodayStart(-DAY)).getTime());
+    expect(since.getHours()).toBe(0);
+    expect(since.getMinutes()).toBe(0);
   });
 });

@@ -1,34 +1,45 @@
-/* Orkas Frontend — sidebar "Today's Tasks"
+/* Orkas Frontend — sidebar "Recent Tasks" (formerly "Today's Tasks")
  *
- * Aggregates every conversation with activity today, whether it lives under a
+ * Aggregates every conversation with activity today or yesterday (local
+ * calendar), whether it lives under a
  * Project or in the catch-all Tasks list, so running work and finished work
  * that still needs a look sit in one place. The section is a mirror only:
  * rows reuse the shared conversation row renderer, click/menu handlers,
  * unread dots, and live-run badges, and the `conversations` cache remains the
- * single source of truth. Nothing here owns state or changes what the other
- * lists do; opening a task from either copy clears both copies' attention cue.
+ * single source of truth. Only the visible row limit belongs to this list;
+ * opening a task from either copy clears both copies' attention cue.
  *
- * Day boundary: `selectTodayConversations` (conv-bucket.js) reads the same
- * activity timestamp and local-midnight rule as the "Today" bucket headers, so
- * a row is never "today" in one list and absent here. Rows for collapsed
- * projects reach the cache through the startup slice's `active_since` filter.
+ * Day boundary: `selectRecentConversations` (conv-bucket.js) reads the same
+ * activity timestamp and local-midnight rule as the "Today"/"Yesterday" bucket
+ * headers, so a row is never "today" or "yesterday" in one list and absent
+ * here. The date rollover re-render (conversation.js
+ * `_refreshConversationBucketsForDateChange`) is the once-a-day check that drops
+ * rows older than yesterday. Rows for collapsed projects reach the cache through
+ * the startup slice's `active_since` filter (start of yesterday).
  *
- * Badges and unread dots are not painted here: every caller is a branch of
- * `renderConversationList`, whose single trailing `_refreshAllConvBadges` pass
- * runs after this list and the Projects section have both rendered.
+ * DOM ids, the i18n keys and the section's collapse key keep their historical
+ * `today` names; only the window and the label changed.
+ *
+ * Regular refreshes use `renderConversationList`'s trailing badge pass.
+ * Loading more or reopening refreshes only this list and its badges;
+ * reopening resets the visible row limit to the first page.
  */
+
+const _RECENT_TASK_PAGE_SIZE = 10;
+let _recentTaskVisibleCount = _RECENT_TASK_PAGE_SIZE;
 
 function _todayTaskRows(now) {
   const rows = typeof conversations !== 'undefined' && Array.isArray(conversations)
     ? conversations
     : [];
-  const today = typeof selectTodayConversations === 'function'
-    ? selectTodayConversations(rows, now)
+  const selected = typeof selectRecentConversations === 'function'
+    ? selectRecentConversations(rows, now)
     : [];
+  const recent = Array.isArray(selected) ? selected : [];
   if (typeof _compareConversationsForSidebar === 'function') {
-    today.sort(_compareConversationsForSidebar);
+    recent.sort(_compareConversationsForSidebar);
   }
-  return today;
+  return recent;
 }
 
 function renderTodayTasksSection() {
@@ -45,10 +56,21 @@ function renderTodayTasksSection() {
     container.innerHTML = `<div class="conv-empty" data-i18n="sidebar.today_empty">${escapeHtml(t('sidebar.today_empty'))}</div>`;
     return;
   }
-  const projectByCid = new Map(rows.map((c) => [c.conversation_id, c.project_id || '']));
-  container.innerHTML = rows.map((c) => _renderConversationSidebarItem(c, { listId: 'today-list' })).join('');
+  const visibleRows = rows.slice(0, _recentTaskVisibleCount);
+  const projectByCid = new Map(visibleRows.map((c) => [c.conversation_id, c.project_id || '']));
+  container.innerHTML = visibleRows.map((c) => _renderConversationSidebarItem(c, { listId: 'today-list' })).join('');
+  if (rows.length > visibleRows.length) {
+    container.insertAdjacentHTML('beforeend', `<button type="button" class="conversation-list-load-more" data-recent-conv-more="1">
+      ${escapeHtml(t('sidebar.load_more_conversations'))}</button>`);
+    container.querySelector('[data-recent-conv-more]').addEventListener('click', () => {
+      _recentTaskVisibleCount += _RECENT_TASK_PAGE_SIZE;
+      renderTodayTasksSection();
+      _refreshAllConvBadges();
+      container.querySelector('[data-recent-conv-more]')?.focus({ preventScroll: true });
+    });
+  }
   _bindConversationSidebarItems(container, {
-    scope: 'today',
+    scope: 'recent',
     async afterDelete(cid) {
       // A projected task also changes its project's count; the nested project
       // list does the same refresh after its own delete.
@@ -56,3 +78,10 @@ function renderTodayTasksSection() {
     },
   });
 }
+
+window.addEventListener('sidebar-section-toggle', (event) => {
+  if (event?.detail?.name !== 'today' || event.detail.collapsed !== false) return;
+  _recentTaskVisibleCount = _RECENT_TASK_PAGE_SIZE;
+  renderTodayTasksSection();
+  _refreshAllConvBadges();
+});

@@ -12,9 +12,12 @@ const _TASK_UNREAD_MAX_RECORDS = 500;
 
 let _taskUnreadOwnerUserId = '';
 let _taskUnreadScopeRefreshPromise = null;
-const _taskUnreadByCid = new Map(); // cid -> { projectId: string|null, finishedAt: number }
+const _taskUnreadByCid = new Map(); // cid -> { projectId: string|null, finishedAt: number, status?: string, entryPoint?: string }
 const _taskReadAtByCid = new Map(); // cid -> last acknowledged terminal timestamp
-const _taskUnreadPendingTerminals = new Map(); // terminal events received before initUser
+const _taskUnreadPendingTerminals = new Map(); // cid -> { finishedAt, status, entryPoint } received before initUser
+// Terminal states that make a run unread; the home page shows the same
+// statuses next to each unread task.
+const _TASK_UNREAD_STATUSES = new Set(['completed', 'stopped', 'failed', 'waiting_input']);
 function _taskUnreadCurrentUserId() {
   try {
     return typeof currentUserId === 'string' ? currentUserId.trim() : '';
@@ -35,6 +38,26 @@ function _taskUnreadSafeCid(value) {
 function _taskUnreadTimestamp(value, fallback = Date.now()) {
   const n = Number(value);
   return Number.isFinite(n) && n > 0 ? Math.round(n) : fallback;
+}
+
+function _taskUnreadStatus(value) {
+  const status = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return _TASK_UNREAD_STATUSES.has(status) ? status : '';
+}
+
+function _taskUnreadEntryPoint(value) {
+  const entryPoint = typeof value === 'string' ? value.trim() : '';
+  return /^[a-z_]{1,32}$/.test(entryPoint) ? entryPoint : '';
+}
+
+/** Optional fields only when known, so old records keep their stored shape. */
+function _taskUnreadOutcome(status, entryPoint) {
+  const out = {};
+  const s = _taskUnreadStatus(status);
+  const e = _taskUnreadEntryPoint(entryPoint);
+  if (s) out.status = s;
+  if (e) out.entryPoint = e;
+  return out;
 }
 
 function _taskUnreadLoadOwner(userId) {
@@ -61,6 +84,7 @@ function _taskUnreadLoadOwner(userId) {
       _taskUnreadByCid.set(cid, {
         projectId,
         finishedAt: _taskUnreadTimestamp(row.finishedAt, 0),
+        ..._taskUnreadOutcome(row.status, row.entryPoint),
       });
     }
     for (const row of readRows.slice(0, _TASK_UNREAD_MAX_RECORDS)) {
@@ -114,6 +138,10 @@ function _taskUnreadSave() {
     // The indicator is helpful but must never affect task settlement or view
     // navigation when storage is unavailable.
   }
+  // The home page lists the same unread runs; it listens for this to refresh.
+  try {
+    window.dispatchEvent(new CustomEvent('task-unread-change'));
+  } catch (_) {}
 }
 
 function _taskUnreadConversationScope(cid) {
@@ -148,6 +176,15 @@ function _taskUnreadConversationIsActivelyViewed(cid) {
     if (typeof document.hasFocus === 'function' && !document.hasFocus()) return false;
   } catch (_) {}
   return true;
+}
+
+/** Unread finished runs, newest first. `status` and `entryPoint` are absent on
+ * records written before they were tracked. */
+function _listUnreadTasks() {
+  _taskUnreadEnsureOwner();
+  return Array.from(_taskUnreadByCid.entries())
+    .map(([cid, record]) => ({ cid, ...record }))
+    .sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0));
 }
 
 function _isConversationUnread(cid) {
@@ -186,23 +223,27 @@ function _markConversationUnread(cid, options = {}) {
   const id = _taskUnreadSafeCid(cid);
   if (!id) return false;
   const finishedAt = _taskUnreadTimestamp(options.finishedAt);
+  const outcome = _taskUnreadOutcome(options.status, options.entryPoint);
   if (_taskUnreadConversationIsActivelyViewed(id)) {
     _markConversationRead(id, { readAt: finishedAt });
     return false;
   }
   if (!_taskUnreadEnsureOwner()) {
-    _taskUnreadPendingTerminals.set(id, Math.max(
-      _taskUnreadPendingTerminals.get(id) || 0,
-      finishedAt,
-    ));
+    const pending = _taskUnreadPendingTerminals.get(id);
+    if (!pending || finishedAt >= pending.finishedAt) {
+      _taskUnreadPendingTerminals.set(id, { finishedAt, ...outcome });
+    }
     return true;
   }
   if ((_taskReadAtByCid.get(id) || 0) >= finishedAt) return false;
   const scope = _taskUnreadConversationScope(id);
   const previous = _taskUnreadByCid.get(id);
+  // The newest terminal decides what the home page says about this task.
+  const newer = !previous || finishedAt >= (previous.finishedAt || 0);
   _taskUnreadByCid.set(id, {
     projectId: scope.known ? scope.projectId : (previous?.projectId ?? null),
     finishedAt: Math.max(previous?.finishedAt || 0, finishedAt),
+    ...(newer ? outcome : _taskUnreadOutcome(previous.status, previous.entryPoint)),
   });
   _taskUnreadSave();
   _refreshUnreadTaskIndicators();
@@ -267,9 +308,9 @@ function _forgetUnreadProject(projectId) {
 function _restoreUnreadTaskState() {
   _taskUnreadOwnerUserId = '';
   if (!_taskUnreadEnsureOwner()) return;
-  for (const [cid, finishedAt] of Array.from(_taskUnreadPendingTerminals.entries())) {
+  for (const [cid, pending] of Array.from(_taskUnreadPendingTerminals.entries())) {
     _taskUnreadPendingTerminals.delete(cid);
-    _markConversationUnread(cid, { finishedAt });
+    _markConversationUnread(cid, pending);
   }
   _taskUnreadHydrateScopes();
   _refreshUnreadTaskIndicators();
@@ -330,7 +371,8 @@ function _refreshUnreadTaskIndicators(projectIdOverride) {
   );
 
   for (const dot of document.querySelectorAll?.('[data-project-unread-dot]') || []) {
-    _taskUnreadSetDot(dot, _taskUnreadProjectCount(dot.dataset?.projectUnreadDot) > 0);
+    const projectId = dot.dataset?.projectUnreadDot;
+    _taskUnreadSetDot(dot, _taskUnreadProjectCount(projectId) > 0);
   }
 }
 
@@ -340,6 +382,8 @@ function _handleTaskTerminalUnread(payload) {
   if (!['completed', 'stopped', 'failed', 'waiting_input'].includes(status)) return false;
   return _markConversationUnread(payload.conversation_id, {
     finishedAt: payload.finished_at_ms,
+    status,
+    entryPoint: payload.entry_point,
   });
 }
 
@@ -364,5 +408,6 @@ if (typeof window !== 'undefined') {
     projectCount: _taskUnreadProjectCount,
     markRead: _markConversationRead,
     refresh: _refreshUnreadTaskIndicators,
+    list: _listUnreadTasks,
   };
 }

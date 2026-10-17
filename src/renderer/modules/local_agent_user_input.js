@@ -2,7 +2,7 @@
 //
 // Codex and Claude Code can pause a running turn for structured questions.
 // Main pushes a bounded request here; dialogs are serialized, cancellable,
-// and answers return only through IPC (never through the chat transcript).
+// and answers return through IPC. Main saves non-secret conversation replies.
 
 (function () {
   const queue = [];
@@ -52,8 +52,8 @@
             : [text];
         });
         try {
-          await respond(requestId, answers, false);
-          return true;
+          const result = await respond(requestId, answers, false);
+          return result?.handled === true;
         } catch (_) {
           return false;
         }
@@ -149,7 +149,24 @@
         }
         answers[String(question.id || '')] = value;
       }
-      await respond(requestId, answers, false);
+      while (!controller.signal.aborted) {
+        const result = await respond(requestId, answers, false);
+        if (result?.handled === true || result?.save_failed !== true) return;
+        // The fallback dialog has already closed, but main has not resumed the
+        // CLI. Retain the collected answers while offering the same save retry.
+        const retry = await uiChoice({
+          title: t('agents.cli_user_input_title'),
+          context: info,
+          message: t('chat.cli_question.send_failed'),
+          choices: [{ id: 'retry', label: t('chat.cli_question.send') }],
+          signal: controller.signal,
+        });
+        if (controller.signal.aborted) return;
+        if (retry !== 'retry') {
+          await respond(requestId, {}, true);
+          return;
+        }
+      }
     } catch (error) {
       try {
         createLogger('local-agent-user-input').warn('structured CLI input response failed', {

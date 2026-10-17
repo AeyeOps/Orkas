@@ -125,6 +125,11 @@ function loadClaimHelpers(nodes: FakePlaceholder[] = []): {
       if (!renderKey) return null;
       return nodes.find((node) => node.dataset.renderKey === renderKey) || null;
     },
+    // `_liveTurnRow` looks up a turn's rows by render-key prefix.
+    querySelectorAll(selector: string) {
+      const prefix = selector.match(/data-render-key\^="([^"]+)"/)?.[1];
+      return prefix ? nodes.filter((node) => (node.dataset.renderKey || '').startsWith(prefix)) : [];
+    },
   };
   const sandbox: any = {
     document: { getElementById: () => container },
@@ -139,6 +144,11 @@ function loadClaimHelpers(nodes: FakePlaceholder[] = []): {
     extractFunction('_messageRenderKey'),
     extractFunction('_phKey'),
     extractFunction('_findRenderNode'),
+    // A terminal record without its segment row adopts its turn's live row
+    // and re-keys it (79f70212d); the claim calls all three helpers.
+    extractFunction('_isTerminalGroupHistoryRecord'),
+    extractFunction('_liveTurnRow'),
+    extractFunction('_stampRenderKey'),
     extractFunction('_claimRenderNodeForMessage'),
     '({ placeholders: _groupPlaceholders, claim: _claimRenderNodeForMessage, key: _phKey });',
   ].join('\n');
@@ -246,6 +256,12 @@ describe('conversation record claim by render key', () => {
     const { claim } = loadClaimHelpers([otherSegment, otherTurn]);
 
     expect(claim('cid-1', { id: 'm1', from: 'commander', turn_id: 'turn-1', seg: 1 })).toBeNull();
+    expect(otherSegment.dataset.finalized).toBeUndefined();
+    expect(otherTurn.dataset.finalized).toBeUndefined();
+
+    // A terminal record may adopt only its own turn's live row, never one
+    // from another turn.
+    expect(claim('cid-1', { id: 'm2', from: 'commander', turn_id: 'turn-3', seg: 0, turn_end: true })).toBeNull();
     expect(otherSegment.dataset.finalized).toBeUndefined();
     expect(otherTurn.dataset.finalized).toBeUndefined();
   });

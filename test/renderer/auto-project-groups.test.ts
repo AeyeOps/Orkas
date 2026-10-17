@@ -26,8 +26,13 @@ function loadAutoTab(options: { projects: Project[] | null; view: string }) {
   };
   Object.defineProperty(list, 'innerHTML', { set() { list.clears += 1; scopes = []; selectedGroup = null; }, get() { return ''; } });
   const elements: Record<string, any> = {
+    'auto-add-btn': {
+      dataset: {}, click() {},
+      addEventListener(name: string, fn: () => void) { if (name === 'click') this.click = fn; },
+    },
     'auto-list': list,
     'auto-empty': { style: {} },
+    'auto-row-project': { hidden: false },
     'auto-header-count': { textContent: '' },
   };
   const sidebarLoads: unknown[] = [];
@@ -64,6 +69,7 @@ function loadAutoTab(options: { projects: Project[] | null; view: string }) {
   };
   context.window.window = context.window;
   vm.createContext(context);
+  vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/icons.js'), 'utf8'), context);
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/auto.js'), 'utf8'), context, { filename: 'auto.js' });
   // Device, sync notice, per-task counts and row markup are owned by other cases.
   vm.runInContext(`
@@ -75,8 +81,10 @@ function loadAutoTab(options: { projects: Project[] | null; view: string }) {
   `, context);
   return {
     context,
+    create: () => elements['auto-add-btn'].click(),
     sidebarLoads,
     scopeNames: () => scopes.map((scope) => /todo-scope-chip-name">([^<]*)</.exec(scope.innerHTML)?.[1] || ''),
+    scopeIcons: () => scopes.map((scope) => /\bis-(folder|globe)\b/.exec(scope.innerHTML)?.[1]),
     activeScope: () => selectedGroup?.dataset.projectId,
     selectScope: (id: string) => scopes.find((scope) => scope.dataset.projectId === id)?.click(),
     clears: () => list.clears,
@@ -84,6 +92,85 @@ function loadAutoTab(options: { projects: Project[] | null; view: string }) {
 }
 
 describe('automation tab and the sidebar project cache', () => {
+  it('initializes each new draft from the currently selected scope without locking its project', async () => {
+    const tab = loadAutoTab({ projects: [{ project_id: 'a', name: 'Alpha' }], view: 'auto' });
+    const opened: any[] = [];
+    tab.context.recordEditor = (opts: any) => opened.push(JSON.parse(JSON.stringify(opts)));
+    vm.runInContext('openAutoTaskDialog = opts => recordEditor(opts)', tab.context);
+    await tab.context.loadAutoList(true);
+    tab.selectScope('a');
+    tab.create();
+    tab.selectScope('');
+    tab.create();
+    tab.selectScope('a');
+    await tab.context.loadAutoList(true);
+    tab.create();
+    expect(opened).toEqual([
+      { initialProjectId: 'a' }, { initialProjectId: '' }, { initialProjectId: 'a' },
+    ]);
+  });
+
+  it('defaults creation to global when the selected automation project is unavailable', async () => {
+    const tab = loadAutoTab({ projects: [{ project_id: 'a', name: 'Alpha' }], view: 'auto' });
+    tab.context.window.orkas.invoke = async () => ({ ok: true, tasks: [{ id: 'orphan', project_id: 'removed' }] });
+    let selected: string | null = null;
+    tab.context.projectPicker = { setOptions() {}, setValue(value: string) { selected = value; }, getValue() { return selected; } };
+    // Keep the real create entry, dialog initialization and scope validation;
+    // unrelated composer, localization and modal painting are covered by E2E.
+    vm.runInContext(`
+      _autoFormMounted = true;
+      _autoProjectSel = projectPicker;
+      _autoResetForm = () => {};
+      _autoRepaintLabels = () => {};
+      _showAutoDialog = () => {};
+    `, tab.context);
+    await tab.context.loadAutoList(true);
+    tab.selectScope('removed');
+    expect(tab.activeScope()).toBe('removed');
+    tab.create();
+    expect(selected).toBe('');
+    expect(vm.runInContext('_autoSelectedProjectId()', tab.context)).toBe('');
+  });
+
+  it.each([
+    ['first visit', null, 't1', 'a'],
+    ['another project selected', [{ project_id: 'a', name: 'Alpha' }], 't2', ''],
+    ['global scope selected', [{ project_id: 'a', name: 'Alpha' }], 't1', 'a'],
+  ] as const)('selects the saved automation scope on %s before opening its editor', async (_name, projects, taskId, scope) => {
+    const tab = loadAutoTab({ projects: projects ? [...projects] : null, view: 'auto' });
+    const opened: any[] = [];
+    tab.context.recordEditor = (task: Task) => opened.push({ task, scope: tab.activeScope() });
+    vm.runInContext('openAutoTaskDialog = ({ task }) => recordEditor(task)', tab.context);
+    if (projects) {
+      await tab.context.loadAutoList(true);
+      tab.selectScope(scope ? '' : 'a');
+    }
+
+    expect(await tab.context.window.openAutoTaskById(taskId)).toBe(true);
+
+    expect(tab.activeScope()).toBe(scope);
+    expect(opened).toEqual([{ task: taskId === 't1' ? { id: 't1', project_id: 'a' } : { id: 't2' }, scope }]);
+    await tab.context.loadAutoList(true);
+    expect(tab.activeScope()).toBe(scope);
+  });
+
+  it('uses the current project assignment and leaves the selection intact for a deleted automation', async () => {
+    const tab = loadAutoTab({ projects: [{ project_id: 'a', name: 'Alpha' }, { project_id: 'b', name: 'Beta' }], view: 'auto' });
+    const opened: Task[] = [];
+    tab.context.recordEditor = (task: Task) => opened.push(task);
+    vm.runInContext('openAutoTaskDialog = ({ task }) => recordEditor(task)', tab.context);
+    await tab.context.loadAutoList(true);
+    tab.selectScope('a');
+    tab.context.window.orkas.invoke = async () => ({ ok: true, tasks: [{ id: 't1', project_id: 'b' }, { id: 't2' }] });
+
+    expect(await tab.context.window.openAutoTaskById('t1')).toBe(true);
+    expect(tab.activeScope()).toBe('b');
+    expect(opened).toEqual([{ id: 't1', project_id: 'b' }]);
+    expect(await tab.context.window.openAutoTaskById('missing')).toBe(false);
+    expect(tab.activeScope()).toBe('b');
+    expect(opened).toHaveLength(1);
+  });
+
   it('groups from the warm project cache without asking the sidebar to repaint', async () => {
     const tab = loadAutoTab({ projects: [{ project_id: 'a', name: 'Alpha' }], view: 'auto' });
 

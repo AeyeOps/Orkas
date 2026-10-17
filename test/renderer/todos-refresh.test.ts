@@ -4,6 +4,7 @@ import path from 'node:path';
 import vm from 'node:vm';
 
 const source = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/todos.js'), 'utf8');
+const projectSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/project-detail.js'), 'utf8');
 
 function harness(invoke: (channel: string, args: any) => Promise<any>) {
   const error = { hidden: true };
@@ -42,7 +43,7 @@ function backlogFixture(options: { gate?: (channel: string, args: any) => Promis
     calls.push(`${channel}:${pid || '-'}`);
     await options.gate?.(channel, args);
     if (channel === 'projects.list') {
-      return { ok: true, projects: [{ project_id: 'b', name: 'Beta' }, { project_id: 'a', name: 'Alpha' }] };
+      return { ok: true, projects: [{ project_id: 'a', name: 'Alpha' }, { project_id: 'b', name: 'Beta' }] };
     }
     if (channel === 'agents.list') return { agents: [] };
     if (channel === 'projects.bindings.list') return { ok: true, agentDetails: [{ agent_id: `agent-${pid}` }] };
@@ -58,6 +59,98 @@ function backlogFixture(options: { gate?: (channel: string, args: any) => Promis
 }
 
 const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe('creating a to-do from the account page', () => {
+  it('follows the selected project on each open but uses global in status grouping', async () => {
+    const h = backlogFixture();
+    await h.context.loadGlobalTodos();
+    const opened: any[] = [];
+    const listeners: Record<string, () => void> = {};
+    h.context.document.getElementById = (id: string) => ({ addEventListener: (_: string, fn: () => void) => { listeners[id] = fn; } });
+    h.context.document.querySelectorAll = () => [];
+    h.context.window.addEventListener = () => {};
+    h.context._bindTodoListActions = () => {};
+    h.context._openProjectTodoEditor = (_: any, context: any) => opened.push(context);
+    h.context._initGlobalTodos();
+    vm.runInContext("_globalTodoActiveScope = 'a'", h.context);
+    listeners['todos-add-btn']();
+    vm.runInContext("_globalTodoMode = 'status'", h.context);
+    listeners['todos-add-btn']();
+    vm.runInContext("_globalTodoMode = 'project'", h.context);
+    listeners['todos-add-btn']();
+    vm.runInContext("_globalTodoActiveScope = 'b'", h.context);
+    listeners['todos-add-btn']();
+    expect(opened.map(context => context.pid)).toEqual(['a', '', 'a', 'b']);
+    expect(opened[0]).toMatchObject({ global: false, agents: [{ agent_id: 'agent-a' }], project: { project_id: 'a', name: 'Alpha' } });
+    expect(opened[0].projects.map((project: any) => project.project_id)).toEqual(['a', 'b']);
+  });
+
+  it.each([null, '', 'removed'])('falls back to global for unavailable selection %s', async (scope) => {
+    const h = backlogFixture();
+    await h.context.loadGlobalTodos();
+    h.context.selection = scope;
+    vm.runInContext(`_globalTodoActiveScope = selection;
+      _globalTodoGroups.push({ project: { project_id: 'removed', name: 'Stale' }, tasks: [], agents: [] });`, h.context);
+    expect(h.context._globalTodoCreateContext()).toMatchObject({ pid: '', global: true });
+  });
+});
+
+describe('todo auto-advance device names', () => {
+  it.each([['', 'throw'], ['p', 'throw'], ['', 'rejected'], ['p', 'rejected']])(
+    'keeps the device name through scope %s loading, regrouping and toggling, retaining it on %s failure', async (pid, failure) => {
+    let config: any = { enabled: true, device_id: 'remote', device_name: '<Office Mac>' };
+    const device = { id: 'local', name: 'Laptop' };
+    let fail = false;
+    const writes: any[] = [], buttons: any[] = [], alerts: string[] = [];
+    const element = () => ({ dataset: {}, attributes: {} as Record<string, string>, innerHTML: '', textContent: '', disabled: false,
+      setAttribute(key: string, value: string) { this.attributes[key] = value; }, addEventListener() {} });
+    const context = vm.createContext({
+      currentView: 'todos', createLogger: () => ({ warn() {} }),
+      document: { readyState: 'loading', addEventListener() {}, createElement: element,
+        querySelectorAll: () => buttons, getElementById: () => null },
+      window: { addEventListener() {}, orkas: { async invoke(channel: string, args: any) {
+        if (channel === 'projects.tasks.list') return { ok: true, tasks: [{ id: 't_one', status: 'todo' }] };
+        if (channel === 'projects.bindings.list') return { ok: true, agentDetails: [] };
+        if (channel === 'agents.list') return { agents: [] };
+        if (channel === 'projects.driver.set') {
+          writes.push(args);
+          if (fail) {
+            if (failure === 'rejected') return { ok: false, config: { enabled: false } };
+            throw new Error('fixture write unavailable');
+          }
+          config = { enabled: args.enabled, ...(args.enabled ? { device_id: device.id, device_name: device.name } : {}) };
+        }
+        return { config, device };
+      } } }, t: String, uiAlert: (message: string) => alerts.push(message),
+      escapeHtml: (value: string) => value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+    });
+    vm.runInContext(projectSource + '\n' + source, context);
+    const group = await context._loadGlobalTodoGroup({ project_id: pid, name: 'Scope' });
+    const byProject = context._renderGlobalTodoDriverToggle(group, false);
+    const byStatus = context._renderGlobalTodoDriverToggle(group, true);
+    buttons.push(byProject, byStatus);
+    expect(byProject.attributes['aria-label']).toBe('project.driver.toggle · <Office Mac>');
+    expect(byStatus.innerHTML).toContain(pid ? 'Scope' : 'todo.global');
+    expect(byStatus.innerHTML).toContain('&lt;Office Mac&gt;');
+    expect(byStatus.innerHTML).not.toContain('<Office Mac>');
+    fail = true;
+    await context._toggleGlobalTodoDriver(group);
+    expect(byProject.attributes['aria-label']).toBe('project.driver.toggle · <Office Mac>');
+    expect(byProject.attributes['aria-pressed']).toBe('true');
+    expect(byProject.disabled).toBe(false);
+    expect(alerts).toEqual(['project.todo.failed']);
+    fail = false;
+    await context._toggleGlobalTodoDriver(group);
+    expect(byProject.attributes['aria-label']).toBe('project.driver.toggle');
+    expect(byStatus.innerHTML).not.toContain('Office Mac');
+    await context._toggleGlobalTodoDriver(group);
+    expect(byProject.attributes['aria-label']).toBe('project.driver.toggle · auto.device_current');
+    expect(byStatus.innerHTML).toContain('auto.device_current');
+    expect(byStatus.innerHTML).not.toContain('Laptop');
+    expect(byProject.attributes['aria-pressed']).toBe('true');
+    expect(writes).toEqual([{ projectId: pid, enabled: false }, { projectId: pid, enabled: false }, { projectId: pid, enabled: true }]);
+  });
+});
 
 describe('global backlog scope refresh', () => {
   it('reloads only the changed project after a tasks-changed push and keeps the other sections', async () => {
@@ -207,7 +300,7 @@ describe('global backlog refresh and recovery', () => {
   it('retains the last complete view when one project fails, then retries without duplicating tasks', async () => {
     let fail = false;
     const h = harness(async (channel, args) => {
-      if (channel === 'projects.list') return { ok: true, projects: [{ project_id: 'b', name: 'Beta' }, { project_id: 'a', name: 'Alpha' }] };
+      if (channel === 'projects.list') return { ok: true, projects: [{ project_id: 'a', name: 'Alpha' }, { project_id: 'b', name: 'Beta' }] };
       if (channel === 'agents.list') return { agents: [] };
       if (channel === 'projects.bindings.list') return { ok: true, agentDetails: [] };
       if (channel === 'projects.tasks.list' && !args.projectId) return { ok: true, tasks: [] };
@@ -250,5 +343,67 @@ describe('global backlog refresh and recovery', () => {
     await pending;
     expect(h.groups()).toEqual([]);
     expect(h.warnings).toEqual([]);
+  });
+});
+
+describe('opening a to-do from a shortcut', () => {
+  function todoRow(tid: string, columnHidden = false) {
+    const classes = new Set<string>();
+    const toggle = { expanded: '', setAttribute: (_: string, value: string) => { toggle.expanded = value; } };
+    const body = { hidden: columnHidden, parentElement: { querySelector: () => toggle } };
+    return {
+      dataset: { tid },
+      classes,
+      toggle,
+      body,
+      scrolled: 0,
+      classList: { add: (name: string) => classes.add(name), remove: (name: string) => classes.delete(name) },
+      closest: (selector: string) => (selector === '.todo-column-body' ? body : null),
+      scrollIntoView() { this.scrolled += 1; },
+    };
+  }
+
+  it.each(['project', 'status'])('switches from %s grouping to the to-do scope, reveals and highlights the row once after loading', async (mode) => {
+    const f = backlogFixture();
+    vm.runInContext(`_globalTodoMode = '${mode}'; _globalTodoActiveScope = 'a'`, f.context);
+    const views: any[] = [];
+    const other = todoRow('a1');
+    const target = todoRow('b1', true);
+    const host = {
+      setAttribute() {},
+      querySelectorAll: (selector: string) => (selector === '.project-todo-item[data-tid]' ? [other, target] : []),
+    };
+    f.context.setView = (...args: any[]) => { views.push(JSON.parse(JSON.stringify(args))); };
+    f.context.document.getElementById = (id: string) => (id === 'todos-error' ? f.error : host);
+
+    f.context.focusTodo('b', 'b1', { entryPoint: 'home' });
+    expect(views).toEqual([['todos', null, { entryPoint: 'home' }]]);
+    expect(vm.runInContext('_globalTodoMode', f.context)).toBe('project');
+    expect(vm.runInContext('_globalTodoActiveScope', f.context)).toBe('b');
+    expect(target.classes.size).toBe(0);
+
+    await f.context.loadGlobalTodos();
+    expect(target.classes.has('is-highlighted')).toBe(true);
+    expect(target.scrolled).toBe(1);
+    expect(target.body.hidden).toBe(false);
+    expect(target.toggle.expanded).toBe('true');
+    expect(other.classes.size).toBe(0);
+
+    // Applied once: a later reload of the page does not jump back to it.
+    target.classes.clear();
+    await f.context.loadGlobalTodos();
+    expect(target.classes.size).toBe(0);
+    expect(target.scrolled).toBe(1);
+  });
+
+  it('just opens the page when the to-do is gone by the time it loads', async () => {
+    const f = backlogFixture();
+    const host = { setAttribute() {}, querySelectorAll: () => [] };
+    f.context.setView = () => {};
+    f.context.document.getElementById = (id: string) => (id === 'todos-error' ? f.error : host);
+    f.context.focusTodo('a', 'missing', { entryPoint: 'home' });
+    await f.context.loadGlobalTodos();
+    expect(f.error.hidden).toBe(true);
+    expect(vm.runInContext('_globalTodoPendingFocus', f.context)).toBe(null);
   });
 });

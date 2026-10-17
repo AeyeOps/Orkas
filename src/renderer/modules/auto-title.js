@@ -20,7 +20,10 @@ const _AUTO_TITLE_ZH_FILLER = /^(帮我看一下|可不可以|帮我看下|帮�
 const _AUTO_TITLE_EN_FILLER = /^(could you|would you|can you|help me|i'?d like to|i want to|please)\s+/i;
 // Half-width display units, not characters: counting characters cut a CJK
 // title at twice the rendered width of a Latin one. Mirrors TITLE_MAX_UNITS.
-const _AUTO_TITLE_MAX_UNITS = 50;
+const _AUTO_TITLE_MAX_UNITS = 100;
+// Mirrors CONVERSATION_TITLE_MAX_UNITS: the stored-title cap for conversations,
+// wide enough for a full auto title plus its ellipsis.
+const _CONVERSATION_TITLE_MAX_UNITS = _AUTO_TITLE_MAX_UNITS + 1;
 
 function _autoTitleGraphemes(text) {
   try {
@@ -91,6 +94,7 @@ if (typeof module !== 'undefined' && typeof module.exports === 'object') {
     _AUTO_TITLE_ZH_FILLER,
     _AUTO_TITLE_EN_FILLER,
     _AUTO_TITLE_MAX_UNITS,
+    _CONVERSATION_TITLE_MAX_UNITS,
     _truncateTitleToWidth,
   };
 }

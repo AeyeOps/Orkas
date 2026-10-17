@@ -20,6 +20,8 @@ test.describe('localization', () => {
       appPage.locator('html').getAttribute('lang')
     )).toBe('pt-BR');
     await expect(appPage.locator('#agents-btn')).toContainText('Equipe de IA');
+    await expect(appPage.locator('#agents-btn')).toBeVisible();
+    await expect(appPage.locator('#projects-section-toggle')).toHaveAttribute('aria-label', 'Recolher Projetos');
     const portugueseFooter = await appPage.evaluate(() => {
       const sidebar = document.querySelector('.sidebar') as HTMLElement | null;
       const settings = document.querySelector('#settings-btn .sidebar-footer-label') as HTMLElement | null;

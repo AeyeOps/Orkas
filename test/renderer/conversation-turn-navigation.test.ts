@@ -236,14 +236,14 @@ describe('conversation turn navigation', () => {
     expect(sentBeforeInitialPage[0].turnNo).toBe(22);
   });
 
-  it('stores at most one user line and two compact assistant lines', () => {
+  it('stores at most two user lines and five compact assistant lines', () => {
     const turn = turnNav.normalizeTurnDescriptor({
       turn_no: 1,
-      user_preview: '用'.repeat(50),
-      assistant_preview: '答'.repeat(100),
+      user_preview: '用'.repeat(150),
+      assistant_preview: '答'.repeat(300),
     });
-    expect(Array.from(turn.userPreview)).toHaveLength(40);
-    expect(Array.from(turn.assistantPreview)).toHaveLength(80);
+    expect(Array.from(turn.userPreview)).toHaveLength(100);
+    expect(Array.from(turn.assistantPreview)).toHaveLength(240);
     expect(turn.userPreview.endsWith('…')).toBe(true);
     expect(turn.assistantPreview.endsWith('…')).toBe(true);
   });
@@ -435,8 +435,8 @@ describe('conversation turn navigation', () => {
     expect(styleSource).toContain('left: 6.5px');
     expect(styleSource).toContain('border-radius: 99px');
     expect(styleSource).toMatch(/\.chat-turn-nav-marker::before\s*\{[^}]*height: 2px;/s);
-    expect(styleSource).toContain('width: clamp(200px, 26cqw, 260px)');
-    expect(styleSource).toContain('-webkit-line-clamp: 1');
-    expect(styleSource).toContain('-webkit-line-clamp: 2');
+    expect(styleSource).toContain('width: clamp(260px, 38cqw, 420px)');
+    expect(styleSource).toMatch(/\.chat-turn-nav-preview-title\s*\{[^}]*-webkit-line-clamp: 2;/s);
+    expect(styleSource).toMatch(/\.chat-turn-nav-preview-body\s*\{[^}]*-webkit-line-clamp: 5;/s);
   });
 });

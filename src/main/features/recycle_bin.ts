@@ -15,6 +15,7 @@ import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
+import { Mutex } from 'async-mutex';
 import { createLogger } from '../logger';
 import { projectMetaFile, userCloudRoot, userRecycleDir, userSyncRecycleDir } from '../paths';
 import {
@@ -701,9 +702,60 @@ async function autoTaskTitle(uid: string, batchId: string | undefined, taskId: s
     batchId,
     pid ? `cloud/projects/${pid}/auto_tasks/${taskId}/config.json` : `cloud/auto_tasks/${taskId}/config.json`,
   );
+  return autoTaskConfigTitle(cfg, taskId);
+}
+
+function autoTaskConfigTitle(cfg: Record<string, any> | null, taskId: string): string {
   return titleFromJson(cfg, ['title'])
     || cleanTitle(typeof cfg?.content === 'string' ? cfg.content.split(/\r?\n/, 1)[0] : '')
     || taskId;
+}
+
+async function autoTaskDisplayItem(
+  uid: string,
+  batchId: string | undefined,
+  metadata: SyncRecycleMetadata | undefined,
+  relPath: string,
+  cfg: Record<string, any> | null,
+  projectTitles: Map<string, Promise<string>>,
+): Promise<RecycleDisplayItem> {
+  const taskId = autoTaskRootDeletedId(relPath)!;
+  const project = projectAutoTaskConfigInfo(relPath);
+  const pid = project?.pid || (safeId(cfg?.project_id) ? cfg!.project_id : '');
+  if (pid && !projectTitles.has(pid)) {
+    projectTitles.set(pid, projectTitle(uid, batchId, metadata, pid));
+  }
+  const detail = pid ? await projectTitles.get(pid) : undefined;
+  return {
+    category: 'auto_task', id: taskId, path: relPath,
+    title: autoTaskConfigTitle(cfg, taskId),
+    ...(detail ? { detail } : {}),
+  };
+}
+
+async function refreshLegacyAutoTaskDisplay(uid: string, batch: SyncRecycleBatch): Promise<void> {
+  if (!batch.display_items?.some(item => item.category === 'auto_task')) return;
+  const configs = new Map<string, string>();
+  for (const item of batch.items) {
+    const taskId = autoTaskRootDeletedId(item.path);
+    if (taskId) configs.set(taskId, item.path);
+  }
+  const projectTitles = new Map<string, Promise<string>>();
+  for (const item of batch.display_items || []) {
+    if (item.category !== 'auto_task') continue;
+    const taskId = item.id || autoTaskRootDeletedId(item.path || '') || '';
+    const relPath = configs.get(taskId);
+    if (!relPath) continue;
+    const project = projectAutoTaskConfigInfo(relPath);
+    if (item.title !== taskId && item.path === relPath && (!project || item.detail)) continue;
+    // Repair display metadata only from the snapshot: live tasks may have
+    // changed since deletion. Keep a saved name if the archive is unavailable.
+    const cfg = parseJsonText(await readRecycleText(uid, batch.id, relPath));
+    const updated = await autoTaskDisplayItem(uid, batch.id, batch.metadata, relPath, cfg, projectTitles);
+    item.path = relPath;
+    if (updated.title !== taskId) item.title = updated.title;
+    if (updated.detail) item.detail = updated.detail;
+  }
 }
 
 async function agentTitle(uid: string, batchId: string | undefined, agentId: string): Promise<string> {
@@ -829,6 +881,8 @@ async function buildRecycleDisplayItems(
   const editConversationRoots = new Map<string, { kind: 'agent' | 'skill'; id: string }>();
   const projectRoots = new Set<string>();
   const taskRoots = new Set<string>();
+  const taskConfigs = new Set<string>();
+  const taskProjectTitles = new Map<string, Promise<string>>();
   const agentRoots = new Set<string>();
   const skillRoots = new Set<string>();
   const appRoots = new Set<string>();
@@ -861,7 +915,10 @@ async function buildRecycleDisplayItems(
     const pid = projectRootDeletedId(relPath);
     if (pid) projectRoots.add(pid);
     const taskId = autoTaskRootDeletedId(relPath);
-    if (taskId) taskRoots.add(taskId);
+    if (taskId) {
+      taskRoots.add(taskId);
+      taskConfigs.add(relPath);
+    }
     const agentId = /^cloud\/agents\/([^/]+)\/agent\.json$/.exec(relPath)?.[1] || '';
     if (safeId(agentId)) agentRoots.add(agentId);
     const skillId = /^cloud\/skills\/([^/]+)\/SKILL\.md$/.exec(relPath)?.[1] || '';
@@ -924,13 +981,9 @@ async function buildRecycleDisplayItems(
       title: await projectTitle(uid, batchId, metadata, pid),
     });
   }
-  for (const taskId of taskRoots) {
-    add({
-      category: 'auto_task',
-      id: taskId,
-      path: `cloud/auto_tasks/${taskId}/config.json`,
-      title: await autoTaskTitle(uid, batchId, taskId),
-    });
+  for (const relPath of taskConfigs) {
+    const cfg = await readDisplayJson(uid, batchId, relPath);
+    add(await autoTaskDisplayItem(uid, batchId, metadata, relPath, cfg, taskProjectTitles));
   }
   for (const agentId of agentRoots) {
     add({
@@ -1575,6 +1628,8 @@ async function readBatch(uid: string, batchId: string): Promise<SyncRecycleBatch
         batch.label,
       );
       if (displayItems.length) batch.display_items = displayItems;
+    } else {
+      await refreshLegacyAutoTaskDisplay(uid, batch);
     }
     return batch;
   } catch (err: any) {
@@ -1948,6 +2003,47 @@ export async function listRecycleBatches(uid: string): Promise<SyncRecycleBatch[
   return batches;
 }
 
+const editRetentionLocks = new Map<string, Mutex>();
+/** Restore and permanent cleanup must not observe each other's partial ownership. */
+export function withEditSnapshotRetention<T>(uid: string, action: () => Promise<T>): Promise<T> {
+  let lock = editRetentionLocks.get(uid);
+  if (!lock) { lock = new Mutex(); editRetentionLocks.set(uid, lock); }
+  return lock.runExclusive(action);
+}
+
+/** Strict ownership inventory: a partial or unreadable archive postpones cleanup. */
+export async function retainedEditConversationIds(uid: string): Promise<Set<string>> {
+  await migrateLegacySyncRecycle(uid);
+  try {
+    const legacy = await fsp.readdir(userSyncRecycleDir(uid), { withFileTypes: true });
+    if (legacy.some(entry => entry.isDirectory() || entry.isSymbolicLink())) throw new Error('pending recycle migration');
+  } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  const ids = new Set<string>();
+  let entries: fs.Dirent[];
+  try { entries = await fsp.readdir(userRecycleDir(uid), { withFileTypes: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return ids; throw error; }
+  for (const entry of entries) {
+    if (entry.isSymbolicLink()) throw new Error('unsafe recycle entry');
+    if (!entry.isDirectory()) continue;
+    const file = batchMetaFile(uid, entry.name);
+    await assertLocalImportTarget(userRecycleDir(uid), file);
+    const raw = JSON.parse(await fsp.readFile(file, 'utf8'));
+    const batch = normalizeBatch(raw);
+    if (!batch || !Array.isArray(raw.items) || batch.items.length !== raw.items.length) throw new Error('incomplete recycle metadata');
+    if (raw.metadata?.chat_index_rows && (!Array.isArray(raw.metadata.chat_index_rows)
+      || raw.metadata.chat_index_rows.length !== (batch.metadata?.chat_index_rows || []).length)) throw new Error('invalid recycle ownership');
+    for (const row of batch.metadata?.chat_index_rows || []) {
+      if (safeId(row.conversation_id)) ids.add(row.conversation_id);
+    }
+    for (const item of batch.items) {
+      const cid = chatCidFromRelPath(item.path)
+        || /^cloud\/(?:chat_attachments|chat_artifacts)\/([^/]+)(?:\/|$)/.exec(item.path)?.[1];
+      if (cid && safeId(cid)) ids.add(cid);
+    }
+  }
+  return ids;
+}
+
 export async function deleteRecycleBatch(uid: string, batchId: string): Promise<{ deleted: boolean }> {
   await migrateLegacySyncRecycle(uid);
   const batch = await readBatch(uid, batchId);
@@ -1959,7 +2055,8 @@ export async function deleteRecycleBatch(uid: string, batchId: string): Promise<
     return { deleted: false };
   }
   try {
-    await fsp.rm(batchDir(uid, batchId), { recursive: true, force: true });
+    await withEditSnapshotRetention(uid, () => fsp.rm(batchDir(uid, batchId), { recursive: true, force: true }));
+    await (await import('./saved_apps')).cleanupEditSnapshots(uid);
     log.info('deleted recycle batch', {
       user_id: maskId(uid),
       ...logRecycleBatchRef(batch),
@@ -1975,7 +2072,11 @@ export async function deleteRecycleBatch(uid: string, batchId: string): Promise<
   }
 }
 
-export async function restoreRecycleBatch(
+export function restoreRecycleBatch(uid: string, batchId: string) {
+  return withEditSnapshotRetention(uid, () => restoreBatch(uid, batchId));
+}
+
+async function restoreBatch(
   uid: string,
   batchId: string,
 ): Promise<{

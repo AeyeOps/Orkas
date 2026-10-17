@@ -48,7 +48,7 @@ function loadMathBridge({ failLoads = 0 } = {}) {
 describe('renderer MathJax lazy loading', () => {
   it('does not retain intermediate stream versions in the session HTML cache', async () => {
     const { context, warn } = loadMathBridge();
-    context.document.createElement = () => ({ style: {}, innerHTML: '', parentElement: null });
+    context.document.createElement = () => ({ dataset: {}, style: {}, innerHTML: '', parentElement: null });
     context.window.MathJax.typesetPromise = async () => {};
     await context.typesetMathHtml('$stable$');
     for (let i = 0; i < 180; i++) await context.typesetMathHtml(`$x+${i}$`, { cache: false });
@@ -60,7 +60,7 @@ describe('renderer MathJax lazy loading', () => {
     const { context, warn } = loadMathBridge();
     const retained = new Set();
     const mounted = new Set();
-    context.document.createElement = () => ({ style: {}, innerHTML: '', parentElement: null });
+    context.document.createElement = () => ({ dataset: {}, style: {}, innerHTML: '', parentElement: null });
     context.document.body = {
       appendChild(host: any) { mounted.add(host); host.parentElement = this; },
       removeChild(host: any) { mounted.delete(host); host.parentElement = null; },

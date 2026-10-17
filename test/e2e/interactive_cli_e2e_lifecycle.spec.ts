@@ -5,7 +5,6 @@ const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
 function interactiveCommand(): string {
   const script = [
-    "process.stdout.write('Enter password: ');",
     "let input = '';",
     'let settle = null;',
     "process.stdin.on('data', chunk => {",
@@ -20,9 +19,12 @@ function interactiveCommand(): string {
   ].join('');
   if (process.platform === 'win32') {
     const quote = (value: string) => `'${value.replace(/'/g, "''")}'`;
-    return `& ${quote(TEST_NODE)} -e ${quote(script)}`;
+    return `[Console]::Write('Enter password: '); & ${quote(TEST_NODE)} -e ${quote(script)}`;
   }
-  return `${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
+  // This case owns inference stopping at a known input prompt. Emit the
+  // fixture prompt before cold Node startup; the real child still owns
+  // stdin, duplicate-submit detection, exit and sensitive-output redaction.
+  return `printf '%s' 'Enter password: '; exec ${JSON.stringify(TEST_NODE)} -e ${JSON.stringify(script)}`;
 }
 
 test.describe('interactive CLI lifecycle', () => {
@@ -64,9 +66,9 @@ test.describe('interactive CLI lifecycle', () => {
     await page.locator(`#conversation-list .conv-item[data-cid="${other.conversation.conversation_id}"]`).click();
     await expect(page.locator('#chat-header-title')).toHaveText('Unrelated E2E task');
     await expect(card).toHaveCount(0);
-    const waiting = await modelOrkas.invoke<{ sessions: Array<{ status: string }> }>('interactiveCli.list');
+    const waiting = await modelOrkas.invoke<{ sessions: Array<{ status: string; prompt_kind?: string }> }>('interactiveCli.list');
     expect(waiting.sessions).toHaveLength(1);
-    expect(waiting.sessions[0].status).toBe('running');
+    expect(waiting.sessions[0]).toMatchObject({ status: 'running', prompt_kind: 'secret' });
     await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
     await expect(card).toBeVisible();
     await expect(input).toHaveValue('secret-code-42');
@@ -96,6 +98,7 @@ test.describe('interactive CLI lifecycle', () => {
     // The user-input boundary ends inference mechanically without a synthesis.
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
     expect(modelOrkas.modelRequests).toHaveLength(2);
+    await expect(page.locator('#chat-history')).not.toContainText('E2E interactive CLI session finished.');
     const interactiveTool = expect.objectContaining({
       function: expect.objectContaining({ name: 'interactive_cli' }),
     });

@@ -61,6 +61,13 @@ function _composerRecipientForTarget(target) {
 
 function _composerRecipientUsesExternalAgent(target) {
   if (typeof _agentsCache === 'undefined' || !Array.isArray(_agentsCache)) return false;
+  // A planned send (D29) is split by a model call even when every mentioned
+  // actor is a CLI agent, so the model choice still applies.
+  if (target !== 'auto' && typeof _composerSendIsPlanned === 'function'
+      && typeof _composerRecipientInput === 'function' && typeof composerText === 'function') {
+    const input = _composerRecipientInput(target);
+    if (input && _composerSendIsPlanned(composerText(input) || '', target)) return false;
+  }
   const preview = target !== 'auto' && _COMPOSER_RECIPIENT_TARGETS.includes(target)
     && typeof _mentionPreviewRecipients === 'function'
     ? _mentionPreviewRecipients(target)

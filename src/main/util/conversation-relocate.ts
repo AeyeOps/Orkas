@@ -436,7 +436,21 @@ function _unresolvedByCid(uid: string, cid: string): UnresolvedRelocation {
 }
 
 export function matchesUnresolvedRelocation(unresolved: UnresolvedRelocation[], relPath: string): boolean {
-  return unresolved.some(item => item.exact.includes(relPath) || item.prefixes.some(prefix => relPath.startsWith(prefix)));
+  return unresolvedRelocationMatcher(unresolved)(relPath);
+}
+
+/** Build the matcher once per sync check: it runs against every disk, remote
+ * and index path. A record's recorded paths normally all name its
+ * conversation; when they do, a path without that id is skipped before its
+ * lists are consulted, which cannot change the answer. */
+export function unresolvedRelocationMatcher(unresolved: UnresolvedRelocation[]): (relPath: string) => boolean {
+  const records = unresolved.map((item) => ({
+    gate: item.cid && [...item.exact, ...item.prefixes].every((value) => value.includes(item.cid)) ? item.cid : '',
+    exact: new Set(item.exact),
+    prefixes: item.prefixes,
+  }));
+  return (relPath) => records.some((record) => (!record.gate || relPath.includes(record.gate))
+    && (record.exact.has(relPath) || record.prefixes.some((prefix) => relPath.startsWith(prefix))));
 }
 
 /** Durable sync intents survive disabled sync and repeated process restarts.

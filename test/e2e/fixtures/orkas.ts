@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import type { AddressInfo } from 'node:net';
 import AdmZip from 'adm-zip';
+import { estimateTextTokens } from '../../../src/core-agent/src/agent/session';
 import { BackgroundServices } from './background-services';
 import { closeElectronFixture, requestElectronQuit } from './electron-cleanup';
 import { ownFixtureServer } from './server-cleanup';
@@ -32,10 +33,9 @@ const PC_ROOT = path.resolve(__dirname, '../../..');
 // value is a fixture UID; it does not create an official account or session.
 const LOCAL_USER_ID = 'account-e2e';
 const { collectLogFiles } = require('./electron-log-files.cjs') as { collectLogFiles: (root: string) => string };
-/** Evidence files read per model round in the context-compaction scenario.
- *  Four ~11.2K-token results stay well under the per-round inline allowance,
- *  so the batch builds context instead of spilling to disk. */
-const CONTEXT_SOURCE_READS_PER_ROUND = 4;
+/** One read per round lets the runtime compact before admitting more evidence;
+ * parallel read-budget rejection is covered by the owning deterministic cases. */
+const CONTEXT_SOURCE_READS_PER_ROUND = 1;
 const E2E_PNG_B64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==';
 const E2E_MP4_BYTES = Buffer.from([
@@ -48,6 +48,8 @@ const E2E_MP4_BYTES = Buffer.from([
 ]);
 
 type OrkasOptions = {
+  /** Opt in only for journeys that require an activatable native owner. */
+  nativeWindowVisible?: boolean;
   /** Exercise native capture on machines/evaluators without GPU compositing. */
   softwareRendering?: boolean;
   captureRendererErrorWindows?: boolean;
@@ -79,6 +81,7 @@ export type CliStubInvocation = {
   model?: string;
   effort?: string;
   toolExecuted?: boolean;
+  questionAnswers?: Record<string, unknown>;
   steers?: Array<{ id: string | null; text: string; localImages: string[] }>;
 };
 
@@ -89,6 +92,8 @@ export type CliStubState = {
   invocations: CliStubInvocation[];
   modelListCalls: number;
   modelListResponses: number;
+  codexResumeHangs?: number;
+  codexThreadRequests?: Array<{ method: string; pid: number }>;
 };
 
 type ModelStubMode = 'success' | 'refusal' | 'http-error' | 'auth-error' | 'model-not-open' | 'slow' | 'very-slow' | 'controlled-slow' | 'truncated';
@@ -106,6 +111,7 @@ type ModelToolScenario =
   }
   | { kind: 'connector'; connectorId: string }
   | { kind: 'agent-authoring'; finalText: string }
+  | { kind: 'saved-tasks'; next: number; projectId: string; finalText: string }
   | {
     kind: 'create-pdf';
     sourceType: 'markdown' | 'html';
@@ -475,7 +481,7 @@ if (args.includes('--version') || args[0] === 'version') {
   process.exit(0);
 }
 if (args.includes('--help')) {
-  process.stdout.write('Usage: claude --model <model> --effort <level>\n');
+  process.stdout.write('Usage: claude --bare --model <model> --effort <level>\n');
   process.exit(0);
 }
 const statePath = process.env.ORKAS_E2E_CLI_STATE;
@@ -504,10 +510,18 @@ const concreteModels = {
 const concreteModel = concreteModels[requestedModel] || requestedModel || 'claude-sonnet-4-6';
 const input = readline.createInterface({ input: process.stdin });
 let handled = false;
+let questionInvocation = -1;
 input.on('line', line => {
-  if (handled) return;
   let message;
   try { message = JSON.parse(line); } catch { return; }
+  if (message.type === 'control_response' && message.response?.request_id === 'native-question' && questionInvocation >= 0) {
+    const state = readState();
+    state.invocations[questionInvocation].questionAnswers = message.response.response.updatedInput?.answers;
+    writeState(state);
+    send({ type: 'result', subtype: 'success', result: 'E2E_CLI_QUESTION_CONTINUED' });
+    return;
+  }
+  if (handled) return;
   if (message.type === 'control_request' && message.request?.subtype === 'list_models') {
     send({ type: 'control_response', response: {
       subtype: 'success',
@@ -541,6 +555,41 @@ input.on('line', line => {
   });
   writeState(state);
   send({ type: 'system', subtype: 'init', session_id: sessionId });
+  if (prompt.includes('E2E_CLAUDE_STREAM_BODY')) {
+    const id = 'claude-stream-body';
+    const partial = event => send({ type: 'stream_event', event });
+    partial({ type: 'message_start', message: { id } });
+    partial({ type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: 'Fixture reasoning.' } });
+    send({ type: 'assistant', message: { id, content: [{ type: 'thinking', thinking: 'Fixture reasoning.' }] } });
+    partial({ type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } });
+    partial({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: '## Report\n\nFirst paragraph.' } });
+    let stage = 0;
+    const timer = setInterval(() => {
+      let released = 0;
+      try { released = Number(fs.readFileSync(statePath + '.claude-stream-stage', 'utf8')); } catch {}
+      if (stage < 1 && released >= 1) {
+        stage = 1;
+        partial({ type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text: '\n\nSecond paragraph.' } });
+      }
+      if (stage < 2 && released >= 2) {
+        stage = 2;
+        clearInterval(timer);
+        const text = '## Report\n\nFirst paragraph.\n\nSecond paragraph.';
+        partial({ type: 'content_block_stop', index: 1 });
+        send({ type: 'assistant', message: { id, content: [{ type: 'text', text }] } });
+        send({ type: 'result', subtype: 'success', result: text });
+      }
+    }, 25);
+    return;
+  }
+  if (prompt.includes('E2E_CLI_NATIVE_QUESTION')) {
+    questionInvocation = state.invocations.length - 1;
+    send({ type: 'control_request', request_id: 'native-question', request: {
+      subtype: 'can_use_tool', tool_name: 'AskUserQuestion', tool_use_id: 'native-question-tool',
+      input: { questions: [{ question: 'Which scope?', header: 'Scope', options: [{ label: 'Current' }, { label: 'All' }] }] },
+    } });
+    return;
+  }
   send({
     type: 'assistant', session_id: sessionId,
     message: {
@@ -607,6 +656,14 @@ input.on('line', line => {
     send({ id: message.id, result: { userAgent: 'orkas-e2e-codex' } });
     return;
   }
+  if (message.method === 'account/read') {
+    send({ id: message.id, result: { account: { type: 'chatgpt' } } });
+    return;
+  }
+  if (message.method === 'config/read') {
+    send({ id: message.id, result: { config: { model: 'gpt-e2e-default', model_reasoning_effort: 'low' } } });
+    return;
+  }
   if (message.method === 'model/list') {
     const state = readState();
     state.modelListCalls += 1;
@@ -660,6 +717,13 @@ input.on('line', line => {
   }
   if (message.method === 'thread/start' || message.method === 'thread/resume') {
     const state = readState();
+    state.codexThreadRequests = state.codexThreadRequests || [];
+    state.codexThreadRequests.push({ method: message.method, pid: process.pid });
+    if (message.method === 'thread/resume' && state.codexResumeHangs > 0) {
+      state.codexResumeHangs -= 1;
+      writeState(state);
+      return;
+    }
     resumedThreadId = message.method === 'thread/resume'
       ? String(message.params?.threadId || '')
       : '';
@@ -686,6 +750,13 @@ input.on('line', line => {
     send({ method: 'turn/started', params: {
       threadId, turn: { id: turnId, status: 'inProgress' },
     } });
+    if (prompt.includes('E2E_CLI_NATIVE_QUESTION')) {
+      send({ id: 'native-question', method: 'item/tool/requestUserInput', params: {
+        threadId, turnId, itemId: 'native-question', isBlocking: true,
+        questions: [{ id: 'scope', question: 'Which scope?', header: 'Scope', options: [{ label: 'Current' }, { label: 'All' }] }],
+      } });
+      return;
+    }
     if (prompt.includes('E2E_CODEX_ASYNC_QUESTION')) {
       send({ method: 'item/completed', params: { threadId, turnId, item: {
         id: 'async-question', type: 'agentMessage', delivery: 'async', text: 'Which scope?',
@@ -693,6 +764,13 @@ input.on('line', line => {
       } } });
     }
     if (!prompt.includes('E2E_CODEX_SEND_NOW_ACTIVE')) finish('E2E_CODEX_DEFAULT_OK');
+    return;
+  }
+  if (message.id === 'native-question' && message.result) {
+    const state = readState();
+    state.invocations[invocationIndex].questionAnswers = message.result.answers;
+    writeState(state);
+    finish('E2E_CLI_QUESTION_CONTINUED');
     return;
   }
   if (message.method === 'turn/steer') {
@@ -734,6 +812,40 @@ function seedWorkspace(workspaceRoot: string, seedLanguage: OrkasOptions['seedLa
 }
 
 
+/** First line of the D29 dispatch-planner prompt (PC/src/main/prompts/dispatch_planner.md). */
+const DISPATCH_PLANNER_MARKER = 'You split one user message from a group chat into tasks';
+
+/** Concatenated text of every message in a chat-completions request. */
+function requestPromptText(requestBody: Record<string, unknown>): string {
+  const messages = Array.isArray(requestBody.messages) ? requestBody.messages : [];
+  return messages.map((message) => {
+    const content = (message as { content?: unknown })?.content;
+    if (typeof content === 'string') return content;
+    return Array.isArray(content)
+      ? content.map((part) => String((part as { text?: unknown })?.text ?? '')).join('')
+      : '';
+  }).join('\n');
+}
+
+/** Deterministic stand-in for the D29 dispatch planner: every mentioned actor
+ * gets the whole message as its part, in mention order, each waiting for the
+ * previous one. Tests that need another split queue it explicitly. */
+function defaultE2eDispatchPlan(prompt: string): string {
+  const keys = prompt.split('\n')
+    .map((line) => { try { return JSON.parse(line); } catch { return null; } })
+    .filter((row) => row && typeof row.key === 'string' && row.mentioned === true)
+    .map((row) => String(row.key));
+  const message = (/<user-message>\n([\s\S]*?)\n<\/user-message>/.exec(prompt)?.[1] || '').trim() || 'do your part';
+  return JSON.stringify({
+    tasks: keys.map((key, i) => ({ key: `t${i + 1}`, assignee: key, part: message, after: i ? [`t${i}`] : [] })),
+    references: [],
+    question: null,
+  });
+}
+
+export const E2E_MODEL_CONTEXT_WINDOW = 64_000;
+export const E2E_MODEL_MAX_OUTPUT_TOKENS = 8_192;
+
 export class OrkasTestApp {
   readonly root: string;
   readonly workspaceRoot: string;
@@ -768,6 +880,11 @@ export class OrkasTestApp {
   }> = [];
   readonly marketplaceRequests: Array<{ path: string; body: Record<string, unknown> }> = [];
   readonly apiRequests: Array<{ method: string; path: string; channel: string }> = [];
+  readonly apiResponses: Array<{ method: string; path: string; status: number }> = [];
+  private expectedApiFailures: Array<{ method: string; path: string; status: number }> = [];
+  expectApiFailure(method: string, route: string, status: number): void {
+    this.expectedApiFailures.push({ method, path: route, status });
+  }
   compactionRequestAborts = 0;
   imageTaskPolls = 0;
   videoTaskPolls = 0;
@@ -813,6 +930,7 @@ export class OrkasTestApp {
   private readonly tracePaths: string[] = [];
   private traceNumber = 0;
   private readonly appClosePromises = new WeakMap<ElectronApplication, Promise<void>>();
+  private readonly appTraceStops = new WeakMap<ElectronApplication, Promise<void>>();
   private activeUserId: string;
   private readonly configuredModelSeededUsers = new Set<string>();
   private modelToolScenario: ModelToolScenario | null = null;
@@ -823,6 +941,12 @@ export class OrkasTestApp {
   private pendingCommentaryReply: (() => void) | null = null;
   commentaryStage = 0;
   private modelTextReplies: string[] = [];
+  private dispatchPlanReplies: string[] = [];
+  /** D29 dispatch-planner calls. Kept out of `modelRequests`, which counts
+   * actor turns. */
+  readonly dispatchPlannerRequests: Array<Record<string, unknown>> = [];
+  /** Set by `holdDispatchPlan()`; `reply` is the parked planner answer. */
+  private dispatchPlanHold: { reply: (() => void) | null } | null = null;
   private libraryImageDescriptionReplies: string[] = [];
 
   constructor(testInfo: TestInfo, private readonly options: OrkasOptions = {}) {
@@ -901,7 +1025,7 @@ export class OrkasTestApp {
       ...process.env,
       ORKAS_WORKSPACE_ROOT: this.workspaceRoot,
       ORKAS_E2E_USER_DATA_DIR: this.userDataRoot,
-      ORKAS_E2E_HIDE_WINDOW: process.env.PWDEBUG === '1' || process.env.ORKAS_E2E_SHOW_WINDOW === '1' ? '0' : '1',
+      ORKAS_E2E_HIDE_WINDOW: this.options.nativeWindowVisible || process.env.PWDEBUG === '1' || process.env.ORKAS_E2E_SHOW_WINDOW === '1' ? '0' : '1',
       CORE_AGENT_AUTH_DIR: this.authRoot,
       ORKAS_API_BASE_URL: this.apiBaseUrl,
       ORKAS_E2E_MARKETPLACE_API_BASE: this.marketplaceStub ? this.apiBaseUrl : '',
@@ -912,6 +1036,8 @@ export class OrkasTestApp {
       no_proxy: 'localhost,127.0.0.1,::1',
       TZ: 'UTC',
     };
+    if (this.appLocale) environment.ORKAS_E2E_SYSTEM_LOCALE = this.appLocale;
+    else delete environment.ORKAS_E2E_SYSTEM_LOCALE;
     // Automation shells can use Electron as their Node runtime and leak this
     // switch into child processes. Playwright must launch Electron in app mode.
     delete environment.ELECTRON_RUN_AS_NODE;
@@ -954,7 +1080,7 @@ export class OrkasTestApp {
       ...(process.platform === 'darwin' ? ['-AppleLanguages', `(${this.appLocale})`] : []),
     ] : [];
     const app = await electron.launch({
-      args: [...(this.options.softwareRendering ? ['--disable-gpu'] : []), ...(this.options.captureRendererErrorWindows ? ['--require', path.join(__dirname, 'preview-recovery-preload.cjs')] : []), '.', ...localeArgs],
+      args: [...(this.options.softwareRendering ? ['--disable-gpu'] : []), ...(this.options.captureRendererErrorWindows ? ['--require', path.join(__dirname, 'preview-recovery-preload.cjs')] : []), ...(this.appLocale ? ['--require', path.join(__dirname, 'system-locale-preload.cjs')] : []), '.', ...localeArgs],
       cwd: PC_ROOT,
       env: environment,
       timeout: 30_000,
@@ -1025,8 +1151,8 @@ export class OrkasTestApp {
           baseUrl: `${this.apiBaseUrl}/v1`,
           model: 'e2e-chat-model',
           apiKey: 'sk-e2e-local-model-xxxxxxxx',
-          contextWindow: 64_000,
-          maxTokens: 8_192,
+          contextWindow: E2E_MODEL_CONTEXT_WINDOW,
+          maxTokens: E2E_MODEL_MAX_OUTPUT_TOKENS,
         });
         await page.evaluate(async () => {
           if (typeof (window as any).refreshModelGuard === 'function') {
@@ -1193,6 +1319,31 @@ export class OrkasTestApp {
     this.modelTextReplies = replies.slice();
   }
 
+  /** Queue exact planner replies (JSON text) for the next planned sends; when
+   * empty, the stub chains every mentioned actor in mention order. */
+  setDispatchPlanReplies(replies: string[]): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    this.dispatchPlanReplies = replies.slice();
+  }
+
+  /** Park the next planner reply until `releaseDispatchPlan()`, so a test can
+   * act while a planned send is still being split. */
+  holdDispatchPlan(): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    this.dispatchPlanHold = { reply: null };
+  }
+
+  /** True while a held planner request is parked (the send is mid-planning). */
+  get dispatchPlanParked(): boolean {
+    return !!this.dispatchPlanHold?.reply;
+  }
+
+  releaseDispatchPlan(): void {
+    const reply = this.dispatchPlanHold?.reply;
+    this.dispatchPlanHold = null;
+    reply?.();
+  }
+
   setLibraryImageDescriptionReplies(replies: string[]): void {
     if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
     if (!replies.length || replies.some((reply) => !reply.trim())) {
@@ -1218,6 +1369,12 @@ export class OrkasTestApp {
     if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
     this.modelToolScenarioRequestStart = this.modelRequests.length;
     this.modelToolScenario = null;
+  }
+
+  setSavedTasksScenario(projectId: string, finalText: string): void {
+    if (!this.modelStub) throw new Error('The local model stub is not enabled for this fixture');
+    this.modelToolScenarioRequestStart = this.modelRequests.length;
+    this.modelToolScenario = { kind: 'saved-tasks', next: 0, projectId, finalText };
   }
 
   setBashDenyScenario(command: string): void {
@@ -1710,6 +1867,20 @@ export class OrkasTestApp {
       failed = true;
     }
 
+    const unexpectedApiFailures = this.apiResponses.filter(item => {
+      if (item.status < 400) return false;
+      const index = this.expectedApiFailures.findIndex(expected => expected.method === item.method
+        && expected.path === item.path && expected.status === item.status);
+      if (index < 0) return true;
+      this.expectedApiFailures.splice(index, 1);
+      return false;
+    });
+    failed ||= unexpectedApiFailures.length > 0 || this.expectedApiFailures.length > 0;
+    if (failed || process.env.ORKAS_E2E_KEEP_LOGS === '1') {
+      mkdirSync(this.testInfo.outputDir, { recursive: true });
+      writeFileSync(this.testInfo.outputPath('stub-responses.json'), JSON.stringify(this.apiResponses, null, 2));
+    }
+
     if (failed) {
       for (const [index, tracePath] of this.tracePaths.entries()) {
         await this.testInfo.attach(`trace-${index + 1}`, {
@@ -1783,6 +1954,8 @@ export class OrkasTestApp {
         `Renderer page error detected (${unresolvedRendererErrors.length}); see attached Electron diagnostics`,
       );
     }
+    expect(unexpectedApiFailures, 'Public fixture received unexpected failed HTTP responses').toEqual([]);
+    expect(this.expectedApiFailures, 'Expected HTTP failures were not exercised').toEqual([]);
     if (cleanupError) throw cleanupError;
   }
 
@@ -1805,14 +1978,12 @@ export class OrkasTestApp {
     // Relaunch and timeout teardown may overlap. Keep one trace and quit per
     // captured application, including the same failure for every waiting caller.
     const closing = Promise.resolve().then(async () => {
-      const tracePath = this.testInfo.outputPath(`trace-${++this.traceNumber}.zip`);
-      this.tracePaths.push(tracePath);
       try {
         await closeElectronFixture({
           process: () => app.process(),
-          context: () => app.context(),
+          context: () => ({ tracing: { stop: () => this.stopAppTrace(app) } }),
           close: () => requestElectronQuit(app),
-        }, tracePath, {
+        }, '', {
           phase: (phase, outcome) => this.recordCleanupPhase(phase, outcome),
         });
       } finally {
@@ -1824,6 +1995,22 @@ export class OrkasTestApp {
     });
     this.appClosePromises.set(app, closing);
     return closing;
+  }
+
+  /** Export while the browser context exists, before a case confirms native exit. */
+  async prepareForNativeShutdown(): Promise<void> {
+    if (!this.electronApp) throw new Error('Electron is unavailable');
+    await this.stopAppTrace(this.electronApp);
+  }
+
+  private stopAppTrace(app: ElectronApplication): Promise<void> {
+    const existing = this.appTraceStops.get(app);
+    if (existing) return existing;
+    const tracePath = this.testInfo.outputPath(`trace-${++this.traceNumber}.zip`);
+    this.tracePaths.push(tracePath);
+    const stopped = Promise.resolve().then(() => app.context().tracing.stop({ path: tracePath }));
+    this.appTraceStops.set(app, stopped);
+    return stopped;
   }
 
   private async ensureStubServer(): Promise<void> {
@@ -1867,6 +2054,9 @@ export class OrkasTestApp {
         path: requestUrl.pathname,
         channel: String(request.headers['orkas-channel'] || ''),
       });
+      response.on('finish', () => {
+        this.apiResponses.push({ method: request.method || '', path: requestUrl.pathname, status: response.statusCode });
+      });
       const isChat = requestUrl.pathname === '/api/v1/chat/completions';
       const isResponses = requestUrl.pathname === '/api/v1/responses';
       const isClientConfig = requestUrl.pathname === '/api/config/client';
@@ -1885,6 +2075,7 @@ export class OrkasTestApp {
           isChat
           || isResponses
           || isImageCreate
+
           || isGenerationReferenceAuth
           || isGenerationReferenceUpload
           || isGenerationReferenceComplete
@@ -2148,6 +2339,10 @@ export class OrkasTestApp {
           }));
           return;
         }
+        // Measure the wire payload before adding the fixture-only messages
+        // compatibility view, which duplicates Responses input for assertions.
+        const promptTokens = this.modelToolScenario?.kind === 'context-compaction'
+          ? Math.max(1, estimateTextTokens(JSON.stringify(requestBody))) : 12;
         if (isResponses) {
           const input = Array.isArray(requestBody.input) ? requestBody.input : [];
           const messages: Array<Record<string, unknown>> = [];
@@ -2515,7 +2710,7 @@ export class OrkasTestApp {
           {
             ...base,
             choices: [],
-            usage: { prompt_tokens: 12, completion_tokens: 4, total_tokens: 16 },
+            usage: { prompt_tokens: promptTokens, completion_tokens: 4, total_tokens: promptTokens + 4 },
           },
         ];
         const toolCallEvents = (
@@ -2574,7 +2769,7 @@ export class OrkasTestApp {
           {
             ...base,
             choices: [],
-            usage: { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 },
+            usage: { prompt_tokens: promptTokens, completion_tokens: 7, total_tokens: promptTokens + 7 },
           },
         ];
         const advertisedToolNames = new Set(
@@ -2585,6 +2780,22 @@ export class OrkasTestApp {
         const requestToolGroup = (callId: string, group: string): void => {
           finishImmediately(toolCallEvents(callId, 'tool_load', { groups: [group] }));
         };
+
+        if (scenario?.kind === 'saved-tasks') {
+          const calls = [
+            { name: 'auto_tasks', args: { action: 'create', project_id: scenario.projectId, title: 'Nightly review', content: 'Review changes', enabled: false, schedule: { type: 'daily', hour: 0, minute: 0 } } },
+            { name: 'todo_tasks', args: { action: 'create', project: scenario.projectId, content: 'Review release notes' } },
+            { name: 'auto_tasks', args: { action: 'create', title: 'Rejected automation', content: '' } },
+          ];
+          const next = calls[scenario.next];
+          if (!next) finishImmediately(finalTextEvents(scenario.finalText));
+          else if (!advertisedToolNames.has(next.name)) requestToolGroup('load-saved-tasks', next.name === 'auto_tasks' ? 'management.automation' : 'management.projects');
+          else {
+            scenario.next++;
+            finishImmediately(toolCallEvents(`save-task-${scenario.next}`, next.name, next.args));
+          }
+          return;
+        }
 
         // Scoped tool surface (production default): executors like `bash` and
         // `write_file` stay dormant until the model loads their group. When a
@@ -2669,6 +2880,22 @@ export class OrkasTestApp {
         }
 
         const requestText = JSON.stringify(requestBody);
+        if (requestText.includes(DISPATCH_PLANNER_MARKER)) {
+          const index = this.modelRequests.lastIndexOf(requestBody);
+          if (index >= 0) this.modelRequests.splice(index, 1);
+          this.dispatchPlannerRequests.push(requestBody);
+          const plan = this.dispatchPlanReplies.shift() ?? defaultE2eDispatchPlan(requestPromptText(requestBody));
+          const reply = (): void => {
+            // A Stop aborts the planner request; its socket is gone by then.
+            if (!response.destroyed && !response.writableEnded) finishImmediately(finalTextEvents(plan));
+          };
+          if (this.dispatchPlanHold && !this.dispatchPlanHold.reply) {
+            this.dispatchPlanHold.reply = reply;
+            return;
+          }
+          reply();
+          return;
+        }
         if (requestText.includes('Library image-understanding assistant')) {
           const imageDescription = this.libraryImageDescriptionReplies.shift();
           if (imageDescription !== undefined) {
@@ -3128,12 +3355,8 @@ export class OrkasTestApp {
             ].join('\n');
             finishImmediately(finalTextEvents(summary));
           } else if (scenario.nextSourceIndex < scenario.sources.length) {
-            // Read a batch per round rather than one file per round. Reaching
-            // the window-derived compaction trigger takes far more evidence
-            // than a single file can carry (a lone oversized file would spill
-            // to disk instead of building context), and serializing every read
-            // would turn this into a dozen model round-trips. The batch stays
-            // under the per-round inline allowance so nothing spills.
+            // Keep each read below admission limits while the real runtime
+            // accumulates enough evidence to compact between requests.
             const batch = scenario.sources.slice(
               scenario.nextSourceIndex,
               scenario.nextSourceIndex + CONTEXT_SOURCE_READS_PER_ROUND,
@@ -3263,6 +3486,7 @@ export class OrkasTestApp {
     this.controlledModelStream?.releaseChunk();
     this.controlledModelStream?.releaseFinish();
     this.controlledModelStream = null;
+    this.releaseDispatchPlan();
     this.pendingCommentaryReply = null;
     for (const timer of this.modelTimers) clearTimeout(timer);
     this.modelTimers.clear();
@@ -3272,6 +3496,16 @@ export class OrkasTestApp {
   }
 }
 
+// Follow the visible sidebar journey: every navigation entry is always shown.
+export async function openSidebarEntry(page: Page, selector: string): Promise<void> {
+  const entry = page.locator(selector);
+  await expect(entry).toBeVisible();
+  await entry.click();
+  // Apps is lazy-loaded after sidebar navigation. Its public refresh hook is
+  // used by setup/recovery cases; a visible shell alone does not mean it exists.
+  if (selector === '#apps-btn') await page.waitForFunction(() => typeof (window as any).loadSavedApps === 'function');
+}
+
 type OrkasFixtures = {
   orkas: OrkasTestApp;
   appPage: Page;
@@ -3279,6 +3513,7 @@ type OrkasFixtures = {
   marketplaceOrkas: OrkasTestApp;
   cliOrkas: OrkasTestApp;
   connectorOrkas: OrkasTestApp;
+  cliModelOrkas: OrkasTestApp;
   updateOrkas: OrkasTestApp;
   metacognitionOrkas: OrkasTestApp;
 };
@@ -3308,6 +3543,15 @@ export const test = base.extend<OrkasFixtures>({
   },
   marketplaceOrkas: async ({}, use, testInfo) => {
     const app = new OrkasTestApp(testInfo, { marketplaceStub: true });
+    try {
+      await app.launch();
+      await use(app);
+    } finally {
+      await app.dispose();
+    }
+  },
+  cliModelOrkas: async ({}, use, testInfo) => {
+    const app = new OrkasTestApp(testInfo, { cliStub: true, modelStub: true });
     try {
       await app.launch();
       await use(app);

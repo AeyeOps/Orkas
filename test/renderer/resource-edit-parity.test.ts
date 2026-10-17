@@ -24,6 +24,7 @@ function loadRenderer(module: 'agents' | 'skills') {
     escapeHtml: (s: string) => s, renderMarkdownFull: (s: string) => `<p>${s}</p>`,
     normalizeDisplayText: (s: string) => s, pickDesc: (agent: any) => agent.description,
     uiAlert: vi.fn(),
+    renderCliAccountUsage: vi.fn(),
   };
   vm.createContext(context);
   vm.runInContext(fs.readFileSync(path.join(process.cwd(), `src/renderer/modules/${module}.js`), 'utf8'), context);

@@ -4,6 +4,7 @@ import { cpSync, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node
 import { createPackageWithOptions } from '@electron/asar';
 import { expect, test, OrkasTestApp } from './fixtures/orkas';
 import { analyzeWebAppLogs } from './fixtures/web-app-log-analysis';
+import { installEmptyLibrarySearch } from './fixtures/empty-library-search';
 
 const pcRoot = path.resolve(__dirname, '../..');
 let previousKeepLogs: string | undefined;
@@ -35,6 +36,261 @@ test.afterEach(async ({}, info) => {
   if (analysis.requiresReview) console.warn('History E2E log warnings:', JSON.stringify(analysis.findings));
 });
 
+test('updates settled message actions in place when the user changes language', async ({}, info) => {
+  const app = new OrkasTestApp(info, { configuredModel: false });
+  try {
+    await app.launch();
+    const cid = (await app.invoke<any>('conversations.create', { title: 'Localized message actions' })).conversation.conversation_id;
+    await app.electronApp!.evaluate(async (_electron, input) => {
+      const req = (process as any).mainModule.require.bind((process as any).mainModule);
+      (process as any).localeEmbedAttempts = 0;
+      req(`${input.root}/src/main/features/kb_embed.ts`)._setEmbedChannelFactoryForTest(() => {
+        (process as any).localeEmbedAttempts += 1;
+        throw new Error('Real embedding is prohibited in the deterministic locale journey');
+      });
+      const uid = req(`${input.root}/src/main/features/users.ts`).getActiveUserId();
+      const file = req(`${input.root}/src/main/util/project-layout.ts`).conversationMessageReadFile(uid, input.cid);
+      const rows = [
+        { id: 'locale-user', from: 'user', to: ['commander'], ts: '2026-10-15T08:00:00Z', text: 'Keep this question' },
+        { id: 'locale-answer', from: 'commander', to: ['user'], ts: '2026-10-15T08:00:01Z', text: 'Keep this answer' },
+        { id: 'locale-failed', from: 'commander', to: ['user'], ts: '2026-10-15T08:00:02Z', text: 'Fixture failure',
+          failure_kind: 'model_output', failure_code: 'provider_error' },
+      ];
+      req('node:fs').writeFileSync(file, rows.map(row => JSON.stringify(row)).join('\n') + '\n');
+    }, { root: pcRoot, cid });
+    const page = app.page!;
+    await page.evaluate(async cid => {
+      const w = window as any;
+      await w.loadConversations();
+      w.setView('conversation', cid);
+    }, cid);
+    const answer = page.locator('[data-msg-id="locale-answer"]');
+    const quote = answer.locator('.bubble-quote-btn');
+    await expect(quote).toHaveText('Quote');
+    const statusLabels = page.locator(`.conv-item[data-cid="${cid}"] .conv-item-status-label`);
+    await expect(statusLabels).not.toHaveCount(0);
+    for (const label of await statusLabels.all()) await expect(label).toHaveText('Failed');
+    await page.evaluate(cid => {
+      (window as any).localeStatusNodes = [...document.querySelectorAll(
+        `.conv-item[data-cid="${CSS.escape(cid)}"] .conv-item-status-label`,
+      )];
+    }, cid);
+    await quote.focus();
+    await page.evaluate(() => {
+      (window as any).localeActionNodes = [...document.querySelectorAll('#chat-history .bubble-action-btn')];
+    });
+    const actions = [
+      ['quote', 'chat.quote_btn', 'chat.quote_btn_title'],
+      ['copy', 'chat.copy_btn', 'chat.copy_btn_title'],
+      ['select', 'chat.message_select', 'chat.message_select_title'],
+      ['archive', 'chat.archive_btn', 'chat.archive_btn_title'],
+      ['retry', 'chat.retry_btn', 'chat.retry_btn_title'],
+    ];
+    for (const language of ['zh', 'en']) {
+      await page.setViewportSize({ width: language === 'zh' ? 720 : 1200, height: 900 });
+      const table = JSON.parse(readFileSync(path.join(pcRoot, 'src/renderer/locales', `${language}.json`), 'utf8'));
+      await page.evaluate(async lang => { await (window as any).setLang(lang); }, language);
+      await expect(page.locator('html')).toHaveAttribute('lang', language === 'zh' ? 'zh-CN' : 'en');
+      for (const [name, labelKey, titleKey] of actions) {
+        const buttons = page.locator(`#chat-history .bubble-${name}-btn`);
+        const expectedCounts: Record<string, number> = { archive: 1, report: 2, retry: 1 };
+        expect(await buttons.count()).toBe(expectedCounts[name] ?? 3);
+        for (const button of await buttons.all()) {
+          await expect(button).toHaveText(table[labelKey]);
+          await expect(button).toHaveAttribute('title', table[titleKey]);
+        }
+      }
+      for (const label of await statusLabels.all()) await expect(label).toHaveText(table['chat.status.failed_short']);
+      expect(await page.evaluate(cid => (window as any).localeStatusNodes.every((node: Element, index: number) =>
+        node === document.querySelectorAll(`.conv-item[data-cid="${CSS.escape(cid)}"] .conv-item-status-label`)[index]), cid)).toBe(true);
+      await expect(quote).toBeFocused();
+      expect(await page.evaluate(() => (window as any).localeActionNodes.every((node: Element, index: number) =>
+        node === document.querySelectorAll('#chat-history .bubble-action-btn')[index]))).toBe(true);
+      await expect(answer.locator('.chat-bubble')).toContainText('Keep this answer');
+      await page.screenshot({ path: info.outputPath(`settled-actions-${language}.png`) });
+    }
+    await page.evaluate(() => {
+      Object.defineProperty(navigator, 'clipboard', { configurable: true,
+        value: { writeText: async (text: string) => { (window as any).localeCopiedText = text; } } });
+    });
+    const copy = answer.locator('.bubble-copy-btn');
+    await copy.click();
+    await expect(copy).toHaveText('Copied');
+    await page.evaluate(async () => { await (window as any).setLang('zh'); });
+    const chinese = JSON.parse(readFileSync(path.join(pcRoot, 'src/renderer/locales/zh.json'), 'utf8'));
+    await expect(copy).toHaveText(chinese['chat.copy_done']);
+    await expect(copy).toBeEnabled();
+    await expect(copy).toHaveText(chinese['chat.copy_btn']);
+    expect(await page.evaluate(() => (window as any).localeCopiedText)).toBe('Keep this answer');
+    const english = JSON.parse(readFileSync(path.join(pcRoot, 'src/renderer/locales/en.json'), 'utf8'));
+    await page.evaluate(() => {
+      (navigator.clipboard as any).writeText = async () => { throw new Error('Fixture clipboard denial'); };
+    });
+    await copy.click();
+    await expect(copy).toHaveText(chinese['chat.copy_failed']);
+    await page.evaluate(async () => { await (window as any).setLang('en'); });
+    await expect(copy).toHaveText(english['chat.copy_failed']);
+    await expect(copy).toBeEnabled();
+    await expect(copy).toHaveText(english['chat.copy_btn']);
+    expect(await app.electronApp!.evaluate(() => (process as any).localeEmbedAttempts)).toBe(0);
+    expect(app.modelRequests).toHaveLength(0);
+
+  } finally { await app.dispose(); }
+});
+
+test('opens a large settled turn before its process pages and retries without losing segmented events', async ({}, info) => {
+  const app = new OrkasTestApp(info, { configuredModel: false });
+  try {
+    await app.launch();
+    const cid = (await app.invoke<any>('conversations.create', { title: 'Paged process' })).conversation.conversation_id;
+    await app.electronApp!.evaluate(async (_electron, input) => {
+      const req = (process as any).mainModule.require.bind((process as any).mainModule);
+      const uid = req(`${input.root}/src/main/features/users.ts`).getActiveUserId();
+      const file = req(`${input.root}/src/main/util/project-layout.ts`).conversationMessageReadFile(uid, input.cid);
+      const rows = [{ id: 'large-process', from: 'fixture-agent', to: ['user'], turn_id: 'paged-turn', seg: 0,
+        ts: '2026-10-12T08:00:00Z', text: 'Earlier segment', process: [
+          ...Array.from({ length: 1203 }, (_, i) => ({ type: 'progress', text: `Process event ${i}` })),
+          { type: 'event', event: { stream: 'runtime', data: { phase: 'segment_end', duration_ms: 1234 } } },
+        ] }, { id: 'later-process', from: 'fixture-agent', to: ['user'], turn_id: 'paged-turn', seg: 1,
+        ts: '2026-10-12T08:01:00Z', text: 'Complete answer \\(x^2\\)', process: [
+          { type: 'progress', text: 'Continuation event' },
+          { type: 'event', event: { stream: 'runtime', data: { phase: 'end', duration_ms: 2000 } } },
+        ] }];
+      req('node:fs').writeFileSync(file, rows.map((row: unknown) => JSON.stringify(row)).join('\n') + '\n');
+    }, { root: pcRoot, cid });
+    const response = await app.invoke<any>('conversations.history', { cid });
+    expect(Buffer.byteLength(JSON.stringify(response))).toBeLessThan(4096);
+    const page = app.page!;
+    await page.evaluate(async cid => { const w = window as any; await w.loadConversations(); w.setView('conversation', cid); }, cid);
+    const row = page.locator('#chat-history .chat-message').filter({ hasText: 'Complete answer' });
+    await expect(row).toHaveCount(1);
+    await expect(row.locator('mjx-container')).toHaveCount(1);
+    const body = row.locator('.stream-process-body');
+    await expect(body).toBeEmpty();
+    await page.evaluate(() => {
+      const w = window as any;
+      w.processFormula = document.querySelector('#chat-history mjx-container');
+      const original = w.apiFetch;
+      let failOnce = true;
+      w.apiFetch = (url: string, options: unknown) => {
+        if (url.includes('/process?') && failOnce) {
+          failOnce = false;
+          return Promise.resolve({ json: async () => ({ ok: false }) });
+        }
+        return original(url, options);
+      };
+    });
+    await row.locator('.stream-process-summary').click();
+    const more = row.locator('.chat-process-load-more');
+    await expect(more).toHaveClass(/is-error/);
+    await expect(body).toBeEmpty();
+    await more.click();
+    await expect(body).toContainText('Process event 199');
+    await expect(body).not.toContainText('Process event 200');
+    await expect(more).toHaveText(await page.evaluate(() => (window as any).t('sidebar.load_more_conversations')));
+    await expect(more).toHaveAttribute('aria-busy', 'false');
+    await more.scrollIntoViewIfNeeded();
+    await page.mouse.move(0, 0);
+    const button = await more.boundingBox();
+    const bubble = await row.locator('.chat-bubble').boundingBox();
+    if (button && bubble) {
+      const viewport = page.viewportSize()!;
+      const top = Math.max(0, button.y - 50);
+      const left = Math.max(0, bubble.x);
+      await page.screenshot({ path: info.outputPath('process-load-more.png'),
+        clip: { x: left, y: top, width: Math.min(bubble.width, viewport.width - left),
+          height: Math.min(150, viewport.height - top) } });
+    }
+    for (let n = 0; n < 7; n++) {
+      await expect(more).toBeEnabled();
+      await more.click();
+      await expect(more).toBeEnabled();
+    }
+    await expect(body).toContainText('Continuation event');
+    await expect(more).toBeHidden();
+    const events = await body.evaluate(node => [...node.textContent!.matchAll(/Process event (\d+)/g)].map(match => Number(match[1])));
+    expect(events).toEqual(Array.from({ length: 1203 }, (_, n) => n));
+    expect(await page.evaluate(() => (window as any).processFormula.isConnected)).toBe(true);
+    await row.locator('.stream-process-summary').click();
+    await row.locator('.stream-process-summary').click();
+    expect(await body.evaluate(node => [...node.textContent!.matchAll(/Process event (\d+)/g)].length)).toBe(1203);
+  } finally { await app.dispose(); }
+});
+
+
+test('discloses byte-bounded process and complete Unicode tool output through native IPC with recoverable paging', async ({}, info) => {
+  test.setTimeout(120_000);
+  const app = new OrkasTestApp(info, { configuredModel: false });
+  try {
+    await app.launch();
+    const cid = (await app.invoke<any>('conversations.create', { title: 'Byte bounded disclosure' })).conversation.conversation_id;
+    const original = await app.electronApp!.evaluate(async (_electron, input) => {
+      const req = (process as any).mainModule.require.bind((process as any).mainModule);
+      const fs = req('node:fs'), crypto = req('node:crypto');
+      const uid = req(`${input.root}/src/main/features/users.ts`).getActiveUserId();
+      const file = req(`${input.root}/src/main/util/project-layout.ts`).conversationMessageReadFile(uid, input.cid);
+      const output = 'a'.repeat(256 * 1024 - 1) + '🌟工具\n<script>window.fixtureLeak=true</script>\n' + '工具🌟'.repeat(140_000) + '\nCOMPLETE';
+      const processItems = [
+        { type: 'event', event: { stream: 'tool', data: { phase: 'end', name: 'bash', id: 'byte-result', output } } },
+        ...Array.from({ length: 1000 }, (_, n) => ({ type: 'progress', text: `Bounded event ${n}` })),
+        { type: 'event', event: { stream: 'runtime', data: { phase: 'end', duration_ms: 1234 } } },
+      ];
+      fs.writeFileSync(file, JSON.stringify({ id: 'byte-turn', from: 'fixture-agent', to: ['user'],
+        ts: '2026-10-13T08:00:00Z', text: 'Complete bounded answer \\(x^2\\)', process: processItems }) + '\n');
+      const hash = (value: any) => crypto.createHash('sha256').update(value).digest('hex');
+      return { file, canonicalHash: hash(fs.readFileSync(file)), outputHash: hash(output), outputBytes: Buffer.byteLength(output) };
+    }, { root: pcRoot, cid });
+    const history = await app.invoke<any>('conversations.history', { cid });
+    expect(Buffer.byteLength(JSON.stringify(history))).toBeLessThan(4096);
+    const part = history.history[0].process_parts[0];
+    const first = await app.invoke<any>('conversations.processPage', { cid, message_id: part.message_id, ref: part.ref, cursor: 0 });
+    expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(1024 * 1024);
+    const resultPath = first.items[0].event.data.result_path;
+    const page = app.page!;
+    await page.evaluate(async cid => { const w = window as any; await w.loadConversations(); w.setView('conversation', cid); }, cid);
+    const row = page.locator('[data-msg-id="byte-turn"]');
+    await expect(row.locator('mjx-container')).toHaveCount(1);
+    await row.locator('.stream-process-summary').click();
+    const result = row.locator('.stream-process-line.is-expandable').first();
+    await expect(result).toHaveCount(1);
+    await row.locator('.stream-process-compact-summary').first().click();
+    await expect(result).toBeVisible();
+    await result.click();
+    const pre = row.locator('pre.stream-process-line-full');
+    const more = pre.locator('button.chat-process-load-more');
+    await expect(more).toHaveText(await page.evaluate(() => (window as any).t('sidebar.load_more_conversations')));
+    const body = () => pre.evaluate(node => [...node.childNodes].filter(child => child.nodeName !== 'BUTTON').map(child => child.textContent).join(''));
+    const head = await body();
+    expect(Buffer.byteLength(head)).toBeLessThanOrEqual(256 * 1024);
+    expect(head).not.toContain('\uFFFD');
+    await app.electronApp!.evaluate((_electron, file) => (process as any).mainModule.require('node:fs').renameSync(file, file + '.held'), resultPath);
+    await more.click();
+    await expect(more).toHaveClass(/is-error/);
+    expect(await body()).toBe(head);
+    await app.electronApp!.evaluate((_electron, file) => (process as any).mainModule.require('node:fs').renameSync(file + '.held', file), resultPath);
+    for (let n = 0; n < 10 && await more.isVisible(); n++) {
+      await more.click();
+      await expect(more).toHaveAttribute('aria-busy', 'false');
+    }
+    await expect(more).toBeHidden();
+    const complete = await body();
+    const verified = await app.electronApp!.evaluate((_electron, input) => {
+      const req = (process as any).mainModule.require.bind((process as any).mainModule);
+      const hash = (value: any) => req('node:crypto').createHash('sha256').update(value).digest('hex');
+      return { outputHash: hash(input.complete), canonicalHash: hash(req('node:fs').readFileSync(input.file)) };
+    }, { file: original.file, complete });
+    expect(verified).toEqual({ outputHash: original.outputHash, canonicalHash: original.canonicalHash });
+    expect(Buffer.byteLength(complete)).toBe(original.outputBytes);
+    expect(await page.evaluate(() => (window as any).fixtureLeak)).toBeUndefined();
+    await expect(row.locator('mjx-container')).toHaveCount(1);
+    await more.evaluate(node => node.parentElement!.scrollTop = 0);
+    await page.screenshot({ path: info.outputPath('tool-output-pages.png') });
+    await result.click();
+    await expect(pre).toHaveCount(0);
+    expect(app.modelRequests).toHaveLength(0);
+    writeFileSync(info.outputPath('byte-disclosure-evidence.json'), JSON.stringify({ ...original, ...verified, firstPageBytes: Buffer.byteLength(JSON.stringify(first)) }, null, 2));
+  } finally { await app.dispose(); }
+});
 
 test('pages a long transcript without unloading bodies or replacing formulas and selects unread pages completely', async ({}, testInfo) => {
   test.setTimeout(150_000);
@@ -152,7 +408,10 @@ test('pages a long transcript without unloading bodies or replacing formulas and
     await expect(page.locator('#chat-history .chat-message')).toHaveCount(10);
     await expect(page.locator('[data-msg-id="window-23"]')).toHaveClass(/search-flash/);
     await expect(page.locator('#chat-history-latest')).toBeVisible();
-    await page.evaluate(async cid => (window as any)._loadNewerConversationHistory(cid), cid);
+    // Scrolling an offscreen button into view already invokes auto-paging and
+    // can consume its action before a pointer click. Activate the same native
+    // button by keyboard; the wheel journey below owns automatic continuation.
+    await page.locator('.chat-history-load-newer').press('Enter');
     await expect(page.locator('[data-msg-id="window-39"]')).toHaveCount(1);
     await page.locator('#chat-history-latest').click();
     await expect(page.locator('[data-msg-id="window-129"]')).toHaveCount(1);
@@ -169,6 +428,7 @@ test('scrolls forward from a search hit and keeps a sent reply reachable when a 
   const app = new OrkasTestApp(testInfo, { modelStub: true });
   try {
     await app.launch();
+    await installEmptyLibrarySearch(app, pcRoot);
     const cid = (await app.invoke<any>('conversations.create', { title: 'Search then send' })).conversation.conversation_id;
     await app.electronApp!.evaluate(async (_electron, input) => {
       const require = (process as any).mainModule.require.bind((process as any).mainModule);
@@ -254,6 +514,7 @@ test('scrolls forward from a search hit and keeps a sent reply reachable when a 
     const persisted = await app.invoke<any>('conversations.history', { cid, limit: 10 });
     expect(persisted.history.filter((row: any) => row.from === 'user' && row.text === prompt)).toHaveLength(1);
     expect(persisted.history.filter((row: any) => row.text === 'Hello from the local E2E model.')).toHaveLength(1);
+    expect(await app.electronApp!.evaluate(() => (globalThis as any).__emptyLibrarySearchQueries)).toBeGreaterThan(0);
     writeFileSync(testInfo.outputPath('search-send-evidence.json'), JSON.stringify({ ids, replyTop, persisted: true }));
   } finally { await app.dispose(); }
 });
@@ -268,23 +529,45 @@ test('joins native turns across forward pages while new replies remain beyond th
       const require = (process as any).mainModule.require.bind((process as any).mainModule);
       const uid = require(`${input.root}/src/main/features/users.ts`).getActiveUserId();
       const file = require(`${input.root}/src/main/util/project-layout.ts`).conversationMessageReadFile(uid, input.cid);
-      const rows = Array.from({ length: 30 }, (_, i) => ({ id: `segment-${i}`, to: ['user'],
+      const rows = Array.from({ length: 50 }, (_, i) => ({ id: `segment-${i}`, to: ['user'],
         from: i >= 8 && i <= 14 ? 'codex-fixture' : 'commander',
         ...(i >= 8 && i <= 14 ? { turn_id: 'native-window', seg: i - 8 } : {}),
         ts: new Date(1_700_000_000_000 + i * 1000).toISOString(), text: `Segment ${i}: \\(x^2\\)`
-          + ((i < 8 || (i > 14 && i < 29)) ? '\n\n' + 'A paragraph for scrolling.\n\n'.repeat(6) : '') }));
+          + ((i < 8 || (i > 14 && i < 49)) ? '\n\n' + 'A paragraph for scrolling.\n\n'.repeat(6) : '') }));
       require('node:fs').writeFileSync(file, rows.map((row: unknown) => JSON.stringify(row)).join('\n') + '\n');
     }, { root: pcRoot, cid });
     const page = app.page!;
     await page.evaluate(async cid => { const w = window as any; await w.loadConversations(); w.setView('conversation', cid); }, cid);
-    await expect(page.locator('[data-msg-id="segment-29"]')).toHaveCount(1);
+    await expect(page.locator('[data-msg-id="segment-49"]')).toHaveCount(1);
     await page.evaluate(async cid => (window as any).loadConversationHistory(cid, {
       searchTarget: { msgId: 'segment-9', msgIndex: 9 },
     }), cid);
     await expect(page.locator('[data-msg-id="segment-9"] mjx-container')).toHaveCount(1);
+    const processDisclosure = page.locator('#chat-history [data-turn-id="native-window"] .stream-process');
+    if (await processDisclosure.evaluate(element => (element as HTMLDetailsElement).open)) await processDisclosure.locator('summary').click();
+    await expect(processDisclosure).toHaveJSProperty('open', false);
+    await page.evaluate(async cid => (window as any)._loadNewerConversationHistory(cid), cid);
+    await expect(page.locator('#chat-history [data-turn-id="native-window"]')).toHaveCount(1);
+    await expect(page.locator('[data-msg-id="segment-14"]')).toContainText('Segment 14:');
+    // Earlier native text belongs to the process trail; pagination must retain
+    // the user's collapse choice rather than restoring obsolete answer blocks.
+    await expect(processDisclosure).toHaveJSProperty('open', false);
+    await expect(page.locator('[data-msg-id="segment-14"] .chat-turn-narration')).toHaveCount(0);
+    await processDisclosure.locator('summary').click();
+    for (let i = 8; i < 14; i++) await expect(processDisclosure.locator('.stream-process-body')).toContainText(`Segment ${i}:`);
+    await expect(processDisclosure.locator('mjx-container')).toHaveCount(6);
+    const finalMath = page.locator('[data-msg-id="segment-14"] > .chat-bubble > .markdown-body mjx-container');
+    await expect(finalMath).toHaveCount(1);
+    // Public history retains the final body and the separate process trail;
+    // hosted conversation sharing and its serializer are excluded.
+    const finalBodyText = await page.locator(
+      '[data-msg-id="segment-14"] > .chat-bubble > .markdown-body',
+    ).innerText();
+    expect(finalBodyText).toContain('Segment 14:');
+    for (let i = 8; i < 14; i++) expect(finalBodyText).not.toContain(`Segment ${i}:`);
     await page.evaluate(() => {
       const w = window as any;
-      w.segmentMath = document.querySelector('[data-msg-id="segment-9"] mjx-container');
+      w.segmentMath = document.querySelector('[data-msg-id="segment-14"] > .chat-bubble > .markdown-body mjx-container');
       w.segmentFrames = { running: true, count: 0, invisible: 0 };
       const frame = () => {
         if (!w.segmentFrames.running) return;
@@ -299,53 +582,70 @@ test('joins native turns across forward pages while new replies remain beyond th
     await expect(page.locator('[data-msg-id="segment-14"]')).toContainText('Segment 14:');
     expect(await page.evaluate(() => (window as any).segmentMath.isConnected)).toBe(true);
     expect(await page.evaluate(() => (window as any).segmentMath.getBoundingClientRect().height)).toBeGreaterThan(0);
-    const segmentFrames = await page.evaluate(async () => {
-      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-      (window as any).segmentFrames.running = false;
-      return (window as any).segmentFrames;
-    });
-    expect(segmentFrames.count).toBeGreaterThan(1);
-    expect(segmentFrames.invisible).toBe(0);
-    for (let i = 8; i < 14; i++) await expect(page.locator(`[data-msg-id="segment-14"] .chat-turn-narration[data-narration-seg="${i - 8}"]`)).toContainText(`Segment ${i}:`);
+
+    await expect(page.locator('[data-msg-id="segment-14"] .chat-turn-narration')).toHaveCount(0);
+    for (let i = 8; i < 14; i++) await expect(processDisclosure.locator('.stream-process-body')).toContainText(`Segment ${i}:`);
     const referenceText = await page.evaluate(() => (window as any)._messageReferencePayload(
       document.querySelector('[data-msg-id="segment-14"]'),
     ).text);
-    for (let i = 8; i <= 14; i++) expect(referenceText).toContain(`Segment ${i}:`);
+    // Both the pinned source and public quote contract exclude process sections.
+    expect(referenceText).toContain('Segment 14:');
+    for (let i = 8; i < 14; i++) expect(referenceText).not.toContain(`Segment ${i}:`);
+    // Keep a real unread range after two10-record forward pages. The old30-row
+    // seed had already exhausted its cursor before this live-arrival assertion.
+    await expect(page.locator('.chat-history-load-newer')).toHaveCount(1);
+    await expect(page.locator('[data-msg-id="segment-49"]')).toHaveCount(0);
     // Actual bus delivery while reading the old window: keep its gap boundary
     // and do not let the next page duplicate the arriving newest record.
     await page.evaluate(cid => {
       const w = window as any;
-      const live = w._ensureActorPlaceholder(cid, 'commander', null, 'late-turn', '', 1_700_000_029_000, 0);
-      w._streamingAppendFinalDelta(live, 'Segment 29: ');
+      const live = w._ensureActorPlaceholder(cid, 'commander', null, 'late-turn', '', 1_700_000_049_000, 0);
+      w._streamingAppendFinalDelta(live, 'Segment 49: ');
       w._handleGroupBusEvent(cid, live, {
-        type: 'message', turn_end: true, msg: { id: 'segment-29', from: 'commander', to: ['user'],
+        type: 'message', turn_end: true, msg: { id: 'segment-49', from: 'commander', to: ['user'],
           turn_id: 'late-turn', seg: 0,
-          ts: new Date(1_700_000_029_000).toISOString(), text: 'Segment 29: \\(x^2\\)' },
+          ts: new Date(1_700_000_049_000).toISOString(), text: 'Segment 49: \\(x^2\\)' },
       });
     }, cid);
     expect(await page.evaluate(() => {
       const gap = document.querySelector('.chat-history-load-newer')!;
-      const latest = document.querySelector('[data-msg-id="segment-29"]')!;
+      const latest = document.querySelector('[data-msg-id="segment-49"]')!;
       return !!(gap.compareDocumentPosition(latest) & Node.DOCUMENT_POSITION_FOLLOWING);
     })).toBe(true);
     // Exercise the event handler and observe its result. The production scroll
     // path also dispatches without awaiting the internal Promise; waiting on
     // that cross-realm Promise through CDP can lose its execution context.
     const beforeForward = await page.evaluate(() => performance.timeOrigin);
-    await page.locator('.chat-history-load-newer').dispatchEvent('click');
-    await expect(page.locator('[data-msg-id="segment-29"]')).toHaveCount(1);
+    // Advance each actual10-record cursor without rewriting window state.
+    for (let pageNumber = 0; pageNumber < 5; pageNumber++) {
+      const gap = page.locator('.chat-history-load-newer');
+      if (!await gap.count()) break;
+      const cursor = await gap.getAttribute('data-cursor');
+      await gap.dispatchEvent('click');
+      await expect.poll(async () => await gap.count()
+        ? gap.getAttribute('data-cursor') : 'closed').not.toBe(cursor);
+      await expect(page.locator('[data-msg-id="segment-49"]')).toHaveCount(1);
+    }
+    await expect(page.locator('[data-msg-id="segment-49"]')).toHaveCount(1);
     await expect(page.locator('.chat-history-load-newer')).toHaveCount(0);
     expect(await page.evaluate(() => performance.timeOrigin)).toBe(beforeForward);
     await page.evaluate(async () => {
-      document.querySelector('[data-msg-id="segment-29"]')!.scrollIntoView({ block: 'end', behavior: 'instant' });
+      document.querySelector('[data-msg-id="segment-49"]')!.scrollIntoView({ block: 'end', behavior: 'instant' });
     });
     expect(await page.evaluate(() => (window as any).segmentMath.isConnected)).toBe(true);
     await page.evaluate(async () => {
       document.querySelector('[data-msg-id="segment-14"]')!.scrollIntoView({ block: 'center', behavior: 'instant' });
       await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     });
-    await expect(page.locator('[data-msg-id="segment-14"] mjx-container')).toHaveCount(2);
-    for (let i = 8; i < 14; i++) await expect(page.locator(`[data-msg-id="segment-14"] .chat-turn-narration[data-narration-seg="${i - 8}"]`)).toContainText(`Segment ${i}:`);
+    const segmentFrames = await page.evaluate(() => {
+      (window as any).segmentFrames.running = false;
+      return (window as any).segmentFrames;
+    });
+    expect(segmentFrames.count).toBeGreaterThan(1);
+    expect(segmentFrames.invisible).toBe(0);
+    await expect(processDisclosure).toHaveJSProperty('open', true);
+    await expect(page.locator('[data-msg-id="segment-14"] mjx-container')).toHaveCount(7);
+    for (let i = 8; i < 14; i++) await expect(processDisclosure.locator('.stream-process-body')).toContainText(`Segment ${i}:`);
   } finally { await app.dispose(); }
 });
 
@@ -422,6 +722,8 @@ test('loads and projects history from ASAR with the shipped dependency layout', 
     const pkg = JSON.parse(readFileSync(path.join(pcRoot, 'package.json'), 'utf8'));
     mkdirSync(source, { recursive: true });
     cpSync(path.join(pcRoot, 'src/main'), path.join(source, 'src/main'), { recursive: true });
+    mkdirSync(path.join(source, 'bin'), { recursive: true });
+    cpSync(path.join(pcRoot, 'bin/tool-input-compat.cjs'), path.join(source, 'bin/tool-input-compat.cjs'));
     for (const file of ['package.json', 'tsconfig.json']) cpSync(path.join(pcRoot, file), path.join(source, file));
     for (const name of ['tsx', 'get-tsconfig', 'resolve-pkg-maps', 'esbuild', `@esbuild/${process.platform}-${process.arch}`,
       'electron-log', 'async-mutex', 'tslib']) {

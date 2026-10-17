@@ -3460,9 +3460,6 @@ describe('conversation history reconcile', () => {
     const finalizeEnd = source.indexOf('\nfunction ', finalizeStart + 1);
     const finalizeBody = source.slice(finalizeStart, finalizeEnd);
     expect(finalizeBody).toContain('_syncRenderedGroupMessageIdentity(ph, gm);');
-    expect(finalizeBody).toMatch(
-      /ph\.querySelector\('\.stream-process'\)\?\.remove\(\);[\s\S]*_renderPersistedProcess\(ph, gm\.process\);/,
-    );
   });
 
   it('moves a live AI bubble once after newer send-now user activity', () => {
@@ -8451,7 +8448,8 @@ describe('conversation auto recipient', () => {
     input.value += '\n> @Writing Helper original quote\nemail@Reviewer';
     context._toggleComposerRecipient(target, a);
     expect(input.value).toBe('review this @Reviewer check sources\n> @Writing Helper original quote\nemail@Reviewer');
-    expect(context._composerSelectedRecipients(target).map((r: any) => r.id)).toEqual(['', 'b']);
+    // D29: prose around a mention gets no default owner; the planner splits it.
+    expect(context._composerSelectedRecipients(target).map((r: any) => r.id)).toEqual(['b']);
     context._toggleComposerRecipient(target, b);
     expect(input.value).toBe('review this check sources\n> @Writing Helper original quote\nemail@Reviewer');
     expect(context.getChatRecipient(target).kind).toBe('commander');
@@ -8475,16 +8473,17 @@ describe('conversation auto recipient', () => {
     expect(context._composerSelectedRecipients('new-chat').map((r: any) => r.id)).toEqual(['a']);
     const snapshot = context._recipientSnapshotForSend('new-chat');
     expect(context._applyRecipientPrefixWithSnapshot(input.value, snapshot)).toBe('@Writer ' + input.value);
-    expect(context._composerDispatchShape(input.value, context._agentsCache)).toEqual({ segments: 0, groups: 0 });
+    expect(context._composerSendIsPlanned(input.value)).toBe(false);
   });
 
-  it('keeps editable selections but excludes empty trailing recipients from the send snapshot', () => {
+  it('keeps every mentioned actor, including a trailing one, in the send snapshot (D29)', () => {
     const context = loadConversationRenderer();
     context._agentsCache = [{ agent_id: 'a', name: 'Writer' }, { agent_id: 'b', name: 'Reviewer' }];
     const input = { value: '@Writer @Writer inspect @Reviewer' };
     context.document.getElementById = (id: string) => id === 'new-chat-input' ? input : null;
     expect(context._composerSelectedRecipients('new-chat').map((r: any) => r.id)).toEqual(['a', 'b']);
-    expect(context._recipientSnapshotForSend('new-chat')).toMatchObject({ kind: 'agent', id: 'a' });
+    expect(context._recipientSnapshotForSend('new-chat').recipients.map((r: any) => r.id)).toEqual(['a', 'b']);
+    expect(context._composerSendIsPlanned(input.value)).toBe(true);
     expect(context._applyRecipientPrefixWithSnapshot(input.value, context._recipientSnapshotForSend('new-chat'))).toBe(input.value);
   });
 
@@ -8497,7 +8496,7 @@ describe('conversation auto recipient', () => {
     context.setChatRecipient('new-chat', { kind: 'agent', id: 'a', name: 'Writer' });
     context._toggleComposerRecipient('new-chat', { kind: 'agent', id: 'a', name: 'Writer' });
     expect(input.value).toBe('draft @Reviewer inspect');
-    expect(context._composerSelectedRecipients('new-chat').map((r: any) => r.id)).toEqual(['', 'b']);
+    expect(context._composerSelectedRecipients('new-chat').map((r: any) => r.id)).toEqual(['b']);
   });
 
   it('ignores a replayed old floor after a newer user choice was confirmed', async () => {
@@ -8531,7 +8530,7 @@ describe('conversation auto recipient', () => {
 
   it.each([
     ['new-chat', 'new-chat-input'], ['conversation', 'chat-input'], ['project', 'project-chat-input'],
-  ])('inserts panel recipients at the selection and shows the inherited first owner in %s', (target, inputId) => {
+  ])('inserts panel recipients at the selection and previews only the mentioned actors in %s', (target, inputId) => {
     const context = loadConversationRenderer();
     context.Event = class { constructor(public type: string) {} };
     context._agentsCache = [
@@ -8550,29 +8549,30 @@ describe('conversation auto recipient', () => {
     expect(input.value).toBe('你好， @Writing Helper 继续');
     context._toggleComposerRecipient(target, b);
     expect(input.value).toBe('你好， @Writing Helper @Reviewer 继续');
-    expect(context._mentionPreviewLabels(target)).toEqual(['chat.recipient_commander', 'Writing Helper', 'Reviewer']);
+    expect(context._mentionPreviewLabels(target)).toEqual(['Writing Helper', 'Reviewer']);
     expect(input.selectionStart).toBe(input.value.indexOf('继续'));
 
     // Removing an earlier chip keeps the insertion point beside the remaining chip.
     context._toggleComposerRecipient(target, a);
     expect(input.value).toBe('你好， @Reviewer 继续');
     expect(input.selectionStart).toBe(input.value.indexOf('继续'));
-    expect(context._mentionPreviewLabels(target)).toEqual(['chat.recipient_commander', 'Reviewer']);
+    expect(context._mentionPreviewLabels(target)).toEqual(['Reviewer']);
 
     // A new cursor selection replaces text there, preserving the rest of the draft.
     input.setSelectionRange(input.value.indexOf('继续'), input.value.length);
     context._toggleComposerRecipient(target, a);
     expect(input.value).toBe('你好， @Reviewer @Writing Helper ');
 
-    // Commander remains the fallback owner; cancellation must not move chips.
+    // D29: picking Commander while other actors are named involves it
+    // explicitly, inserted at the caret like any other actor.
     context._toggleComposerRecipient(target, { kind: 'commander', id: '' });
-    expect(input.value).toBe('你好， @Reviewer @Writing Helper ');
-    expect(context._mentionPreviewLabels(target)).toEqual(['chat.recipient_commander', 'Reviewer', 'Writing Helper']);
+    expect(input.value).toBe('你好， @Reviewer @Writing Helper @commander ');
+    expect(context._mentionPreviewLabels(target)).toEqual(['Reviewer', 'Writing Helper', 'chat.recipient_commander']);
 
     input.value = '@commander first @Reviewer second';
     context._toggleComposerRecipient(target, { kind: 'commander', id: '' });
     expect(input.value).toBe('first @Reviewer second');
-    expect(context._mentionPreviewLabels(target)).toEqual(['chat.recipient_commander', 'Reviewer']);
+    expect(context._mentionPreviewLabels(target)).toEqual(['Reviewer']);
 
     input.value = 'before after';
     input.setSelectionRange(0, 0);
@@ -8613,8 +8613,9 @@ describe('conversation auto recipient', () => {
 
     render('@Orkas Codex check this');
     expect(modelChip).toMatchObject({ hidden: false, disabled: true });
+    // D29: two actors make a planned send, and planning runs on the model.
     render('@Orkas Codex @Orkas Claude check this');
-    expect(modelChip).toMatchObject({ hidden: false, disabled: true });
+    expect(modelChip).toMatchObject({ hidden: false, disabled: false });
 
     render('plan this @Orkas Codex implement');
     expect(modelChip).toMatchObject({ hidden: false, disabled: false });
@@ -8642,7 +8643,7 @@ describe('conversation auto recipient', () => {
     expect(modelChip).toMatchObject({ hidden: false, disabled: false });
   });
 
-  it('freezes the first instruction owner and lets leading mentions override it', () => {
+  it('never injects a default owner into text that already routes by mention (D29)', () => {
     // Scenario value: on the new-chat / project composers the picked
     // recipient is synthesized into the outgoing text. When the user has
     // already named their assignees inline, adding that prefix silently turns
@@ -8663,8 +8664,8 @@ describe('conversation auto recipient', () => {
     // prefix is suppressed by real routing rather than by position.
     const twoTargets = '先出个提纲 @PptMaker 做成ppt，素材找 @FamilyTutor 要';
     expect(context.applyRecipientPrefix(twoTargets, 'new-chat', { recipientSnapshot: context.__snap }))
-      .toBe('@FamilyTutor ' + twoTargets);
-    expect(context.applyRecipientPrefix(twoTargets, 'project')).toBe('@FamilyTutor ' + twoTargets);
+      .toBe(twoTargets);
+    expect(context.applyRecipientPrefix(twoTargets, 'project')).toBe(twoTargets);
 
     // Negative control: tokens that do NOT route must not swallow the prefix,
     // or the message lands on the commander while the chip says FamilyTutor.
@@ -8677,67 +8678,40 @@ describe('conversation auto recipient', () => {
       .toBe('@FamilyTutor 接着写');
   });
 
-  it('surfaces the order choice for every multi-segment send with the shape default (D23)', () => {
-    // Scenario value: the user asked for the serial/parallel choice to be
-    // visible on EVERY multi-agent send. An adjacent group used to run
-    // parallel with no way to chain it; a wrong default here silently
-    // changes execution order.
+  it('mirrors the main-process route: only a message that starts with its sole mentioned actor is direct (D29)', () => {
     const context = loadConversationRenderer();
     context._agentsCache = [
       { agent_id: 'a1', name: 'FamilyTutor' },
       { agent_id: 'a2', name: 'OtherTutor' },
     ];
-    const shape = (text: string) => context._composerDispatchShape(text, context._agentsCache);
-    const mode = (text: string) => context._composerDispatchDefaultMode(shape(text));
-
-    // Adjacent mentions: ONE group but TWO segments → toggle shows, default
-    // stays today's all-parallel semantics.
-    expect(shape('@FamilyTutor @OtherTutor check this')).toEqual({ segments: 2, groups: 1 });
-    expect(mode('@FamilyTutor @OtherTutor check this')).toBe('parallel');
-    // Multi-group: written order chains by default.
-    expect(shape('@FamilyTutor write it @OtherTutor make a ppt')).toEqual({ segments: 2, groups: 2 });
-    expect(mode('@FamilyTutor write it @OtherTutor make a ppt')).toBe('serial');
-    // The unaddressed first instruction is its own ordered segment.
-    expect(shape('写一个登录页 @FamilyTutor 出视觉稿')).toEqual({ segments: 2, groups: 2 });
-    // Same agent twice = two segments (no dedup), one target each span.
-    expect(shape('@FamilyTutor a @FamilyTutor b')).toEqual({ segments: 2, groups: 2 });
-    expect(shape('@FamilyTutor @FamilyTutor check @OtherTutor')).toEqual({ segments: 1, groups: 1 });
-    expect(shape('@FamilyTutor @OtherTutor')).toEqual({ segments: 0, groups: 0 });
-    // Single mention / plain text → no choice to offer.
-    expect(shape('@FamilyTutor 单独做')).toEqual({ segments: 1, groups: 1 });
-    expect(shape('no mentions at all')).toEqual({ segments: 0, groups: 0 });
+    const planned = (text: string) => context._composerSendIsPlanned(text);
+    expect(planned('@FamilyTutor 单独做')).toBe(false);
+    expect(planned('@FamilyTutor a @FamilyTutor b')).toBe(false);
+    expect(planned('> 引用的上下文\n@FamilyTutor 处理')).toBe(false);
+    expect(planned('no mentions at all')).toBe(false);
+    expect(planned('@FamilyTutor @OtherTutor')).toBe(false);
+    expect(planned('@FamilyTutor @OtherTutor check this')).toBe(true);
+    expect(planned('@FamilyTutor write it @OtherTutor make a ppt')).toBe(true);
+    expect(planned('写一个登录页 @FamilyTutor 出视觉稿')).toBe(true);
+    expect(planned('帮我翻译 @FamilyTutor')).toBe(true);
+    // Commander alone has one possible owner wherever it is named.
+    expect(planned('先看一下现状 @指挥官 再定计划')).toBe(false);
+    expect(planned('check first @commander review')).toBe(false);
+    expect(planned('先看一下现状 @指挥官 再让 @FamilyTutor 出稿')).toBe(true);
   });
 
-  it('keeps a flipped order override for the send and drops it when the text stops qualifying', () => {
+  it('keeps a quoted single-recipient forward direct and enables planning for multiple recipients without prose', () => {
     const context = loadConversationRenderer();
-    context._agentsCache = [
-      { agent_id: 'a1', name: 'FamilyTutor' },
-      { agent_id: 'a2', name: 'OtherTutor' },
-    ];
-    let text = '@FamilyTutor @OtherTutor check this';
-    const btn = { hidden: true, textContent: '', title: '' };
-    context.document.getElementById = (id: string) => (
-      id === 'chat-input' ? { value: text }
-        : id === 'chat-seq-toggle' ? btn
-          : null
-    );
-
-    context._updateComposerSeqToggle('conversation');
-    expect(btn.hidden).toBe(false);
-    expect(context._composerEffectiveDispatchMode('conversation')).toBe('parallel');
-
-    // Flip: adjacent group can now chain serially for this one send.
-    // (script-scope const — reach it from inside the vm context)
-    vm.runInContext("_composerDispatchOverride.set('conversation', 'serial')", context);
-    context._updateComposerSeqToggle('conversation');
-    expect(context._composerEffectiveDispatchMode('conversation')).toBe('serial');
-    expect(btn.textContent).toBe('chat.multi_dispatch_serial');
-
-    // Text stops qualifying → toggle hides and the override is forgotten.
-    text = '@FamilyTutor 单独做';
-    context._updateComposerSeqToggle('conversation');
-    expect(btn.hidden).toBe(true);
-    expect(vm.runInContext("_composerDispatchOverride.has('conversation')", context)).toBe(false);
+    context._agentsCache = [{ agent_id: 'a1', name: 'QuoteWriter' }, { agent_id: 'a2', name: 'QuoteReviewer' }];
+    vm.runInContext('currentCid = "c1";', context);
+    expect(context._composerSendIsEmpty('@QuoteWriter', 'conversation')).toBe(true);
+    context._addQuote('c1', { sourceCid: 'source-cid', msgId: 'source-msg', text: 'Quoted user question.' });
+    expect(context._composerSendIsEmpty('@QuoteWriter', 'conversation', context._getQuotes('c1'))).toBe(false);
+    expect(context._composerSendIsPlanned('@QuoteWriter')).toBe(false);
+    expect(context._composerSendIsPlanned('@QuoteWriter @QuoteReviewer')).toBe(true);
+    context._clearQuotes('c1');
+    expect(context._composerSendIsEmpty('@QuoteWriter @QuoteReviewer', 'conversation')).toBe(true);
+    expect(context._composerSendIsPlanned('@QuoteWriter @QuoteReviewer')).toBe(false);
   });
 
   it('normalizes commander routing markers on replay without hiding agent mentions', () => {
@@ -8758,8 +8732,10 @@ describe('conversation auto recipient', () => {
     const commander = { kind: 'commander' };
     expect(context._commanderMentionDisplayForSend('@指挥官 check this', commander))
       .toEqual({ commander_mention_display: 'preserve' });
+    // D29: no owner prefix is generated for mention-carrying text, so an
+    // authored mid-text Commander mention is preserved as written.
     expect(context._commanderMentionDisplayForSend('first instruction @commander second', commander))
-      .toEqual({ commander_mention_display: 'hide_generated_prefix' });
+      .toEqual({ commander_mention_display: 'preserve' });
     expect(context._commanderMentionDisplayForSend('just a follow-up', { ...commander, resetFloor: true }))
       .toEqual({});
     expect(context._commanderMentionDisplayForSend('Explain `@commander` and email@commander', commander))
@@ -8797,7 +8773,6 @@ describe('conversation auto recipient', () => {
     context._clearQuotes = () => {};
     context._rememberSentComposerSnapshot = () => {};
     context.autoGrow = () => {};
-    context._updateComposerSeqToggle = () => {};
     context.isConvPending = (cid: string) => busy && cid === 'conversation-a';
     context.apiFetch = async (url: string, options: any) => {
       sends.push({ cid: url.split('/')[3], content: JSON.parse(options.body).content });
@@ -9134,7 +9109,11 @@ describe('conversation controller settlement', () => {
     context.ensureModelConfigured = () => true;
     context.nowIsoLocal = () => '2026-08-24T15:59:31';
     context._createStreamingAssistantMessage = () => ({ dataset: {}, querySelector: () => null });
-    context._handleStreamEvent = (_cid: string, _msg: any, event: any) => rendered.push(event);
+    context.currentCid = 'c2';
+    context.currentView = 'conversation';
+    // Routing must still consume global state; observe actual process paints
+    // rather than treating every call into the router as a DOM mutation.
+    context._renderAgentEvent = (_msg: any, event: any) => rendered.push(event);
     context._bufferOffViewGroupProcessEvent = (_cid: string, event: any) => {
       buffered.push(event);
       return true;
@@ -10352,8 +10331,11 @@ describe('new chat quick-start scenarios', () => {
     expect(button.disabled).toBe(false);
   });
 
-  it('keeps the full composer retryable when attachment adoption is incomplete', async () => {
+  it.each(['incomplete', 'permission_denied'])('keeps the full composer retryable and hides adoption failure details (%s)', async (failure) => {
     const context = loadConversationRenderer();
+    const messages = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales/en.json'), 'utf8'));
+    context.t = (key: string, params: Record<string, unknown> = {}) => String(messages[key] || key)
+      .replace(/\{(\w+)\}/g, (_: string, name: string) => String(params[name] ?? `{${name}}`));
     const events: any[] = [];
     const invocations: any[] = [];
     const alerts: string[] = [];
@@ -10412,6 +10394,9 @@ describe('new chat quick-start scenarios', () => {
         if (url.endsWith('/create')) {
           return { ok: true, conversation: { conversation_id: 'c_failed_adopt', title: 'New task' } };
         }
+        if (failure === 'permission_denied') return {
+          ok: false, error: 'EPERM: rename C:\\PRIVATE_ATTACHMENT_PATH\\draft to conversation',
+        };
         return {
           ok: true,
           items: [{ sourceName: 'brief.pdf', targetName: 'brief.pdf' }],
@@ -10437,14 +10422,13 @@ describe('new chat quick-start scenarios', () => {
     expect(consumedSelections).toBe(0);
     expect(renderedConversations).toBe(0);
     expect(sends).toBe(0);
-    expect(alerts).toEqual(['chat.attach_adopt_failed']);
+    expect(alerts).toEqual(['Could not confirm the attachments. Your message and files are still here; try again.']);
+    expect(alerts.join(' ')).not.toContain('PRIVATE_ATTACHMENT_PATH');
   });
 
   it('falls back to commander without toast when the scenario agent is missing', async () => {
     const context = loadConversationRenderer();
     const toasts: any[] = [];
-    const clicks: any[] = [];
-    const events: any[] = [];
     const classChanges: string[] = [];
     let clickHandler: Function | null = null;
     const input = {
@@ -10472,11 +10456,6 @@ describe('new chat quick-start scenarios', () => {
     };
 
     context._agentsCache = [];
-    context.Monitor = {
-      click: (name: string, payload: any) => clicks.push({ name, payload }),
-      event: (name: string, payload: any) => events.push({ name, payload }),
-    };
-    context.window.Monitor = true;
     context.loadAgents = async () => [];
     context._setQuickStartItems([{ id: 'ui_design', agent_id: 'missing-ui-agent' }]);
     context.uiToast = (...args: any[]) => toasts.push(args);
@@ -10501,11 +10480,7 @@ describe('new chat quick-start scenarios', () => {
     expect(input.value.slice(input.selection[0], input.selection[1])).toBe('a personal finance app');
     expect(classChanges).toEqual([]);
     expect(toasts).toHaveLength(0);
-    expect(input.dataset).toMatchObject({
-      commanderEntryPoint: 'quick_start',
-      commanderResourceId: 'ui_design',
-      commanderRecipientType: 'commander',
-    });
+    expect(input.dataset).not.toHaveProperty('commanderEntryPoint');
     expect(input.dataset.commanderQuickStartPlaceholder).toBeUndefined();
   });
 

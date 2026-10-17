@@ -184,7 +184,14 @@ test.describe('projects', () => {
     await page.locator('#project-todo-save').click();
     let todo = page.locator('.project-todo-item', { hasText: 'Run the desktop E2E regression' });
     await expect(todo).toHaveAttribute('data-status', 'todo');
-    await todo.locator('[data-action="todo-status"]').click();
+    // Project and account cards share the same current-status chip on hover.
+    const move = todo.locator('[data-action="todo-status"]');
+    await expect(move).toHaveText('Pending');
+    await page.locator('#project-detail-title').hover();
+    await expect(move).toHaveCSS('opacity', '0');
+    await todo.hover();
+    await expect(move).toHaveCSS('opacity', '1');
+    await move.click();
     await page.locator('.context-menu-item', { hasText: 'Done' }).click();
     await expect(todo).toHaveAttribute('data-status', 'done');
 
@@ -743,6 +750,46 @@ test.describe('projects', () => {
     await expect(renamedRow).toHaveCount(1);
     await renamedRow.click();
     await expect(relaunchedPage.locator('#project-detail-title')).toHaveText(renamedName);
+  });
+
+  // The project page header keeps only the title; rename and delete live in its
+  // "⋯" menu, and "Done" stands in for the menu while the title is edited.
+  test('renames from the project header menu and keeps delete behind its confirmation', async ({ orkas }, testInfo) => {
+    const originalName = 'E2E Header Rename Before';
+    const renamedName = 'E2E Header Rename After';
+    await createProject(orkas, originalName);
+    const page = orkas.page!;
+    const more = page.locator('#project-action-more');
+    const done = page.locator('#project-action-rename');
+    const title = page.locator('#project-detail-title');
+    await expect(more).toBeVisible();
+    await expect(done).toBeHidden();
+    await more.click();
+    await expect(page.locator('.context-menu-item')).toHaveText(['Rename', 'Delete']);
+    await page.screenshot({ path: testInfo.outputPath('project-header-local-actions.png') });
+    await page.locator('.context-menu-item', { hasText: 'Rename' }).click();
+    const input = page.locator('#project-detail-title-input');
+    await expect(input).toBeFocused();
+    await expect(input).toHaveValue(originalName);
+    await expect(more).toBeHidden();
+    await expect(done).toHaveText('Done');
+    await page.locator('#panel-project .project-detail-header').screenshot({ path: testInfo.outputPath('project-header-rename-mode.png') });
+    await input.fill(renamedName);
+    await done.click();
+    await expect(title).toHaveText(renamedName);
+    await expect(done).toBeHidden();
+    await expect(more).toBeVisible();
+    await expect.poll(async () => (await orkas.invoke<{ projects: Array<{ name: string }> }>('projects.list'))
+      .projects.some((project) => project.name === renamedName)).toBe(true);
+
+    await more.click();
+    await page.locator('.context-menu-item', { hasText: 'Delete' }).click();
+    await expect(page.locator('.ui-dialog-overlay:visible .ui-dialog-danger')).toBeVisible();
+    await page.locator('.ui-dialog-overlay:visible [data-act="cancel"]').click();
+    await expect(page.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
+    await expect(title).toHaveText(renamedName);
+    const listed = await orkas.invoke<{ projects: Array<{ name: string }> }>('projects.list');
+    expect(listed.projects.some((project) => project.name === renamedName)).toBe(true);
   });
 
   test('keeps an unsaved rename draft without applying it during a background refresh', async ({

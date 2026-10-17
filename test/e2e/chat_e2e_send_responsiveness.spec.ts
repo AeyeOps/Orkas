@@ -83,20 +83,26 @@ for (const injectedStallMs of [0, 600]) {
 
     // Schedule the click immediately after Send inside the renderer. Sequential
     // Playwright clicks could wait out the stall before starting the measurement.
-    const switchMs = await page.evaluate(({ cidB, marker }) => new Promise<number>((resolve, reject) => {
+    const timing = await page.evaluate(({ cidB, marker }) => new Promise<{ switchMs: number; clickDelayMs: number; historyMs: number }>((resolve, reject) => {
       const rowSelector = `#conversation-list .conv-item[data-cid="${cidB}"]`;
       const startedAt = performance.now();
+      let clickedAt = startedAt;
       const timeout = setTimeout(() => { observer.disconnect(); reject(new Error('Conversation switch did not finish')); }, 5000);
       const observer = new MutationObserver(() => {
         if (!document.querySelector('#chat-history')?.textContent?.includes(marker)) return;
         observer.disconnect();
         clearTimeout(timeout);
-        resolve(performance.now() - startedAt);
+        const finishedAt = performance.now();
+        resolve({ switchMs: finishedAt - startedAt, clickDelayMs: clickedAt - startedAt, historyMs: finishedAt - clickedAt });
       });
       observer.observe(document.getElementById('chat-history')!, { childList: true, subtree: true, characterData: true });
       document.getElementById('chat-send-btn')!.click();
-      setTimeout(() => (document.querySelector(rowSelector) as HTMLElement).click(), 0);
+      setTimeout(() => {
+        clickedAt = performance.now();
+        (document.querySelector(rowSelector) as HTMLElement).click();
+      }, 0);
     }), { cidB, marker });
+    const switchMs = timing.switchMs;
     await expect.poll(() => modelOrkas.modelRequests.length).toBe(requestsBefore + 1);
     const pulse = await app.evaluate(async () => {
       // Drain one timer tick: even a stall ending at the request boundary must count.
@@ -115,13 +121,16 @@ for (const injectedStallMs of [0, 600]) {
     );
     expect(historyA.history.filter(message => message.from === 'user').map(message => message.text))
       .toEqual(['Send while I read another conversation.']);
-    console.log('[send-responsiveness]', JSON.stringify({ switch_ms: switchMs, main_loop_gap_ms: pulse.maxGapMs, injected_stall_ms: injectedStallMs }));
+    console.log('[send-responsiveness]', JSON.stringify({ switch_ms: switchMs, scheduled_click_ms: timing.clickDelayMs, history_ms: timing.historyMs, main_loop_gap_ms: pulse.maxGapMs, injected_stall_ms: injectedStallMs }));
     if (injectedStallMs) {
       expect(pulse.injected).toBe(true);
       expect(() => checkLatencyBudget('main loop response negative control', { elapsedMs: pulse.maxGapMs }))
         .toThrow('budget 500 ms');
     } else {
-      checkLatencyBudget('send A then open B', { elapsedMs: switchMs });
+      checkLatencyBudget('send A then open B', { elapsedMs: switchMs, phases: [
+        { phase: 'scheduled_click', ms: timing.clickDelayMs },
+        { phase: 'history_render', ms: timing.historyMs },
+      ] });
       checkLatencyBudget('main loop response during send', { elapsedMs: pulse.maxGapMs });
     }
   });

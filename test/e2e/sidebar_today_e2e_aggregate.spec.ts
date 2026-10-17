@@ -1,14 +1,17 @@
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { expect, test, type OrkasTestApp } from './fixtures/orkas';
+import { openSidebarEntry, expect, test, type OrkasTestApp } from './fixtures/orkas';
 
-// Sidebar "Today's Tasks" aggregate through the real IPC + renderer wiring:
-// the startup slice must carry today's rows from a collapsed project, the
-// aggregate must exclude older rows, and the unread cue must behave as one
-// task mirrored in two lists.
+// Sidebar "Recent Tasks" aggregate (today + yesterday) through the real IPC +
+// renderer wiring: the startup slice must carry today's and yesterday's rows
+// from a collapsed project, the aggregate must exclude older rows, and the
+// unread cue must behave as one task mirrored in two lists.
 
 type Conversation = { conversation_id: string; project_id?: string };
+
+// Sidebar scenarios use the local account service as well as isolated storage;
+// an unavailable account endpoint must not introduce unrelated retry noise.
 
 async function createConversation(orkas: OrkasTestApp, title: string, projectId = ''): Promise<Conversation> {
   const result = await orkas.invoke<{ conversation: Conversation }>('conversations.create', { title, projectId });
@@ -40,6 +43,11 @@ function backdateConversations(workspaceRoot: string, cids: string[], iso: strin
     let changed = false;
     for (const row of rows) {
       if (!cids.includes(row.conversation_id)) continue;
+      // These are previously active tasks, not empty legacy placeholders.
+      // The real startup ghost migration must retain their canonical history.
+      writeFileSync(path.join(path.dirname(file), `${row.conversation_id}.jsonl`),
+        JSON.stringify({ id: `${row.conversation_id}-activity`, from: 'user',
+          to: ['commander'], text: 'Deterministic sidebar activity', ts: iso }) + '\n');
       row.created_at = iso;
       row.updated_at = iso;
       row.participant_summary_updated_at = iso;
@@ -52,7 +60,7 @@ function backdateConversations(workspaceRoot: string, cids: string[], iso: strin
 }
 
 test.describe('sidebar today aggregate', () => {
-  test('lists today\'s tasks across a collapsed project and the Tasks list and mirrors unread state', async ({ orkas }) => {
+  test('lists recent tasks across a collapsed project and the Tasks list and mirrors unread state', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;
 
@@ -62,8 +70,11 @@ test.describe('sidebar today aggregate', () => {
     const projectOld = await createConversation(orkas, 'Project task from last week', pid);
     const unprojectedToday = await createConversation(orkas, 'Loose task ran today');
     const unprojectedOld = await createConversation(orkas, 'Loose task from last week');
+    const projectYesterday = await createConversation(orkas, 'Project task ran yesterday', pid);
     const lastWeek = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     backdateConversations(orkas.workspaceRoot, [projectOld.conversation_id, unprojectedOld.conversation_id], lastWeek);
+    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    backdateConversations(orkas.workspaceRoot, [projectYesterday.conversation_id], yesterday);
 
     // Keep the project collapsed: the aggregate must not depend on expansion.
     await page.evaluate(() => {
@@ -72,11 +83,18 @@ test.describe('sidebar today aggregate', () => {
     const relaunched = await orkas.relaunch();
 
     const todayRows = relaunched.locator('#today-list .conv-item');
-    await expect(todayRows).toHaveCount(2);
+    await expect(todayRows).toHaveCount(3);
+    await expect(relaunched.locator(`#today-list .conv-item[data-cid="${projectYesterday.conversation_id}"]`)).toHaveCount(1);
     await expect(relaunched.locator(`#today-list .conv-item[data-cid="${projectToday.conversation_id}"]`)).toHaveCount(1);
     await expect(relaunched.locator(`#today-list .conv-item[data-cid="${unprojectedToday.conversation_id}"]`)).toHaveCount(1);
     await expect(relaunched.locator(`#today-list .conv-item[data-cid="${projectOld.conversation_id}"]`)).toHaveCount(0);
     await expect(relaunched.locator(`#today-list .conv-item[data-cid="${unprojectedOld.conversation_id}"]`)).toHaveCount(0);
+    // Older tasks remain valid records: age filtering, not ghost migration,
+    // excludes them from the aggregate.
+    const persisted = await orkas.invoke<{ conversations: Conversation[] }>('conversations.list');
+    expect(persisted.conversations.map((row) => row.conversation_id))
+      .toEqual(expect.arrayContaining([projectYesterday.conversation_id,
+        projectOld.conversation_id, unprojectedOld.conversation_id]));
     // The project itself stays collapsed and the Tasks list still owns its
     // own copy of the unprojected task.
     await expect(relaunched.locator('#projects-list .conv-item')).toHaveCount(0);
@@ -104,5 +122,80 @@ test.describe('sidebar today aggregate', () => {
     // Entering a projected task auto-expands its project: the same task is now
     // mounted twice and both copies are highlighted.
     await expect(relaunched.locator(`.sidebar-conversation-nav .conv-item.active[data-cid="${projectToday.conversation_id}"]`)).toHaveCount(2);
+  });
+});
+
+test.describe('manual task receipt and sidebar refresh', () => {
+  test('shows one task when a real list refresh precedes the run receipt', async ({ cliOrkas: orkas }) => {
+    const page = orkas.page!;
+    await page.evaluate(() => (window as any).setLang('en'));
+    const { agent } = await orkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+      name: 'ReceiptRaceCodex', category: 'general', runtime: { kind: 'cli', cli: 'codex' },
+    });
+    const { project } = await orkas.invoke<{ project: { project_id: string } }>('projects.create', {
+      name: 'Receipt race project',
+    });
+    const pid = project.project_id;
+    await orkas.invoke('projects.bindings.add', { projectId: pid, kind: 'agent', id: agent.agent_id });
+    const content = 'E2E_CODEX_SEND_NOW_ACTIVE inspect receipt race';
+    const { task } = await orkas.invoke<{ task: { id: string } }>('projects.tasks.create', {
+      projectId: pid, content, owner_agent_id: agent.agent_id,
+    });
+    // Hold only the acknowledgement of the admitted execution. Creation,
+    // dispatch, persistence, list IPC and sidebar rendering all stay real.
+    await orkas.electronApp!.evaluate(({ ipcMain }, tid) => {
+      const original = (ipcMain as any)._invokeHandlers.get('orkas.invoke');
+      if (typeof original !== 'function') throw new Error('Fixture invoke handler unavailable');
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => { release = resolve; });
+      const state = { cid: '', calls: 0, release, restore: () => {
+        ipcMain.removeHandler('orkas.invoke'); ipcMain.handle('orkas.invoke', original);
+      } };
+      (globalThis as any).__receiptRace = state;
+      ipcMain.removeHandler('orkas.invoke');
+      ipcMain.handle('orkas.invoke', async (event, request) => {
+        const result = await original(event, request);
+        if (request?.channel === 'projects.tasks.run' && request.payload?.taskId === tid) {
+          state.cid = result.cid;
+          state.calls += 1;
+          await gate;
+        }
+        return result;
+      });
+    }, task.id);
+    let cid = '';
+    try {
+      await openSidebarEntry(page, '#todos-btn');
+      const card = page.locator('#todos-content .project-todo-item', { hasText: content });
+      await card.hover();
+      await card.locator('[data-action="todo-menu"]').click();
+      await page.locator('.context-menu-item', { hasText: 'Process now' }).click();
+      await expect.poll(async () => {
+        cid = await orkas.electronApp!.evaluate(() => (globalThis as any).__receiptRace.cid);
+        return !!cid;
+      }).toBe(true);
+      await page.evaluate(async () => (window as any).loadConversations());
+      const todayRow = page.locator(`#today-list .conv-item[data-cid="${cid}"]`);
+      await expect(todayRow).toHaveCount(1);
+      await expect(todayRow).not.toHaveClass(/\bactive\b/);
+      await orkas.electronApp!.evaluate(() => (globalThis as any).__receiptRace.release());
+      // The same row becomes active once the original run receipt arrives.
+      // No subsequent list reload may mask a duplicate introduced by it.
+      await expect(todayRow).toHaveClass(/\bactive\b/);
+      await expect(todayRow).toHaveCount(1);
+      const listed = await orkas.invoke<{ conversations: Conversation[] }>('conversations.list');
+      expect(listed.conversations.filter((row) => row.project_id === pid)).toHaveLength(1);
+      const execution = await orkas.invoke<{ tasks: Array<{ assignee: string }> }>('groupChat.tasks.list', { cid });
+      expect(execution.tasks).toHaveLength(1);
+      expect(execution.tasks[0].assignee).toBe(agent.agent_id);
+      expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__receiptRace.calls)).toBe(1);
+      await expect.poll(() => orkas.readCliState().invocations.filter((run) => run.prompt.includes(content)).length).toBe(1);
+    } finally {
+      await orkas.electronApp!.evaluate(() => {
+        const state = (globalThis as any).__receiptRace;
+        state.release(); state.restore(); delete (globalThis as any).__receiptRace;
+      });
+      if (cid) await orkas.invoke('groupChat.abort', { cid });
+    }
   });
 });

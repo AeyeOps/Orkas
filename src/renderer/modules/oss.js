@@ -331,35 +331,18 @@ function ossOpenRepo(p) {
 // ③ behavior — prefill the Commander composer, focus, NO send. The caret lands
 // on the first `[...]` placeholder (the blank task slot) when present, so the
 // user types their specific task over it; otherwise it goes to the end.
-function _setOssCommanderAttribution(input, raw) {
-  if (!input || !input.dataset || !raw || typeof raw !== 'object') return;
-  if (typeof window.setCommanderTemplateAttribution === 'function') {
-    window.setCommanderTemplateAttribution(input, raw);
-    return;
-  }
-  const resourceId = String(raw.resource_id || '').trim();
-  const position = Math.round(Number(raw.position) || 0);
-  input.dataset.commanderEntryPoint = 'oss_tool';
-  if (/^[A-Za-z0-9._-]{1,64}$/.test(resourceId)) input.dataset.commanderResourceId = resourceId;
-  input.dataset.commanderSource = 'commander_home';
-  input.dataset.commanderRecipientType = 'commander';
-  if (position > 0 && position <= 100) input.dataset.commanderPosition = String(position);
-}
-
-function prefillCommander(text, attribution, opts = {}) {
+function prefillCommander(text, opts = {}) {
   const value = String(text || '');
   if (!value) return false;
   if (typeof setView === 'function') setView('new-chat');
   if (typeof setChatRecipient === 'function') setChatRecipient('new-chat', { kind: 'commander' });
   const input = document.getElementById('new-chat-input');
   if (!input) {
-    _ossLog.warn('Commander OSS prefill failed: composer missing', {
-      resource_id: String((attribution && attribution.resource_id) || ''),
-    });
+    _ossLog.warn('Commander OSS prefill failed: composer missing');
     return false;
   }
   composerSetText(input, value);
-  if (attribution) _setOssCommanderAttribution(input, attribution);
+  input.dataset.ossTemplateDraft = '1';
   const m = opts.trackPlaceholder === false ? null : value.match(/\[[^\]]*\]/);
   if (m) input.dataset.ossTemplatePlaceholder = m[0];
   else delete input.dataset.ossTemplatePlaceholder;
@@ -399,8 +382,8 @@ function unresolvedOssTemplatePlaceholder(input) {
 function _ossPromptForComposer(p, input) {
   const prompt = ossPromptFor(p);
   const existing = String((input && composerText(input)) || '').trim();
-  const existingEntryPoint = String((input && input.dataset && input.dataset.commanderEntryPoint) || '');
-  if (!existing || existingEntryPoint === 'oss_tool') return prompt;
+  const existingOssDraft = input?.dataset?.ossTemplateDraft === '1';
+  if (!existing || existingOssDraft) return prompt;
   if (/\[[^\]]*\]/.test(prompt)) return prompt.replace(/\[[^\]]*\]/, () => existing);
   return `${prompt}\n\n${existing}`;
 }

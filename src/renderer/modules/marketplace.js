@@ -1984,7 +1984,7 @@ function _mpActionResult(result) {
   return result === 'success' || result === 'cancelled' ? result : 'failure';
 }
 
-function _mpLogActionResult(startedAt, action, kind, result, errorCode = '') {
+function _mpLogActionResult(action, kind, result, errorCode = '') {
   const safeAction = _mpActionName(action);
   const safeKind = _mpResourceKind(kind);
   const safeResult = _mpActionResult(result);
@@ -2040,14 +2040,13 @@ async function _mpInstall(kind, id, itemOverride = null) {
   if (!item) return;
   const key = `${kind}:${id}`;
   if (_mpState.installing.has(key)) return;
-  const startedAt = Date.now();
   const initialStatus = _mpInstallStatus(kind, item);
   const actionName = initialStatus.installed && initialStatus.updateAvailable ? 'update' : 'install';
   let resultLogged = false;
   const logResult = (result, errorCode = '') => {
     if (resultLogged) return;
     resultLogged = true;
-    _mpLogActionResult(startedAt, actionName, kind, result, errorCode);
+    _mpLogActionResult(actionName, kind, result, errorCode);
   };
   _mpState.installing.add(key);
   _mpRender();
@@ -2131,12 +2130,11 @@ async function _mpUninstall(kind, id) {
   if (!_mpState.uninstalling) _mpState.uninstalling = new Set();
   const key = `${kind}:${id}`;
   if (_mpState.installing.has(key)) return;
-  const startedAt = Date.now();
   let resultLogged = false;
   const logResult = (result, errorCode = '') => {
     if (resultLogged) return;
     resultLogged = true;
-    _mpLogActionResult(startedAt, 'uninstall', kind, result, errorCode);
+    _mpLogActionResult('uninstall', kind, result, errorCode);
   };
   _mpState.installing.add(key);
   _mpState.uninstalling.add(key);

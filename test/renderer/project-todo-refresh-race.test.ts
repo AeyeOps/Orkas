@@ -9,10 +9,12 @@ const source = fs.readFileSync(
 );
 
 describe('project to-do refresh ordering', () => {
+
   it('counts every status including collapsed completed tasks and resets for an empty scope', async () => {
     const count = { textContent: '' };
     const list = { innerHTML: '', style: {}, appendChild() {} };
     const context = vm.createContext({
+      currentUserId: 'me',
       console,
       createLogger: () => ({ warn() {}, info() {}, error() {} }),
       document: {

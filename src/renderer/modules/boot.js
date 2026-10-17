@@ -393,6 +393,7 @@ function setView(view, cid, opts = {}) {
   // A resource detail opened from another page is only a transient overlay.
   // Any explicit sidebar/programmatic navigation dismisses it first, so a
   // later visit to AI Team or Skills always starts from its list.
+  if (typeof _closeProjectDriverHint === 'function') _closeProjectDriverHint();
   if (typeof _resetAgentsDetailForNavigation === 'function') {
     _resetAgentsDetailForNavigation();
   }

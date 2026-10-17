@@ -1,4 +1,6 @@
-// Top-level Today, Projects and Tasks section collapse state.
+// Sidebar task sections persist local collapse preferences. The navigation
+// entries above them are a flat, always-visible list; collapse values stored for
+// the retired navigation groups are ignored and dropped on the next write.
 (function () {
   const STORAGE_KEY = 'sidebar.sectionCollapsed';
   const SECTION_CONFIG = [
@@ -26,15 +28,16 @@
   ];
 
   function readCollapsedState(storage) {
+    let parsed = {};
     try {
-      const parsed = JSON.parse(storage.getItem(STORAGE_KEY) || '{}');
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-      return Object.fromEntries(
-        SECTION_CONFIG.map(({ name }) => [name, parsed[name] === true]),
-      );
-    } catch (_) {
-      return {};
-    }
+      const saved = JSON.parse(storage.getItem(STORAGE_KEY) || '{}');
+      if (saved && typeof saved === 'object' && !Array.isArray(saved)) parsed = saved;
+    } catch (_) {}
+    return Object.fromEntries(
+      SECTION_CONFIG.map(({ name, defaultCollapsed }) => [
+        name, typeof parsed[name] === 'boolean' ? parsed[name] : defaultCollapsed === true,
+      ]),
+    );
   }
 
   function writeCollapsedState(storage, state) {

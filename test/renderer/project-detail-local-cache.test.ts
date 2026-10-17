@@ -24,6 +24,7 @@ function mountWithSlowSecondaryCard({ delayInstructionsFor = '' } = {}) {
   };
   const context = vm.createContext({
     console,
+    performance,
     currentUserId: 'member',
     _byDisplayName: (a: any, b: any) => a.name.localeCompare(b.name),
     createLogger: () => ({ warn() {}, info() {}, error() {} }),
@@ -74,7 +75,32 @@ function mountWithSlowSecondaryCard({ delayInstructionsFor = '' } = {}) {
 }
 
 describe('project detail local cache after restart', () => {
-it('preserves automation content while its feature loads without a loading placeholder', async () => {
+  it('does not restore a deleted file from a project load started before deletion', async () => {
+    const { context, nodes, finishAutoTasks } = mountWithSlowSecondaryCard();
+    let finishTree!: (value: unknown) => void;
+    const originalInvoke = context.window.orkas.invoke;
+    context.window.orkas.invoke = (channel: string, args: any) => {
+      if (channel === 'projects.files.tree') return new Promise(resolve => { finishTree = resolve; });
+      if (channel === 'projects.files.delete') return Promise.resolve({ ok: true });
+      return originalInvoke(channel, args);
+    };
+    vm.runInContext(`_projectDetailPid = 'project_a'; _projectDetailMeta = {
+      project: { project_id: 'project_a' }, files: [{ type: 'file', name: 'cached.md', relPath: 'cached.md' }]
+    }`, context);
+    context.uiConfirm = vi.fn(async () => true);
+    const loading = context.loadProjectDetail('project_a');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await context._deleteProjectFile('cached.md');
+    expect(nodes['project-files-list'].innerHTML).not.toContain('cached.md');
+    finishTree({ ok: true, tree: [{ type: 'file', name: 'cached.md', relPath: 'cached.md' }] });
+    finishAutoTasks({ ok: true, tasks: [] });
+    await loading;
+    expect(vm.runInContext('_projectDetailMeta.files', context)).toEqual([]);
+    expect(nodes['project-files-list'].innerHTML).not.toContain('cached.md');
+    expect(nodes['project-instructions-read'].textContent).toBe('Saved local rules');
+  });
+
+  it('preserves automation content while its feature loads without a loading placeholder', async () => {
     const { context, nodes } = mountWithSlowSecondaryCard();
     const list = { innerHTML: 'Saved automation' };
     nodes['project-auto-list'] = list;

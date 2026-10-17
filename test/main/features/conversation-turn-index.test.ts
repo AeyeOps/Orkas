@@ -62,7 +62,7 @@ it('preserves exact preview text across Unicode, math, Markdown and truncation b
   const texts = ['', 'plain', '中文🌟e\u0301👨‍👩‍👧‍👦', '\\(x^2+y^2=z^2\\)\n$$\\frac{a}{b}$$',
     '## [Useful link](https://example.com) ![image](image.png) <b>bold</b>',
     '> quoted\n1. numbered\n- list\n```js\nconst n = 1;\n```', '[unclosed](\n<unfinished',
-    ' \r\n\t ', ...[39, 40, 41, 79, 80, 81].flatMap(n => ['中', '🌟'].map(c => c.repeat(n))),
+    ' \r\n\t ', ...[99, 100, 101, 239, 240, 241].flatMap(n => ['中', '🌟'].map(c => c.repeat(n))),
     'word '.repeat(400_000)];
   const file = write('previews', texts.flatMap((text, i) => [user(`u${i}`, text), reply(text)]));
   const turns: any[] = [];
@@ -74,8 +74,8 @@ it('preserves exact preview text across Unicode, math, Markdown and truncation b
   } while (before !== undefined);
   expect(turns.map(t => t.messageId)).toEqual(texts.map((_, i) => `u${i}`));
   turns.forEach((turn, i) => {
-    expect(turn.userPreview).toBe(legacyPreview(texts[i], 40));
-    expect(turn.assistantPreview).toBe(legacyPreview(texts[i], 80));
+    expect(turn.userPreview).toBe(legacyPreview(texts[i], 100));
+    expect(turn.assistantPreview).toBe(legacyPreview(texts[i], 240));
     expect(turn.messageIndex).toBe(i * 2);
   });
 });
@@ -137,7 +137,7 @@ it.each(['replace', 'truncate', 'unterminated', 'corrupt-index', 'old-version'] 
   const page = await read(file);
   expect(page.turns.map(t => t.messageId)).toEqual(mode === 'unterminated' ? ['old', 'new']
     : mode === 'replace' || mode === 'truncate' ? ['new'] : ['old']);
-  expect(JSON.parse(fs.readFileSync(indexPath('user', 'chat'), 'utf8')).version).toBe(2);
+  expect(JSON.parse(fs.readFileSync(indexPath('user', 'chat'), 'utf8')).version).toBe(3);
 });
 
 it('retries a moving source once and never publishes a repeatedly unstable scan', async () => {

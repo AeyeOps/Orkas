@@ -28,15 +28,6 @@ const _wsInfoByTarget = {
   project: { currentPath: '', defaultPath: '', isDefault: true, recentPaths: [], scope: 'default' },
 };
 
-function _logWorkspaceOpenFolderResult(target, result, startedAt, errorCode = '') {
-  if (result !== 'failure') return;
-  _wsLog.warn('workspace open folder failed', {
-    target,
-    error_code: errorCode || 'unknown',
-    duration_ms: Math.max(0, Date.now() - startedAt),
-  });
-}
-
 // ── Workspace display helpers ───────────────────────────────────────
 
 /** Extract just the folder name from an absolute path. */
@@ -229,18 +220,14 @@ async function _resetWorkspace(target) {
 
 async function _openWorkspaceFolder(target) {
   const hint = _wsScopeHintFor(target);
-  const startedAt = Date.now();
   try {
     const result = await window.orkas.invoke('workspace.openPath', hint);
     if (result && result.ok) {
-      _logWorkspaceOpenFolderResult(target, 'success', startedAt, '', result);
       _wsLog.info('workspace opened', { target });
     } else {
-      _logWorkspaceOpenFolderResult(target, 'failure', startedAt, 'open_rejected');
       _wsLog.warn('workspace open rejected', { target, error_code: 'open_rejected' });
     }
   } catch (err) {
-    _logWorkspaceOpenFolderResult(target, 'failure', startedAt, 'invoke_failed');
     _wsLog.error('workspace open failed', {
       target,
       error_type: err && typeof err.name === 'string' ? err.name : 'unknown',
@@ -420,6 +407,7 @@ function _showWorkspaceDropdown(anchor, target) {
   });
   menu.appendChild(openItem);
 
+  menu.dataset.uiOverlay = '';
   menu.style.position = 'fixed';
   menu.style.visibility = 'hidden';
   document.body.appendChild(menu);
