@@ -335,6 +335,31 @@ describe('Web app capability journeys', () => {
     expect(host.closed).toHaveBeenCalledTimes(2);
     expect(host.closed).toHaveBeenLastCalledWith(uid, { id: b.token, owner: 1 });
   });
+  it('logs one redacted warning per method and code per minute and nothing for cancellation', async () => {
+    const warn = vi.fn();
+    vi.doMock('../../../src/main/logger', async (original) => ({ ...(await original<any>()),
+      createLogger: () => ({ warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() }) }));
+    try {
+      vi.resetModules();
+      const logged = await import('../../../src/main/features/web_apps/runtime');
+      const rt = new logged.WebAppRuntime(host);
+      const a = rt.open(uid, 1, bundle());
+      host.generate = async () => { throw new Error('/Users/test/private provider body'); };
+      for (let i = 0; i < 3; i += 1) {
+        await expect(rt.call(uid, 1, a.token, `fail-${i}`, 'ai.generate', { prompt: 'secret prompt' })).rejects.toThrow();
+      }
+      await expect(rt.call(uid, 1, a.token, 'tool', 'tools.call', { name: 'bash', arguments: {} })).rejects.toMatchObject({ code: 'E_TOOL' });
+      host.generate = async () => { throw new logged.AppError('E_CANCELLED'); };
+      await expect(rt.call(uid, 1, a.token, 'cancelled', 'ai.generate', { prompt: 'x' })).rejects.toMatchObject({ code: 'E_CANCELLED' });
+      const rows = warn.mock.calls.filter(([message]) => message === 'web app call failed');
+      expect(rows).toEqual([
+        ['web app call failed', { method: 'ai.generate', code: 'E_FAILED', suppressed_count: 0, error: expect.objectContaining({ message_hash: expect.any(String) }) }],
+        ['web app call failed', { method: 'tools.call', code: 'E_TOOL', suppressed_count: 0 }],
+      ]);
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/alice|secret prompt|provider body/);
+      rt.closeOwner(1);
+    } finally { vi.doUnmock('../../../src/main/logger'); }
+  });
   it('delivers streaming progress and usage without an app-specific output default', async () => {
     const a=open(), progress=vi.fn(); host.generate=vi.fn(async(_uid,_args,_signal,out)=>{out({type:'delta',text:'Hi'});return {text:'Hi',usage:{outputTokens:1},stopReason:'end_turn'};});
     expect(await runtime.call(uid,1,a.token,'model','ai.generate',{prompt:'Hello'},progress)).toMatchObject({text:'Hi',usage:{outputTokens:1}});

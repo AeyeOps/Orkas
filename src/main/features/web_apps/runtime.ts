@@ -11,6 +11,7 @@ import { isPathAllowed } from '../../util/path-sandbox';
 import { MAX_TEXT_FILE_BYTES } from '../../util/file-size-limits';
 import { LocalAppData } from './data';
 import {createLogger} from '../../logger';
+import { logErrorSummary } from '../../util/log-redact';
 import { commonMethod, type AppType, type DataDefinition } from './data-contract';
 import { RequestHistory } from './request-history';
 import { requireLocalAppType } from './commercial-entry';
@@ -78,6 +79,27 @@ interface ParsedStore { signature: string; owner: string; bytes: number; entries
 const storeSignature = (st: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number }) =>
   `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
 const error = (code: string): never => { throw new AppError(code); };
+const callLog = createLogger('web-app-runtime');
+const CALL_FAILURE_WINDOW_MS = 60_000;
+const CALL_FAILURE_MAX_KEYS = 64;
+const callFailures = new Map<string, { at: number; suppressed: number }>();
+/** One warning per catalog method + code per minute, with the suppressed
+ *  count carried forward. Unexpected non-AppError causes keep only a redacted
+ *  summary; app arguments, results, paths, and identities are never logged. */
+function logCallFailure(method: string, code: string, cause: unknown): void {
+  try {
+    const key = `${method}\0${code}`, now = Date.now();
+    const seen = callFailures.get(key);
+    if (seen && now - seen.at < CALL_FAILURE_WINDOW_MS) { seen.suppressed++; return; }
+    if (!seen && callFailures.size >= CALL_FAILURE_MAX_KEYS) {
+      for (const [old, entry] of callFailures) if (now - entry.at >= CALL_FAILURE_WINDOW_MS) callFailures.delete(old);
+      if (callFailures.size >= CALL_FAILURE_MAX_KEYS) return;
+    }
+    callFailures.set(key, { at: now, suppressed: 0 });
+    callLog.warn('web app call failed', { method, code, suppressed_count: seen?.suppressed || 0,
+      ...(cause instanceof AppError ? {} : { error: logErrorSummary(cause) }) });
+  } catch { /* Diagnostics are best effort. */ }
+}
 const liveRuntimes=new Set<WeakRef<WebAppRuntime>>();
 const heldAppData=new Set<string>();
 export function holdAppData(uid:string,key:string){const identity=JSON.stringify([uid,key]);if(heldAppData.has(identity))throw new AppError('E_BUSY');heldAppData.add(identity);return ()=>heldAppData.delete(identity);}
@@ -317,6 +339,17 @@ export class WebAppRuntime {
   async call(uid: string, owner: number, token: string, requestId: string, method: string, raw: unknown,
     progress: (event: unknown) => void = () => {}) {
     const s = this.current(uid, owner, token);
+    try { return await this.dispatch(s, requestId, method, raw, progress); }
+    catch (cause) {
+      const code = cause instanceof AppError ? cause.code : 'E_FAILED';
+      if (code !== 'E_CANCELLED' && code !== 'E_CLOSED') {
+        logCallFailure(Object.hasOwn(METHODS, method) ? method : 'unknown', code, cause);
+      }
+      throw cause;
+    }
+  }
+  private async dispatch(s: Instance, requestId: string, method: string, raw: unknown,
+    progress: (event: unknown) => void) {
     if (s.bundle.browserOnly) return error('E_UNAVAILABLE');
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(requestId)) return error('E_INPUT');
     if (s.seen.has(requestId)) return error('E_DUPLICATE');
