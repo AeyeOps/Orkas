@@ -1556,6 +1556,7 @@ async function fetchJson(url, init = {}, providerName = 'provider', parse = JSON
 async function fetchStatusOnlyJson(url, init, providerName, parse) {
   return fetchJson(url, init, providerName, parse);
 }
+const merchantIdentityJson = fields => text => require('./local-api-auth.cjs').parseMerchantIdentityJson(text, fields);
 
 const tokenCache = new Map();
 const tokenAcquisitions = new Map();
@@ -2419,7 +2420,8 @@ async function etsyRequest(config, method, path, p = {}) {
     }
   }
   try {
-    return await fetchJson(`https://openapi.etsy.com/v3/application${path}${queryString(p.query)}`, init);
+    return await fetchJson(`https://openapi.etsy.com/v3/application${path}${queryString(p.query)}`, init, 'Etsy',
+      path === `/shops/${config.metadata.shop_id}` ? merchantIdentityJson(['shop_id', 'user_id']) : undefined);
   } catch (error) {
     const status = String(error?.message || '').match(/HTTP (\d{3})/)?.[1];
     throw commerceError(error?.code, `Etsy request failed${status ? ` (HTTP ${status})` : ''}`, error);
@@ -2610,7 +2612,7 @@ async function refreshMercadoLibreToken(config) {
       grant_type: 'refresh_token', client_id: String(config.credentials.client_id || ''),
       client_secret: String(config.credentials.client_secret || ''), refresh_token: String(config.credentials.refresh_token || ''),
     }).toString(),
-  }, 'Mercado Libre authorization');
+  }, 'Mercado Libre authorization', merchantIdentityJson(['user_id']));
   if (!token.access_token || !token.refresh_token || String(token.user_id || '') !== String(config.metadata.user_id)) {
     throw new Error('Mercado Libre refresh returned incomplete or mismatched credentials');
   }
@@ -2641,7 +2643,8 @@ async function mercadoLibreRequest(config, method, path, p = {}) {
     headers['content-type'] = 'application/json';
     init.body = JSON.stringify(p.body);
   }
-  return fetchStatusOnlyJson(`https://api.mercadolibre.com${path}${queryString(p.query)}`, init, 'Mercado Libre');
+  return fetchStatusOnlyJson(`https://api.mercadolibre.com${path}${queryString(p.query)}`, init, 'Mercado Libre',
+    path === '/users/me' ? merchantIdentityJson(['id']) : undefined);
 }
 
 async function executeMercadoLibre(config, name, p) {
@@ -2698,7 +2701,7 @@ async function taobaoRequestWithToken(config, accessToken, method, parameters = 
   const body = await fetchStatusOnlyJson(TAOBAO_API_URL, {
     method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded;charset=utf-8', accept: 'application/json' },
     body: new URLSearchParams(Object.fromEntries(Object.entries(form).map(([key, value]) => [key, String(value)]))).toString(),
-  }, 'Taobao', options.parseJson || JSON.parse);
+  }, 'Taobao', options.parseJson || (method === 'taobao.user.seller.get' ? merchantIdentityJson(['user_id']) : JSON.parse));
   if (body?.error_response) {
     const code = String(body.error_response.code);
     throw commerceError(code === '7' ? 'E_TOOL_CALL_RATE_LIMIT'
@@ -2720,7 +2723,7 @@ async function refreshTaobaoToken(config) {
         grant_type: 'refresh_token', refresh_token: String(config.credentials.refresh_token),
         client_id: String(config.credentials.app_key), client_secret: String(config.credentials.app_secret),
       }).toString(),
-    }, 'Taobao authorization');
+    }, 'Taobao authorization', merchantIdentityJson(['taobao_user_id', 'taobao_open_uid']));
     if (!token.access_token
         || (token.taobao_user_id && String(token.taobao_user_id) !== String(config.credentials.identity.user_id))
         || (config.credentials.identity.open_uid && token.taobao_open_uid
@@ -2840,7 +2843,7 @@ async function refreshAlibaba1688Token(config) {
           grant_type: 'refresh_token', client_id: String(config.credentials.app_key),
           client_secret: String(config.credentials.app_secret), refresh_token: String(config.credentials.refresh_token),
         }).toString(),
-      }, '1688 authorization',
+      }, '1688 authorization', merchantIdentityJson(['memberId', 'aliId']),
     );
     if (!token.access_token || (token.memberId && String(token.memberId) !== String(config.credentials.identity.member_id))) {
       throw new Error('1688 refresh returned incomplete or mismatched credentials');
@@ -3008,7 +3011,7 @@ async function refreshJdToken(config) {
         grant_type: 'refresh_token', app_key: config.credentials.app_key,
         app_secret: config.credentials.app_secret, refresh_token: config.credentials.refresh_token,
       }).toString(),
-    }, 'JD.com authorization');
+    }, 'JD.com authorization', merchantIdentityJson(['uid', 'xid']));
     if (!token.access_token) throw new Error('JD.com refresh returned incomplete credentials');
     if (token.xid && config.credentials.identity.xid && String(token.xid) !== String(config.credentials.identity.xid)) {
       throw commerceError('E_TOOL_CALL_AUTH', 'JD.com refresh returned a different seller');
@@ -3162,7 +3165,8 @@ async function pinduoduoRequestWithToken(config, accessToken, type, parameters =
     body: new URLSearchParams(Object.fromEntries(
       Object.entries(form).map(([key, value]) => [key, encodePinduoduoParameter(value)]),
     )).toString(),
-  }, 'Pinduoduo');
+  }, 'Pinduoduo', ['pdd.pop.auth.token.refresh', 'pdd.mall.info.get'].includes(type)
+    ? require('./local-api-auth.cjs').parsePinduoduoIdentityJson : undefined);
   if (body?.error_response) {
     throw new Error(`Pinduoduo request failed (provider code ${String(body.error_response.error_code || 'unknown').slice(0, 40)})`);
   }
@@ -3376,7 +3380,8 @@ async function douyinRequestWithToken(config, accessToken, pathName, method, par
       method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
       body: paramJson,
     },
-    'Douyin Shop',
+    'Douyin Shop', ['token.create', 'token.refresh', 'open.getAuthInfo'].includes(method)
+      ? merchantIdentityJson(['shop_id', 'auth_id', 'authority_id']) : JSON.parse,
   );
   if (body?.code !== undefined && Number(body.code) !== 10000) {
     throw new Error(`Douyin Shop request failed (provider code ${String(body.code).slice(0, 40)})`);
@@ -3715,7 +3720,7 @@ async function youzanTokenRequest(config, refresh) {
       authorize_type: 'silent', grant_id: safePlatformNumericId(config.metadata.kdt_id, 'kdt_id'),
       refresh: Boolean(refresh),
     }),
-  }, 'Youzan token');
+  }, 'Youzan token', merchantIdentityJson(['authority_id']));
   const token = body?.data ?? body;
   if (!token?.access_token || String(token.authority_id || '') !== String(config.metadata.kdt_id)) {
     throw new Error('Youzan token returned incomplete credentials or a different shop');
@@ -3803,7 +3808,7 @@ async function weimobTokenRequest(config) {
   }).toString();
   const body = await fetchStatusOnlyJson(url, {
     method: 'POST', headers: { accept: 'application/json' },
-  }, 'Weimob WOS token');
+  }, 'Weimob WOS token', merchantIdentityJson(['business_operation_system_id', 'public_account_id', 'business_id']));
   const token = body?.data ?? body;
   if (!token?.access_token
       || String(token.business_operation_system_id || '') !== String(config.metadata.shop_id)) {
@@ -4679,7 +4684,15 @@ async function verifyIdentity(config) {
   if (config.provider === 'woocommerce') return woocommerceIdentity(config);
   if (config.provider === 'walmart') return walmartTokenDetails(config);
   if (config.provider === 'ebay') return executeEbay(config, 'account.privileges', {});
-  if (config.provider === 'etsy') return executeEtsy(config, 'shop.get', {});
+  if (config.provider === 'etsy') {
+    const identity = await executeEtsy(config, 'shop.get', {});
+    if (String(identity?.shop_id || '') !== String(config.metadata.shop_id)
+        || (identity.user_id && config.credentials.identity?.user_id
+          && String(identity.user_id) !== String(config.credentials.identity.user_id))) {
+      throw new Error('Etsy authorization belongs to a different shop or owner');
+    }
+    return identity;
+  }
   if (config.provider === 'amazon_seller') {
     const identity = await executeAmazon(config, 'account.marketplace_participations', {});
     if (config.metadata.environment === 'live') {

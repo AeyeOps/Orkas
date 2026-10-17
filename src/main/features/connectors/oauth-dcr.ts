@@ -33,7 +33,7 @@ import { getLanguage } from '../config';
 import { normalizeLang } from '../../i18n';
 import { createLogger } from '../../logger';
 import { logErrorSummary } from '../../util/log-redact';
-import { fetchWithTimeout } from '../../util/abort';
+import { fetchAndReadWithTimeout, fetchWithTimeout } from '../../util/abort';
 import { broadcastOAuthConnectProgress } from './oauth-events';
 import { LOCAL_API_REDIRECT_URI } from './oauth-redirect';
 export { LOCAL_API_REDIRECT_URI } from './oauth-redirect';
@@ -49,6 +49,9 @@ function _localizedState(): string {
   return `orkas1_${normalizeLang(getLanguage()) || 'en'}_${_b64url(crypto.randomBytes(32))}`;
 }
 const DCR_HTTP_TIMEOUT_MS = 60_000;
+// Discovery, registration and token documents are small; the cap only stops a
+// provider-controlled 200 from streaming into main-process memory.
+const DCR_MAX_JSON_BODY_BYTES = 1024 * 1024;
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
 const CLIENT_NAME = 'Orkas';
 
@@ -131,7 +134,7 @@ function _startLocalApiAuthorization(
       controller: new AbortController(),
       ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
       timer: setTimeout(() => {
-        if (_pending === pending) _cancelPending('Authorization timed out; connect again');
+        if (_pending === pending) _cancelPending('Authorization timed out; connect again', 'flow_timeout');
       }, FLOW_TIMEOUT_MS),
     };
     pending.timer.unref?.();
@@ -172,13 +175,13 @@ function _startLocalApiAuthorization(
   });
 }
 
-function _cancelPending(reason: string): void {
+function _cancelPending(reason: string, code?: string): void {
   if (!_pending) return;
   const p = _pending;
   _pending = null;
   clearTimeout(p.timer);
   if (p.kind === 'local_api') p.controller.abort();
-  p.reject(new Error(reason));
+  p.reject(Object.assign(new Error(reason), code ? { code } : {}));
 }
 
 // ── Discovery + DCR ─────────────────────────────────────────────────────
@@ -224,6 +227,75 @@ function _fetchDcr(label: string, url: string, init: RequestInit = {}): Promise<
   );
 }
 
+function _dcrBodyTooLarge(label: string): Error {
+  const error = new Error(`${label} response exceeded ${DCR_MAX_JSON_BODY_BYTES} bytes`);
+  error.name = 'DcrResponseTooLarge';
+  return error;
+}
+
+/** Read an accepted JSON body through a byte cap. Content-Length rejects early;
+ * a chunked body is cancelled as soon as it crosses the cap. */
+async function _readDcrJson(label: string, response: Response): Promise<unknown> {
+  const declared = Number(response.headers?.get?.('content-length'));
+  if (Number.isFinite(declared) && declared > DCR_MAX_JSON_BODY_BYTES) {
+    await response.body?.cancel().catch(() => {});
+    throw _dcrBodyTooLarge(label);
+  }
+  const body = response.body;
+  if (!body || typeof body.getReader !== 'function') return response.json();
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      total += value.byteLength;
+      if (total > DCR_MAX_JSON_BODY_BYTES) throw _dcrBodyTooLarge(label);
+      chunks.push(value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+  return JSON.parse(new TextDecoder('utf-8').decode(Buffer.concat(chunks, total)));
+}
+
+/** Keep the request deadline active until JSON has been consumed. Rejected bodies are
+ * provider-controlled and may contain credentials; they never become error text. */
+function _fetchDcrJson(
+  label: string,
+  url: string,
+  init: RequestInit = {},
+  onHeaders?: () => void,
+): Promise<{ response: Response; body: unknown }> {
+  return fetchAndReadWithTimeout(
+    url,
+    init,
+    DCR_HTTP_TIMEOUT_MS,
+    undefined,
+    `${label} timed out after ${Math.round(DCR_HTTP_TIMEOUT_MS / 1000)}s`,
+    async response => {
+      onHeaders?.();
+      if (response.ok) {
+        try { return await _readDcrJson(label, response); }
+        catch (error) {
+          // JSON.parse can include response bytes in SyntaxError.message. Keep
+          // the original typed parse failure without exposing those bytes.
+          if (error instanceof SyntaxError) throw new SyntaxError(`${label} response JSON invalid`);
+          throw error;
+        }
+      }
+      await response.body?.cancel().catch(() => {});
+      return undefined;
+    },
+  );
+}
+
+
 /** Some hosts answer unknown discovery paths with HTTP 200 and an error body (Zapier MCP returns a
  *  JSON-RPC "not found" object), so a successful status alone does not make a candidate usable. */
 function _hasAuthorizationServers(body: unknown): boolean {
@@ -258,9 +330,8 @@ async function _fetchWellKnown<T>(
   let lastErr: Error | null = null;
   for (const cand of Array.from(new Set(candidates))) {
     try {
-      const r = await _fetchDcr(`DCR ${wellKnownName}`, cand, strict ? { redirect: 'error' } : {});
+      const { response: r, body } = await _fetchDcrJson(`DCR ${wellKnownName}`, cand, strict ? { redirect: 'error' } : {});
       if (r.ok) {
-        const body: unknown = await r.json();
         if (accept(body)) return body as T;
         lastErr = new Error(`DCR ${wellKnownName} metadata missing required fields`);
         continue;
@@ -288,18 +359,14 @@ async function _fetchAuthServerMetadata(authServer: string, mcpUrl: string, stri
   let lastErr: Error | null = null;
   for (const cand of candidates) {
     let r: Response;
+    let body: unknown;
     try {
-      r = await _fetchDcr('DCR auth server metadata', cand, strict ? { redirect: 'error' } : {});
+      ({ response: r, body } = await _fetchDcrJson('DCR auth server metadata', cand, strict ? { redirect: 'error' } : {}));
     } catch (err) {
       lastErr = _fmtFetchErr('DCR auth server metadata fetch failed', err);
       continue;
     }
     if (r.ok) {
-      let body: unknown;
-      try { body = await r.json(); } catch (err) {
-        lastErr = _fmtFetchErr('DCR auth server metadata parse failed', err);
-        continue;
-      }
       if (_hasAuthorizationEndpoints(body)) return body as AuthServerMetadata;
       lastErr = new Error('auth server metadata missing authorization or token endpoint');
       continue;
@@ -326,11 +393,11 @@ async function _fetchChallengedResourceMetadata(mcpUrl: string): Promise<Protect
     const resourceMetadataUrl = extractWWWAuthenticateParams(response).resourceMetadataUrl;
     if (!resourceMetadataUrl) throw new Error('MCP authorization challenge lacks resource_metadata');
     _validateCustomOAuthUrl(mcpUrl, resourceMetadataUrl.toString());
-    const metadataResponse = await _fetchDcr('MCP challenged resource metadata', resourceMetadataUrl.toString(), {
+    const { response: metadataResponse, body } = await _fetchDcrJson('MCP challenged resource metadata', resourceMetadataUrl.toString(), {
       redirect: 'error',
     });
     if (!metadataResponse.ok) throw new Error(`MCP resource metadata HTTP ${metadataResponse.status}`);
-    return await metadataResponse.json() as ProtectedResourceMetadata;
+    return body as ProtectedResourceMetadata;
   } finally { await response.body?.cancel().catch(() => {}); }
 }
 
@@ -435,8 +502,9 @@ async function _registerClient(
   strict = false,
 ): Promise<{ client_id: string; client_secret?: string; token_endpoint_auth_method?: string }> {
   let r: Response;
+  let body: unknown;
   try {
-    r = await _fetchDcr('DCR client registration', registrationEndpoint, {
+    ({ response: r, body } = await _fetchDcrJson('DCR client registration', registrationEndpoint, {
       method: 'POST',
       ...(strict ? { redirect: 'error' as const } : {}),
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
@@ -448,14 +516,15 @@ async function _registerClient(
         application_type: 'web',
         token_endpoint_auth_method: tokenEndpointAuthMethod,
       }),
-    });
+    }));
   } catch (err) {
+    if (err instanceof SyntaxError) throw err;
     throw _fmtFetchErr('DCR client registration fetch failed', err);
   }
   if (!r.ok) {
     throw new Error(`DCR registration failed: HTTP ${r.status}`);
   }
-  return await r.json() as { client_id: string; client_secret?: string; token_endpoint_auth_method?: string };
+  return body as { client_id: string; client_secret?: string; token_endpoint_auth_method?: string };
 }
 
 // ── PKCE ───────────────────────────────────────────────────────────────
@@ -564,7 +633,7 @@ async function _startDcrOAuth(
 
   return new Promise<{ grant: OAuthGrant; client: DcrClientCredentials }>((resolve, reject) => {
     const timer = setTimeout(() => {
-      if (_pending === pending) _cancelPending('DCR flow timed out');
+      if (_pending === pending) _cancelPending('DCR flow timed out', 'flow_timeout');
     }, FLOW_TIMEOUT_MS);
     timer.unref?.();
     const pending: PendingDcrFlow = {
@@ -625,7 +694,7 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
   let payload: { code: string; state: string; issuer?: string };
   try {
     const relayBase = pending.kind === 'local_api' ? pending.relayBase : accountApiBase();
-    const res = await _fetchDcr('DCR exchange', `${relayBase}/connectors/oauth/dcr-exchange`, {
+    const { response: res, body: rawBody } = await _fetchDcrJson('DCR exchange', `${relayBase}/connectors/oauth/dcr-exchange`, {
       method: 'POST',
       headers: withCommonHeaders({
         'Content-Type': 'application/json',
@@ -634,7 +703,7 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
       body: JSON.stringify({ exchange_code: exchangeCode, device_id: tokenStore.getDeviceId() }),
     });
     if (!res.ok) throw new Error(`/dcr-exchange HTTP ${res.status}`);
-    const body = await res.json() as {
+    const body = rawBody as {
       code: number;       // status — 0 = ok
       msg?: string;
       oauth_code?: string;
@@ -689,7 +758,7 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
       code_verifier: pending.codeVerifier,
       resource: pending.resource,
     });
-    const res = await _fetchDcr('DCR token exchange', pending.client.token_endpoint, {
+    const { response: res, body: rawBody } = await _fetchDcrJson('DCR token exchange', pending.client.token_endpoint, {
       method: 'POST',
       ...(pending.storeLocally ? { redirect: 'error' as const } : {}),
       headers: tokenReq.headers,
@@ -698,7 +767,7 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
     if (!res.ok) {
       throw new Error(`token endpoint HTTP ${res.status}`);
     }
-    const tokens = await res.json() as {
+    const tokens = rawBody as {
       access_token: string;
       refresh_token?: string;
       expires_in?: number;
@@ -756,20 +825,24 @@ export async function refreshDcrIfStale(
   if (client.resource) params.resource = client.resource;
   const tokenReq = _buildTokenRequest(client, params);
   let res: Response;
+  let rawBody: unknown;
   try {
-    res = await _fetchDcr('DCR token refresh', client.token_endpoint, {
+    ({ response: res, body: rawBody } = await _fetchDcrJson('DCR token refresh', client.token_endpoint, {
       method: 'POST',
       ...(opts.strict ? { redirect: 'error' as const } : {}),
       headers: tokenReq.headers,
       body: tokenReq.body.toString(),
-    });
+    }));
   } catch (err) {
+    // Parse failures previously lived outside the fetch-only catch. Preserve
+    // that boundary: malformed JSON must not become a transient fetch failure.
+    if (err instanceof SyntaxError) throw err;
     throw _fmtFetchErr('DCR token refresh fetch failed', err);
   }
   if (!res.ok) {
     throw new Error(`DCR refresh HTTP ${res.status}`);
   }
-  const tokens = await res.json() as {
+  const tokens = rawBody as {
     access_token: string;
     refresh_token?: string;
     expires_in?: number;

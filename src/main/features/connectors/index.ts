@@ -31,6 +31,7 @@ export type {
   StreamableHttpTransport,
   ToolSchema,
   ConnectorStatus,
+  DiscordWebhookTarget,
   ConnectorInstance,
   CatalogEntry,
   CatalogCategory,

@@ -100,6 +100,40 @@ afterEach(() => {
 });
 
 describe('direct commerce stdio adapter', () => {
+  it.each(['etsy', 'mercado_libre'] as const)('verifies an exact cached %s identity without rounding or refreshing it', async provider => {
+    for (const accepts of [true, false]) {
+      const expected = accepts ? '9007199254740993' : '9007199254740992';
+      const env = envFor(provider, { client_id: 'fixture-client', client_secret: 'fixture-secret', keystring: 'fixturekey', shared_secret: 'fixture-secret',
+        access_token: '12345.fixture-token', refresh_token: 'fixture-refresh', expires_at: Date.now() + 3600_000,
+        scope: provider === 'etsy' ? 'shops_r shops_w listings_r listings_w listings_d transactions_r transactions_w' : 'offline_access read write',
+        identity: { shop_id: expected, user_id: provider === 'etsy' ? '12345' : expected } },
+      provider === 'etsy' ? { shop_id: expected } : { user_id: expected });
+      const fetch = vi.fn(async () => new Response(provider === 'etsy'
+        ? '{"shop_id":9007199254740993,"user_id":12345}' : '{"id":9007199254740993}'));
+      vi.stubGlobal('fetch', fetch);
+      const lookup = adapter.callTool('list_capabilities', {}, env);
+      if (accepts) {
+        const result = await lookup;
+        expect(result.identity[provider === 'etsy' ? 'shop_id' : 'id']).toBe('9007199254740993');
+      } else await expect(lookup).rejects.toThrow(/different (shop|seller)/);
+      expect(fetch).toHaveBeenCalledTimes(1);
+      expect(codec.readCredentialFile(env.ORKAS_LOCAL_API_CREDENTIAL_FILE!, env.ORKAS_LOCAL_API_CREDENTIAL_KEY!).access_token).toBe('12345.fixture-token');
+    }
+  });
+
+  it('rejects a cached Etsy shop whose known authorizing owner changed without rewriting its grant', async () => {
+    const env = envFor('etsy', { keystring: 'fixturekey', shared_secret: 'fixture-secret',
+      access_token: '9007199254740992.fixture-token', refresh_token: 'fixture-refresh', expires_at: Date.now() + 3600_000,
+      scope: 'shops_r shops_w listings_r listings_w listings_d transactions_r transactions_w',
+      identity: { shop_id: '123', user_id: '9007199254740992' } }, { shop_id: '123' });
+    const before = codec.readCredentialFile(env.ORKAS_LOCAL_API_CREDENTIAL_FILE!, env.ORKAS_LOCAL_API_CREDENTIAL_KEY!);
+    const fetch = vi.fn(async () => new Response('{"shop_id":123,"user_id":9007199254740993}'));
+    vi.stubGlobal('fetch', fetch);
+    await expect(adapter.callTool('list_capabilities', {}, env)).rejects.toThrow('different shop or owner');
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(codec.readCredentialFile(env.ORKAS_LOCAL_API_CREDENTIAL_FILE!, env.ORKAS_LOCAL_API_CREDENTIAL_KEY!)).toEqual(before);
+  });
+
   it('describes Shopify output types on demand without fetching or widening other actions', async () => {
     const fetch = vi.fn(); vi.stubGlobal('fetch', fetch);
     const env = envFor('shopify', { client_id: 'fixture-client', client_secret: 'fixture-secret' }, { shop_domain: 'fixture.myshopify.com' });

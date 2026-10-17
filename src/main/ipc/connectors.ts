@@ -21,7 +21,7 @@
 import * as path from 'node:path';
 
 import * as connectors from '../features/connectors';
-import type { ConnectorInstance, ConnectorStatus, ToolSchema } from '../features/connectors';
+import type { ConnectorInstance, ConnectorStatus, DiscordWebhookTarget, ToolSchema } from '../features/connectors';
 import { isConnectorEnabled, setConnectorEnabled } from '../features/component_enabled';
 import { catalogWithAvailability, isConnectorRuntimeEnabled } from '../features/connectors/availability';
 import { requireConnectorApiKey } from '../features/connectors/api-key';
@@ -47,7 +47,9 @@ interface ClientConnectorInstance {
     | { kind: 'stdio'; summary: string; command?: string; argument_count?: number }
     | { kind: 'streamable-http'; summary: string };
   enabled_subtools: string[] | null;
-  tools_cache: ToolSchema[];
+  /** How many tools the last successful list returned. The renderer only needs
+   * to know whether a connector ever listed tools; schemas stay in main. */
+  tools_count: number;
   tools_cached_at: number;
   status: ConnectorStatus;
   oauth_grant?: { account_label: string };
@@ -90,7 +92,7 @@ function toClientInstance(inst: ConnectorInstance, enabled?: boolean, uid?: stri
     ...(inst.custom_auth_mode ? { custom_auth_mode: inst.custom_auth_mode } : {}),
     ...(transport ? { transport } : {}),
     enabled_subtools: inst.enabled_subtools,
-    tools_cache: inst.tools_cache,
+    tools_count: Array.isArray(inst.tools_cache) ? inst.tools_cache.length : 0,
     tools_cached_at: inst.tools_cached_at,
     status: inst.status,
     created_at: inst.created_at,

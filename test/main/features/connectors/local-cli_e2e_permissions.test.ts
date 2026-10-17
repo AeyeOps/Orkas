@@ -82,7 +82,7 @@ it('completes real Lark authorization after bot denial without replaying a messa
     expect(pending).toMatchObject({ scopes: [], access_issues: [
       { identity: 'bot', code: 230013, recovery: 'check_bot_availability' },
     ] });
-    expect(JSON.parse(fs.readFileSync(grants, 'utf8'))).toEqual(['im:message.send_as_user', 'offline_access']);
+    expect(JSON.parse(fs.readFileSync(grants, 'utf8'))).toEqual(expect.arrayContaining(['im:message.send_as_user', 'offline_access', 'calendar:calendar.event:read', 'docx:document:readonly']));
     const callsBeforeRetry = fs.readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
     expect(callsBeforeRetry.filter(args => args[0] === 'im' && !args.includes('--help'))).toHaveLength(2);
     expect(callsBeforeRetry.filter(args => args[0] === 'auth' && args[1] === 'login')).toHaveLength(1);
@@ -172,4 +172,59 @@ it.each(['dingtalk', 'wecom'])('keeps %s reads usable across a business denial a
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+it.each(['granted', 'restricted', 'cancel'])('runs the real DingTalk authorization driver with full-domain consent: %s', async outcome => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-dws-consent-e2e-'));
+  const work = path.join(root, 'work');
+  fs.mkdirSync(work);
+  const cli = path.join(root, 'npx-cli.cjs');
+  const trace = path.join(root, 'calls.jsonl');
+  const authenticated = path.join(root, 'authenticated');
+  const marker = path.join(root, 'integrity.json');
+  const manifest = adapter.MANIFESTS.dingtalk;
+  fs.writeFileSync(marker, JSON.stringify(manifest));
+  fs.writeFileSync(cli, [
+    "const fs = require('node:fs');",
+    `const trace = ${JSON.stringify(trace)}, authenticated = ${JSON.stringify(authenticated)}, outcome = ${JSON.stringify(outcome)};`,
+    'const args = process.argv.slice(5);',
+    "fs.appendFileSync(trace, JSON.stringify(args) + '\\n');",
+    "if (args[0] === 'auth' && args[1] === 'login') { fs.writeFileSync(authenticated, 'verified'); }",
+    "else if (args[0] === 'auth' && args[1] === 'status') { process.stdout.write(JSON.stringify({success:true,authenticated:fs.existsSync(authenticated)})); }",
+    "else if (args[0] === 'pat' && args.includes('--dry-run')) { process.stdout.write(JSON.stringify({success:true,data:{allGranted:outcome==='granted',pendingScopes:[],skippedScopes:[]}})); }",
+    "else if (args[0] === 'pat' && outcome === 'cancel') { process.stderr.write('Consent cancelled'); process.exitCode = 130; }",
+    "else if (args[0] === 'pat' && outcome === 'restricted') { process.stderr.write(JSON.stringify({success:false,code:'PAT_ORG_POLICY_DENIED',data:{scope:'chat.message:send'}})); process.exitCode = 4; }",
+    "else if (args[0] === 'pat' && args.includes('json')) { process.stdout.write(JSON.stringify({success:true,data:{grantedScopes:['chat.message:send']}})); }",
+    "else if (args[0] === 'pat') { process.stdout.write('Fixture consent completed'); }",
+    "else { process.stderr.write('Unexpected command'); process.exitCode = 9; }",
+  ].join('\n'));
+  const node = process.env.ORKAS_TEST_NODE || process.execPath;
+  const env = { ORKAS_LOCAL_CLI_PROVIDER: 'dingtalk', ORKAS_NODE: node,
+    ORKAS_LOCAL_CLI_PACKAGE: manifest.package, ORKAS_LOCAL_CLI_PACKAGE_INTEGRITY: manifest.integrity,
+    ORKAS_LOCAL_CLI_EXECUTABLE: manifest.executable, ORKAS_LOCAL_CLI_ALLOWED_DOMAINS_JSON: JSON.stringify(manifest.domains),
+    ORKAS_LOCAL_CLI_RUNTIME_DIR: root, ORKAS_LOCAL_CLI_WORK_DIR: work, ORKAS_LOCAL_CLI_PROFILE: 'dws-consent-e2e',
+    ORKAS_LOCAL_CLI_NPX_CLI: cli, ORKAS_LOCAL_CLI_INTEGRITY_MARKER: marker };
+  try {
+    const result = spawnSync(node, [path.resolve('bin/local-cli-auth.cjs')], { env, encoding: 'utf8', timeout: 10_000 });
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(outcome === 'cancel' ? 1 : 0);
+    if (outcome === 'granted') expect(result.stderr).toBe('');
+    else expect(result.stderr).toContain(outcome === 'restricted' ? 'PAT_ORG_POLICY_DENIED' : 'Consent cancelled');
+    const calls: string[][] = fs.readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(calls[0]).toEqual(['auth', 'login', '--device', '--no-browser']);
+    expect(calls.every(args => ['auth', 'pat'].includes(args[0]))).toBe(true);
+    const grants = calls.filter(args => args[0] === 'pat' && !args.includes('--dry-run'));
+    expect(grants.length).toBeGreaterThan(0);
+    for (const args of grants) {
+      expect(args[args.indexOf('--domains') + 1].split(','))
+        .toEqual(expect.arrayContaining(['calendar', 'chat', 'doc', 'drive']));
+      expect(args).toContain('--yes');
+    }
+    if (outcome === 'restricted') expect(permissions.readPermissionRequest(env)).toMatchObject({
+      admin_required: true, plan_missing: true, pat_scopes: ['chat.message:send'],
+    });
+    else expect(permissions.readPermissionRequest(env)).toBeNull();
+    if (outcome === 'cancel') expect(calls.some(args => args.includes('--dry-run'))).toBe(false);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });

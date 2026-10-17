@@ -7,6 +7,17 @@ const tool = (name: string, description = 'Read a fixture'): ToolSchema => ({ na
 const visible = (tools: ToolSchema[], id = 'custom-fixture', name = 'Fixture') => [{ instance: { id, display_name: name } as any, tools }];
 
 describe('bounded connector discovery', () => {
+  it('uses browsing/search defaults for out-of-range counts and preserves exact-schema conflicts', () => {
+    const discover = createConnectorToolDiscovery();
+    const scoped = visible(Array.from({ length: 40 }, (_, i) => tool(`report_${i}`, 'Read report')));
+    for (const limit of [-1, 0, 51, 1000]) {
+      for (const query of [undefined, 'report']) {
+        const params = { connector_id: 'custom-fixture', offset: 2, ...(query ? { query } : {}) };
+        expect(discover(scoped, validateDiscoveryParams({ ...params, limit }))).toEqual(discover(scoped, params));
+      }
+      expect(() => validateDiscoveryParams({ connector_id: 'custom-fixture', tool_name: 'report_1', limit })).toThrow('cannot be combined');
+    }
+  });
   it('reports full search coverage and permits recovery without treating an empty page as no matches', () => {
     const discover = createConnectorToolDiscovery();
     const scoped = [...visible([tool('read_invoice', 'Read invoice amount')], 'first'),
@@ -168,8 +179,7 @@ describe('bounded connector discovery', () => {
     [{ query: ' ' }, 'query must be a non-empty string'],
     [{ query: 3 }, 'query must be a non-empty string'],
     [{ query: 'x'.repeat(1025) }, 'query must be at most 1024 characters'],
-    [{ limit: 0 }, 'limit must be an integer from 1 to 50'],
-    [{ limit: 51 }, 'limit must be an integer from 1 to 50'],
+    [{ limit: '20' }, 'limit must be an integer from 1 to 50'],
     [{ limit: 1.5 }, 'limit must be an integer from 1 to 50'],
     [{ offset: -1 }, 'offset must be an integer from 0 to 9007199254740991'],
     [{ offset: Infinity }, 'offset must be an integer from 0 to 9007199254740991'],

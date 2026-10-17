@@ -777,7 +777,17 @@ describe('connector_setup', () => {
       page_id: 'page-1',
       untrusted_content: true,
     });
-    expect(observePage).toHaveBeenCalledWith('xiaohongshu-seller');
+    // The page gets the read_files allowance less this reply's own fields.
+    const [, budget] = (observePage.mock.calls.at(-1) || []) as unknown as [string, number];
+    expect(observePage).toHaveBeenLastCalledWith('xiaohongshu-seller', budget);
+    expect(budget).toBeGreaterThan(9_900);
+    expect(budget).toBeLessThan(10_000);
+    await tool.execute({ operation: 'page_observe', connector_id: 'xiaohongshu-seller' }, {
+      state: { toolResultInlineLedger: { initialTokens: 20_000, remainingTokens: 3_000, perResultTokens: 10_000 } },
+    } as never);
+    const [, roundBudget] = (observePage.mock.calls.at(-1) || []) as unknown as [string, number];
+    expect(roundBudget).toBeGreaterThan(2_900);
+    expect(roundBudget).toBeLessThan(3_000);
 
     const acted = await run(tool, {
       operation: 'page_act',
@@ -791,9 +801,10 @@ describe('connector_setup', () => {
       operation: 'page_act',
       code: 'user_action_required',
     });
+    expect(acted.isError).toBe(true);
     expect(actPage).toHaveBeenCalledWith('xiaohongshu-seller', expect.objectContaining({
       page_id: 'page-1', element_ref: 'e1', page_action: 'click',
-    }));
+    }), undefined);
 
     const waited = await run(tool, {
       operation: 'page_wait',
@@ -802,15 +813,15 @@ describe('connector_setup', () => {
       timeout_ms: 1000,
     });
     expect(waited.result).toMatchObject({ ok: true, operation: 'page_wait', condition: 'loaded' });
-    expect(waitPage).toHaveBeenCalledWith('xiaohongshu-seller', expect.any(Object));
+    expect(waitPage).toHaveBeenCalledWith('xiaohongshu-seller', expect.any(Object), undefined);
 
-    // Web Assist accepts up to 2000 characters for fill/select but only 240
+    // Web Assist accepts up to 100000 characters for fill/select but only 240
     // for a page_wait text condition. The schema keeps the wider bound and the
     // parameter description states the narrower one, so the model does not
     // spend a round trip discovering it; the tool forwards the text unchanged
     // and leaves enforcement to the page layer.
     const textProperty = (tool.inputSchema as any).properties.text;
-    expect(textProperty.maxLength).toBe(2000);
+    expect(textProperty.maxLength).toBe(100000);
     expect(textProperty.description).toMatch(/page_wait \(up to 240 characters\)/);
     const longText = 'x'.repeat(300);
     await run(tool, {
@@ -821,7 +832,148 @@ describe('connector_setup', () => {
     });
     expect(waitPage).toHaveBeenLastCalledWith('xiaohongshu-seller', expect.objectContaining({
       wait_condition: 'text', text: longText,
-    }));
+    }), undefined);
+  });
+
+  it.each([
+    ['page_observe', 'observePage', { ok: false, code: 'observation_failed' }],
+    ['page_act', 'actPage', { ok: false, code: 'stale_page' }],
+    ['page_act', 'actPage', { ok: false, code: 'user_action_required', reason: 'mfa_or_captcha' }],
+    ['page_wait', 'waitPage', { ok: false, code: 'wait_timeout', timeout_ms: 1000 }],
+  ] as const)('preserves %s failure and permits an explicit later recovery (%s)', async (operation, callback, failure) => {
+    const recovered = { ok: true, page_id: 'fresh-page', untrusted_content: true };
+    const delegate = vi.fn().mockResolvedValueOnce(failure).mockResolvedValueOnce(recovered);
+    const stageConfigure = vi.fn(() => ({ ok: true as const }));
+    const tool = buildConnectorSetupTool({
+      uid: 'u1', language: 'en', stageConfigure, [callback]: delegate,
+      dependencies: { catalog: () => [entry()], instances: () => [], enabledSnapshot: () => ({ connectors: {} }) },
+    });
+    const input = { operation, connector_id: 'xiaohongshu-seller', page_action: 'click' };
+    const failed = await run(tool, input);
+    expect(failed).toEqual({ isError: true, result: { operation, connector_id: input.connector_id, ...failure } });
+    expect(delegate).toHaveBeenCalledOnce();
+    expect(stageConfigure).not.toHaveBeenCalled();
+    expect(await run(tool, input)).toEqual({ result: { operation, connector_id: input.connector_id, ...recovered } });
+    expect(delegate).toHaveBeenCalledTimes(2);
+    expect(stageConfigure).not.toHaveBeenCalled();
+  });
+
+  it.each(['page_act', 'page_wait'] as const)('passes the executor cancellation signal to a pending connector %s', async operation => {
+    const controller = new AbortController();
+    let received: AbortSignal | undefined;
+    let release!: () => void;
+    const delegate = vi.fn(async (_id, _input, signal?: AbortSignal) => {
+      received = signal;
+      await new Promise<void>(resolve => { release = resolve; });
+      return signal?.aborted ? { ok: false, code: 'task_run_ended' } : { ok: true };
+    });
+    const tool = buildConnectorSetupTool({ uid: 'u1', language: 'en', stageConfigure: () => ({ ok: true }),
+      [operation === 'page_act' ? 'actPage' : 'waitPage']: delegate,
+      dependencies: { catalog: () => [entry()], instances: () => [], enabledSnapshot: () => ({ connectors: {} }) } });
+    const pending = tool.execute({ operation, connector_id: entry().id, page_action: 'click' }, { signal: controller.signal } as any);
+    controller.abort(); release();
+    const result = await pending;
+    expect(received).toBe(controller.signal);
+    expect(result.isError).toBe(true);
+    expect(JSON.parse(result.content)).toMatchObject({ ok: false, code: 'task_run_ended' });
+    expect(delegate).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps connector page continuation inline together with argument feedback', async () => {
+    const { fitWebAssistObservation } = await import('../../../../src/main/features/web_assist');
+    const { estimateToolResultTokens } = await import('../../../../src/main/util/tool-result-cap');
+    const { appendInputReceipt } = require('../../../../bin/tool-input-compat.cjs');
+    const inputReceipt = { ignored_fields: Array.from({ length: 10 }, (_, i) => `${i}${'x'.repeat(79)}`) };
+    const raw = { ok: true, page_id: 'page-1', text: '界'.repeat(6000), text_offset: 0,
+      elements: Array.from({ length: 80 }, (_, i) => ({ ref: `e${i}`, tag: 'button', label: '格'.repeat(40) })) };
+    const tool = buildConnectorSetupTool({ uid: 'u1', language: 'en',
+      observePage: async (_id, budget) => fitWebAssistObservation(raw, budget!),
+      dependencies: { catalog: () => [entry()], instances: () => [], enabledSnapshot: () => ({ connectors: {} }) } });
+    const result = await tool.execute({ operation: 'page_observe', connector_id: entry().id }, { inputReceipt,
+      state: { toolResultInlineLedger: { initialTokens: 10_000, remainingTokens: 10_000, perResultTokens: 10_000 } } });
+    const delivered = result.appliedInputReceipt === inputReceipt ? result.content : appendInputReceipt(result.content, inputReceipt);
+    expect(estimateToolResultTokens(delivered)).toBeLessThanOrEqual(10_000);
+    const body = JSON.parse(delivered);
+    expect(body.connector_id).toBe(entry().id);
+    expect(body.elements).toHaveLength(80);
+    expect(body.ignored_fields).toEqual(inputReceipt.ignored_fields);
+    expect(body.text_next_offset).toBe(body.text.length);
+    expect(body.text_next_offset).toBeGreaterThan(0);
+    expect(body.text_next_offset).toBeLessThan(raw.text.length);
+  });
+
+  it('records a failed wait in the real runner and resumes with one explicit browser submission', async () => {
+    const { AgentRunner, ProviderRegistry, createConfig } = await import('../../../../src/core-agent/src/index');
+    const waitPage = vi.fn(async () => ({ ok: false, code: 'wait_timeout', condition: 'text' }));
+    const observePage = vi.fn(async () => ({ ok: true, page_id: 'fresh-page', elements: [{ ref: 'e1', label: 'Save application' }] }));
+    const submissions: string[] = [];
+    const actPage = vi.fn(async (_id: string, input: Record<string, unknown>) => {
+      submissions.push(String(input.element_ref));
+      return { ok: true, text: 'Application saved' };
+    });
+    const tool = buildConnectorSetupTool({ uid: 'u1', language: 'en', stageConfigure: () => ({ ok: true }),
+      waitPage, observePage, actPage,
+      dependencies: { catalog: () => [entry()], instances: () => [], enabledSnapshot: () => ({ connectors: {} }) },
+    });
+    const inputs = [
+      { operation: 'page_wait', connector_id: 'xiaohongshu-seller', wait_condition: 'text', text: 'Ready' },
+      { operation: 'page_observe', connector_id: 'xiaohongshu-seller' },
+      { operation: 'page_act', connector_id: 'xiaohongshu-seller', page_id: 'fresh-page', element_ref: 'e1', page_action: 'click' },
+    ];
+    let requests = 0;
+    const received: Array<{ isError?: boolean; result: unknown }> = [];
+    const provider: any = { id: 'fixture', name: 'Fixture', validateAuth: async () => true,
+      complete: async () => { throw new Error('Unexpected nonstream fixture request'); },
+      async *stream(params: any) {
+        const index = requests++;
+        if (index > 3) throw new Error('Unexpected retry or replay');
+        const result = params.messages.flatMap((message: any) => message.content)
+          .filter((block: any) => block.type === 'tool_result').at(-1);
+        if (result) received.push({ isError: result.isError, result: JSON.parse(result.content) });
+        if (index === 3) {
+          yield { type: 'text_delta', text: 'Application saved.' };
+          yield { type: 'message_end', stopReason: 'end_turn' }; return;
+        }
+        const call = { type: 'tool_use', id: 'fixture-' + index, name: tool.name, input: inputs[index] };
+        yield { type: 'tool_use_start', id: call.id, name: call.name };
+        yield { type: 'tool_use_delta', id: call.id, input: JSON.stringify(call.input) };
+        yield { type: 'tool_use_end', id: call.id };
+        yield { type: 'message_end', stopReason: 'tool_use', content: [call] };
+      },
+    };
+    const providers = new ProviderRegistry();
+    providers.registerFactory('fixture', () => provider);
+    const runner = new AgentRunner({ tools: [tool], providers, config: createConfig({
+      agent: { defaultProvider: 'fixture', defaultModel: 'fixture' }, evolution: { enabled: false },
+    }) });
+    const warnings = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const events: any[] = [];
+      for await (const event of runner.runStream({ message: 'Finish the application after the page becomes ready.' })) events.push(event);
+      expect(received[0]).toEqual({ isError: true, result: {
+        operation: 'page_wait', connector_id: 'xiaohongshu-seller', ok: false, code: 'wait_timeout', condition: 'text',
+      } });
+      expect(events.filter(event => event.type === 'tool_end').map(event => Boolean(event.isError))).toEqual([true, false, false]);
+      expect(events.findLast(event => event.type === 'done')?.result).toMatchObject({ text: 'Application saved.', meta: { permanentToolErrors: 1 } });
+      expect(events.findLast(event => event.type === 'done')?.result.meta.error).toBeUndefined();
+      expect(waitPage).toHaveBeenCalledOnce();
+      expect(observePage).toHaveBeenCalledOnce();
+      expect(actPage).toHaveBeenCalledOnce();
+      expect(submissions).toEqual(['e1']);
+      expect(requests).toBe(4);
+      const errors = warnings.mock.calls.filter(call => call[1] === 'Tool returned error');
+      const descriptionWarnings = warnings.mock.calls.filter(call => call[1] !== 'Tool returned error');
+      // This existing warning is emitted once per definition identity. Account
+      // for it when present without depending on another case's cache state.
+      for (const warning of descriptionWarnings) {
+        expect(warning[1]).toBe('tool definition description exceeds soft budget; sent untruncated');
+        expect(warning[2]).toMatchObject({ tool: 'connector_setup' });
+      }
+      expect(errors).toHaveLength(1);
+      expect(errors[0][2]).toMatchObject({ tool: 'connector_setup' });
+      console.log('[connector-setup:recovery]', JSON.stringify({ failedTools: errors.length,
+        descriptionWarnings: descriptionWarnings.length, submissions: submissions.length, recovered: true }));
+    } finally { warnings.mockRestore(); }
   });
 });
 

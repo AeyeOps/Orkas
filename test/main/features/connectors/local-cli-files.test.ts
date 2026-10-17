@@ -51,6 +51,7 @@ function envFor(provider: string) {
     ORKAS_LOCAL_CLI_NPX_CLI: '/fixture/npx-cli.js',
   };
 }
+function fullLarkScopes(env: any, ...extra: string[]) { return [...new Set([...auth.larkRequiredScopes(env), ...extra])]; }
 function ok(data: unknown) { return { status: 0, stdout: JSON.stringify(data), stderr: '' }; }
 function runnerFor(execute: (args: string[], options: any) => unknown, provider = 'lark') {
   return vi.fn((_command: string, argv: string[], options: any) => {
@@ -415,9 +416,9 @@ describe('reauthorization across business domains and CLI providers', () => {
     const npx = path.join(root, 'fake-npx.cjs');
     const calls = path.join(root, 'calls.json');
     fs.writeFileSync(npx, `const fs = require('node:fs');
-fs.writeFileSync(process.env.FIXTURE_CALLS, JSON.stringify(process.argv.slice(2)));
+if (!process.argv.includes('scopes')) fs.writeFileSync(process.env.FIXTURE_CALLS, JSON.stringify(process.argv.slice(2)));
 if (process.env.FIXTURE_MODE === 'unavailable') process.exit(1);
-process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.stringify({ identities: { user: { available: true, verified: true, scope: 'docx:document:readonly im:message.send_as_user' } } }));`);
+process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.stringify({ identities: { user: { available: true, verified: true, scope: ${JSON.stringify(auth.larkRequiredScopes(env).join(' '))} } } }));`);
     auth.writeIntegrityMarker(auth.MANIFESTS.lark, env);
     permissions.rememberPermissionRequest({ provider_error: { type: 'authorization', identity: 'user', missing_scopes: ['docx:document:readonly'] } }, env);
     const file = path.join(env.ORKAS_LOCAL_CLI_RUNTIME_DIR, '.orkas-user-permissions.json');
@@ -439,8 +440,9 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
 
   it('discovers missing send permission without logging in, preserves other grants and removes the notice after a confirmed grant', () => {
     const env = envFor('lark');
-    let grant = 'docx:document:readonly offline_access';
+    let grant = fullLarkScopes(env, 'offline_access').filter(scope => scope !== 'im:message.send_as_user').join(' ');
     const runner = vi.fn((_node, argv) => {
+      if (argv.includes('scopes')) return ok({ tokenType: 'user', userScopes: fullLarkScopes(env) });
       expect(argv.slice(4)).toEqual(['auth', 'status', '--profile', 'file-contract', '--verify', '--json']);
       return ok({ identities: { user: { available: true, verified: true, scope: grant } } });
     });
@@ -464,11 +466,11 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     }
     auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, () => {
       permissions.rememberPermissionRequest({ code: 'connector_permission_denied' }, env);
-      return ok({ identities: { user: { available: true, verified: true, scope: 'docx:document:readonly im:message.send_as_user' } } });
+      return ok({ identities: { user: { available: true, verified: true, scope: fullLarkScopes(env).join(' ') } } });
     });
     expect(permissions.readPermissionRequest(env)).toMatchObject({ unresolved_access: true });
     auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, () => ok({ identities: { user: {
-      available: true, verified: true, scope: 'docx:document:readonly im:message.send_as_user',
+      available: true, verified: true, scope: fullLarkScopes(env).join(' '),
     } } }));
     expect(permissions.readPermissionRequest(env)).toMatchObject({ scopes: [], unresolved_access: true });
   });
@@ -529,13 +531,13 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     },
   );
 
-  it('retains an access advisory when the accumulated Lark scope list exceeds the bounded explicit request', () => {
+  it('retains a permission recovery entry when the accumulated Lark scope list exceeds the bounded request', () => {
     const env = envFor('lark');
     permissions.rememberPermissionRequest({ provider_error: { type: 'authorization', identity: 'user',
-      missing_scopes: Array.from({ length: 51 }, (_, index) => `resource:scope${index}`),
+      missing_scopes: Array.from({ length: 257 }, (_, index) => `resource:scope${index}`),
     } }, env);
     expect(permissions.readPermissionRequest(env)).toMatchObject({ reauthorize: true, scopes: [],
-      access_issues: [{ recovery: 'check_resource_access' }] });
+      missing_scope_overflow: true, access_issues: [] });
   });
 
   it.each([230013, 99991679])('retains Lark API permission code %s with the applicable access recovery', code => {
@@ -567,8 +569,9 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     granted = ['calendar.event:get'];
     execute.mockClear();
     await auth.authorizeDingtalk('', '', auth.MANIFESTS.dingtalk, env, deps);
-    expect(execute.mock.calls).toHaveLength(2);
-    for (const [args] of execute.mock.calls) {
+    const grants = execute.mock.calls.filter(([args]) => args[0] === 'pat' && !args.includes('--dry-run'));
+    expect(grants).toHaveLength(2);
+    for (const [args] of grants) {
       expect(args).toContain('calendar.event:get');
       expect(args).not.toContain('chat.message:send');
       expect(args.slice(0, 2)).toEqual(['pat', 'chmod']);
@@ -592,7 +595,7 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     await expect(auth.authorizeDingtalk('', '', auth.MANIFESTS.dingtalk, env,
       { execute, authorizationReady: () => true })).rejects.toThrow('permissions are still unavailable');
     expect(permissions.readPermissionRequest(env)).toMatchObject({ pat_scopes: pending.pat_scopes, scopes: [] });
-    expect(execute.mock.calls.every(([args]) => args[0] === 'pat')).toBe(true);
+    expect(execute.mock.calls.every(([args]) => ['auth', 'pat'].includes(args[0]))).toBe(true);
   });
 
   it('stops before PAT grant when DingTalk identity renewal is cancelled or remains unverified', async () => {
@@ -618,10 +621,10 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     const execute = vi.fn(async (args: string[]) => args.includes('json')
       ? JSON.stringify({ success: true, data: { alreadyGrantedScopes: ['chat.message:send'] } }) : undefined);
     await auth.authorizeDingtalk('', '', auth.MANIFESTS.dingtalk, env, { execute, authorizationReady: () => true });
-    expect(execute.mock.calls.map(([args]) => args)).toEqual([
-      ['pat', 'chmod', 'chat.message:send', '--grant-type', 'permanent', '--yes', '--format', 'table'],
-      ['pat', 'chmod', 'chat.message:send', '--grant-type', 'permanent', '--yes', '--format', 'json'],
-    ]);
+    expect(execute.mock.calls[0][0]).toEqual(['auth', 'login', '--device', '--no-browser']);
+    const grants = execute.mock.calls.filter(([args]) => args[0] === 'pat' && !args.includes('--dry-run'));
+    expect(grants).toHaveLength(2);
+    for (const [args] of grants) expect(args).toEqual(expect.arrayContaining(['chat.message:send', '--domains', auth.MANIFESTS.dingtalk.domains.join(','), '--yes']));
     expect(permissions.readPermissionRequest(env)).toBeNull();
   });
 
@@ -653,7 +656,7 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     await expect(auth.authorizeDingtalk('', '', auth.MANIFESTS.dingtalk, env,
       { execute, authorizationReady: () => true })).rejects.toThrow('permissions could not be verified');
     expect(permissions.readPermissionRequest(env)).toMatchObject({ scopes: ['mail:send'], pat_scopes: [] });
-    expect(execute.mock.calls.every(([args]) => args[0] === 'pat')).toBe(true);
+    expect(execute.mock.calls.every(([args]) => ['auth', 'pat'].includes(args[0]))).toBe(true);
   });
 
   it.each(['cancel', 'partial', 'newer'])('keeps DingTalk permission recovery after %s', async mode => {
@@ -670,7 +673,7 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     if (mode === 'newer') await result;
     else await expect(result).rejects.toThrow(mode === 'cancel' ? 'cancelled' : 'permissions are still unavailable');
     expect(permissions.readPermissionRequest(env)).not.toBeNull();
-    expect(execute.mock.calls.every(([args]) => args[0] === 'pat')).toBe(true);
+    expect(execute.mock.calls.every(([args]) => ['auth', 'pat'].includes(args[0]))).toBe(true);
   });
 
   it.each(['PAT_SCOPE_AUTH_REQUIRED', 'PAT_ORG_POLICY_DENIED', 'PAT_NO_PERMISSION'])(
@@ -681,12 +684,12 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
       await expect(auth.authorizeDingtalk('', '', auth.MANIFESTS.dingtalk, env,
         { execute, authorizationReady: () => true })).rejects.toThrow();
       expect(permissions.readPermissionRequest(env)).not.toBeNull();
-      expect(execute.mock.calls.length).toBe(code === 'PAT_ORG_POLICY_DENIED' ? 0 : 1);
+      expect(execute.mock.calls[0][0]).toEqual(['auth', 'login', '--device', '--no-browser']);
     });
 
   it('keeps WeCom recovery after cancellation and identity-only reauthorization without replaying business calls', async () => {
     const env = envFor('wecom');
-    const denied = { code: 'connector_permission_denied' };
+    const denied = { code: 'connector_permission_denied', provider_error: { type: 'authorization', connector_level: true } };
     permissions.rememberPermissionRequest(denied, env);
     const execute = vi.fn(async () => { throw new Error('cancelled'); });
     await expect(auth.authorizeSingleStep('', '', auth.MANIFESTS.wecom, env, () => true, { execute }))
@@ -706,7 +709,7 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
   it('preserves cancellation and old grants without mistaking unknown Lark access for an authorization failure', async () => {
     const env = envFor('lark');
     permissions.rememberPermissionRequest({ code: 'connector_permission_denied' }, env);
-    const oldScopes = ['im:message.send_as_user', 'offline_access'];
+    const oldScopes = fullLarkScopes(env, 'offline_access');
     const authorizationReady = vi.fn(() => true);
     const execute = vi.fn(async () => { throw new Error('cancelled'); });
     const deps = { execute, authorizationReady, authorizationScopes: () => oldScopes };
@@ -715,8 +718,8 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     execute.mockImplementation(async () => undefined);
     await expect(auth.authorizeLark('', '', auth.MANIFESTS.lark, env, deps)).resolves.toBeUndefined();
     expect(execute).toHaveBeenCalledTimes(2);
-    expect(execute).toHaveBeenLastCalledWith([...auth.MANIFESTS.lark.login(env)[1], '--scope', oldScopes.join(' ')]);
-    expect(authorizationReady).toHaveBeenLastCalledWith(oldScopes);
+    expect(execute.mock.calls.at(-1)?.[0]).toEqual(expect.arrayContaining(['--domain', '--scope', [...oldScopes].sort().join(' '), '--json']));
+    expect(authorizationReady).toHaveBeenLastCalledWith();
     expect(permissions.readPermissionRequest(env)).toMatchObject({ unresolved_access: true });
   });
 
@@ -733,15 +736,16 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     lark.rememberPermissionRequest(permissionError('user'), env);
     const execute = vi.fn(async () => undefined);
     await expect(auth.authorizeLark('', '', auth.MANIFESTS.lark, env, {
-      execute, authorizationReady: () => true, authorizationScopes: () => ['offline_access'],
+      execute, authorizationReady: () => true, authorizationScopes: () => fullLarkScopes(env, 'offline_access'),
     })).resolves.toBeUndefined();
-    expect(execute).toHaveBeenCalledExactlyOnceWith([
-      'auth', 'login', '--profile', 'file-contract', '--scope', 'im:message.send_as_user offline_access',
-    ]);
+    expect(execute).toHaveBeenCalledOnce();
+    expect(execute.mock.calls[0][0]).toEqual(expect.arrayContaining(['auth', 'login', '--domain', '--scope', '--json']));
+    expect(execute.mock.calls[0][0][execute.mock.calls[0][0].indexOf('--scope') + 1].split(' '))
+      .toEqual(expect.arrayContaining(['im:message.send_as_user', 'calendar:calendar.event:read', 'offline_access']));
     expect(permissions.readPermissionRequest(env)).toMatchObject({ scopes: [], unresolved_access: true,
       access_issues: [{ identity: 'bot', recovery: 'check_app_permissions' }] });
     auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, () => ok({ identities: { user: {
-      available: true, verified: true, scope: 'im:message.send_as_user offline_access',
+      available: true, verified: true, scope: fullLarkScopes(env, 'offline_access').join(' '),
     } } }));
     expect(permissions.readPermissionRequest(env)).toMatchObject({ scopes: [], unresolved_access: true });
   });
@@ -753,7 +757,7 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     }));
     const execute = vi.fn(async () => undefined);
     const deps = { execute, authorizationReady: () => true,
-      authorizationScopes: () => ['im:message.send_as_user', 'offline_access'] };
+      authorizationScopes: () => fullLarkScopes(env, 'offline_access') };
     for (let attempt = 0; attempt < 2; attempt++) {
       await expect(auth.authorizeLark('', '', auth.MANIFESTS.lark, env, deps)).resolves.toBeUndefined();
       expect(permissions.readPermissionRequest(env)).toMatchObject({ scopes: [], unresolved_access: true,
@@ -784,9 +788,10 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
       expect(lark.readPermissionRequest(env)?.scopes).toEqual([...required].sort());
       const granted = new Set(['im:message.send_as_user', 'offline_access']);
       const execute = vi.fn(async (args: string[]) => {
-        expect(args.slice(0, 5)).toEqual(['auth', 'login', '--profile', 'file-contract', '--scope']);
-        const requested = args[5].split(' ');
-        expect(new Set(requested)).toEqual(new Set([...required, ...granted]));
+        expect(args.slice(0, 4)).toEqual(['auth', 'login', '--profile', 'file-contract']);
+        expect(args).toContain('--domain');
+        const requested = args[args.indexOf('--scope') + 1].split(' ');
+        expect(requested).toEqual(expect.arrayContaining([...required, ...granted]));
         requested.forEach(scope => granted.add(scope));
       });
       await auth.authorizeLark('', '', auth.MANIFESTS.lark, env, {
@@ -818,7 +823,7 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     expect(auth.larkUserScopes('', '', auth.MANIFESTS.lark, envFor('lark'), runner))
       .toEqual(['offline_access', 'docx:document:readonly']);
   });
-  it('retains the missing user scope and explicitly requests it on reconnect while preserving normal login reuse', async () => {
+  it('requests full business permissions on explicit reconnect while preserving existing grants', async () => {
     const env = envFor('lark');
     const error = permissionError();
     lark.rememberPermissionRequest(error, env);
@@ -826,30 +831,31 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     expect(JSON.stringify(error)).not.toContain('private');
     let granted = false;
     const execute = vi.fn(async (args: string[]) => {
-      expect(args).toEqual(['auth', 'login', '--profile', 'file-contract', '--scope', 'docs:document:read im:message.send_as_user']);
+      expect(args).toEqual(expect.arrayContaining(['auth', 'login', '--domain', '--json']));
+      expect(args[args.indexOf('--scope') + 1].split(' ')).toEqual(expect.arrayContaining(['docs:document:read', 'im:message.send_as_user', 'calendar:calendar.event:read']));
       granted = true;
     });
     await auth.authorizeLark('', '', auth.MANIFESTS.lark, env, {
       execute, authorizationReady: (scopes: string[] = []) => !scopes.length || granted,
-      authorizationScopes: () => ['docs:document:read'],
+      authorizationScopes: () => granted ? fullLarkScopes(env, 'docs:document:read') : ['docs:document:read'],
     });
     expect(execute).toHaveBeenCalledOnce();
     expect(lark.readPermissionRequest(env)).toBeNull();
     execute.mockClear();
-    await auth.authorizeLark('', '', auth.MANIFESTS.lark, env, { execute, authorizationReady: () => true });
-    expect(execute).not.toHaveBeenCalled();
+    await auth.authorizeLark('', '', auth.MANIFESTS.lark, env, { execute, authorizationReady: () => true, authorizationScopes: () => fullLarkScopes(env, 'docs:document:read') });
+    expect(execute).toHaveBeenCalledOnce();
   });
 
-  it('does not mistake a valid old login for successful permission grant and retains a retry', async () => {
+  it('keeps a usable partial connection and missing permissions after completed consent without the grants', async () => {
     const env = envFor('lark');
     lark.rememberPermissionRequest(permissionError(), env);
     const execute = vi.fn(async () => undefined);
     await expect(auth.authorizeLark('', '', auth.MANIFESTS.lark, env, {
       execute, authorizationReady: (scopes: string[] = []) => !scopes.length,
       authorizationScopes: () => [],
-    })).rejects.toThrow(/permissions are still unavailable/);
+    })).resolves.toBeUndefined();
     expect(execute).toHaveBeenCalledOnce();
-    expect(lark.readPermissionRequest(env)?.scopes).toEqual(['im:message.send_as_user']);
+    expect(lark.readPermissionRequest(env)?.scopes).toEqual(expect.arrayContaining(['im:message.send_as_user', 'calendar:calendar.event:read']));
   });
 
   it('retains an unknown access advisory without inventing scopes when the provider supplies no scope list', () => {
@@ -883,7 +889,7 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
       newer = permissions.readPermissionRequest(env);
     });
     await auth.authorizeLark('', '', auth.MANIFESTS.lark, env, {
-      execute, authorizationReady: () => true, authorizationScopes: () => ['offline_access'],
+      execute, authorizationReady: () => true, authorizationScopes: () => fullLarkScopes(env, 'offline_access'),
     });
     expect(permissions.readPermissionRequest(env)).toEqual(newer);
     expect(execute).toHaveBeenCalledOnce();
@@ -902,6 +908,230 @@ process.stdout.write(process.env.FIXTURE_MODE === 'malformed' ? '{' : JSON.strin
     expect(pending.access_issues).toEqual([{ identity: 'bot', recovery: 'check_bot_availability', code: 230013 }]);
     expect(JSON.stringify(pending)).not.toContain('private-recipient');
     expect(Buffer.byteLength(JSON.stringify(pending))).toBeLessThan(1024);
+  });
+
+  it.each(['calendar:calendar.event:read', 'docx:document:readonly', 'drive:file:download',
+    'mail:user_mailbox.message:send', 'task:task:read'])(
+    'detects missing %s before a business call and clears only after the verified grant', scope => {
+      const env = envFor('lark');
+      const granted = new Set(fullLarkScopes(env, 'offline_access'));
+      granted.delete(scope);
+      const runner = vi.fn((_node, argv) => {
+        if (argv.includes('scopes')) return ok({ tokenType: 'user', userScopes: fullLarkScopes(env) });
+        expect(argv.slice(4)).toEqual(['auth', 'status', '--profile', 'file-contract', '--verify', '--json']);
+        return ok({ identities: { user: { available: true, verified: true, scope: [...granted] } } });
+      });
+      expect(auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, runner)).toBe(true);
+      expect(permissions.readPermissionRequest(env)?.scopes).toEqual([scope]);
+      granted.add(scope);
+      auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, runner);
+      expect(permissions.readPermissionRequest(env)).toBeNull();
+    },
+  );
+
+  it('keeps the complete domain deficiency readable when no business scope was granted', () => {
+    const env = envFor('lark');
+    auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, () => ok({ identities: { user: {
+      available: true, verified: true, scope: 'offline_access',
+    } } }));
+    const pending = permissions.readPermissionRequest(env);
+    expect(pending.scopes).toEqual(expect.arrayContaining(['calendar:calendar.event:read', 'docx:document:readonly', 'im:message.send_as_user']));
+    expect(pending.scopes.length).toBeGreaterThan(50);
+    expect(Buffer.byteLength(JSON.stringify(pending))).toBeLessThan(16 * 1024);
+  });
+
+  it('clears a confirmed user-app restriction only when the official enabled-scope report verifies it', () => {
+    const env = envFor('lark');
+    permissions.rememberPermissionRequest(permissionError('user', 'app_scope_not_applied'), env);
+    let enabled = fullLarkScopes(env).filter(scope => scope !== 'im:message.send_as_user');
+    const runner = vi.fn((_node, argv) => argv.includes('scopes')
+      ? ok({ tokenType: 'user', userScopes: enabled, appId: 'must-not-be-persisted' })
+      : ok({ identities: { user: { available: true, verified: true, scope: fullLarkScopes(env) } } }));
+    auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, runner);
+    expect(permissions.readPermissionRequest(env)?.access_issues).toMatchObject([{ recovery: 'check_app_permissions' }]);
+    expect(JSON.stringify(permissions.readPermissionRequest(env))).not.toContain('must-not-be-persisted');
+    enabled = fullLarkScopes(env);
+    auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, runner);
+    expect(permissions.readPermissionRequest(env)).toBeNull();
+  });
+
+  it.each(['complete', 'partial', 'cancel'])('runs full login after initialization creates a verified identity: %s', async outcome => {
+    const env = envFor('lark');
+    let identity = false;
+    let scopes = ['offline_access'];
+    const execute = vi.fn(async (args: string[]) => {
+      if (args[0] === 'config') { identity = true; return; }
+      expect(args).toContain('--domain');
+      const requested = args[args.indexOf('--scope') + 1].split(' ');
+      expect(requested).toEqual(expect.arrayContaining(['calendar:calendar.event:read', 'im:message.send_as_user', 'offline_access']));
+      if (outcome === 'cancel') throw new Error('cancelled');
+      scopes = outcome === 'partial' ? requested.filter(scope => scope !== 'calendar:calendar.event:read') : requested;
+      if (outcome === 'partial') throw Object.assign(new Error('official CLI exited with 3'), {
+        stdout: JSON.stringify({ event: 'authorization_complete', requested, granted: scopes }),
+      });
+    });
+    const attempt = auth.authorizeLark('', '', auth.MANIFESTS.lark, env, {
+      execute, profileConfigured: () => false, authorizationReady: () => identity, authorizationScopes: () => scopes,
+    });
+    if (outcome === 'cancel') await expect(attempt).rejects.toThrow('cancelled');
+    else await attempt;
+    expect(execute.mock.calls.map(([args]) => args[0])).toEqual(['config', 'auth']);
+    if (outcome === 'partial') expect(permissions.readPermissionRequest(env)?.scopes).toEqual(['calendar:calendar.event:read']);
+    else expect(permissions.readPermissionRequest(env)).toBeNull();
+  });
+
+  it('does not accept an incomplete authorization event as successful recovery of an old identity', async () => {
+    const env = envFor('lark');
+    permissions.rememberPermissionRequest(permissionError(), env);
+    const original = permissions.readPermissionRequest(env);
+    await expect(auth.authorizeLark('', '', auth.MANIFESTS.lark, env, {
+      authorizationReady: () => true, authorizationScopes: () => ['offline_access'],
+      execute: async () => { throw Object.assign(new Error('cancelled'), { stdout: '{"event":"authorization_complete"}' }); },
+    })).rejects.toThrow('cancelled');
+    expect(permissions.readPermissionRequest(env)).toEqual(original);
+  });
+
+  it('checks DingTalk full-domain permissions without granting and retains independent OAuth and newer denials', () => {
+    const env = envFor('dingtalk');
+    let complete = false;
+    const runner = vi.fn((_node, argv) => {
+      const args = argv.slice(4);
+      expect(args).toEqual(expect.arrayContaining(['pat', 'chmod', '--domains', auth.MANIFESTS.dingtalk.domains.join(','), '--dry-run', '--format', 'json']));
+      expect(args).not.toContain('--yes');
+      return ok({ success: true, data: { allGranted: complete, selectedScopes: ['chat.message:send'], pendingScopes: [], skippedScopes: [] } });
+    });
+    expect(auth.checkDingtalkPermissions('', '', auth.MANIFESTS.dingtalk, env, runner)).toBe(true);
+    expect(permissions.readPermissionRequest(env)).toMatchObject({ plan_missing: true });
+    complete = true;
+    auth.checkDingtalkPermissions('', '', auth.MANIFESTS.dingtalk, env, runner);
+    expect(permissions.readPermissionRequest(env)).toBeNull();
+    dwsDenied(env, 'PAT_SCOPE_AUTH_REQUIRED', { identity: 'user', missingScope: 'Contact.User.Read' });
+    auth.checkDingtalkPermissions('', '', auth.MANIFESTS.dingtalk, env, runner);
+    expect(permissions.readPermissionRequest(env)?.scopes).toEqual(['Contact.User.Read']);
+    const before = permissions.readPermissionRequest(env);
+    auth.checkDingtalkPermissions('', '', auth.MANIFESTS.dingtalk, env, (...args: any[]) => {
+      dwsDenied(env, 'PAT_NO_PERMISSION', { scope: 'chat.message:send' });
+      return runner(...args);
+    });
+    expect(permissions.readPermissionRequest(env)?.revision).not.toBe(before.revision);
+    expect(permissions.readPermissionRequest(env)?.pat_scopes).toContain('chat.message:send');
+  });
+
+  it.each(['timeout', 'malformed', 'missing-status', 'invalid-scopes', 'null-scopes'])(
+    'preserves DingTalk permission evidence when the full-domain plan is %s', mode => {
+      const env = envFor('dingtalk');
+      dwsDenied(env, 'PAT_NO_PERMISSION', { scope: 'chat.message:send' });
+      const original = permissions.readPermissionRequest(env);
+      const result = mode === 'timeout' ? { error: new Error('timeout') }
+        : mode === 'malformed' ? { status: 0, stdout: '{' }
+          : ok({ success: true, data: { ...(mode === 'invalid-scopes' ? { allGranted: true, pendingScopes: ['--invalid'] } : mode === 'null-scopes' ? { allGranted: true, pendingScopes: null } : {}) } });
+      expect(auth.checkDingtalkPermissions('', '', auth.MANIFESTS.dingtalk, env, () => result)).toBe(false);
+      expect(permissions.readPermissionRequest(env)).toEqual(original);
+    },
+  );
+
+  it.each(['complete', 'restricted', 'cancel'])('requests full DingTalk domain access on the first connection: %s', async outcome => {
+    const env = envFor('dingtalk');
+    let authenticated = false;
+    const execute = vi.fn(async (args: string[]) => {
+      if (args[0] === 'auth') { authenticated = true; return; }
+      expect(args).toContain('--domains');
+      expect(args[args.indexOf('--domains') + 1].split(',')).toEqual(expect.arrayContaining(['calendar', 'chat', 'doc', 'drive']));
+      if (args.includes('--dry-run')) return JSON.stringify({ success: true, data: {
+        allGranted: outcome === 'complete', pendingScopes: [], skippedScopes: [],
+      } });
+      if (outcome === 'cancel') throw new Error('cancelled');
+      if (outcome === 'restricted') throw Object.assign(new Error('official CLI exited with 4'), {
+        stderr: JSON.stringify({ success: false, code: 'PAT_ORG_POLICY_DENIED', data: { scope: 'chat.message:send' } }),
+      });
+      return args.includes('json') ? JSON.stringify({ success: true, data: { grantedScopes: ['chat.message:send'] } }) : undefined;
+    });
+    const attempt = auth.authorizeDingtalk('', '', auth.MANIFESTS.dingtalk, env, {
+      execute, authorizationReady: () => authenticated,
+    });
+    if (outcome === 'cancel') await expect(attempt).rejects.toThrow('cancelled');
+    else await attempt;
+    expect(execute.mock.calls[0][0]).toEqual(['auth', 'login', '--device', '--no-browser']);
+    expect(execute.mock.calls.every(([args]) => ['auth', 'pat'].includes(args[0]))).toBe(true);
+    if (outcome === 'restricted') expect(permissions.readPermissionRequest(env)).toMatchObject({ admin_required: true, plan_missing: true });
+    else expect(permissions.readPermissionRequest(env)).toBeNull();
+  });
+
+  it('records confirmed WeCom identity-discovery restrictions without treating network failure or identity success as grant proof', () => {
+    const env = envFor('wecom');
+    expect(auth.checkWecomPermissions('', '', auth.MANIFESTS.wecom, env,
+      () => ({ error: new Error('timeout') }))).toBe(false);
+    expect(permissions.readPermissionRequest(env)).toBeNull();
+    expect(auth.checkWecomPermissions('', '', auth.MANIFESTS.wecom, env,
+      () => ({ status: 1, stdout: '', stderr: JSON.stringify({ error: { type: 'PermissionError' } }) }))).toBe(false);
+    const pending = permissions.readPermissionRequest(env);
+    expect(pending).toMatchObject({ reauthorize: true, identity_denied: true });
+    expect(auth.checkWecomPermissions('', '', auth.MANIFESTS.wecom, env,
+      () => ok({ extra_identity_context: 'verified-fixture-identity' }))).toBe(true);
+    expect(permissions.readPermissionRequest(env)?.identity_denied).toBeUndefined();
+    expect(permissions.readPermissionRequest(env)?.unresolved_access).toBe(true);
+  });
+
+  it('accepts declared API alternatives but keeps shortcut requirements exact', () => {
+    const env = { ...envFor('lark'), ORKAS_LOCAL_CLI_ALLOWED_DOMAINS_JSON: '["calendar"]' };
+    const apiScopes = ['calendar:calendar:create', 'calendar:calendar:delete', 'calendar:calendar:read', 'calendar:calendar:update'];
+    const grant = new Set(fullLarkScopes(env).filter(scope => !apiScopes.includes(scope)));
+    grant.add('calendar:calendar');
+    // Some API read contracts omit the broad scope and require a readonly alternative.
+    grant.add('calendar:calendar:readonly');
+    const runner = () => ok({ identities: { user: { available: true, verified: true, scope: [...grant] } } });
+    auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, runner);
+    expect(permissions.readPermissionRequest(env)).toBeNull();
+    grant.delete('calendar:calendar.event:read');
+    auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, runner);
+    expect(permissions.readPermissionRequest(env)?.scopes).toEqual(['calendar:calendar.event:read']);
+  });
+
+  it('does not turn an absent Lark scope report into an empty grant or a full deficiency', () => {
+    const env = envFor('lark');
+    const runner = () => ok({ identities: { user: { available: true, verified: true } } });
+    expect(auth.larkAuthorizationReady('', '', auth.MANIFESTS.lark, env, runner)).toBe(true);
+    expect(auth.larkUserScopes('', '', auth.MANIFESTS.lark, env, runner)).toBeNull();
+    expect(auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, runner)).toBe(false);
+    expect(permissions.readPermissionRequest(env)).toBeNull();
+  });
+
+  it('detects an app-disabled scope despite an unchanged valid user token, then clears it after app approval', () => {
+    const env = envFor('lark');
+    let enabled = fullLarkScopes(env).filter(scope => scope !== 'im:message.send_as_user');
+    const runner = (_node: string, argv: string[]) => argv.includes('scopes')
+      ? ok({ tokenType: 'user', userScopes: enabled })
+      : ok({ identities: { user: { available: true, verified: true, scope: fullLarkScopes(env) } } });
+    auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, runner);
+    expect(permissions.readPermissionRequest(env)?.access_issues).toEqual([
+      { identity: 'user', recovery: 'check_app_permissions', scopes: ['im:message.send_as_user'] },
+    ]);
+    enabled = fullLarkScopes(env);
+    auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, runner);
+    expect(permissions.readPermissionRequest(env)).toBeNull();
+  });
+
+  it('preserves full-plan and overflow evidence when a newer unrelated denial arrives', () => {
+    const dws = envFor('dingtalk');
+    permissions.recordDingtalkPermissionCheck(dws, null, { complete: false, missing: [] }, auth.MANIFESTS.dingtalk.domains);
+    permissions.rememberPermissionRequest({ code: 'connector_permission_denied' }, dws);
+    expect(permissions.readPermissionRequest(dws)?.plan_missing).toBe(true);
+    const env = envFor('lark');
+    permissions.rememberPermissionRequest({ provider_error: { type: 'authorization', identity: 'user',
+      missing_scopes: Array.from({ length: 257 }, (_, i) => `fixture:scope${i}`) } }, env);
+    permissions.rememberPermissionRequest({ code: 'connector_permission_denied' }, env);
+    expect(permissions.readPermissionRequest(env)?.missing_scope_overflow).toBe(true);
+  });
+
+  it('keeps simultaneous full user/app deficiencies inside the existing ledger byte bound', () => {
+    const env = envFor('lark');
+    auth.checkLarkPermissions('', '', auth.MANIFESTS.lark, env, (_node: string, argv: string[]) => argv.includes('scopes')
+      ? ok({ tokenType: 'user', userScopes: null, count: 0 })
+      : ok({ identities: { user: { available: true, verified: true, scope: 'offline_access' } } }));
+    const pending = permissions.readPermissionRequest(env);
+    expect(pending.scopes).toEqual(expect.arrayContaining(['im:message.send_as_user', 'docx:document:readonly']));
+    expect(pending.access_issues[0].scopes).toContain('calendar:calendar.event:read');
+    expect(Buffer.byteLength(JSON.stringify(pending))).toBeLessThan(16 * 1024);
   });
 
   it('verifies requested scope membership as well as the user identity', () => {

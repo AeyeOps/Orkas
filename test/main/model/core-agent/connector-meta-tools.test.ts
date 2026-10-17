@@ -618,6 +618,10 @@ describe('list_connector_tools', () => {
     expect(result.content).toContain('### create_page');
     expect(result.content).toContain('"required"');
     expect(result.content).toContain('"title"');
+    const defaultResult = await runTool(list, { connector_id: 'notion', offset: 0 });
+    for (const limit of [0, 51]) {
+      expect(await runTool(list, { connector_id: 'notion', limit, offset: 0 })).toEqual(defaultResult);
+    }
     expect(list.inputSchema.properties.query.description).toContain('not record ids');
     const [, call] = await (await loadModule()).createConnectorMetaTools({ userId: UID });
     expect(call.description).toContain(require('../../../../bin/connector-discovery-contract.cjs').callSuitability);
@@ -625,7 +629,7 @@ describe('list_connector_tools', () => {
 
   it.each([
     [{ query: ' ' }, 'query must be a non-empty string'],
-    [{ limit: 0 }, 'limit must be an integer from 1 to 50'],
+    [{ limit: 1.5 }, 'limit must be an integer from 1 to 50'],
     [{ offset: -1 }, 'offset must be an integer from 0 to 9007199254740991'],
     [{ query: 4 }, 'query must be a non-empty string'],
     [{ connector_id: 'notion', tool_name: 'search', query: 'search' }, 'tool_name cannot be combined'],

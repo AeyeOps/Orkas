@@ -495,7 +495,7 @@ export async function authorizeLocalApi(
       return normalized.metadata;
     } catch (error) {
       const code = (error as { code?: string })?.code;
-      if (code === 'user_cancelled') throw error;
+      if (code === 'user_cancelled' || code === 'flow_timeout') throw error;
       log.warn('local API authorization failed', { id: entry.id, provider: config.provider, ...logErrorSummary(error) });
       if (code?.startsWith('storefront_')) {
         const key = code === 'storefront_permission_denied' ? 'permission_denied'
@@ -522,7 +522,7 @@ export async function authorizeLocalApi(
       return normalized.metadata;
     } catch (error) {
       const code = (error as { code?: string })?.code;
-      if (code === 'user_cancelled') throw error;
+      if (code === 'user_cancelled' || code === 'flow_timeout') throw error;
       log.warn('local API authorization failed', { id: entry.id, provider: config.provider, ...logErrorSummary(error) });
       const key = code === 'seller_shop_mismatch' ? 'shop_mismatch'
         : code === 'seller_request_failed' ? 'request_failed' : 'authorization_failed';
@@ -537,7 +537,8 @@ export async function authorizeLocalApi(
       saveCredentials(uid, entry, credentials);
       return normalized.metadata;
     } catch (error) {
-      if ((error as { code?: string })?.code === 'user_cancelled') throw error;
+      const code = (error as { code?: string })?.code;
+      if (code === 'user_cancelled' || code === 'flow_timeout') throw error;
       log.warn('local API authorization failed', { id: entry.id, provider: config.provider, ...logErrorSummary(error) });
       throw Object.assign(new Error(t('connectors.woocommerce.authorization_failed', {}, getLanguageForUser(uid))), {
         code: 'local_api_authorization_failed',

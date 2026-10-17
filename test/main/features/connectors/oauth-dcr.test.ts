@@ -124,10 +124,168 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.unstubAllGlobals();
 });
 
 describe('features/connectors/oauth-dcr', () => {
+  it('continues discovery after a candidate sends headers but stalls its metadata body', async () => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    const resource = { authorization_servers: ['https://auth.notion.example'], resource: 'https://mcp.notion.example/mcp' };
+    const fetchMock = vi.fn(async (raw: string, init: RequestInit) => {
+      if (fetchMock.mock.calls.length === 1) {
+        const signal = init.signal!;
+        return { ok: true, status: 200, json: () => new Promise((resolve, reject) => {
+          const abort = () => reject(signal.reason);
+          signal.addEventListener('abort', abort, { once: true });
+          release = () => { signal.removeEventListener('abort', abort); resolve(resource); };
+        }) };
+      }
+      if (raw.includes('oauth-protected-resource')) return jsonResponse(resource);
+      if (raw.includes('oauth-authorization-server')) return jsonResponse({
+        authorization_endpoint: 'https://auth.notion.example/authorize',
+        token_endpoint: 'https://auth.notion.example/token', registration_endpoint: 'https://auth.notion.example/register',
+      });
+      if (raw.endsWith('/register')) return jsonResponse({ client_id: 'fixture-client' });
+      throw new Error('Unexpected discovery request');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const flow = oauth.startMcpDcrOAuth('uid-1', notionEntry()).catch(error => error);
+    try {
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(electronMock.openExternal).toHaveBeenCalledOnce();
+      expect(fetchMock.mock.calls[1][0]).toBe('https://mcp.notion.example/.well-known/oauth-protected-resource/mcp');
+      expect(new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('resource')).toBe(resource.resource);
+    } finally {
+      oauth.cancelDcrOAuth();
+      release?.();
+      await flow;
+    }
+  });
+
+  it.each(['token-refresh'] as const)('bounds the %s response body without replaying an accepted request', async operation => {
+    vi.useFakeTimers();
+    let release!: () => void;
+    let requestSignal: AbortSignal | undefined;
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      requestSignal = init.signal as AbortSignal;
+      return { ok: true, status: 200, json: () => new Promise((resolve, reject) => {
+        const done = () => {
+          requestSignal?.removeEventListener('abort', abort);
+          resolve({ code: 0, access_token: 'fixture-access', grant_id: 'fixture-grant', expires_in: 3600 });
+        };
+        const abort = () => reject(requestSignal?.reason);
+        requestSignal?.addEventListener('abort', abort, { once: true });
+        release = done;
+      }) };
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const client = { client_id: 'fixture-client', token_endpoint_auth_method: 'none' as const,
+      authorization_endpoint: 'https://provider.example/authorize', token_endpoint: 'https://provider.example/token' };
+    const grant = { access_token: 'fixture-old', refresh_token: 'fixture-refresh', scopes: [],
+      token_type: 'Bearer', expires_at: Date.now() - 1 };
+    let settled = false;
+    const pending = oauth.refreshDcrIfStale(client, grant)
+      .then(value => { settled = true; return value; }, error => { settled = true; return error; });
+    try {
+      await vi.advanceTimersByTimeAsync(0);
+      expect(release).toBeTypeOf('function');
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(settled, 'receiving headers must not disable the request deadline').toBe(true);
+      expect(requestSignal?.aborted).toBe(true);
+      expect(await pending).toBeInstanceOf(Error);
+      expect(fetchMock, 'body timeout must not repeat a possibly completed refresh/store').toHaveBeenCalledOnce();
+    } finally {
+      release?.();
+      await pending;
+    }
+  });
+
+  it.each(['declared', 'streamed'] as const)('stops reading an oversized %s token response without replaying it or exposing its bytes', async shape => {
+    const marker = 'PRIVATE_TOKEN_BYTES_';
+    const chunk = new TextEncoder().encode(marker.repeat((64 * 1024) / marker.length));
+    let produced = 0, cancelled = false;
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) { produced += chunk.byteLength; controller.enqueue(chunk); },
+      cancel() { cancelled = true; },
+    }, { highWaterMark: 0 });
+    const fetchMock = vi.fn(async () => new Response(body, { headers: {
+      'Content-Type': 'application/json', ...(shape === 'declared' ? { 'Content-Length': String(8 * 1024 * 1024) } : {}),
+    } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const client = { client_id: 'fixture-client', authorization_endpoint: 'https://provider.example/authorize',
+      token_endpoint: 'https://provider.example/token' };
+    const grant = { access_token: 'fixture-access', refresh_token: 'fixture-refresh', scopes: [],
+      token_type: 'Bearer', expires_at: Date.now() - 1 };
+    const error = await oauth.refreshDcrIfStale(client, grant).catch(error => error);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).not.toContain('PRIVATE');
+    expect(error.message).not.toMatch(/timed out/i);
+    expect(fetchMock, 'an oversized body must not replay the refresh').toHaveBeenCalledOnce();
+    expect(cancelled, 'the provider stream must be cancelled').toBe(true);
+    expect(produced).toBeLessThanOrEqual(shape === 'declared' ? 0 : 1024 * 1024 + chunk.byteLength);
+  });
+
+  it.each(['token-refresh'] as const)('keeps %s malformed JSON private without classifying it as a fetch failure', async operation => {
+    const request = vi.fn(async () => new Response('PRIVATE123 account payload', {
+      headers: { 'Content-Type': 'application/json' },
+    }));
+    vi.stubGlobal('fetch', request);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const client = { client_id: 'fixture-client', authorization_endpoint: 'https://provider.example/authorize',
+      token_endpoint: 'https://provider.example/token' };
+    const grant = { access_token: 'fixture-access', refresh_token: 'fixture-refresh', scopes: [],
+      token_type: 'Bearer', expires_at: Date.now() - 1 };
+    const error = await oauth.refreshDcrIfStale(client, grant).catch(error => error);
+    expect(error).toBeInstanceOf(SyntaxError);
+    expect(error.message).not.toContain('PRIVATE');
+    expect(error.message).not.toMatch(/fetch failed|timed out|network/i);
+    expect(request).toHaveBeenCalledOnce();
+  });
+
+  it.each(['dcr', 'local_api'])('expires %s authorization at ten minutes and rejects late callbacks', async kind => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn(async (raw: string) => {
+      const url = new URL(raw);
+      if (url.pathname.includes('oauth-protected-resource')) return jsonResponse({
+        authorization_servers: ['https://auth.notion.example'], resource: 'https://mcp.notion.example/mcp',
+      });
+      if (url.pathname.includes('oauth-authorization-server')) return jsonResponse({
+        authorization_endpoint: 'https://auth.notion.example/authorize',
+        token_endpoint: 'https://auth.notion.example/token', registration_endpoint: 'https://auth.notion.example/register',
+      });
+      if (url.pathname === '/register') return jsonResponse({ client_id: 'client-1' });
+      throw new Error('Expired authorization must not exchange credentials');
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const exchange = vi.fn();
+    const flow = kind === 'dcr' ? oauth.startMcpDcrOAuth('uid-1', notionEntry())
+      : oauth.startLocalApiBrowserOAuth('shopee', () => 'https://open.shopee.com/auth', exchange);
+    let rejected = false;
+    const outcome = flow.catch(error => { rejected = true; return error; });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(electronMock.openExternal).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000 - 1);
+    expect(rejected).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await outcome).toMatchObject({ code: 'flow_timeout' });
+    fetchMock.mockClear();
+    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=late');
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(exchange).not.toHaveBeenCalled();
+    expect(oauthEventMock.progress).not.toHaveBeenCalled();
+    expect(loggerMock.warn).toHaveBeenCalledWith('DCR callback arrived with no pending flow');
+    const retry = oauth.startLocalApiBrowserOAuth('shopee', () => 'https://open.shopee.com/auth', exchange);
+    const cancelled = expect(retry).rejects.toMatchObject({ code: 'user_cancelled' });
+    expect(oauth.cancelDcrOAuth()).toBe(true);
+    await cancelled;
+  });
+
   it('authorizes a custom MCP server with PKCE and keeps its rotating grant local', async () => {
     const fetchMock = vi.fn(async (raw: string, init?: RequestInit) => {
       const url = new URL(raw);

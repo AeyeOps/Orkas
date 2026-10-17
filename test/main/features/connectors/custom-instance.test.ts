@@ -225,6 +225,32 @@ describe('connectors/manager › addCustomInstance', () => {
     expect(transports.some(t => t.headers?.Authorization === 'Bearer stale-refresh')).toBe(false);
   });
 
+  it('expires custom reauthorization without changing the existing grant or reporting a failure', async () => {
+    mockMcpClient();
+    const outcome = vi.fn();
+    vi.doMock('../../../../src/main/features/connectors/oauth-events', () => ({
+      broadcastOAuthConnectOutcome: outcome, broadcastOAuthConnectProgress: vi.fn(),
+    }));
+    const start = vi.fn(async () => ({
+      grant: { access_token: 'existing-grant', refresh_token: null, expires_at: null, scopes: [], token_type: 'Bearer' },
+      client: { client_id: 'client', token_endpoint: 'https://login.example/token', authorization_endpoint: 'https://login.example/authorize' },
+    }));
+    vi.doMock('../../../../src/main/features/connectors/oauth-dcr', async importOriginal => ({
+      ...await importOriginal<typeof import('../../../../src/main/features/connectors/oauth-dcr')>(), startCustomMcpOAuth: start,
+    }));
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const instance = await manager.addCustomInstance(TEST_UID, { display_name: 'Existing', auth_mode: 'oauth',
+      transport: { kind: 'streamable-http', url: 'https://mcp.example/mcp' } });
+    const before = registry.load(TEST_UID).connections[instance.id];
+    start.mockRejectedValue(Object.assign(new Error('DCR flow timed out'), { code: 'flow_timeout' }));
+    const started = manager.beginCustomOAuthConnect(TEST_UID, instance.id);
+    await vi.waitFor(() => expect(outcome).toHaveBeenCalledOnce());
+    expect(outcome).toHaveBeenCalledWith({ attempt_id: started.attempt_id, catalog_id: instance.id,
+      result: 'cancelled', code: 'flow_timeout', duration_ms: expect.any(Number) });
+    expect(registry.load(TEST_UID).connections[instance.id]).toEqual(before);
+  });
+
   it('starts browser authorization after the add request returns and reports completion', async () => {
     mockMcpClient();
     let finish!: (result: unknown) => void;

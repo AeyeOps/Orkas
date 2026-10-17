@@ -98,3 +98,37 @@ it('retains call cancellation through token ownership and the shared rate limite
   controller.abort(new Error('private cancellation')); await expect(settle(promise)).rejects.toMatchObject({ code: 'E_TOOL_CALL_CANCELLED' });
   expect(calls.filter(c => c.url.pathname !== '/oauth/token')).toHaveLength(0);
 });
+
+it.each(['single', 'competing', 'cancelled'])('keeps the one-second request boundary when a timer wakes early: %s', async mode => {
+  const calls = fixture(url => json(url.pathname === '/admin-api/v1/products'
+    ? { productList: [] } : { status: 'success', memberId: '9' }));
+  const bound = config();
+  await settle(api.execute(bound, 'futureshop.products.search'));
+  const timeout = globalThis.setTimeout;
+  let early = true;
+  const timer = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback: any, delay: number, ...args: any[]) => {
+    if (early && delay > 0 && delay <= 1000) { early = false; delay -= 1; }
+    return timeout(callback, delay, ...args);
+  }) as typeof setTimeout);
+  const controller = new AbortController();
+  const create = () => api.execute(bound, 'futureshop.members.create', { query: { mail: 'buyer@example.test', registrationPointsEnabled: 'NO' } });
+  const observe = (promise: Promise<any>) => promise.then(value => ({ value }), error => ({ error }));
+  try {
+    const pending = [observe(withRequestSignal(controller.signal, create))];
+    if (mode === 'competing') pending.push(observe(create()));
+    await vi.advanceTimersByTimeAsync(999);
+    expect(calls).toHaveLength(2); // No merchant write before the provider interval.
+    if (mode === 'cancelled') controller.abort();
+    await vi.advanceTimersByTimeAsync(1);
+    const results = await Promise.all(pending);
+    if (mode === 'cancelled') {
+      expect(results).toMatchObject([{ error: { code: 'E_TOOL_CALL_CANCELLED' } }]);
+      expect(calls).toHaveLength(2);
+    } else {
+      expect(results.filter(row => 'value' in row)).toEqual([{ value: { status: 'acknowledged', errors: [], memberId: '9' } }]);
+      expect(results.filter(row => 'error' in row)).toMatchObject(mode === 'competing' ? [{ error: { code: 'E_TOOL_CALL_RATE_LIMIT' } }] : []);
+      expect(calls).toHaveLength(3);
+      expect(calls[2].time - calls[1].time).toBeGreaterThanOrEqual(1000);
+    }
+  } finally { timer.mockRestore(); }
+});

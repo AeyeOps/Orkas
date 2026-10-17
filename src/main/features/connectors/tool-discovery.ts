@@ -1,3 +1,4 @@
+import { defaultNumericRange } from '../../../../bin/tool-input-compat.cjs';
 /** Local, scope-filtered discovery shared by Agent, Web SDK and CLI runtimes. */
 import { createHash } from 'node:crypto';
 import { tokenize } from '../search/tokenize';
@@ -56,14 +57,14 @@ export function validateDiscoveryParams(raw: Record<string, unknown>): Params {
   if (params.query && params.query.length > 1024) bad('query must be at most 1024 characters');
   for (const key of ['limit', 'offset'] as const) {
     if (raw[key] === undefined) continue;
-    const value = raw[key];
+    const value = key === 'limit' ? defaultNumericRange(raw[key], params.query ? 8 : 20, 1, 50) : raw[key];
     if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < (key === 'limit' ? 1 : 0) || (key === 'limit' && value > 50)) {
       bad(key === 'limit' ? 'limit must be an integer from 1 to 50' : `offset must be an integer from 0 to ${Number.MAX_SAFE_INTEGER}`);
     }
     params[key] = value as number;
   }
   if (params.tool_name && !params.connector_id) bad('`connector_id` is required when `tool_name` is provided');
-  if (params.tool_name && (params.query !== undefined || params.limit !== undefined || params.offset !== undefined)) bad('tool_name cannot be combined with query, limit or offset');
+  if (params.tool_name && (params.query !== undefined || Object.hasOwn(raw, 'limit') || params.offset !== undefined)) bad('tool_name cannot be combined with query, limit or offset');
   return params;
 }
 

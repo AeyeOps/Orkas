@@ -127,19 +127,27 @@ export function localCliPermissionRecovery(uid: string, catalogId: string): {
   const empty = { missingPermissions: null, accessAdvisories: [] };
   if (!uid || !['feishu', 'lark', 'dingtalk', 'wecom', 'xero'].includes(catalogId)) return empty;
   const contract = require(path.join(pcDirForChild(), 'bin/local-cli-permissions.cjs')) as {
-    readPermissionRequest: (env: Record<string, string>) => { scopes: string[]; pat_scopes?: string[] } | null;
-    larkAccessIssues: (pending: unknown) => Array<{ recovery: string }>;
+    readPermissionRequest: (env: Record<string, string>) => { scopes: string[]; pat_scopes?: string[];
+      missing_scope_overflow?: boolean; admin_required?: boolean; plan_missing?: boolean;
+      connector_level?: boolean; identity_denied?: boolean } | null;
+    larkAccessIssues: (pending: unknown) => Array<{ recovery: string; scopes?: string[] }>;
   };
   const pending = contract.readPermissionRequest({
     ORKAS_LOCAL_CLI_RUNTIME_DIR: localCliRuntimeDir(uid, catalogId),
     ORKAS_LOCAL_CLI_PROFILE: localCliProfileName(uid, catalogId),
   });
   if (!pending) return empty;
-  if (catalogId === 'feishu' || catalogId === 'lark') return {
-    missingPermissions: pending.scopes.length ? pending.scopes : null,
-    accessAdvisories: [...new Set(contract.larkAccessIssues(pending).map(issue => issue.recovery))],
-  };
-  return { missingPermissions: [...new Set([...pending.scopes, ...(pending.pat_scopes || [])])].sort(), accessAdvisories: [] };
+  if (catalogId === 'feishu' || catalogId === 'lark') {
+    const issues = contract.larkAccessIssues(pending).filter(issue => issue.recovery === 'check_app_permissions');
+    return {
+      missingPermissions: pending.scopes.length || issues.length || pending.missing_scope_overflow
+        ? [...new Set([...pending.scopes, ...issues.flatMap(issue => issue.scopes || [])])].sort() : null,
+      accessAdvisories: [],
+    };
+  }
+  const missing = [...new Set([...pending.scopes, ...(pending.pat_scopes || [])])].sort();
+  return { missingPermissions: catalogId === 'xero' || missing.length || pending.admin_required
+    || pending.plan_missing || pending.connector_level || pending.identity_denied ? missing : null, accessAdvisories: [] };
 }
 
 const permissionChecks = new Map<string, { checkedAt: number; running?: Promise<void>; abort: AbortController }>();
@@ -154,7 +162,8 @@ registerUserSwitchHook('connector-permission-checks', () => {
 export async function checkLocalCliPermissions(
   uid: string, entry: CatalogEntry, force = false, runner: LocalCliInstallRunner = runLocalCliProcess,
 ): Promise<void> {
-  if (!uid || entry.local_cli?.provider !== 'lark' || !localCliInstallStatus(uid, entry).installed) return;
+  if (!uid || !['lark', 'dingtalk', 'wecom'].includes(entry.local_cli?.provider || '')
+    || !localCliInstallStatus(uid, entry).installed) return;
   const key = JSON.stringify([uid, entry.id]);
   const prior = permissionChecks.get(key);
   if (prior?.running) {

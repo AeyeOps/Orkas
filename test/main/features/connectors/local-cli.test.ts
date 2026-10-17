@@ -105,6 +105,20 @@ describe('official local CLI connector runtime', () => {
     } finally { fs.rmSync(runtime, { recursive: true, force: true }); }
   });
 
+  it.each(['feishu', 'dingtalk', 'wecom'])('checks %s on demand without interactive authorization', async id => {
+    const entry = findCatalogEntry(id)!;
+    const uid = `permission-page-${id}`;
+    const directory = seedInstalled(uid, entry);
+    const runner = vi.fn(async () => ({ exitCode: 0, stderr: '' }));
+    const interactiveCount = interactiveMocks.start.mock.calls.length;
+    try {
+      await checkLocalCliPermissions(uid, entry, true, runner);
+      expect(runner).toHaveBeenCalledOnce();
+      expect(runner.mock.calls[0][0].env.ORKAS_LOCAL_CLI_CHECK_PERMISSIONS_ONLY).toBe('1');
+      expect(interactiveMocks.start).toHaveBeenCalledTimes(interactiveCount);
+    } finally { fs.rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it.each(['nonzero', 'timeout', 'exception'])('diagnoses an unavailable permission check (%s) without exposing account or provider output', async mode => {
     diagnostics.warn.mockClear();
     const entry = findCatalogEntry('feishu')!;
@@ -332,7 +346,7 @@ describe('official local CLI connector runtime', () => {
     ]);
   });
 
-  it('reuses an already verified Lark user without opening either authorization step', async () => {
+  it('requests full business access on explicit connect even when the Lark user already verifies', async () => {
     const helper = require('../../../../bin/local-cli-auth.cjs') as {
       MANIFESTS: Record<string, { login: (env: NodeJS.ProcessEnv) => string[][] }>;
       authorizeLark: (
@@ -344,6 +358,7 @@ describe('official local CLI connector runtime', () => {
           execute: ReturnType<typeof vi.fn>;
           profileConfigured: ReturnType<typeof vi.fn>;
           authorizationReady: ReturnType<typeof vi.fn>;
+          authorizationScopes?: () => string[];
         },
       ) => Promise<void>;
     };
@@ -354,11 +369,14 @@ describe('official local CLI connector runtime', () => {
     await helper.authorizeLark('/runtime/node', '/runtime/npx-cli.js', helper.MANIFESTS.lark, {
       ORKAS_LOCAL_CLI_PROFILE: 'orkas-profile',
       ORKAS_LOCAL_CLI_ALLOWED_DOMAINS_JSON: JSON.stringify(['docs']),
-    }, { execute, profileConfigured, authorizationReady });
+    }, { execute, profileConfigured, authorizationReady, authorizationScopes: () => ['offline_access'] });
 
-    expect(authorizationReady).toHaveBeenCalledOnce();
+    expect(authorizationReady).toHaveBeenCalledTimes(2);
     expect(profileConfigured).not.toHaveBeenCalled();
-    expect(execute).not.toHaveBeenCalled();
+    expect(execute).toHaveBeenCalledOnce();
+    const args = execute.mock.calls[0][0];
+    expect(args).toEqual(expect.arrayContaining(['auth', 'login', '--domain', 'docs', '--json']));
+    expect(args[args.indexOf('--scope') + 1].split(' ')).toEqual(expect.arrayContaining(['docx:document:readonly', 'offline_access']));
   });
 
   it('accepts a verified Lark user postcondition when auth login itself exits nonzero', async () => {
@@ -373,11 +391,15 @@ describe('official local CLI connector runtime', () => {
           execute: ReturnType<typeof vi.fn>;
           profileConfigured: ReturnType<typeof vi.fn>;
           authorizationReady: ReturnType<typeof vi.fn>;
+          authorizationScopes?: () => string[];
         },
       ) => Promise<void>;
     };
-    const execute = vi.fn(async () => {
-      throw new Error('official CLI exited with 3');
+    const execute = vi.fn(async (args: string[]) => {
+      throw Object.assign(new Error('official CLI exited with 3'), { stdout: JSON.stringify({
+        event: 'authorization_complete', requested: args[args.indexOf('--scope') + 1].split(' '),
+        granted: ['docx:document:readonly'],
+      }) });
     });
     const profileConfigured = vi.fn(() => true);
     const authorizationReady = vi.fn()
@@ -398,9 +420,7 @@ describe('official local CLI connector runtime', () => {
 
     expect(profileConfigured).toHaveBeenCalledOnce();
     expect(execute).toHaveBeenCalledOnce();
-    expect(execute).toHaveBeenCalledWith([
-      'auth', 'login', '--profile', 'orkas-profile', '--domain', 'docs',
-    ]);
+    expect(execute.mock.calls[0][0]).toEqual(expect.arrayContaining(['auth', 'login', '--profile', 'orkas-profile', '--domain', 'docs', '--scope', '--json']));
     expect(authorizationReady).toHaveBeenCalledTimes(2);
   });
 
@@ -546,6 +566,7 @@ describe('official local CLI connector runtime', () => {
         dependencies: {
           execute: ReturnType<typeof vi.fn>;
           authorizationReady: ReturnType<typeof vi.fn>;
+          authorizationScopes?: () => string[];
         },
       ) => Promise<void>;
     };

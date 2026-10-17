@@ -82,6 +82,10 @@ describe('MCP stdio diagnostic boundary', () => {
       `require.cache[require.resolve(${JSON.stringify(path.resolve('src/main/util/proxy-dispatcher.ts'))})] = { exports: { buildChildProxyEnvironment: async () => ({}) } };`,
       `const { McpConnection } = require(${JSON.stringify(path.resolve('src/main/features/connectors/mcp-client.ts'))});`,
       'const realSetTimeout = global.setTimeout; const deadlines = [];',
+      // Assert configured defaults independently of a one-millisecond setup
+      // tick. Timers and the native peer stay real; only connect's clock is
+      // pinned and it is restored before operations and cleanup.
+      'const realNow = Date.now; const connectEpoch = realNow();',
       // Scale only the production 30s budget. An incorrect 180s/60s default fails the probe deadline.
       'global.setTimeout = (fn, ms, ...args) => { deadlines.push(ms); return realSetTimeout(fn, ms === 30000 ? 500 : ms, ...args); };',
       '(async () => {',
@@ -92,11 +96,12 @@ describe('MCP stdio diagnostic boundary', () => {
       "    : { kind: 'streamable-http', url: 'http://127.0.0.1:' + server.address().port + '/mcp' };",
       "  const connection = new McpConnection('fixture', transport);",
       '  try {',
+      '    Date.now = () => connectEpoch;',
       '    await connection.connect();',
       '    throw new Error("Unexpected connection success");',
       '  } catch (error) {',
       '    process.stdout.write(JSON.stringify({ message: error.message, connected: connection.isConnected, deadlines }));',
-      '  } finally { await connection.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }',
+      '  } finally { Date.now = realNow; await connection.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); }',
       '})().catch(() => { process.exitCode = 1; });',
     ].join('\n'));
     try {
@@ -152,16 +157,19 @@ describe('MCP stdio diagnostic boundary', () => {
       `const { McpConnection } = require(${JSON.stringify(path.resolve('src/main/features/connectors/mcp-client.ts'))});`,
       `const connection = new McpConnection('fixture', { kind: 'stdio', command: process.execPath, args: [${JSON.stringify(childPath)}], env: { ELECTRON_RUN_AS_NODE: '1' } });`,
       'const realSetTimeout = global.setTimeout; const deadlines = [];',
+      'const realNow = Date.now; const connectEpoch = realNow();',
       'global.setTimeout = (fn, ms, ...args) => { deadlines.push(ms); return realSetTimeout(fn, ms === 600000 ? 1200 : ms === 60000 ? 300 : ms, ...args); };',
       '(async () => {',
       '  try {',
+      '    Date.now = () => connectEpoch;',
       '    await connection.connect();',
+      '    Date.now = realNow;',
       '    try {',
       `      const result = await connection.callTool('execute_write', {}${mode === 'late-progress' ? ', { timeoutMs: 300 }' : ''});`,
       "      process.stdout.write(JSON.stringify({ outcome: result.content[0].text, deadlines }));",
       '    } catch (error) { process.stdout.write(JSON.stringify({ code: error.code, deadlines })); }',
       '    await new Promise(resolve => setTimeout(resolve, 150));',
-      '  } finally { await connection.close(); }',
+      '  } finally { Date.now = realNow; await connection.close(); }',
       '})().catch(() => { process.exitCode = 1; });',
     ].join('\n'));
     try {

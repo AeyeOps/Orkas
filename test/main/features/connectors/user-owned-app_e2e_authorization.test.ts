@@ -101,6 +101,97 @@ afterEach(() => {
 });
 
 describe('user-owned app authorization journey', () => {
+  const integerMerchants = [
+    { provider: 'taobao_top', grant: ['taobao_user_id'], profile: ['user_seller_get_response', 'user', 'user_id'], binding: 'user_id' },
+    { provider: 'alibaba_1688', grant: ['memberId'], profile: ['result', 'memberId'], binding: 'member_id' },
+    { provider: 'mercado_libre', input: 'user_id', grant: ['user_id'], profile: ['id'], binding: 'user_id' },
+    { provider: 'etsy', input: 'shop_id', profile: ['shop_id'], binding: 'shop_id' },
+    { provider: 'douyin_shop', input: 'shop_id', grant: ['data', 'shop_id'], profile: ['data', 'auth_id'], binding: 'shop_id' },
+    { provider: 'youzan', input: 'kdt_id', grant: ['data', 'authority_id'], profile: ['data', 'id'], binding: 'kdt_id' },
+    { provider: 'weimob_wos', input: 'shop_id', grant: ['data', 'business_operation_system_id'], binding: 'business_operation_system_id' },
+  ];
+  const put = (object: any, keys: string[], value: string) => {
+    const parent = keys.slice(0, -1).reduce((node, key) => node[key], object);
+    parent[keys.at(-1)!] = value;
+  };
+  it.each(integerMerchants.flatMap(row => [true, false].map(accepts => ({ ...row, accepts }))))(
+    'keeps exact $provider authorization identities (accepts=$accepts)', async scenario => {
+      const row = cases.find(row => row.provider === scenario.provider)!;
+      const entry = findCatalogEntry(row.id)!;
+      const exact = '9007199254740993', other = '9007199254740992';
+      const replies: any[] = structuredClone(row.replies);
+      if (scenario.grant) put(replies[0], scenario.grant, exact);
+      if (scenario.profile) put(replies[1], scenario.profile, scenario.input || scenario.accepts ? exact : other);
+      const input = { ...row.input, ...(scenario.input ? { [scenario.input]: scenario.accepts ? exact : other } : {}) };
+      let index = 0;
+      vi.stubGlobal('fetch', vi.fn(async (raw: string | URL) => {
+        if (new URL(String(raw)).pathname.endsWith('/dcr-exchange')) return json({ code: 0,
+          oauth_code: 'one-time-code', oauth_state: opened().searchParams.get('state') });
+        return new Response(JSON.stringify(replies[Math.min(index++, replies.length - 1)])
+          .replaceAll('"9007199254740993"', exact).replaceAll('"9007199254740992"', other));
+      }));
+      const flow = authorizeLocalApi(UID, entry, input);
+      const outcome = scenario.accepts ? expect(flow).resolves.toBeDefined() : expect(flow).rejects.toThrow('Could not authorize');
+      if (row.host) await callback();
+      await outcome;
+      expect(hasLocalApiAuthorization(UID, entry)).toBe(scenario.accepts);
+      if (scenario.accepts) {
+        const transport = await localApiTransport(UID, entry, await flow);
+        if (transport.kind !== 'stdio') throw new Error('Expected stdio');
+        expect(adapter.configured(transport.env).credentials.identity[scenario.binding]).toBe(exact);
+      }
+    });
+
+  it('preserves the independently returned JD vendor and shop integer identifiers', async () => {
+    const row = cases.find(row => row.provider === 'jd_jos')!;
+    const replies: any[] = structuredClone(row.replies);
+    const identity = replies[1].jingdong_seller_vender_info_get_responce.vender_info_result;
+    identity.vender_id = '9007199254740993'; identity.shop_id = '9007199254740995';
+    let index = 0;
+    vi.stubGlobal('fetch', vi.fn(async (raw: string | URL) => {
+      if (new URL(String(raw)).pathname.endsWith('/dcr-exchange')) return json({ code: 0,
+        oauth_code: 'one-time-code', oauth_state: opened().searchParams.get('state') });
+      return new Response(JSON.stringify(replies[Math.min(index++, 1)])
+        .replaceAll('"9007199254740993"', '9007199254740993').replaceAll('"9007199254740995"', '9007199254740995'));
+    }));
+    const flow = authorizeLocalApi(UID, findCatalogEntry(row.id)!, row.input);
+    await callback(); await flow;
+    const transport = await localApiTransport(UID, findCatalogEntry(row.id)!, {});
+    if (transport.kind !== 'stdio') throw new Error('Expected stdio');
+    expect(adapter.configured(transport.env).credentials.identity).toMatchObject({
+      vender_id: '9007199254740993', shop_id: '9007199254740995',
+    });
+  });
+
+  it.each([
+    { identity: '9007199254740993', accepts: true },
+    { identity: '9007199254740992', accepts: false },
+  ])('compares Pinduoduo integer identities without rounding ($identity, accepts=$accepts)', async ({ identity, accepts }) => {
+    const row = cases.find(row => row.provider === 'pinduoduo')!;
+    const entry = findCatalogEntry(row.id)!;
+    const requests = vi.fn(async (raw: string | URL, init: any) => {
+      if (new URL(String(raw)).pathname.endsWith('/dcr-exchange')) return json({ code: 0,
+        oauth_code: 'one-time-code', oauth_state: opened().searchParams.get('state') });
+      const token = new URLSearchParams(init.body).get('type') === 'pdd.pop.auth.token.create';
+      // Raw numeric JSON is essential: JSON.stringify would round the fixture
+      // before the owning parser sees the two independently issued identifiers.
+      return new Response(token
+        ? '{"pop_auth_token_create_response":{"access_token":"fixture-access","refresh_token":"fixture-refresh","expires_in":7200,"owner_id":9007199254740993}}'
+        : `{"mall_info_get_response":{"mall_id":${identity},"mall_name":"Fixture shop"}}`);
+    });
+    vi.stubGlobal('fetch', requests);
+    const flow = authorizeLocalApi(UID, entry, row.input);
+    const outcome = accepts ? expect(flow).resolves.toEqual({}) : expect(flow).rejects.toThrow('Could not authorize');
+    await callback(); await outcome;
+    expect(hasLocalApiAuthorization(UID, entry)).toBe(accepts);
+    if (accepts) {
+      const transport = await localApiTransport(UID, entry, {});
+      if (transport.kind !== 'stdio') throw new Error('Expected stdio');
+      expect(adapter.configured(transport.env).credentials.identity.mall_id).toBe(identity);
+    }
+    expect(requests).toHaveBeenCalledTimes(3);
+  });
+
   it('binds official Kuaishou sellerId without numeric loss and never invents missing token scopes', async () => {
     const auth = require('../../../../bin/local-api-auth.cjs');
     const scopes = auth.KUAISHOU_SCOPES.join(',');
