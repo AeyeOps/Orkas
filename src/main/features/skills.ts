@@ -2557,7 +2557,9 @@ interface SkillMetadataApplyResult {
   name?: string;
   written: boolean;
   report?: QualityReport;
-  reason?: WriteSkillFileResult['reason'];
+  /** `not_applied`: the write finished but the Skill does not report the
+   *  requested description, so the edit must not be presented as done. */
+  reason?: WriteSkillFileResult['reason'] | 'not_applied';
 }
 
 export async function applySkillMetadataForEdit(
@@ -2572,18 +2574,47 @@ export async function applySkillMetadataForEdit(
   }
   const mdPath = path.join(skill.dir, 'SKILL.md');
   const current = fs.existsSync(mdPath) ? fs.readFileSync(mdPath, 'utf8') : '';
-  const next = _applyMetadataToSkillMdContent(current, updates, skill.id, skill.source);
+  const has = (key: keyof SkillMetadataUpdate) => Object.prototype.hasOwnProperty.call(updates, key);
+  // A custom Skill keeps one description in SKILL.md and stores a sidecar
+  // pair only when both languages exist. Resolve a one-sided localized edit
+  // against the current pair; otherwise the old SKILL.md description wins on
+  // read and the edit silently has no effect.
+  const localized = skill.source === 'custom' && (has('description_zh') || has('description_en'))
+    ? (() => {
+      const cur = _resolveSkillDescriptions(splitSkillMd(current).meta, readSkillOrkasMetaSync(skill.dir));
+      const lang = descriptionLang(getLanguage());
+      const legacy = has('description') ? _normalizeDisplayDescription(String(updates.description || '')) : '';
+      let zh = has('description_zh') ? _normalizeDisplayDescription(String(updates.description_zh || '')) : cur.description_zh;
+      let en = has('description_en') ? _normalizeDisplayDescription(String(updates.description_en || '')) : cur.description_en;
+      if (legacy && lang === 'zh' && !has('description_zh')) zh = legacy;
+      if (legacy && lang !== 'zh' && !has('description_en')) en = legacy;
+      return { zh, en, primary: lang === 'zh' ? (zh || en) : (en || zh) };
+    })()
+    : null;
+  const mdUpdates: SkillMetadataUpdate = localized
+    ? (() => {
+      const next: SkillMetadataUpdate = { ...updates, description: localized.primary };
+      delete next.description_zh;
+      delete next.description_en;
+      return next;
+    })()
+    : updates;
+  const next = _applyMetadataToSkillMdContent(current, mdUpdates, skill.id, skill.source);
   const rawSidecarPatch = _skillSidecarPatchFromMetadataUpdate(updates);
-  const sidecarPatch = skill.source === 'marketplace'
+  const sidecarPatch = skill.source === 'marketplace' || localized
     ? _stripSkillSidecarDescriptions(rawSidecarPatch)
     : rawSidecarPatch;
   const writesMarkdown = next !== current;
   if (writesMarkdown && skill.source !== 'custom') return { ok: false, skillId, written: false };
-  const wrote = writesMarkdown || _hasSkillSidecarPatch(sidecarPatch);
+  const wrote = writesMarkdown || _hasSkillSidecarPatch(sidecarPatch) || !!localized;
   const currentSidecar = readSkillOrkasMetaSync(skill.dir);
   const proposedSidecar = opts.replaceSidecar && _hasSkillSidecarPatch(sidecarPatch)
     ? _stripSkillSidecarDescriptions(_skillSidecarReplacementFromMetadataUpdate(updates, currentSidecar))
     : mergeSkillOrkasMeta(currentSidecar, sidecarPatch);
+  if (localized) {
+    if (localized.zh && localized.en) proposedSidecar.descriptions = { zh: localized.zh, en: localized.en };
+    else delete proposedSidecar.descriptions;
+  }
   if (wrote && skill.source === 'custom') delete proposedSidecar._import;
   const policyReports = await validateWithOperatorPolicy(uid, { kind: 'files', files: [
     { relpath: 'SKILL.md', content: next }, { relpath: '_meta.json', content: JSON.stringify(proposedSidecar, null, 2) },
@@ -2598,7 +2629,7 @@ export async function applySkillMetadataForEdit(
   if (writesMarkdown && !_writeSkillFileAt(skill.dir, 'SKILL.md', next)) {
     return { ok: false, skillId, written: false, report, reason: 'invalid_path' };
   }
-  if (_hasSkillSidecarPatch(sidecarPatch) || (wrote && currentSidecar._import)) {
+  if (localized || _hasSkillSidecarPatch(sidecarPatch) || (wrote && currentSidecar._import)) {
     writeJsonSync(skillMetaFile(skill.dir), proposedSidecar);
     _invalidateSkillListCache();
     invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
@@ -2609,6 +2640,15 @@ export async function applySkillMetadataForEdit(
   if (skill.source === 'custom') {
     const newId = await _renameSkillByFrontmatterIfNeeded(skillId, opts.isCancelled);
     if (newId && newId !== skillId) resolvedId = newId;
+  }
+  if (localized) {
+    const persisted = await _getCustomSkillForUser(resolvedId, uid);
+    const applied = (!has('description_zh') || persisted?.description_zh === localized.zh)
+      && (!has('description_en') || persisted?.description_en === localized.en);
+    if (!applied) {
+      log.warn('description edit not reflected after write');
+      return { ok: false, skillId: resolvedId, written: wrote, reason: 'not_applied' };
+    }
   }
   const post = await getSkillForEdit(resolvedId);
   log.info(`skill=${skillId}${resolvedId !== skillId ? ` -> ${resolvedId}` : ''} metadata updated`);
@@ -3199,6 +3239,26 @@ export interface SkillContainerResult {
   validation_warnings?: { path: string; report: QualityReport }[];
   /** Total-failure cause when `ok: false`. Already localized via `t()`. */
   error?: string;
+}
+
+const SKILL_READ_REF_TARGET_RE = /^@skill\/([^/\s]*)(\/.*)?$/;
+
+/** Resolve a run-scoped `@skill/<ref>` edit target to the host Skill id.
+ *  The model edits the Skill it read through that ref, so the host id stays
+ *  hidden from discovery results. Plain ids keep their existing behavior. An
+ *  unknown or malformed ref is a failed edit, never a create: the missing-id
+ *  create fallback must not turn a mistyped ref into a duplicate Skill. */
+export function resolveSkillContainerTarget(
+  container: SkillContainerExtracted,
+  bindings: ReadonlyMap<string, { id: string }>,
+): { ok: true; container: SkillContainerExtracted } | { ok: false; error: string } {
+  const raw = (container.skillId || '').trim();
+  const m = SKILL_READ_REF_TARGET_RE.exec(raw);
+  if (!m) return { ok: true, container };
+  const tail = (m[2] || '').replace(/\/+$/, '');
+  const binding = m[1] && (!tail || /^\/SKILL\.md$/i.test(tail)) ? bindings.get(m[1]) : undefined;
+  if (!binding) return { ok: false, error: t('skills.errors.skill_not_found', { id: raw }) };
+  return { ok: true, container: { ...container, skillId: binding.id } };
 }
 
 /** Apply a parsed `<skill>` container from commander. Routes to edit when

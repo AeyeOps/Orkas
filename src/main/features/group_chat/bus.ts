@@ -1300,6 +1300,7 @@ export interface TaskTerminalEvent {
   conversation_created_at?: string;
 }
 
+
 export type TaskTerminalListener = (event: TaskTerminalEvent) => void;
 
 /**
@@ -7380,9 +7381,15 @@ async function runActorTurnWithDisplay(
       // Apply each `<skill>` container independently. A failed container
       // appends its own warning span and is omitted from createdSkills —
       // the chip slot only fills when the spec was actually written.
-      for (const container of skillR.containers) {
+      for (const extractedContainer of skillR.containers) {
+        // A `@skill/<ref>` edit target resolves through this run's bindings;
+        // an unknown ref fails here instead of reaching the create fallback.
+        const target = skillsFeat.resolveSkillContainerTarget(extractedContainer, runtimeSkillBindings);
+        const container = target.ok ? target.container : extractedContainer;
         try {
-          let result = await skillsFeat.applySkillContainerFromCommander(container, { isCancelled: () => w.stopRequested || getActiveUserId() !== uid });
+          let result: Awaited<ReturnType<typeof skillsFeat.applySkillContainerFromCommander>> = target.ok === false
+            ? { ok: false, error: target.error }
+            : await skillsFeat.applySkillContainerFromCommander(container, { isCancelled: () => w.stopRequested || getActiveUserId() !== uid });
           if (!result.ok && !errText && !aborted && !w.stopRequested
               && skillR.containers.length === 1 && !r.blocks.length
               && !toolCreatedSkills.length && !terminalHandoffCompleted

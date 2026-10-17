@@ -10494,3 +10494,59 @@ describe('group_chat bus integration › deferred conversation filing', () => {
     },
   );
 });
+
+describe('group_chat bus integration › Commander Skill edit by read ref', () => {
+  // Discovery keeps host Skill ids hidden; Commander edits the Skill it found
+  // through the run-scoped `@skill/<ref>` returned by skill_search.
+  async function seedSkill(id: string) {
+    const paths = await import('../../../../src/main/paths');
+    const dir = path.join(paths.userSkillsDir(TEST_UID), id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'),
+      `---\nname: "${id}"\ndescription: "Review release notes for refedit."\n---\n\n# Release review\n`);
+    return { paths, dir };
+  }
+
+  it('applies an edit addressed by the ref skill_search returned', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const storage = await import('../../../../src/main/storage');
+    const { paths } = await seedSkill('refedit-notes');
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: '__call_tool__', name: 'skill_search', input: { query: 'refedit' } },
+      { type: 'final', text: 'Updated.\n<skill>\n<skill_id>@skill/refedit-notes</skill_id>\n<description_en>Review release notes and report blocking evidence.</description_en>\n</skill>' },
+    ]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'change the refedit Skill description' });
+    await waitForQuiescent(TEST_UID, cid, 5000);
+
+    const searched = JSON.parse(_recordedToolResults.find((entry) => entry.name === 'skill_search')?.content || '{}');
+    expect(searched.results?.[0]?.read_path).toBe('@skill/refedit-notes');
+    const skills = await import('../../../../src/main/features/skills');
+    expect((await skills.getCustomSkill('refedit-notes'))?.description_en)
+      .toBe('Review release notes and report blocking evidence.');
+    const messages = await storage.readJsonl<any>(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`));
+    expect(messages.flatMap((message: any) => message.created_skills || []))
+      .toEqual([expect.objectContaining({ skill_id: 'refedit-notes' })]);
+  }, 12_000);
+
+  it('rejects an unknown ref without creating a Skill from the attached SKILL.md', async () => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const storage = await import('../../../../src/main/storage');
+    const { paths } = await seedSkill('refedit-keep');
+    const before = fs.readdirSync(paths.userSkillsDir(TEST_UID)).sort();
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'final', text: 'Done.\n<skill>\n<skill_id>@skill/refedit-missing</skill_id>\n<<<skill-file path=SKILL.md\n---\nname: "refedit-ghost"\ndescription: "Ghost."\n---\n\nBody\n>>>\n</skill>' },
+    ]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'edit that Skill' });
+    await waitForQuiescent(TEST_UID, cid, 5000);
+
+    expect(fs.readdirSync(paths.userSkillsDir(TEST_UID)).sort()).toEqual(before);
+    const messages = await storage.readJsonl<any>(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`));
+    expect(messages.flatMap((message: any) => message.created_skills || [])).toHaveLength(0);
+    const reply = messages.filter((message: any) => message.from === 'commander').map((message: any) => String(message.text || '')).join('\n');
+    expect(reply).toMatch(/Skill not found: @skill\/refedit-missing|不存在|找不到/);
+  }, 12_000);
+});

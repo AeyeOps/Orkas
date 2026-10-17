@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "072b2380f61351ad62e826097232c1dbc2ae3ebb61973ad58ed58f909162245c",
+  "content_tree_sha256": "0e78e96e8b9b5abf21a7977610c05c909e5582414d43da4710e36303fa6111b5",
   "files": [
     {
       "path": "marketplace/agents/1040b336306f/agent.json",
@@ -1770,7 +1770,7 @@
     {
       "path": "system/skills/_system.json",
       "bytes": 273,
-      "sha256": "4a0e971481b9b6032914069a0ff08638c16ded94bb2d3a0ecbb1cc6030c84f08"
+      "sha256": "dfa3d511c76ef69f6c376b3d8e6d74f95ae39d1ed8151e6b9e261cd76a57e359"
     },
     {
       "path": "system/skills/agent-creator/references/cli-and-prose.md",
@@ -1819,8 +1819,8 @@
     },
     {
       "path": "system/skills/skill-creator/SKILL.md",
-      "bytes": 7611,
-      "sha256": "1b1c0fe62c8fa7dfe45cc0dc3139a25e7dc1e58c8e05e929b12640175ac42d38"
+      "bytes": 7615,
+      "sha256": "6bc6ce7ba58505d181f03dd69b66d5b7c1639099166569ca119f7fa72f3eaf91"
     },
     {
       "path": "system/skills/web-app-sdk/assets/starter/index.html",
@@ -1885,7 +1885,7 @@
       },
       {
         "id": "skill-creator",
-        "update_at": 1792125132889
+        "update_at": 1792221336825
       },
       {
         "id": "web-app-sdk",

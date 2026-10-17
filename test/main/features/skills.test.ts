@@ -633,6 +633,46 @@ describe('skills › applySkillContainerFromCommander › create', () => {
   });
 });
 
+describe('skills › resolveSkillContainerTarget', () => {
+  const bindings = new Map([
+    ['review-notes-1', { id: 'release-review-notes' }],
+    ['shipped-1', { id: 'shipped' }],
+  ]);
+  const container = (skillId?: string) => ({ skillId, files: [], metadata: { description_en: 'x' } });
+
+  it('maps the run-scoped read ref the model used to the host Skill id', async () => {
+    const s = await loadSkills();
+    for (const ref of ['@skill/review-notes-1', '@skill/review-notes-1/SKILL.md', '  @skill/review-notes-1/  ']) {
+      const r = s.resolveSkillContainerTarget(container(ref), bindings);
+      expect(r).toMatchObject({ ok: true, container: { skillId: 'release-review-notes', metadata: { description_en: 'x' } } });
+    }
+  });
+
+  it('keeps plain ids and create containers unchanged', async () => {
+    const s = await loadSkills();
+    expect(s.resolveSkillContainerTarget(container('release-review-notes'), bindings))
+      .toEqual({ ok: true, container: container('release-review-notes') });
+    expect(s.resolveSkillContainerTarget(container(undefined), bindings))
+      .toEqual({ ok: true, container: container(undefined) });
+  });
+
+  it('fails an unknown or malformed ref instead of falling back to create', async () => {
+    const s = await loadSkills();
+    for (const ref of ['@skill/unknown-9', '@skill/', '@skill/review-notes-1/references/a.md', '@skill/../x']) {
+      const r = s.resolveSkillContainerTarget({ ...container(ref), files: [{ path: 'SKILL.md', content: '---\nname: "x"\n---\n' }] }, bindings);
+      expect(r.ok, ref).toBe(false);
+      if (!r.ok) expect(r.error).toMatch(/not found|不存在|找不到/i);
+    }
+  });
+
+  it('does not treat look-alike ids as refs', async () => {
+    const s = await loadSkills();
+    for (const id of ['skill/review-notes-1', '@skills/review-notes-1', 'review-notes-1']) {
+      expect(s.resolveSkillContainerTarget(container(id), bindings)).toEqual({ ok: true, container: container(id) });
+    }
+  });
+});
+
 describe('skills › applySkillContainerFromCommander › edit', () => {
   it('writes blocks to existing custom skill', async () => {
     writeCustomSkill('beta', 'name: "beta"\ndescription_en: "old"', 'old body');
@@ -669,6 +709,57 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
     expect(after).toContain('description_en: "old"');
     const meta = JSON.parse(fs.readFileSync(path.join(customSkillsDir(), 'beta', '_meta.json'), 'utf8'));
     expect(meta.category).toBe('data');
+  });
+
+  // A single-language description edit must persist and be what the Skill
+  // reports afterwards; the host previously wrote the old frontmatter
+  // description back and returned `updated` (2026-10-17 app-assist finding).
+  it.each(['en', 'zh'] as const)('persists a description_en-only edit on an English-only Skill (UI %s)', async (lang) => {
+    writeCustomSkill('review-notes', 'name: "review-notes"\ndescription: "Review release notes."', '# Release review\n');
+    const { setLanguage } = await import('../../../src/main/features/config');
+    setLanguage(lang);
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'review-notes', files: [],
+      metadata: { description_en: 'Review release notes and report blocking evidence.' },
+    });
+    expect(r.ok).toBe(true);
+    const skill = await s.getCustomSkill('review-notes');
+    expect(skill?.description_en).toBe('Review release notes and report blocking evidence.');
+    const md = fs.readFileSync(path.join(customSkillsDir(), 'review-notes', 'SKILL.md'), 'utf8');
+    expect(md).toContain('# Release review');
+    expect(md).not.toContain('description_en:');
+  });
+
+  it.each([
+    ['en', 'description_en', '审查发布说明。', 'Review notes and blockers.'],
+    ['zh', 'description_en', '审查发布说明。', 'Review notes and blockers.'],
+    ['en', 'description_zh', '审查发布说明并报告阻塞证据。', 'Review release notes.'],
+    ['zh', 'description_zh', '审查发布说明并报告阻塞证据。', 'Review release notes.'],
+  ] as const)('keeps the other language when editing one side of a bilingual Skill (UI %s, %s)', async (lang, field, zh, en) => {
+    writeCustomSkill('bilingual', 'name: "bilingual"\ndescription: "Review release notes."', 'body');
+    fs.writeFileSync(path.join(customSkillsDir(), 'bilingual', '_meta.json'),
+      JSON.stringify({ descriptions: { zh: '审查发布说明。', en: 'Review release notes.' } }));
+    const { setLanguage } = await import('../../../src/main/features/config');
+    setLanguage(lang);
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'bilingual', files: [], metadata: { [field]: field === 'description_en' ? en : zh },
+    });
+    expect(r.ok).toBe(true);
+    const skill = await s.getCustomSkill('bilingual');
+    expect(skill?.description_zh).toBe(zh);
+    expect(skill?.description_en).toBe(en);
+  });
+
+  it('accepts whitespace the host normalizes in a description edit', async () => {
+    writeCustomSkill('spacing', 'name: "spacing"\ndescription: "Old."', 'body');
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'spacing', files: [], metadata: { description_en: 'New   spaced\ndescription.' },
+    });
+    expect(r.ok).toBe(true);
+    expect((await s.getCustomSkill('spacing'))?.description_en).toBe('New spaced description.');
   });
 
   it('rejects edit on builtin skill (read-only outside dev panel)', async () => {
