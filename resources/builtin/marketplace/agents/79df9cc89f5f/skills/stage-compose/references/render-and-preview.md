@@ -44,7 +44,7 @@ the native approval is current. It reruns render, media and frame QA at the
 delivery quality (high by default), writes the frame-0 cover beside the video
 as `<video-name>-cover.png`, and returns `next_action:"deliver_final"`; the
 final response must include the video and mention the cover, or a clear
-blocker. When the user explicitly accepts a faster lower-quality delivery,
+blocker. That delivery is not a stop: it carries no `<plan-interaction>` marker. When the user explicitly accepts a faster lower-quality delivery,
 pass `quality:"standard"` or `quality:"draft"` on the export call — a
 draft-quality export reuses the approved draft's cached render and finishes in
 seconds, while high re-captures every frame at 30fps and can take tens of

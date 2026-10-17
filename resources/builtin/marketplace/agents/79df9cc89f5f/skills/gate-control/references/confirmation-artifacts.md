@@ -18,7 +18,8 @@ repairs, and partial progress are not stops: publish them and keep producing.
 The same closing marker applies to any other message that hands the next step
 to the user — a blocked report, an exhausted repair budget, a missing
 capability: without it the runtime reads the stop as an unfinished turn and
-bounces the reply.
+bounces the reply. The completed delivery after the final-video approval is not
+a stop and asks the user nothing: end it without the marker.
 
 ## Direction and preview
 

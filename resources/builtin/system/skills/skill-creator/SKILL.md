@@ -15,7 +15,7 @@ Before authoring, read the matching reference through this Skill's read ref:
 - New Skill, SKILL.md body rewrite, new reference, or bundled script → [authoring.md](references/authoring.md).
 - Name, description, category, routing hints, or any SKILL.md frontmatter work → [metadata.md](references/metadata.md).
 - URL, local directory, ZIP, attachment, pasted existing Skill, or any source-preserving import → [importing.md](references/importing.md) and [metadata.md](references/metadata.md).
-- File deletion or imported-package cleanup → [file-deletion.md](references/file-deletion.md).
+- Deleting files, package cleanup, or removing a whole Skill → [file-deletion.md](references/file-deletion.md).
 
 Do not read unrelated references. A category-only edit needs only `metadata.md`; a body-only guide edit normally needs only `authoring.md`; an import needs `importing.md` plus `metadata.md`.
 

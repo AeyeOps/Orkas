@@ -1,0 +1,31 @@
+{
+  "sdkVersion": 1,
+  "capabilities": [
+    "data"
+  ],
+  "data": {
+    "version": 1,
+    "tables": [
+      {
+        "id": "messages",
+        "name": "messages",
+        "fields": [
+          {
+            "id": "body",
+            "name": "body",
+            "type": "string",
+            "required": true
+          }
+        ],
+        "access": {
+          "read": [
+            "body"
+          ],
+          "insert": [
+            "body"
+          ]
+        }
+      }
+    ]
+  }
+}

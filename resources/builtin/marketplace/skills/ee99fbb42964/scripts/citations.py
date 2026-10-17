@@ -58,6 +58,58 @@ _COMPARISON_FACTUAL_FIELDS = tuple(
 )
 _TRUSTED_SNAPSHOT_ENV = "ORKAS_DEEP_RESEARCH_EVIDENCE_FILE"
 _MAX_TRUSTED_SNAPSHOT_BYTES = 4 * 1024 * 1024
+
+# Explicit comparison shapes in an Agent-authored claim. Such a claim must name
+# its baseline: a "25x" gain over a model two generations old reads as a
+# generational jump unless the comparator is stated (2026-10-02 Astra review).
+# Ordinary counts ("more than 100k GPUs") and frequencies ("3 times a day")
+# are not comparisons and do not match.
+_COMPARATIVE_CLAIM_RE = re.compile(
+    r"\d+(?:[.,]\d+)?\s*(?:[x×](?!\w)|倍|-?fold\b|percentage points?\b|pp\b|个百分点)"
+    r"|\d+(?:[.,]\d+)?\s*times\s+(?:higher|lower|more|less|fewer|faster|slower|better|worse"
+    r"|larger|smaller|greater|bigger|as)\b"
+    r"|\b(?:vs\.?|versus|compared (?:with|to)|outperform(?:s|ed|ing)?)(?!\w)"
+    r"|\b(?:better|worse|higher|lower|faster|slower|stronger|weaker) than\b"
+    r"|\bfrom\s+\d+(?:[.,]\d+)?\s*%?\s+to\s+\d+(?:[.,]\d+)?\s*%?"
+    r"|从\s*\d+(?:\.\d+)?\s*%?\s*(?:升|增|提|提高|提升|降|下降|跌)(?:至|到)"
+    r"|相比|相较|对比|较之|高于|低于|优于|劣于|强于|弱于|领先于",
+    re.IGNORECASE,
+)
+
+# Coverage leads: works a fetched source names (author-year citations, arXiv
+# identifiers, DOIs) that no fetched or cited source matches. A companion
+# report named in a paper's introduction was never fetched in the run that
+# motivated this list; the script names leads, the Agent judges relevance.
+_LEAD_AUTHOR = r"[A-Z][\w'’\-]*(?:\s+(?:et\s+al\.?|(?:and|&)\s+[A-Z][\w'’\-]*))?(?:\s+Team)?"
+_PAREN_GROUP_RE = re.compile(r"\(([^()]{3,400})\)")
+_PAREN_CITE_RE = re.compile(
+    r"^\s*(?:see\s+|e\.g\.,?\s+|cf\.\s+|i\.e\.,?\s+)?(?P<author>" + _LEAD_AUTHOR
+    + r"),?\s+(?P<year>(?:19|20)\d{2})[a-z]?\s*$"
+)
+_NARRATIVE_CITE_RE = re.compile(
+    r"(?P<author>[A-Z][\w'’\-]*\s+(?:et\s+al\.?|(?:and|&)\s+[A-Z][\w'’\-]*))"
+    r"\s*\(\s*(?P<year>(?:19|20)\d{2})[a-z]?\s*\)"
+)
+# A reference-list entry continues with its author list ("Jia et al. (2026)
+# Mengzhao Jia, Yang Lin, ..." or "Ann Liu and Bo Wu."); prose continues with
+# a lowercase verb ("Jia et al. (2026) showed ...").
+_REFERENCE_ENTRY_START_RE = re.compile(
+    r"\s+[A-Z][\w.'’\-]*(?:\s+[A-Z][\w.'’\-]*){0,3}(?:,|\s+(?:and|&)\s+[A-Z])")
+_ARXIV_ID_RE = re.compile(
+    r"(?:arxiv:\s*|arxiv\.org/(?:abs|pdf|html)/)(\d{4}\.\d{4,5})(?:v\d+)?", re.IGNORECASE)
+_LEAD_URL_RE = re.compile(r"https?://[^\s<>\"'()\[\]]+")
+_LEAD_STOPWORDS = frozenset({
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december", "jan", "feb", "mar", "apr",
+    "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec", "spring", "summer",
+    "fall", "autumn", "winter", "updated", "accessed", "published", "released",
+    "version", "copyright", "figure", "table", "section", "appendix", "since",
+    "see", "in", "on", "by", "as", "of", "the", "and", "or", "q1", "q2", "q3", "q4",
+})
+_MAX_LEAD_TEXT_CHARS = 500_000
+_MAX_LEAD_TOTAL_CHARS = 3_000_000
+_MAX_LEAD_ENTRY_CHARS = 600
+_MAX_COVERAGE_LEADS = 10
 def _normalize_text(s: str) -> str:
     """Collapse away the differences that are NOT fabrication: unicode form,
     smart quotes/dashes, case, and whitespace runs. Preserves word content, so a
@@ -206,6 +258,9 @@ def _render_evidence_markdown(rows: list) -> str:
         )
         for row in source_rows:
             claim = _inline_markdown(row.get("claim"))
+            baseline = _inline_markdown(row.get("baseline"))
+            if baseline:
+                claim = "{} (baseline: {})".format(claim, baseline)
             quote = _inline_markdown(row.get("quote"))
             lines.append(
                 '  - [{evidence_id}] {claim} — "{quote}" — quote matched —'.format(
@@ -410,7 +465,162 @@ def _classify_citation(
     return out
 
 
-def verify(payload: dict) -> dict:
+def _url_key(url: str) -> str:
+    """Scheme-, www- and trailing-slash-insensitive URL key for lead matching."""
+    key = _normalize_url(url or "").lower()
+    return re.sub(r"^https?://(?:www\.)?", "", key).rstrip("/")
+
+
+def _lead_tokens(value: str) -> set:
+    return {token for token in re.findall(r"[0-9a-z]+", (value or "").casefold()) if len(token) >= 3}
+
+
+def _entry_identifiers(entry: str) -> list:
+    found = ["arXiv:" + match.group(1) for match in _ARXIV_ID_RE.finditer(entry)]
+    found.extend("doi:" + match.group(0).rstrip(".,;:)").lower() for match in _DOI_RE.finditer(entry))
+    found.extend(match.group(0).rstrip(".,;:") for match in _LEAD_URL_RE.finditer(entry))
+    return list(dict.fromkeys(found))
+
+
+def _coverage_leads(sources: list, snapshots_by_url: dict, fetched_urls=None) -> tuple[list, int]:
+    """Works that fetched text cites but no fetched or cited source matches.
+
+    Scans source texts and host-captured snapshots for author-year citations,
+    arXiv identifiers and DOIs. A lead is covered when one of its identifiers
+    matches a fetched/cited URL or its first author/organization name appears
+    in such a URL or a source title. Returns the top uncovered leads (most
+    recent, then most mentioned) and the total uncovered count. Names only:
+    whether a lead can change a conclusion is the Agent's judgment.
+    """
+    covered_urls = []
+    covered_dois: set = set()
+    covered_tokens: set = set()
+    label_by_url: dict = {}
+    texts = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        if source.get("doi"):
+            covered_dois.add(str(source["doi"]).strip().lower())
+        for value in (source.get("url"), source.get("canonical_url")):
+            if value:
+                covered_urls.append(_url_key(str(value)))
+                label_by_url.setdefault(_url_key(str(value)), str(source.get("id") or ""))
+        for value in (source.get("title"), source.get("publisher")):
+            covered_tokens |= _lead_tokens(str(value or ""))
+        if isinstance(source.get("text"), str):
+            texts.append((str(source.get("id") or source.get("url") or "source"), source["text"]))
+    for url, chunks in snapshots_by_url.items():
+        covered_urls.append(_url_key(url))
+        label = label_by_url.get(_url_key(url)) or urlsplit(url).netloc
+        texts.extend((label, chunk) for chunk in chunks)
+    covered_urls.extend(_url_key(str(url)) for url in fetched_urls or [])
+    covered_urls = [url for url in covered_urls if url]
+    for url in covered_urls:
+        covered_tokens |= _lead_tokens(url)
+
+    leads: dict = {}
+    attached: set = set()
+
+    def lead_for(key, display: str, token, year: int, standalone: bool) -> dict:
+        if key not in leads:
+            leads[key] = {"lead": display, "token": token, "year": year, "standalone": standalone,
+                          "mentions": 0, "sources": [], "identifiers": [], "context": "",
+                          "order": len(leads)}
+        return leads[key]
+
+    def author_lead(author: str, year: str):
+        author = _WS_RE.sub(" ", author).strip()
+        token = re.split(r"[\s'’\-]", author, maxsplit=1)[0].casefold()
+        if not token or token in _LEAD_STOPWORDS:
+            return None
+        return lead_for((token, year), "{}, {}".format(author, year), token, int(year), False)
+
+    def record(lead: dict, label: str, text: str, position: int) -> None:
+        lead["mentions"] += 1
+        if label not in lead["sources"]:
+            lead["sources"].append(label)
+        if not lead["context"]:
+            start, end = max(0, position - 160), min(len(text), position + 120)
+            lead["context"] = ("…" if start else "") + _WS_RE.sub(" ", text[start:end]).strip() \
+                + ("…" if end < len(text) else "")
+
+    budget = _MAX_LEAD_TOTAL_CHARS
+    seen = set()
+    for label, raw_text in texts:
+        if budget <= 0:
+            break
+        text = raw_text.replace("\u00a0", " ")[:min(_MAX_LEAD_TEXT_CHARS, budget)]
+        digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if digest in seen:
+            continue
+        seen.add(digest)
+        budget -= len(text)
+        for group in _PAREN_GROUP_RE.finditer(text):
+            for part in group.group(1).split(";"):
+                match = _PAREN_CITE_RE.match(part)
+                lead = author_lead(match.group("author"), match.group("year")) if match else None
+                if lead is not None:
+                    record(lead, label, text, group.start())
+        for match in _NARRATIVE_CITE_RE.finditer(text):
+            lead = author_lead(match.group("author"), match.group("year"))
+            if lead is None:
+                continue
+            record(lead, label, text, match.start())
+            if not _REFERENCE_ENTRY_START_RE.match(text, match.end()):
+                continue
+            entry = text[match.end():match.end() + _MAX_LEAD_ENTRY_CHARS]
+            following = _NARRATIVE_CITE_RE.search(entry)
+            for ident in _entry_identifiers(entry[:following.start()] if following else entry):
+                attached.add(ident.casefold())
+                if ident not in lead["identifiers"]:
+                    lead["identifiers"].append(ident)
+        standalone = [
+            ("arXiv:" + match.group(1), 2000 + int(match.group(1)[:2]), match.start())
+            for match in _ARXIV_ID_RE.finditer(text)
+        ] + [
+            ("doi:" + match.group(0).rstrip(".,;:)").lower(), 0, match.start())
+            for match in _DOI_RE.finditer(text)
+        ]
+        for ident, year, position in standalone:
+            if ident.casefold() in attached:
+                continue
+            lead = lead_for(("id", ident.casefold()), ident, None, year, True)
+            if ident not in lead["identifiers"]:
+                lead["identifiers"].append(ident)
+            record(lead, label, text, position)
+
+    def is_covered(lead: dict) -> bool:
+        for ident in lead["identifiers"]:
+            low = ident.casefold()
+            if low.startswith(("arxiv:", "doi:")):
+                needle = low.split(":", 1)[1]
+                if needle in covered_dois or any(needle in url for url in covered_urls):
+                    return True
+                continue
+            key = _url_key(ident)
+            if any(url == key or url.startswith(key + "/") or key.startswith(url + "/")
+                   for url in covered_urls):
+                return True
+        return lead["token"] is not None and lead["token"] in covered_tokens
+
+    uncovered = [lead for lead in leads.values() if not is_covered(lead)]
+    # Contemporaneous work first: a companion report published with the studied
+    # release outranks the foundational papers a reference list also cites.
+    uncovered.sort(key=lambda lead: (-lead["year"], lead["standalone"], -lead["mentions"], lead["order"]))
+    return [
+        {
+            "lead": lead["lead"],
+            "mentions": lead["mentions"],
+            "sources": lead["sources"][:5],
+            "identifiers": lead["identifiers"][:3],
+            "context": lead["context"],
+        }
+        for lead in uncovered[:_MAX_COVERAGE_LEADS]
+    ], len(uncovered)
+
+
+def verify(payload: dict, fetched_urls=None) -> dict:
     sources = payload.get("sources") or []
     claims = payload.get("claims") or []
     if not sources:
@@ -421,13 +631,13 @@ def verify(payload: dict) -> dict:
             "abstain": True,
             "abstain_reason": "no_sources",
             "summary": {"claims": len(claims), "citations": 0,
-                        "verified": 0, "weak": 0, "flagged": 0},
+                        "verified": 0, "weak": 0, "flagged": 0, "coverage_leads": 0},
             "claims": [], "references": [], "evidence_rows": [],
             "evidence_markdown": "", "comparison_rows": comparison_rows,
             "comparison_markdown": comparison_markdown,
             "comparison_coverage": comparison_coverage,
             "comparison_warnings": comparison_warnings,
-            "flags": [], "warnings": [],
+            "flags": [], "warnings": [], "coverage_leads": [],
         }
 
     by_id, by_url = _index_sources(sources)
@@ -445,6 +655,15 @@ def verify(payload: dict) -> dict:
             continue
         cits = claim.get("citations") or []
         claim_id = _inline_markdown(claim.get("id")) or "claim_{}".format(ci + 1)
+        baseline = _inline_markdown(claim.get("baseline")) or None
+        if baseline is None and _COMPARATIVE_CLAIM_RE.search(_inline_markdown(claim.get("text"))):
+            warnings.append({
+                "claim": ci,
+                "issue": "comparison_baseline_missing",
+                "detail": "claim {} compares magnitudes without claims[].baseline; name the "
+                          "comparator and version, and whether it is the direct predecessor "
+                          "or the source's official comparator".format(claim_id),
+            })
         classified = []
         for cj, cit in enumerate(cits):
             if not isinstance(cit, dict):
@@ -491,6 +710,7 @@ def verify(payload: dict) -> dict:
                         "source_id": src.get("id"),
                         "title": src.get("title"),
                         "claim": claim.get("text"),
+                        "baseline": baseline,
                         "quote": cit.get("quote"),
                         "url": src.get("url"),
                         "source_date": src.get("date") or src.get("published_at"),
@@ -508,6 +728,7 @@ def verify(payload: dict) -> dict:
         out_claims.append({
             "id": claim_id,
             "text": claim.get("text"),
+            "baseline": baseline,
             "citations": classified,
         })
 
@@ -515,12 +736,15 @@ def verify(payload: dict) -> dict:
     comparison_rows, comparison_markdown, comparison_warnings = _render_comparison(
         payload.get("comparison"), evidence_rows)
     comparison_coverage = _comparison_coverage(comparison_rows)
+    snapshots_by_url, _ = _trusted_source_snapshots()
+    coverage_leads, uncovered_leads = _coverage_leads(sources, snapshots_by_url, fetched_urls)
     return {
         "abstain": False,
         "abstain_reason": None,
         "summary": {"claims": len(out_claims), "citations": n_cit,
                     "verified": n_verified, "weak": n_weak, "flagged": n_flagged,
-                    "comparison_rows": len(comparison_coverage)},
+                    "comparison_rows": len(comparison_coverage),
+                    "coverage_leads": uncovered_leads},
         "claims": out_claims,
         "references": references,
         "evidence_rows": evidence_rows,
@@ -531,6 +755,7 @@ def verify(payload: dict) -> dict:
         "comparison_warnings": comparison_warnings,
         "flags": flags,
         "warnings": warnings,
+        "coverage_leads": coverage_leads,
     }
 
 
@@ -837,6 +1062,7 @@ def _expand_compact_landscape_payload(payload: dict, input_path) -> dict:
         claims.append({
             "id": _inline_markdown(row.get("id")),
             "text": _inline_markdown(row.get("claim")),
+            "baseline": row.get("baseline"),
             "citations": [{"source": source_id, "quote": quote}],
         })
 
@@ -915,6 +1141,30 @@ def _enrich_sources_from_evidence_ledger(payload: dict, input_path) -> dict:
     }
 
 
+def _sibling_fetch_ledger_urls(input_path) -> list:
+    """URLs attempted in the sibling fetch_ledger.jsonl; they count as followed leads."""
+    if not input_path or input_path == "-":
+        return []
+    ledger_path = os.path.join(os.path.dirname(os.path.abspath(input_path)), "fetch_ledger.jsonl")
+    urls = []
+    try:
+        with open(ledger_path, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    row = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                for key in ("url", "canonical_url"):
+                    value = row.get(key)
+                    if isinstance(value, str) and value.startswith(("http://", "https://")):
+                        urls.append(value)
+    except OSError:
+        return []
+    return urls
+
+
 def _load(path):
     if not path or path == "-":
         raw = sys.stdin.read()
@@ -950,7 +1200,10 @@ def main(argv):
         raise ValueError("input must be a JSON object with 'sources' and 'claims'")
     compact_expansion = _expand_compact_landscape_payload(payload, args.input)
     enrichment = _enrich_sources_from_evidence_ledger(payload, args.input)
-    data = references(payload) if args.op == "references" else verify(payload)
+    data = (
+        references(payload) if args.op == "references"
+        else verify(payload, fetched_urls=_sibling_fetch_ledger_urls(args.input))
+    )
     data["metadata_enrichment"] = enrichment
     data["compact_landscape_expansion"] = compact_expansion
 
@@ -1016,6 +1269,18 @@ def _cli_stdout(result: dict, argv: list[str]) -> dict:
             "missing_citation_fields": item.get("missing_citation_fields") or [],
         })
 
+    leads = [
+        {
+            "lead": item.get("lead"),
+            "mentions": item.get("mentions"),
+            "sources": (item.get("sources") or [])[:3],
+            "identifiers": (item.get("identifiers") or [])[:2],
+            "context": str(item.get("context") or "")[:220],
+        }
+        for item in (data.get("coverage_leads") or [])[:8]
+        if isinstance(item, dict)
+    ]
+
     compact = {
         "ok": bool(result.get("ok")),
         "output": output_path,
@@ -1030,6 +1295,7 @@ def _cli_stdout(result: dict, argv: list[str]) -> dict:
         "comparison_coverage_details": coverage,
         "comparison_rows": len(data.get("comparison_rows") or []),
         "evidence_rows": len(data.get("evidence_rows") or []),
+        "coverage_leads": leads,
         "compact_landscape_expansion": data.get("compact_landscape_expansion") or {},
         "report": data.get("report") or {},
     }

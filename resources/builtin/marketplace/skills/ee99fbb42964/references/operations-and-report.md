@@ -15,8 +15,11 @@ Optional `caps` fields are `max_subquestions`, `max_fetches`,
 `max_fetches_per_subquestion`, `max_model_calls`, `max_depth`, and
 `max_cost_usd`. Omit limits that should keep their defaults. Use caps for normal
 fan-out research and whenever the user, task, cost policy, or resumed state
-supplies a real budget. A fresh compact landscape has no default fetch-count
-ceiling: its two-batch/eight-fetch suggestion is only an efficiency target.
+supplies a real budget. A fetch cap below its default (40 total, 8 per
+subquestion) needs a top-level `caps_reason` string naming that budget; `plan`
+rejects the input otherwise and records the reason in `caps_plan.json`. A fresh
+compact landscape has no default fetch-count ceiling: its two-batch/eight-fetch
+suggestion is only an efficiency target.
 
 When caps apply, use returned deduplicated `subquestions`,
 `fetch_budget_per_subquestion`, `total_fetch_budget`, `allowed`, and `dropped`.
@@ -28,7 +31,17 @@ After every fetch batch, append one JSON object for every attempted call to
 ```
 
 Each valid fetch row consumes one fetch attempt under that saved budget; search
-or query rows remain audit history but do not consume `max_fetches`. Continue fetching only
+or query rows remain audit history but do not consume `max_fetches`. Two row
+kinds are exempt up to the allowances reported in `data.fetch_rows`, then count:
+a continuation window of an already-fetched page and a no-content result.
+
+```json
+{"kind":"fetch","url":"https://example.org/paper","status":"ok"}
+{"kind":"fetch","url":"https://example.org/paper","offset":12000,"status":"ok"}
+{"kind":"fetch","url":"https://example.org/card.pdf","status":"no_content","reason":"binary"}
+```
+
+Use `reason` `binary`, `navigation_only`, or `empty`. Continue fetching only
 when the latest result has `data.stop=false` and `data.remaining.fetches>0`;
 when `data.stop=true`, make no further fetch and deliver an honest partial result
 if evidence is incomplete. `caps_plan.json` is a static plan and has no `stop`
@@ -137,6 +150,15 @@ remains valid.
   Apply the Skill's verification rules to the final ledger and analysis.
 - A citation `verdict=verified` means its quote and DOI attribution passed,
   never that its claim is true. No claim-support verdict is emitted.
+- An optional claim `baseline` names what a comparative claim is measured
+  against and is shown after the claim in the Evidence section. A claim with an
+  explicit comparison (a multiplier, percentage points, vs/compared with,
+  better/higher than, from X to Y) and no `baseline` returns a
+  `comparison_baseline_missing` warning.
+- `coverage_leads` lists up to ten works that source texts cite (author-year
+  citations, arXiv IDs, DOIs) but no fetched source, cited source, or
+  fetch-ledger URL matches, newest first, each with a context snippet;
+  `summary.coverage_leads` is the total. It names leads; it does not judge them.
 - An unknown source, missing quote in source, malformed DOI, or DOI absent from
   the source is flagged. A known source without an adequate quote is weak.
 - When the input file has a sibling `evidence_ledger.jsonl`, missing dates,

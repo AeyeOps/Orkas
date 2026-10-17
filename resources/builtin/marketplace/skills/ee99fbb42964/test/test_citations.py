@@ -1422,6 +1422,174 @@ class AbstainAndSummary(unittest.TestCase):
         ))
 
 
+class ComparisonBaseline(unittest.TestCase):
+    """Comparative claims must name their comparator (2026-10-02 Astra review:
+    a 25x ratio against a model two generations old read as a generational jump)."""
+
+    SOURCE = [{"id": "s1", "url": "https://example.com/eval", "title": "Evaluation",
+               "text": "Model A reaches 22.48% average success; Model B reaches 0.88%."}]
+    QUOTE = "Model A reaches 22.48% average success; Model B reaches 0.88%."
+
+    def _warnings(self, text, **extra):
+        claim = {"id": "c1", "text": text, "citations": [{"source": "s1", "quote": self.QUOTE}], **extra}
+        out = verify({"sources": self.SOURCE, "claims": [claim]})
+        return out, [w for w in out["warnings"] if w["issue"] == "comparison_baseline_missing"]
+
+    def test_comparative_shapes_without_baseline_warn(self):
+        for text in (
+            "Astra/GPT-5.5的平均SR比约25.5倍。",
+            "Model A is 25x more successful than Model B.",
+            "Model A completes tasks 1.9× faster.",
+            "Model A scores 25 times higher than Model B.",
+            "Model A leads by 3.14 percentage points.",
+            "Model A 22.48% vs Model B 0.88%.",
+            "Model A outperforms the previous release.",
+            "ScreenSpot-Pro rose from 76.9% to 92.7%.",
+            "相比 GPT-5.6 Sol，速度更快。",
+            "成功率从 76.9% 升到 92.7%。",
+        ):
+            with self.subTest(text=text):
+                _, warnings = self._warnings(text)
+                self.assertEqual(len(warnings), 1)
+                self.assertEqual(warnings[0]["claim"], 0)
+
+    def test_declared_baseline_clears_the_warning_and_is_rendered(self):
+        out, warnings = self._warnings(
+            "Model A is 25x more successful than Model B.",
+            baseline="Model B, two releases before Model A; the direct predecessor was not tested",
+        )
+        self.assertEqual(warnings, [])
+        self.assertEqual(out["claims"][0]["baseline"].split(",")[0], "Model B")
+        self.assertIn("(baseline: Model B, two releases before Model A;", out["evidence_markdown"])
+
+    def test_counts_frequencies_and_dimensions_are_not_comparisons(self):
+        for text in (
+            "Training used more than 100k GPUs.",
+            "The robot was queried 3 times a day.",
+            "The board uses a 2x2 grid of 1920x1080 cameras.",
+            "Model A reaches 22.48% average success.",
+            "RoboDojo中Astra平均成功率22.48%。",
+        ):
+            with self.subTest(text=text):
+                out, warnings = self._warnings(text)
+                self.assertEqual(warnings, [])
+                self.assertNotIn("baseline:", out["evidence_markdown"])
+
+
+class CoverageLeads(unittest.TestCase):
+    """Works a fetched source names but the run never fetched (2026-10-02: a
+    paper's introduction named a companion report that was never read)."""
+
+    PAPER = (
+        "Recent reports suggest direct control is improving ( Liu et al., 2019 ; Berman et al., 2026 ) . "
+        "Reports released with Model X ( OpenAI, 2026 ) showed strong results, but used small "
+        "custom task suites ( Robocurve, 2026 ; Jia et\u00a0al., 2026 ) . "
+        "Foundational planners ( Liu et al., 2019 ) and (Liu et al., 2019) and (Liu et al., 2019) recur. "
+        "Released in (September 2026) with (Updated 2026) notes. "
+        "Jia et al. (2026) showed robust results; see https://data.example.org/other for data. "
+        "References. "
+        "Berman et al. (2026) Shmuel Berman and Daniel Freeman. Robot Play. Lab Research, 2026. "
+        "URL https://research.example.com/robot-play . "
+        "Jia et al. (2026) Mengzhao Jia, Yang Lin, and Meng Jiang. Agent as Policy for Robotic "
+        "Manipulation. arXiv preprint arXiv:2609.12541 , 2026. URL https://arxiv.org/abs/2609.12541 . "
+        "Liu et al. (2019) Ann Liu and Bo Wu. Old Planner. 2019. "
+    )
+    SOURCES = [
+        {"id": "S1", "url": "https://arxiv.org/html/2609.24170v1", "title": "An Unexpected Robot Policy",
+         "text": PAPER},
+        {"id": "S2", "url": "https://openai.robocurve.org/model-x/", "title": "Model X on robot arms",
+         "text": "Robocurve report text."},
+        {"id": "S3", "url": "https://openai.com/index/model-x", "title": "Model X release",
+         "text": "Release text."},
+    ]
+
+    def _leads(self, sources=None, fetched_urls=None):
+        out = verify({"sources": sources or self.SOURCES, "claims": []}, fetched_urls=fetched_urls)
+        return out, {lead["lead"]: lead for lead in out["coverage_leads"]}
+
+    def test_names_an_unfetched_companion_report_with_its_identifier(self):
+        out, leads = self._leads()
+        self.assertIn("Jia et al., 2026", leads)
+        jia = leads["Jia et al., 2026"]
+        self.assertIn("arXiv:2609.12541", jia["identifiers"])
+        self.assertIn("Reports released with Model X", jia["context"])
+        self.assertEqual(jia["sources"], ["S1"])
+        # Fetched sources cover their own citations by URL or name.
+        self.assertNotIn("Robocurve, 2026", leads)
+        self.assertNotIn("OpenAI, 2026", leads)
+        self.assertEqual(out["summary"]["coverage_leads"], len(out["coverage_leads"]))
+
+    def test_dates_and_status_words_are_not_citations(self):
+        _, leads = self._leads()
+        self.assertFalse([name for name in leads if name.startswith(("September", "Updated"))])
+
+    def test_contemporaneous_work_ranks_before_often_cited_older_work(self):
+        out, _ = self._leads()
+        names = [lead["lead"] for lead in out["coverage_leads"]]
+        self.assertLess(names.index("Jia et al., 2026"), names.index("Liu et al., 2019"))
+        self.assertGreater(
+            {lead["lead"]: lead["mentions"] for lead in out["coverage_leads"]}["Liu et al., 2019"],
+            {lead["lead"]: lead["mentions"] for lead in out["coverage_leads"]}["Jia et al., 2026"],
+        )
+
+    def test_a_fetched_identifier_covers_the_lead(self):
+        sources = self.SOURCES + [{"id": "S4", "url": "https://arxiv.org/abs/2609.12541",
+                                   "title": "Agent as Policy", "text": "Abstract."}]
+        _, leads = self._leads(sources)
+        self.assertNotIn("Jia et al., 2026", leads)
+        _, leads = self._leads(fetched_urls=["https://arxiv.org/pdf/2609.12541v2"])
+        self.assertNotIn("Jia et al., 2026", leads)
+
+    def test_prose_does_not_attach_a_nearby_unrelated_url(self):
+        # "Jia et al. (2026) showed ...; see https://data.example.org/other" is prose,
+        # so fetching that URL must not mark the companion report as followed.
+        _, leads = self._leads(fetched_urls=["https://data.example.org/other"])
+        self.assertIn("Jia et al., 2026", leads)
+        self.assertNotIn("https://data.example.org/other", leads["Jia et al., 2026"]["identifiers"])
+
+    def test_standalone_identifiers_are_leads_except_a_source_s_own_doi(self):
+        sources = [{"id": "s1", "url": "https://example.com/paper", "title": "Paper",
+                    "doi": "10.1234/abcd.5678",
+                    "text": "This paper (doi:10.1234/abcd.5678) builds on 10.5555/xyz.999 and arXiv:2501.01234."}]
+        _, leads = self._leads(sources)
+        self.assertIn("doi:10.5555/xyz.999", leads)
+        self.assertIn("arXiv:2501.01234", leads)
+        self.assertNotIn("doi:10.1234/abcd.5678", leads)
+
+    def test_leads_are_bounded_and_counted(self):
+        citations_text = " ".join("(Author{} et al., 2026)".format(chr(65 + i)) for i in range(14))
+        out, _ = self._leads([{"id": "S1", "url": "https://example.com/survey", "title": "Survey",
+                               "text": citations_text}])
+        self.assertEqual(len(out["coverage_leads"]), 10)
+        self.assertEqual(out["summary"]["coverage_leads"], 14)
+
+    def test_cli_reports_leads_and_counts_the_sibling_fetch_ledger(self):
+        script = os.path.join(os.path.dirname(__file__), "..", "scripts", "citations.py")
+        with tempfile.TemporaryDirectory() as root:
+            input_path = os.path.join(root, "citations_input.json")
+            output_path = os.path.join(root, "citations_output.json")
+            with open(input_path, "w", encoding="utf-8") as fh:
+                json.dump({"sources": self.SOURCES, "claims": []}, fh)
+
+            def run():
+                completed = subprocess.run(
+                    [sys.executable, script, "--op", "verify", "--input", input_path, "--out", output_path],
+                    check=True, capture_output=True, env={**os.environ, "ORKAS_DEEP_RESEARCH_EVIDENCE_FILE": ""},
+                )
+                return json.loads(completed.stdout.decode("ascii"))
+
+            before = run()
+            with open(os.path.join(root, "fetch_ledger.jsonl"), "w", encoding="utf-8") as fh:
+                fh.write(json.dumps({"kind": "fetch", "url": "https://arxiv.org/abs/2609.12541",
+                                     "status": "ok"}) + "\n")
+            after = run()
+
+        jia = [lead for lead in before["coverage_leads"] if lead["lead"] == "Jia et al., 2026"]
+        self.assertEqual(len(jia), 1)
+        self.assertLessEqual(len(jia[0]["context"]), 220)
+        self.assertFalse([lead for lead in after["coverage_leads"] if lead["lead"] == "Jia et al., 2026"])
+
+
 class UrlNormalization(unittest.TestCase):
     def test_normalize_equivalences(self):
         a = _normalize_url("https://Example.com/Path/")

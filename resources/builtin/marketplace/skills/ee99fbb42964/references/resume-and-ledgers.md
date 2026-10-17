@@ -87,7 +87,8 @@ count.
 ## Ledger schemas
 
 `fetch_ledger.jsonl`: `kind`, normalized `query` or `canonical_url`,
-`subquestion`, `status`, `accessed_at`, charged counters.
+`subquestion`, `status`, `accessed_at`, charged counters; `offset` for a
+continuation window and `reason` for a `no_content` status.
 
 `evidence_ledger.jsonl`: `schema_version`, `source_id`, `canonical_url`,
 `title`, `publisher`, `published_at`, `accessed_at`, `source_type`,

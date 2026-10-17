@@ -1,0 +1,7 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Messages</title><script src="/__orkas/sdk.js"></script><body><form><label>Message <input required maxlength="200" name="body"></label><button>Save</button></form><p role="status"></p><ul></ul><script>
+const api=window.orkasApp,status=document.querySelector('[role=status]'),form=document.querySelector('form');
+async function refresh(){const result=await api.data.query({table:'messages'});const list=document.querySelector('ul');list.replaceChildren();for(const record of result.records){const row=document.createElement('li');row.textContent=record.body;list.append(row);}}
+let pending;
+form.onsubmit=async event=>{event.preventDefault();const button=form.querySelector('button');button.disabled=true;let saved=false;try{pending ||= {table:'messages',values:{body:form.body.value},requestId:crypto.randomUUID()};await api.data.insert(pending);pending=undefined;form.reset();saved=true;await refresh();status.textContent='Saved';}catch(error){status.textContent=saved?'Saved. Refresh this page to load messages.':'Could not save. Try again.';}finally{button.disabled=false;}};
+refresh().catch(()=>{status.textContent='Could not load messages.';});
+</script></body></html>

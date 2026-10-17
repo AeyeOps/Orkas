@@ -94,6 +94,9 @@ Layout:
 - Responsive behavior is intentional.
 - Fixed-format elements have stable dimensions.
 - Spacing supports hierarchy.
+- Parallel content shares one component, heading level, and alignment; repeated items fill rows evenly.
+- Unchanged regions of an existing product match its markup and styles.
+- Containers fit their content: short repeated rows do not leave most of a wide pane empty.
 
 Controls:
 
@@ -105,6 +108,7 @@ Controls:
 Typography:
 
 - Type scale matches container.
+- Sizes come from one scale; no near-duplicate one-off sizes.
 - Labels and table text are readable.
 - No hero-scale type in compact panels.
 - Line length and wrapping are controlled.

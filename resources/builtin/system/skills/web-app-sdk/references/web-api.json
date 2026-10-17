@@ -1,0 +1,985 @@
+{
+  "sdkVersion": 1,
+  "manifest": {
+    "file": "orkas-app.json",
+    "schema": {
+      "type": "object",
+      "properties": {
+        "sdkVersion": {
+          "type": "number",
+          "const": 1
+        },
+        "minimumClient": {
+          "type": "string",
+          "const": "1.9.0"
+        },
+        "capabilities": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": [
+              "data"
+            ]
+          },
+          "maxItems": 7
+        },
+        "data": {
+          "type": "object",
+          "properties": {
+            "version": {
+              "type": "number",
+              "const": 1
+            },
+            "tables": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                  },
+                  "name": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                  },
+                  "fields": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "id": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                        },
+                        "name": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                        },
+                        "type": {
+                          "type": "string",
+                          "enum": [
+                            "string",
+                            "number",
+                            "integer",
+                            "boolean",
+                            "json",
+                            "timestamp"
+                          ]
+                        },
+                        "required": {
+                          "type": "boolean"
+                        },
+                        "nullable": {
+                          "type": "boolean"
+                        },
+                        "unique": {
+                          "type": "boolean"
+                        },
+                        "default": {},
+                        "references": {
+                          "type": "object",
+                          "properties": {
+                            "table": {
+                              "type": "string",
+                              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                            }
+                          },
+                          "required": [
+                            "table"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "name",
+                        "type"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "maxItems": 128
+                  },
+                  "access": {
+                    "type": "object",
+                    "properties": {
+                      "read": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                        },
+                        "default": []
+                      },
+                      "insert": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                        },
+                        "default": []
+                      },
+                      "count": {
+                        "type": "boolean"
+                      },
+                      "maxCount": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 1000000
+                      },
+                      "aggregate": {
+                        "type": "array",
+                        "items": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                        }
+                      },
+                      "readFilters": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "field": {
+                              "type": "string",
+                              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                            },
+                            "op": {
+                              "type": "string",
+                              "enum": [
+                                "eq",
+                                "ne",
+                                "lt",
+                                "lte",
+                                "gt",
+                                "gte"
+                              ]
+                            },
+                            "value": {
+                              "anyOf": [
+                                {
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "number",
+                                  "minimum": -9007199254740991,
+                                  "maximum": 9007199254740991
+                                },
+                                {
+                                  "type": "boolean"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "field",
+                            "op",
+                            "value"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "maxItems": 16
+                      }
+                    },
+                    "additionalProperties": false
+                  },
+                  "indexes": {
+                    "type": "array",
+                    "items": {
+                      "type": "array",
+                      "items": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                      },
+                      "minItems": 1,
+                      "maxItems": 4
+                    },
+                    "maxItems": 16
+                  }
+                },
+                "required": [
+                  "id",
+                  "name",
+                  "fields",
+                  "access"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 32
+            }
+          },
+          "required": [
+            "version",
+            "tables"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "sdkVersion",
+        "capabilities"
+      ],
+      "additionalProperties": false,
+      "$schema": "http://json-schema.org/draft-07/schema#",
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "capabilities": {
+                "contains": {
+                  "const": "data"
+                }
+              }
+            },
+            "required": [
+              "capabilities"
+            ]
+          },
+          "then": {
+            "required": [
+              "data"
+            ]
+          }
+        }
+      ]
+    },
+    "starter": {
+      "entry": "@skill/web-app-sdk/assets/web/index.html",
+      "manifest": "@skill/web-app-sdk/assets/web/orkas-app.json"
+    }
+  },
+  "dataDefinition": {
+    "type": "object",
+    "properties": {
+      "version": {
+        "type": "number",
+        "const": 1
+      },
+      "tables": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+            },
+            "name": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+            },
+            "fields": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                  },
+                  "name": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "string",
+                      "number",
+                      "integer",
+                      "boolean",
+                      "json",
+                      "timestamp"
+                    ]
+                  },
+                  "required": {
+                    "type": "boolean"
+                  },
+                  "nullable": {
+                    "type": "boolean"
+                  },
+                  "unique": {
+                    "type": "boolean"
+                  },
+                  "default": {},
+                  "references": {
+                    "type": "object",
+                    "properties": {
+                      "table": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                      }
+                    },
+                    "required": [
+                      "table"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "id",
+                  "name",
+                  "type"
+                ],
+                "additionalProperties": false
+              },
+              "maxItems": 128
+            },
+            "access": {
+              "type": "object",
+              "properties": {
+                "read": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                  },
+                  "default": []
+                },
+                "insert": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                  },
+                  "default": []
+                },
+                "count": {
+                  "type": "boolean"
+                },
+                "maxCount": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 1000000
+                },
+                "aggregate": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                  }
+                },
+                "readFilters": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "field": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                      },
+                      "op": {
+                        "type": "string",
+                        "enum": [
+                          "eq",
+                          "ne",
+                          "lt",
+                          "lte",
+                          "gt",
+                          "gte"
+                        ]
+                      },
+                      "value": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "number",
+                            "minimum": -9007199254740991,
+                            "maximum": 9007199254740991
+                          },
+                          {
+                            "type": "boolean"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "field",
+                      "op",
+                      "value"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "maxItems": 16
+                }
+              },
+              "additionalProperties": false
+            },
+            "indexes": {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                },
+                "minItems": 1,
+                "maxItems": 4
+              },
+              "maxItems": 16
+            }
+          },
+          "required": [
+            "id",
+            "name",
+            "fields",
+            "access"
+          ],
+          "additionalProperties": false
+        },
+        "maxItems": 32
+      }
+    },
+    "required": [
+      "version",
+      "tables"
+    ],
+    "additionalProperties": false,
+    "$schema": "http://json-schema.org/draft-07/schema#"
+  },
+  "methods": [
+    {
+      "name": "data.query",
+      "capability": "data",
+      "description": "Read declared fields under readFilters; default limit 20, maximum 100, offset maximum 100000. Ordering adds id as a stable tie-breaker; include reads at most four declared one-hop relations.",
+      "appTypes": [
+        "local",
+        "web"
+      ],
+      "environments": [
+        "desktop",
+        "preview",
+        "online"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+            },
+            "maxItems": 130
+          },
+          "include": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+            },
+            "maxItems": 4
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                },
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "eq",
+                    "ne",
+                    "lt",
+                    "lte",
+                    "gt",
+                    "gte"
+                  ]
+                },
+                "value": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "number",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "field",
+                "op",
+                "value"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 16
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 100
+          },
+          "offset": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100000
+          },
+          "order": {
+            "type": "object",
+            "properties": {
+              "field": {
+                "type": "string",
+                "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+              },
+              "direction": {
+                "type": "string",
+                "enum": [
+                  "asc",
+                  "desc"
+                ]
+              }
+            },
+            "required": [
+              "field",
+              "direction"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "table"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{records:object[]}; include adds relations keyed by reference field.",
+      "example": {
+        "table": "messages",
+        "fields": [
+          "body"
+        ],
+        "limit": 20
+      }
+    },
+    {
+      "name": "data.count",
+      "capability": "data",
+      "description": "Count records under declared readFilters and caller filters; requires count permission.",
+      "appTypes": [
+        "local",
+        "web"
+      ],
+      "environments": [
+        "desktop",
+        "preview",
+        "online"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                },
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "eq",
+                    "ne",
+                    "lt",
+                    "lte",
+                    "gt",
+                    "gte"
+                  ]
+                },
+                "value": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "number",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "field",
+                "op",
+                "value"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 16
+          }
+        },
+        "required": [
+          "table"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{count:number}",
+      "example": {
+        "table": "messages"
+      }
+    },
+    {
+      "name": "data.insert",
+      "capability": "data",
+      "description": "Insert declared fields, apply defaults and meter canonical UTF-8 bytes atomically. requestId deduplicates the latest 2048 insert requests across reopening.",
+      "appTypes": [
+        "local",
+        "web"
+      ],
+      "environments": [
+        "desktop",
+        "preview",
+        "online"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+          },
+          "values": {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          "requestId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$"
+          }
+        },
+        "required": [
+          "table",
+          "values"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{id:string}; generated record ID, never the private row.",
+      "example": {
+        "table": "messages",
+        "values": {
+          "body": "Hello"
+        },
+        "requestId": "message-1"
+      }
+    },
+    {
+      "name": "data.insertIf",
+      "capability": "data",
+      "description": "Atomically check whole-table count and insert. maxCount can only tighten the application declaration; full capacity returns E_CONDITION.",
+      "appTypes": [
+        "local",
+        "web"
+      ],
+      "environments": [
+        "desktop",
+        "preview",
+        "online"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+          },
+          "values": {
+            "type": "object",
+            "additionalProperties": {}
+          },
+          "requestId": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9_-]{1,64}$"
+          },
+          "maxCount": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 1000000
+          }
+        },
+        "required": [
+          "table",
+          "values",
+          "maxCount"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{id:string}; no partial insertion on failure.",
+      "example": {
+        "table": "messages",
+        "values": {
+          "body": "Hello"
+        },
+        "maxCount": 100,
+        "requestId": "message-2"
+      }
+    },
+    {
+      "name": "data.aggregate",
+      "capability": "data",
+      "description": "Compute a declared aggregate under readFilters and caller filters; groupBy requires read permission. Up to 100 groups; larger results fail with E_LIMIT.",
+      "appTypes": [
+        "local",
+        "web"
+      ],
+      "environments": [
+        "desktop",
+        "preview",
+        "online"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "table": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+          },
+          "field": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+          },
+          "op": {
+            "type": "string",
+            "enum": [
+              "count",
+              "sum",
+              "min",
+              "max",
+              "avg"
+            ]
+          },
+          "groupBy": {
+            "type": "string",
+            "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+          },
+          "filters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "field": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+                },
+                "op": {
+                  "type": "string",
+                  "enum": [
+                    "eq",
+                    "ne",
+                    "lt",
+                    "lte",
+                    "gt",
+                    "gte"
+                  ]
+                },
+                "value": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "number",
+                      "minimum": -9007199254740991,
+                      "maximum": 9007199254740991
+                    },
+                    {
+                      "type": "boolean"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              },
+              "required": [
+                "field",
+                "op",
+                "value"
+              ],
+              "additionalProperties": false
+            },
+            "maxItems": 16
+          }
+        },
+        "required": [
+          "table",
+          "field",
+          "op"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{value:number|string|null} or {groups:[{key,value}]} when groupBy is supplied.",
+      "example": {
+        "table": "messages",
+        "field": "score",
+        "op": "sum"
+      }
+    },
+    {
+      "name": "capabilities.list",
+      "capability": null,
+      "description": "Discover supported methods, current availability and authorization requirements.",
+      "appTypes": [
+        "local",
+        "web"
+      ],
+      "environments": [
+        "desktop",
+        "preview",
+        "online"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{sdkVersion, methods, unsupported}",
+      "example": {}
+    },
+    {
+      "name": "capabilities.describe",
+      "capability": null,
+      "description": "Read one method schema, result contract and example.",
+      "appTypes": [
+        "local",
+        "web"
+      ],
+      "environments": [
+        "desktop",
+        "preview",
+        "online"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "method": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "required": [
+          "method"
+        ],
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "Method documentation.",
+      "example": {
+        "method": "data.query"
+      }
+    },
+    {
+      "name": "host.getContext",
+      "capability": null,
+      "description": "Read the current application language and SDK version.",
+      "appTypes": [
+        "local",
+        "web"
+      ],
+      "environments": [
+        "desktop",
+        "preview",
+        "online"
+      ],
+      "status": "supported",
+      "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": false,
+        "$schema": "http://json-schema.org/draft-07/schema#"
+      },
+      "result": "{language, sdkVersion}",
+      "example": {}
+    }
+  ],
+  "unsupported": [
+    {
+      "capability": "account.renewalReminders",
+      "reason": "Host-only: account-wide reminder claims and billing navigation belong to the signed-in desktop account UI, not saved applications."
+    },
+    {
+      "capability": "browser",
+      "reason": "Host-only: task browser control, native file selection and site consent require a live conversation and its user-owned Chromium profile."
+    },
+    {
+      "capability": "files.writeInPlace",
+      "reason": "Deferred: needs shared revision/lock/indexer integration; export through files.saveAs."
+    },
+    {
+      "capability": "projects",
+      "reason": "Deferred: apps have no user-selected project binding; source conversation is not authority."
+    },
+    {
+      "capability": "memory",
+      "reason": "Deferred: needs a user-selected scope; Agent-private and global memories are not app state."
+    },
+    {
+      "capability": "history",
+      "reason": "Deferred: needs an explicit conversation grant and bounded history projection."
+    },
+    {
+      "capability": "agents.tasks",
+      "reason": "Deferred: needs a host-owned task lifetime, permissions and billing association."
+    },
+    {
+      "capability": "skills",
+      "reason": "Host-only: Skill script execution needs an explicitly scoped application sandbox and execution contract."
+    },
+    {
+      "capability": "shell",
+      "reason": "Host-only: arbitrary execution would escape the application capability boundary."
+    },
+    {
+      "capability": "media.generate",
+      "reason": "Deferred: owning studio plan, output and spending gates must be adapted first."
+    }
+  ]
+}
