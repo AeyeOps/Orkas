@@ -1,6 +1,6 @@
 import { createServer } from 'node:http';
 import path from 'node:path';
-import { expect, test, type OrkasTestApp } from './fixtures/orkas';
+import { expect, test, OrkasTestApp } from './fixtures/orkas';
 
 async function withInputPage(orkas: OrkasTestApp, run: (browser: Awaited<ReturnType<typeof openInputPage>>) => Promise<void>) {
   const server = createServer((_req, res) => {
@@ -71,13 +71,56 @@ async function openInputPage(orkas: OrkasTestApp, origin: string) {
   }, { url: origin, code });
   const act = async (label: string, page_action: string, extras: Record<string, unknown> = {}) => {
     const observed = await call({ operation: 'observe', tab_id: tabId });
-    expect(observed.ok).toBe(true);
+    expect(observed.ok, JSON.stringify(observed)).toBe(true);
     const element = observed.elements.find((e: any) => e.label === label);
     expect(element).toBeTruthy();
     return call({ operation: 'act', tab_id: tabId, page_id: observed.page_id, element_ref: element.ref, page_action, ...extras });
   };
   return { cid, tabId, origin, call, inspect, act };
 }
+
+test('a first physical click survives the human-control banner reflow', async ({}, testInfo) => {
+  const orkas = new OrkasTestApp(testInfo, { nativeWindowVisible: true });
+  try {
+    await orkas.launch();
+    await withInputPage(orkas, async ({ cid, origin, act, inspect }) => {
+      expect(await act('Save', 'hover')).toMatchObject({ ok: true });
+      await orkas.page!.evaluate(id => {
+        document.getElementById('foreground-draft')!.remove();
+        (window as any).setView('conversation', id);
+        (window as any).ConversationInfo.openAndSetTab('browser');
+      }, cid);
+      await expect(orkas.page!.locator('.web-assist-shell')).toBeVisible();
+      const target = await orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView, webContents }, url) => {
+        const wc = webContents.getAllWebContents().find(wc => wc.getURL() === url)!;
+        const win = BrowserWindow.getAllWindows()[0];
+        const view = win.contentView.children.find(v => v instanceof WebContentsView && v.webContents === wc)!;
+        wc.focus();
+        const point = await wc.executeJavaScript('(()=>{const r=save.getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()');
+        const zoom = wc.getZoomFactor();
+        return { bounds: view.getBounds(), point: { x: Math.round(point.x * zoom), y: Math.round(point.y * zoom) } };
+      }, origin);
+      const send = (type: 'mouseDown' | 'mouseUp') => orkas.electronApp!.evaluate(({ webContents }, args) => {
+        webContents.getAllWebContents().find(wc => wc.getURL() === args.url)!
+          .sendInputEvent({ type: args.type, ...args.point, button: 'left', clickCount: 1 });
+      }, { url: origin, point: target.point, type });
+      const bounds = () => orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView, webContents }, url) => {
+        const wc = webContents.getAllWebContents().find(wc => wc.getURL() === url)!;
+        return BrowserWindow.getAllWindows()[0].contentView.children
+          .find(v => v instanceof WebContentsView && v.webContents === wc)!.getBounds();
+      }, origin);
+      await send('mouseDown');
+      await expect(orkas.page!.locator('[data-act="handback"]')).toBeVisible();
+      // Let the actual renderer's ResizeObserver and layout IPC run while held.
+      await expect.poll(async () => (await orkas.page!.locator('.web-assist-native-host').boundingBox())!.y)
+        .toBeGreaterThan(target.bounds.y);
+      expect(await bounds()).toEqual(target.bounds);
+      await send('mouseUp');
+      await expect.poll(() => inspect('evidence')).toMatchObject({ clicks: 1, trusted: true });
+      await expect.poll(async () => (await bounds()).y).toBeGreaterThan(target.bounds.y);
+    });
+  } finally { await orkas.dispose(); }
+});
 
 test('long articles fill background editors completely without taking foreground input', async ({ orkas }) => {
   await withInputPage(orkas, async ({ act, inspect }) => {
@@ -109,6 +152,65 @@ test('long articles fill background editors completely without taking foreground
   });
 });
 
+test('scaled task pages click cross-origin controls repeatedly without taking human control', async ({ orkas }) => {
+  const server = createServer((req, res) => {
+    res.setHeader('Content-Type', 'text/html');
+    if (req.url === '/child') {
+      res.end(`<!doctype html><style>body{margin:0}button{position:absolute;left:40px;top:30px;width:100px;height:40px}</style>
+        <button>Frame control</button><script>window.clicks=0;window.trusted=false;
+        document.querySelector('button').onclick=e=>{clicks++;trusted=e.isTrusted};</script>`);
+    } else {
+      res.end(`<!doctype html><style>body{margin:0}iframe{position:absolute;left:200px;top:100px;width:450px;height:260px;border:0}</style>
+        <iframe src="http://localhost:${(server.address() as { port: number }).port}/child"></iframe>`);
+    }
+  });
+  await new Promise<void>(resolve => server.listen(0, '::', resolve));
+  const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+  try {
+    const { tabId, call } = await openInputPage(orkas, origin + '/first');
+    const readFrame = () => orkas.electronApp!.evaluate(({ webContents }, url) => {
+      const wc = webContents.getAllWebContents().find(wc => wc.getURL() === url)!;
+      const child = wc.mainFrame.frames.find(f => f.url.endsWith('/child'))!;
+      return child.executeJavaScript('({clicks,trusted})');
+    }, origin + '/first');
+    const observed = await call({ operation: 'observe', tab_id: tabId });
+    const frame = observed.frames.find((f: any) => f.display_url.endsWith('/child'));
+    expect(frame).toBeTruthy();
+    let clicks = 0;
+    for (const width of [408, 600, 1280, 600]) {
+      await orkas.invoke('webAssist.layout', { x: 0, y: 0, width, height: 500 });
+      const child = await call({ operation: 'observe', tab_id: tabId, frame_id: frame.frame_id });
+      const acted = await call({ operation: 'act', tab_id: tabId, page_id: child.page_id,
+        element_ref: child.elements.find((e: any) => e.label === 'Frame control').ref, page_action: 'click' });
+      expect(acted, JSON.stringify({ width, acted })).toMatchObject({ ok: true });
+      expect(await readFrame()).toEqual({ clicks: ++clicks, trusted: true });
+      expect((await call({ operation: 'tabs' })).tabs.find((t: any) => t.tab_id === tabId).user_controlled).toBeFalsy();
+    }
+    // The shared login profile must not make a narrow same-origin tab resize
+    // this page. Main-process setZoomFactor alone would share zoom by origin.
+    const sibling = await call({ operation: 'open', url: origin + '/second' });
+    await orkas.invoke('webAssist.activateTab', { tabId: sibling.active_tab_id });
+    await orkas.invoke('webAssist.layout', { x: 0, y: 0, width: 300, height: 500 });
+    expect(await call({ operation: 'wait', tab_id: sibling.active_tab_id })).toMatchObject({ ok: true });
+    expect(await call({ operation: 'observe', tab_id: sibling.active_tab_id })).toMatchObject({ ok: true });
+    expect(await orkas.electronApp!.evaluate(({ webContents }, url) => {
+      const wc = webContents.getAllWebContents().find(wc => wc.getURL() === url)!;
+      return wc.executeJavaScript('innerWidth');
+    }, origin + '/first')).toBe(1280);
+    expect(await call({ operation: 'close', tab_id: sibling.active_tab_id })).toMatchObject({ ok: true });
+    await orkas.invoke('webAssist.layout', { x: 0, y: 0, width: 600, height: 500 });
+    const screenshot = await call({ operation: 'screenshot', tab_id: tabId });
+    expect(screenshot).toMatchObject({ ok: true });
+    expect(await call({ operation: 'act', tab_id: tabId, page_id: screenshot.page_id,
+      point: [290, 150], page_action: 'click' })).toMatchObject({ ok: true });
+    expect(await readFrame()).toEqual({ clicks: ++clicks, trusted: true });
+    expect((await call({ operation: 'tabs' })).tabs.find((t: any) => t.tab_id === tabId).user_controlled).toBeFalsy();
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
 test('background page input preserves the user workspace, scaled coordinates and automatic handback', async ({ orkas }) => {
   await withInputPage(orkas, async ({ cid, tabId, origin, call, inspect, act }) => {
     expect(await act('Draft', 'fill', { text: 'Background draft' })).toMatchObject({ ok: true });
@@ -117,13 +219,42 @@ test('background page input preserves the user workspace, scaled coordinates and
     expect(await inspect('evidence')).toMatchObject({ clicks: 1, trusted: true });
     expect(await act('Enabled', 'check')).toMatchObject({ ok: true });
     expect(await inspect('check.checked')).toBe(true);
+    // Establish real native overlap instead of assuming keyboard transport
+    // finishes within the production drag's12 bounded16ms steps.
+    const holdNextMove = () => orkas.electronApp!.evaluate(({ webContents }, url) => {
+      const target = webContents.getAllWebContents().find(wc => wc.getURL() === url)!;
+      const original = target.debugger.sendCommand.bind(target.debugger);
+      const hold = { release: null as (() => void) | null, original };
+      (globalThis as any).__workspaceDragHold = hold;
+      target.debugger.sendCommand = async (method, params) => {
+        const result = await original(method, params);
+        if (params?.type === 'mouseMoved' && params.buttons === 1) {
+          target.debugger.sendCommand = original;
+          await new Promise<void>(resolve => { hold.release = resolve; });
+        }
+        return result;
+      };
+    }, origin);
+    const waitForHeldMove = () => expect.poll(() => orkas.electronApp!.evaluate(
+      () => typeof (globalThis as any).__workspaceDragHold?.release,
+    )).toBe('function');
+    const releaseMove = () => orkas.electronApp!.evaluate(({ webContents }, url) => {
+      const target = webContents.getAllWebContents().find(wc => wc.getURL() === url)!;
+      const hold = (globalThis as any).__workspaceDragHold;
+      target.debugger.sendCommand = hold.original;
+      hold.release?.();
+    }, origin);
     await orkas.page!.locator('#foreground-draft').press('End');
+    await holdNextMove();
     const backgroundDrag = act('Position', 'drag', { drag_delta_x: 160, drag_delta_y: 0 });
-    await expect.poll(() => inspect('evidence.down'), { intervals: [5] }).toBe(true);
-    // keyboard.type uses the current focus; a locator action would refocus and hide a regression.
-    await orkas.page!.keyboard.type(' uninterrupted', { delay: 5 });
-    expect(await inspect('evidence.down')).toBe(true);
-    await expect(orkas.page!.locator('#foreground-draft')).toHaveValue('User keeps working uninterrupted');
+    try {
+      await waitForHeldMove();
+      expect(await inspect('evidence.down')).toBe(true);
+      // keyboard.type uses current focus; locator input would hide a focus regression.
+      await orkas.page!.keyboard.type(' uninterrupted', { delay: 5 });
+      expect(await inspect('evidence.down')).toBe(true);
+      await expect(orkas.page!.locator('#foreground-draft')).toHaveValue('User keeps working uninterrupted');
+    } finally { await releaseMove(); }
     expect(await backgroundDrag).toMatchObject({ ok: true });
     expect(await inspect('evidence')).toMatchObject({ down: false, distance: 160 });
     await expect(orkas.page!.locator('#foreground-draft')).toBeFocused();
@@ -138,11 +269,15 @@ test('background page input preserves the user workspace, scaled coordinates and
     expect(await inspect('evidence.clicks')).toBe(2);
     // Taking control during a held pointer cancels further movement and releases it.
     await inspect('evidence.distance=0');
+    await holdNextMove();
     const drag = act('Position', 'drag', { drag_delta_x: 300, drag_delta_y: 0 });
-    await expect.poll(() => inspect('evidence.down'), { intervals: [10] }).toBe(true);
-    await orkas.electronApp!.evaluate(({ webContents }, url) => {
-      webContents.getAllWebContents().find(wc => wc.getURL() === url)!.sendInputEvent({ type: 'keyDown', keyCode: 'B' });
-    }, origin);
+    try {
+      await waitForHeldMove();
+      expect(await inspect('evidence.down')).toBe(true);
+      await orkas.electronApp!.evaluate(({ webContents }, url) => {
+        webContents.getAllWebContents().find(wc => wc.getURL() === url)!.sendInputEvent({ type: 'keyDown', keyCode: 'B' });
+      }, origin);
+    } finally { await releaseMove(); }
     expect(await drag).toMatchObject({ ok: false, code: 'user_controlled' });
     expect(await inspect('evidence.down')).toBe(false);
     expect(await inspect('evidence.distance')).toBeLessThan(300);
@@ -261,6 +396,9 @@ test('IME candidate selection stays human controlled and automatically resumes w
       }
       else await target.debugger.sendCommand('Input.imeSetComposition', { text: '你好', selectionStart: 0, selectionEnd: 2 });
     }, { origin, commit });
+    // Establish the browser's owned protocol session before the native IME
+    // fixture uses it; an unrelated attached debugger cannot be commandeered.
+    expect(await call({ operation: 'observe', tab_id: tabId })).toMatchObject({ ok: true });
     await ime(false);
     await expect.poll(async () => (await call({ operation: 'tabs' })).tabs.find((t: any) => t.tab_id === tabId).user_controlled).toBe(true);
     // A candidate can remain open beyond the idle threshold with no held key.

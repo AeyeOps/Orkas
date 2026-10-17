@@ -1,5 +1,17 @@
 // Sandboxed, isolated frame preload. No page API, input text or key data crosses IPC.
-const { ipcRenderer } = require('electron');
+const { ipcRenderer, webFrame } = require('electron');
+if (process.isMainFrame) {
+  ipcRenderer.on('web-assist:viewport', (_event, revision, factor) => {
+    if (!Number.isSafeInteger(revision) || revision < 1 || !Number.isFinite(factor) || factor <= 0 || factor > 1) return;
+    webFrame.setZoomFactor(factor);
+    ipcRenderer.send('web-assist:viewport-applied', revision);
+  });
+  // Renderer zoom is temporary and tab-scoped. Apply it before page scripts
+  // see the viewport; the page receives no API or IPC access.
+  const factor = ipcRenderer.sendSync('web-assist:viewport-factor');
+  if (Number.isFinite(factor) && factor > 0 && factor <= 1) webFrame.setZoomFactor(factor);
+  ipcRenderer.send('web-assist:viewport-ready');
+}
 let composing = false;
 const report = (event, active) => {
   if (!event.isTrusted || composing === active) return;

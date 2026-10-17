@@ -101,6 +101,9 @@ export async function main(): Promise<number> {
     const ref = (observed.elements as Array<{ ref: string; label: string }> | undefined)
       ?.find(element => element.label === 'Continue')?.ref;
     if (observed.ok !== true || !ref) return [...failures, `observe failed: ${String(observed.code)}`];
+    // Observation may own a persistent frame-controller session. Input must
+    // preserve that session and release only a session it attached itself.
+    const debuggerAttachedBeforeInput = contents.debugger.isAttached();
     const before = clicks.length;
     const acted = await web.actOnModelWebAssist(USER, TASK, {
       tabId, pageId: observed.page_id, elementRef: ref, action: 'click',
@@ -118,7 +121,9 @@ export async function main(): Promise<number> {
       || owner.isFocused() !== ownerState.focused || contents.isFocused() !== pageFocused) {
       failures.push('background input changed native window or page focus/visibility');
     }
-    if (contents.debugger.isAttached()) failures.push('background input retained a debugger session');
+    if (contents.debugger.isAttached() !== debuggerAttachedBeforeInput) {
+      failures.push('background input changed the controller debugger attachment');
+    }
     // Native clicking itself makes document.hasFocus() true even after the
     // emulation session has ended. Native window/view focus above is the oracle
     // for stealing the user's focus; document focus is not that boundary.

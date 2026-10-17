@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { WebContents } from 'electron';
-import { dispatchWebAssistPointer, consumeWebAssistPointerEvent, wakeWebAssistRendering } from '../../../src/main/features/web_assist_input';
+import { dispatchWebAssistPointer, consumeWebAssistPointerEvent, wakeWebAssistRendering, dispatchWebAssistKeys, consumeWebAssistKeyEvent } from '../../../src/main/features/web_assist_input';
 
 const target = { ok: true, pointer: { x: 200, y: 100, width: 1280, height: 800 } };
 function page(send = async (_method: string, _params: Record<string, unknown>) => ({}), attached = false) {
@@ -13,6 +13,26 @@ function page(send = async (_method: string, _params: Record<string, unknown>) =
 afterEach(() => vi.useRealTimers());
 
 describe('target-scoped browser pointer failure recovery', () => {
+  it('matches frame-local native receipts while preserving human input during a transformed drag', async () => {
+    vi.useFakeTimers();
+    const framed = { ok: true, pointer: { x: 300, y: 200, width: 1280, height: 800,
+      eventPoint: { x: 40, y: 30, transform: [2, 0, 0, 2] } } };
+    const contents = page(async (_method, params) => {
+      const type = params.type === 'mousePressed' ? 'mouseDown' : params.type === 'mouseReleased' ? 'mouseUp' : 'mouseMove';
+      const receipt = { type, button: 'left', x: 40 + 2 * (Number(params.x) - 300), y: 30 } as any;
+      expect(consumeWebAssistPointerEvent(contents, { ...receipt, x: receipt.x + 10 })).toBe(false);
+      expect(consumeWebAssistPointerEvent(contents, { ...receipt, type: 'mouseWheel' })).toBe(false);
+      expect(consumeWebAssistPointerEvent(contents, receipt)).toBe(true);
+      expect(consumeWebAssistPointerEvent(contents, receipt)).toBe(false);
+      return {};
+    });
+    const result = dispatchWebAssistPointer(contents, async () => framed, () => null, () => 0.5, { x: 120, y: 0 });
+    await vi.runAllTimersAsync();
+    expect(await result).toMatchObject({ ok: true });
+    expect(contents.debugger.sendCommand).toHaveBeenLastCalledWith('Input.dispatchMouseEvent',
+      { type: 'mouseReleased', x: 420, y: 200, button: 'left', buttons: 0, clickCount: 1 });
+  });
+
   it('never mistakes human presses for AI input while a native acknowledgement is pending', async () => {
     vi.useFakeTimers();
     let release: (() => void) | undefined;
@@ -60,13 +80,13 @@ describe('target-scoped browser pointer failure recovery', () => {
     expect(await retry).toMatchObject({ ok: true });
   });
 
-  it('rejects an out-of-viewport drag without input and permits a corrected request', async () => {
+  it('delivers native drags across the viewport boundary without a browser endpoint restriction', async () => {
     vi.useFakeTimers();
     const contents = page();
     const outside = dispatchWebAssistPointer(contents, async () => target, () => null, () => 1, { x: -201, y: 0 });
     await vi.runAllTimersAsync();
-    expect(await outside).toMatchObject({ ok: false, code: 'invalid_drag' });
-    expect(contents.debugger.sendCommand).not.toHaveBeenCalled();
+    expect(await outside).toMatchObject({ ok: true });
+    expect(contents.debugger.sendCommand).toHaveBeenLastCalledWith('Input.dispatchMouseEvent', { type: 'mouseReleased', x: -1, y: 100, button: 'left', buttons: 0, clickCount: 1 });
     const corrected = dispatchWebAssistPointer(contents, async () => target, () => null, () => 1, { x: -200, y: 0 });
     await vi.runAllTimersAsync();
     expect(await corrected).toMatchObject({ ok: true });
@@ -84,7 +104,7 @@ describe('target-scoped browser pointer failure recovery', () => {
     await vi.runAllTimersAsync();
     await rejected;
     expect(contents.debugger.sendCommand).toHaveBeenCalledTimes(1);
-    expect(contents.debugger.sendCommand).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 100, y: 50 });
+    expect(contents.debugger.sendCommand).toHaveBeenCalledWith('Input.dispatchMouseEvent', { type: 'mouseMoved', x: 200, y: 100 });
     expect(contents.debugger.detach).not.toHaveBeenCalled();
     expect(consumeWebAssistPointerEvent(contents, { type: 'mouseDown', button: 'left', x: 100, y: 50 })).toBe(false);
   });
@@ -196,5 +216,93 @@ describe('rendering a hidden page before native input', () => {
     await vi.advanceTimersByTimeAsync(400);
     await waking;
     expect(state).toBe('woken');
+  });
+});
+
+
+describe('native keyboard and pointer controls', () => {
+  it.each(['hover', 'double_click', 'right_click'] as const)('dispatches %s through the target page only', async mode => {
+    vi.useFakeTimers(); const contents = page();
+    const result = dispatchWebAssistPointer(contents, async () => target, () => null, () => 1, undefined, undefined, mode);
+    await vi.runAllTimersAsync(); expect(await result).toMatchObject({ ok: true });
+    const events = vi.mocked(contents.debugger.sendCommand).mock.calls.map(([, args]) => args);
+    if (mode === 'hover') expect(events).toEqual([{ type: 'mouseMoved', x: 200, y: 100 }]);
+    else if (mode === 'double_click') expect(events.filter(e => e.type === 'mousePressed').map(e => e.clickCount)).toEqual([1, 2]);
+    else expect(events.filter(e => e.type === 'mousePressed')).toMatchObject([{ button: 'right', buttons: 2 }]);
+  });
+  it('recognizes only its own native key events, leaving physical input with the user', async () => {
+    let contents: WebContents;
+    contents = page(async (_method, params) => {
+      expect(consumeWebAssistKeyEvent(contents, { type: params.type, key: 'b' } as any)).toBe(false);
+      expect(consumeWebAssistKeyEvent(contents, { type: params.type, key: 'a' } as any)).toBe(true);
+      expect(consumeWebAssistKeyEvent(contents, { type: params.type, key: 'a' } as any)).toBe(false);
+      return {};
+    });
+    expect(await dispatchWebAssistKeys(contents, 'Control+a', () => null)).toMatchObject({ ok: true });
+    expect(contents.debugger.sendCommand).toHaveBeenCalledTimes(2);
+    expect(contents.debugger.sendCommand).toHaveBeenCalledWith('Input.dispatchKeyEvent', expect.objectContaining({ type: 'keyDown', key: 'a', modifiers: 2 }));
+  });
+  it('rejects unsupported key syntax and cancellation before dispatch', async () => {
+    const contents = page();
+    expect(await dispatchWebAssistKeys(contents, 'Unknown+Enter', () => null)).toMatchObject({ code: 'invalid_keys' });
+    expect(await dispatchWebAssistKeys(contents, 'Enter', () => ({ ok: false, code: 'task_run_ended' }))).toMatchObject({ code: 'task_run_ended' });
+    expect(contents.debugger.sendCommand).not.toHaveBeenCalled();
+  });
+  it('releases a possibly held key when native key-down fails without replaying the press', async () => {
+    const contents = page(async (_method, params) => { if (params.type === 'keyDown') throw new Error('fixture dispatch failure'); return {}; });
+    await expect(dispatchWebAssistKeys(contents, 'Enter', () => null)).rejects.toThrow('fixture dispatch failure');
+    expect(vi.mocked(contents.debugger.sendCommand).mock.calls.map(([, args]) => args.type)).toEqual(['keyDown', 'keyUp']);
+    expect(contents.debugger.detach).toHaveBeenCalledOnce();
+  });
+});
+
+// A synchronous dialog freezes Chromium before native input acknowledgement.
+// These cases reject duplicate releases/keypresses independently of tool output.
+describe('native input yielding to browser dialog decisions', () => {
+  it.each([1, 2])('does not replay a double-click release when dialog %s blocks its acknowledgement', async releaseIndex => {
+    const { EventEmitter } = await import('node:events');
+    const { attachWebAssistDialogs, WebAssistDialogOpenedError } = await import('../../../src/main/features/web_assist_dialogs');
+    let releases = 0, acknowledge!: () => void;
+    const emitter = new EventEmitter();
+    emitter.on('-run-dialog', () => { throw new Error('Native UI must not open'); });
+    const contents = Object.assign(emitter, page(async (_method, params) => {
+      if (params.type === 'mouseReleased' && ++releases === releaseIndex) {
+        return new Promise<void>(resolve => {
+          acknowledge = resolve;
+          emitter.emit('-run-dialog', { dialogType: 'confirm', messageText: 'Continue?', defaultPromptText: '' }, () => resolve());
+        });
+      }
+      return {};
+    }));
+    const dialogs = attachWebAssistDialogs(contents, () => 'run', () => {})!;
+    await expect(dispatchWebAssistPointer(contents, async () => target, () => null, () => 1, undefined, undefined, 'double_click'))
+      .rejects.toBeInstanceOf(WebAssistDialogOpenedError);
+    expect(releases).toBe(releaseIndex);
+    dialogs.act(dialogs.pending()!.id, 'click', 'e2'); acknowledge();
+    await Promise.resolve();
+    expect(releases).toBe(releaseIndex);
+    dialogs.dispose();
+  });
+
+  it.each(['keyDown', 'keyUp'])('releases a key once when %s opens a synchronous dialog', async trigger => {
+    const { EventEmitter } = await import('node:events');
+    const { attachWebAssistDialogs, WebAssistDialogOpenedError } = await import('../../../src/main/features/web_assist_dialogs');
+    const emitter = new EventEmitter();
+    emitter.on('-run-dialog', () => { throw new Error('Native UI must not open'); });
+    const sent: string[] = [];
+    const contents = Object.assign(emitter, page(async (_method, params) => {
+      sent.push(String(params.type));
+      if (params.type === trigger) return new Promise<void>(resolve => {
+        emitter.emit('-run-dialog', { dialogType: 'confirm', messageText: 'Continue?', defaultPromptText: '' }, () => resolve());
+      });
+      return {};
+    }));
+    const dialogs = attachWebAssistDialogs(contents, () => 'run', () => {})!;
+    await expect(dispatchWebAssistKeys(contents, 'Enter', () => null)).rejects.toBeInstanceOf(WebAssistDialogOpenedError);
+    expect(sent).toEqual(['keyDown', 'keyUp']);
+    dialogs.act(dialogs.pending()!.id, 'click', 'e2');
+    await Promise.resolve();
+    expect(sent).toEqual(['keyDown', 'keyUp']);
+    dialogs.dispose();
   });
 });

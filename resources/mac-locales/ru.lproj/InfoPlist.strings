@@ -1,1 +1,3 @@
-"NSMicrophoneUsageDescription" = "Orkas использует микрофон для голосового ввода.";
+"NSMicrophoneUsageDescription" = "Orkas использует микрофон для голосового ввода и сайтов, которым вы дали разрешение.";
+"NSCameraUsageDescription" = "Orkas позволяет сайтам использовать камеру с вашего разрешения.";
+"NSBluetoothAlwaysUsageDescription" = "Orkas использует Bluetooth, чтобы убедиться, что телефон с ключом доступа находится рядом.";

@@ -1,1 +1,3 @@
-"NSMicrophoneUsageDescription" = "Orkas ใช้ไมโครโฟนสำหรับการป้อนข้อมูลด้วยเสียง";
+"NSMicrophoneUsageDescription" = "Orkas ใช้ไมโครโฟนสำหรับการป้อนข้อมูลด้วยเสียงและเว็บไซต์ที่คุณอนุญาต";
+"NSCameraUsageDescription" = "Orkas ให้เว็บไซต์ใช้กล้องเมื่อคุณอนุญาต";
+"NSBluetoothAlwaysUsageDescription" = "Orkas ใช้บลูทูธเพื่อยืนยันว่าโทรศัพท์ที่เก็บพาสคีย์อยู่ใกล้คุณ";

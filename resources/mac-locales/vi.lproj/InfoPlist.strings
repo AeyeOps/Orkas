@@ -1,1 +1,3 @@
-"NSMicrophoneUsageDescription" = "Orkas sử dụng micrô để nhập liệu bằng giọng nói.";
+"NSMicrophoneUsageDescription" = "Orkas sử dụng micrô để nhập liệu bằng giọng nói và cho các trang web bạn cho phép.";
+"NSCameraUsageDescription" = "Orkas cho phép trang web sử dụng máy ảnh khi bạn đồng ý.";
+"NSBluetoothAlwaysUsageDescription" = "Orkas dùng Bluetooth để xác nhận điện thoại lưu khóa truy cập của bạn ở gần.";

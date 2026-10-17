@@ -1,6 +1,6 @@
 /** Per-page human input lease. Native events own it; model calls cannot extend it. */
 import type { Input, IpcMainEvent, MouseInputEvent, WebContents } from 'electron';
-import { consumeWebAssistPointerEvent } from './web_assist_input';
+import { consumeWebAssistPointerEvent, consumeWebAssistKeyEvent } from './web_assist_input';
 
 export const WEB_ASSIST_USER_IDLE_MS = 10_000;
 
@@ -30,6 +30,7 @@ export function watchWebAssistUserActivity(contents: WebContents, changed: (acti
     timer.unref();
   };
   const keyboard = (_event: unknown, input: Input) => {
+    if (consumeWebAssistKeyEvent(contents, input)) return;
     if (input.type !== 'keyDown' && input.type !== 'keyUp') return;
     const key = input.code || input.key || 'unknown';
     if (input.type === 'keyDown') keys.add(key);
@@ -82,5 +83,10 @@ export function watchWebAssistUserActivity(contents: WebContents, changed: (acti
     contents.removeListener('destroyed', dispose);
   };
   contents.once('destroyed', dispose);
-  return { release, dispose };
+  const handback = () => {
+    if (keys.size || buttons.size || composing || composingFrames.size) return false;
+    clearTimeout(timer); timer = undefined;
+    active = false; changed(false); return true;
+  };
+  return { release, dispose, handback, pointerHeld: () => buttons.size > 0 };
 }

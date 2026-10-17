@@ -7,13 +7,15 @@ import {
   addWebAssistTab,
   closeWebAssistTab,
   closeWebAssist,
-  captureWebAssistPreview,
+  handBackWebAssist,
+  resetWebAssistPermissions,
+  answerWebAssistPermission,
+  setWebAssistOverlayState,
   layoutWebAssist,
   navigateWebAssist,
   navigateWebAssistTo,
   openWebAssist,
   openWebAssistInDefaultBrowser,
-  allowWebAssistDownloadOrigin,
   setActiveWebAssistConversation,
   webAssistDownloads,
   webAssistNavigations,
@@ -57,12 +59,12 @@ export const invokeHandlers = {
   ) => setActiveWebAssistConversation(ctx.sender, payload?.conversationId),
 
   'webAssist.layout': async (
-    payload: { x?: unknown; y?: unknown; width?: unknown; height?: unknown; visible?: unknown },
+    payload: { x?: unknown; y?: unknown; width?: unknown; height?: unknown; visible?: unknown; overlayRevision?: unknown; overlayEpoch?: unknown },
     ctx: WebAssistIpcContext,
   ) => layoutWebAssist(ctx.sender, payload),
 
-  'webAssist.capturePreview': async (payload: { tabId?: unknown }, ctx: WebAssistIpcContext) => (
-    captureWebAssistPreview(ctx.sender, payload?.tabId)
+  'webAssist.overlayState': async (payload: { blocked?: unknown; revision?: unknown; epoch?: unknown }, ctx: WebAssistIpcContext) => (
+    setWebAssistOverlayState(ctx.sender, payload || {})
   ),
 
   'webAssist.navigate': async (
@@ -75,6 +77,12 @@ export const invokeHandlers = {
   ),
 
   'webAssist.close': async (_payload: unknown, ctx: WebAssistIpcContext) => closeWebAssist(ctx.sender),
+
+  'webAssist.resetPermissions': async (payload: { tabId?: unknown }, ctx: WebAssistIpcContext) => resetWebAssistPermissions(ctx.sender, payload?.tabId),
+
+  'webAssist.permissionResponse': async (payload: { tabId?: unknown; requestId?: unknown; allowed?: unknown }, ctx: WebAssistIpcContext) => answerWebAssistPermission(ctx.sender, payload || {}),
+
+  'webAssist.handback': async (payload: { tabId?: unknown }, ctx: WebAssistIpcContext) => handBackWebAssist(ctx.sender, payload?.tabId),
 
   'webAssist.state': async (_payload: unknown, ctx: WebAssistIpcContext) => webAssistState(ctx.sender),
 
@@ -97,27 +105,6 @@ export const invokeHandlers = {
     typeof payload?.conversation_id === 'string' ? payload.conversation_id : '',
   ),
 
-  /** The user's answer to a refused download. Granted outside the transfer,
-   *  because a download cannot be held for a dialog; the page retries. */
-  'webAssist.allowDownloadOrigin': async (
-    payload: { conversation_id?: unknown; origin?: unknown },
-    ctx: WebAssistIpcContext,
-  ) => allowWebAssistDownloadOrigin(
-    ctx.userId,
-    typeof payload?.conversation_id === 'string' ? payload.conversation_id : '',
-    payload?.origin,
-  ),
-
-  /** Renderer answer to one protected page action handback. Shape-only
-   *  validation; which handbacks are answerable lives in
-   *  features/web_assist_confirm.ts. */
-  'webAssist.actionConfirmResponse': async (payload: { request_id?: unknown; decision?: unknown }) => {
-    if (typeof payload?.request_id !== 'string' || !payload.request_id) throw new Error('invalid request_id');
-    if (payload?.decision !== 'deny' && payload?.decision !== 'once' && payload?.decision !== 'run') {
-      throw new Error('invalid decision');
-    }
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const confirm = require('../features/web_assist_confirm') as typeof import('../features/web_assist_confirm');
-    return { handled: confirm.respond(payload.request_id, payload.decision) };
-  },
+  // Compatibility for a renderer from before browser page-action gates were removed.
+  'webAssist.actionConfirmResponse': async () => ({ handled: false }),
 };
