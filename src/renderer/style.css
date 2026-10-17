@@ -1838,6 +1838,8 @@ html[dir="rtl"] .project-driver-toggle[aria-pressed="true"] .project-driver-swit
   border: 1px solid transparent;
   border-radius: 4px;
 }
+.project-todo-assign:hover { border-color: var(--border-strong); background: var(--surface); }
+
 .project-todo-assign .project-todo-assign-name {
   flex: 1 1 auto;
   min-width: 0;
@@ -10835,6 +10837,24 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   background: #fff;
 }
 
+/* Shared selected-content chip chrome. */
+.chat-skill-chip {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 3px 6px 3px 9px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+  align-self: center;
+}
+
 .chat-recipient-chip {
   flex-shrink: 0;
   display: inline-flex;
@@ -14748,6 +14768,72 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
   border-top: 1px solid var(--border);
 }
 .settings-data-root-row .settings-mono { margin-top: 8px; }
+/* Shared Settings actions, pagination and keyboard reorder controls. */
+.settings-sheet-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 18px;
+  background: #fcfcfe;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.settings-sheet-foot[hidden] { display: none; }
+
+.settings-link-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--primary-text);
+  font: inherit;
+  font-size: 12.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background .15s;
+}
+
+.settings-link-btn:hover { background: var(--primary-soft); }
+
+.settings-link-btn:disabled { opacity: .55; cursor: default; background: transparent; }
+
+.entry-sort {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 0 0 auto;
+  margin-left: 2px;
+}
+
+.entry-sort-btn {
+  width: 22px;
+  height: 18px;
+  padding: 0;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--muted);
+  font-family: inherit;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background .12s, color .12s;
+}
+
+.entry-sort-btn:hover:not(:disabled) { background: var(--surface-2); color: var(--text); }
+
+.entry-sort-btn:disabled { opacity: .3; cursor: default; }
+
+.entry-sort-btn:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+
 #settings-task-cleanup-age { flex: 0 0 160px; }
 #settings-task-cleanup-body > .settings-row,
 #settings-task-cleanup-body > .settings-cleanup-list { border-top: 1px solid var(--border); }

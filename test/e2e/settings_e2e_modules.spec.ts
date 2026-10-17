@@ -31,7 +31,7 @@ test.describe('settings modules and model guard', () => {
     await expect(appPage.locator('[data-settings-add="chat"]')).toBeFocused();
   });
 
-  test('renders data, recycle bin, and BYO credential settings', async ({ appPage }) => {
+  test('renders data, recycle bin, and BYO credential settings', async ({ appPage }, testInfo) => {
     await openSettingsTab(appPage, 'data');
     await expect(appPage.locator('#settings-data-root-btn')).toBeVisible();
     await expect(appPage.locator('#settings-recycle-group')).toBeVisible();
@@ -54,6 +54,11 @@ test.describe('settings modules and model guard', () => {
       hasText: 'E2E-Local-Model',
     })).toBeVisible();
     await expect(appPage.locator('#settings-entries .settings-empty')).toHaveCount(0);
+    const sort = appPage.locator('#settings-entries .entry-row').first().locator('.entry-sort');
+    await expect(sort).toHaveCSS('display', 'flex');
+    await expect(sort).toHaveCSS('flex-direction', 'column');
+    await expect(sort.locator('button').first()).toHaveCSS('border-top-width', '0px');
+    await appPage.screenshot({ path: testInfo.outputPath('settings-model-sort-actions.png') });
     await openAddModelDialog(appPage);
     await expect(appPage.locator('#settings-add-entry-btn')).toBeVisible();
     await appPage.locator('#settings-add-entry-btn').click();

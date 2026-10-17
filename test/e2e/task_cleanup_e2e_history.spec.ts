@@ -149,6 +149,7 @@ test.describe('inline historical task cleanup', () => {
     await expect(personalOpen).toHaveCSS('opacity', '0');
     await personalOpen.locator('xpath=ancestor::*[contains(@class,"settings-cleanup-item")]').hover();
     await expect(personalOpen).toHaveCSS('opacity', '1');
+    await expect(personalOpen).toHaveCSS('border-top-width', '0px');
     await personalOpen.click();
     await expect(page.locator('#panel-conversation')).toHaveClass(/active/);
     await expect(page.locator('#chat-history')).toContainText('Personal history to inspect');
