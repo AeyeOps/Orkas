@@ -20,6 +20,13 @@ const HTML_PREVIEW_MAX_BLOCKED_RESOURCE_SAMPLES = 8;
 const HTML_PREVIEW_MAX_DIAGNOSTICS = 12;
 const HTML_PREVIEW_MAX_INTERACTION_SAMPLES = 10;
 const HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS = 400;
+const HTML_PREVIEW_DESIGN_MAX_ELEMENTS = 4_000;
+const HTML_PREVIEW_DESIGN_MAX_TEXT_BOXES = 600;
+const HTML_PREVIEW_DESIGN_MAX_RULES = 20_000;
+/** A product type scale has about this many roles (display, page title,
+ *  section title, body, small body, caption, mono); more sizes on one screen
+ *  is drift from one-off values, not hierarchy. */
+const HTML_PREVIEW_FONT_SIZE_LIMIT = 8;
 
 export type HtmlPreviewViewportName = 'desktop' | 'mobile' | 'embed';
 
@@ -33,6 +40,46 @@ export interface HtmlPreviewLayoutIssue {
   selector: string;
   kind: 'left-overflow' | 'right-overflow';
   pixels: number;
+}
+
+export interface HtmlPreviewTextOverlap {
+  selector: string;
+  /** The unrelated text element or control the text collides with. */
+  other: string;
+  width: number;
+  height: number;
+}
+
+export interface HtmlPreviewLowContrastText {
+  selector: string;
+  ratio: number;
+  /** WCAG AA: 4.5 for body text, 3 for large text. */
+  required: number;
+  color: string;
+  background: string;
+  fontSize: number;
+}
+
+/** Measurable design consistency of the rendered page. These numbers find
+ *  drift and collisions; they do not judge taste, so they are warnings. */
+export interface HtmlPreviewDesignEvidence {
+  /** Distinct computed font sizes (px) of visible text, largest first. */
+  fontSizes: number[];
+  /** Distinct colors declared in color custom properties. */
+  colorTokenCount: number;
+  /** Used colors the author wrote as literals instead of tokens. Alpha is
+   *  ignored, so a translucent variant of a token still counts as the token;
+   *  browser-default colors of unstyled controls are not counted. */
+  nonTokenColorCount: number;
+  nonTokenColors: string[];
+  /** Text that collides with unrelated text or a control, after clipping. */
+  textOverlaps: HtmlPreviewTextOverlap[];
+  lowContrastCount: number;
+  lowContrastText: HtmlPreviewLowContrastText[];
+  /** Existing measurement limits reached; collected observations remain valid. */
+  incomplete?: string[];
+  /** Present when the measurement itself failed; the lists are then empty. */
+  error?: string;
 }
 
 export interface HtmlPreviewViewportEvidence {
@@ -56,6 +103,7 @@ export interface HtmlPreviewViewportEvidence {
   failedImageCount: number;
   layoutIssues: HtmlPreviewLayoutIssue[];
   ineffectiveTransforms?: string[];
+  design?: HtmlPreviewDesignEvidence;
   consoleErrors: string[];
 }
 
@@ -139,6 +187,10 @@ export interface HtmlPreviewRenderOptions {
    *  `chat-media://local` with the viewer's sandbox (no storage, CORS-gated
    *  assets). Generated artifacts render in `chat-app://` and keep the default. */
   fileViewer?: boolean;
+  /** Measure type sizes, token colors, text overlap, and contrast, and report
+   *  findings as warnings. Defaults to true; the chat-artifact smoke judges
+   *  operability only and turns it off. */
+  designAudit?: boolean;
 }
 
 type PageEvidence = Omit<
@@ -212,7 +264,407 @@ const INEFFECTIVE_TRANSFORMS_SCRIPT = `
   };
 `;
 
-const EVIDENCE_SCRIPT = `(() => {
+// Design audit, spliced into the evidence script after `visible` and
+// `selector`. It reads computed styles only. Colors are normalized through a
+// canvas so hex, rgb(), and named values compare equal; text boxes are Range
+// rects clipped by overflow ancestors, so a scrolled-away list item does not
+// "overlap" what sits below its scroller. Any failure is returned in
+// `design.error` rather than failing the preview.
+const DESIGN_EVIDENCE_SCRIPT = `
+  const designEvidence = () => {
+    const maxSamples = ${HTML_PREVIEW_MAX_DIAGNOSTICS};
+    const maxBoxes = ${HTML_PREVIEW_DESIGN_MAX_TEXT_BOXES};
+    const incomplete = new Set();
+    const colorCanvas = document.createElement('canvas');
+    colorCanvas.width = colorCanvas.height = 1;
+    const paint = colorCanvas.getContext('2d', { willReadFrequently: true });
+    const parsedColors = new Map();
+    const normalizeColor = (raw) => {
+      if (!raw || !paint || /^(none|currentcolor|inherit|initial|unset)$/i.test(raw)) return null;
+      paint.fillStyle = '#000001';
+      paint.fillStyle = raw;
+      const first = String(paint.fillStyle);
+      paint.fillStyle = '#000002';
+      paint.fillStyle = raw;
+      if (String(paint.fillStyle) !== first) return null;
+      if (first.charAt(0) === '#') {
+        const bits = parseInt(first.slice(1, 7), 16);
+        return [(bits >> 16) & 255, (bits >> 8) & 255, bits & 255, 1];
+      }
+      const match = first.match(/^rgba?\\(([^)]+)\\)$/);
+      if (!match) {
+        // CSS Color 4 values retain their syntax in fillStyle. Read the actual
+        // sRGB paint instead of treating a valid rendered color as unavailable.
+        paint.clearRect(0, 0, 1, 1);
+        paint.fillRect(0, 0, 1, 1);
+        const pixels = paint.getImageData(0, 0, 1, 1).data;
+        return [pixels[0], pixels[1], pixels[2], pixels[3] / 255];
+      }
+      const parts = match[1].split(',').map((part) => parseFloat(part));
+      if (parts.length < 3 || parts.some((part) => !Number.isFinite(part))) return null;
+      return [parts[0], parts[1], parts[2], parts.length > 3 ? parts[3] : 1];
+    };
+    const parseColor = (value) => {
+      const raw = String(value || '').trim();
+      if (!parsedColors.has(raw)) parsedColors.set(raw, normalizeColor(raw));
+      return parsedColors.get(raw);
+    };
+    const hex = (color) => '#' + color.slice(0, 3)
+      .map((channel) => Math.max(0, Math.min(255, Math.round(channel))).toString(16).padStart(2, '0'))
+      .join('');
+
+    // Tokens are color custom properties; "hard-coded" colors are color
+    // literals the author wrote anywhere else. A used color that is neither
+    // came from the browser's default styles, which is a different problem.
+    const tokenNames = new Set();
+    const tokenColors = [];
+    const literalColors = [];
+    const colorProperty = /color|^background|^border|^outline|^fill$|^stroke$|shadow|^column-rule|^text-decoration/;
+    const literalPattern = /#[0-9a-f]{3,8}\\b|\\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\\([^()]*\\)|\\b[a-z]{3,20}\\b/gi;
+    const collect = (value, into) => {
+      for (const literal of String(value || '').match(literalPattern) || []) {
+        const color = parseColor(literal);
+        if (color && color[3] > 0) into.push(color);
+      }
+    };
+    const scanDeclarations = (style) => {
+      for (let index = 0; index < style.length; index += 1) {
+        const name = String(style[index]);
+        if (name.startsWith('--')) collect(style.getPropertyValue(name), tokenColors);
+        else if (colorProperty.test(name)) collect(style.getPropertyValue(name), literalColors);
+      }
+    };
+    // Bounded so a full utility-class framework cannot stall the preview.
+    let rulesLeft = ${HTML_PREVIEW_DESIGN_MAX_RULES};
+    const scanRules = (rules) => {
+      for (let index = 0; index < (rules?.length || 0); index += 1) {
+        if (rulesLeft-- <= 0) { incomplete.add('stylesheet_rule_limit'); return; }
+        const rule = rules[index];
+        if (rule.style) {
+          scanDeclarations(rule.style);
+          if (/^\\s*(:root|html|body)\\b/i.test(String(rule.selectorText || ''))) {
+            for (let index = 0; index < rule.style.length; index += 1) {
+              if (String(rule.style[index]).startsWith('--')) tokenNames.add(rule.style[index]);
+            }
+          }
+        }
+        if (rule.cssRules) scanRules(rule.cssRules);
+      }
+    };
+    for (const sheet of Array.from(document.styleSheets || [])) {
+      let rules = [];
+      try { rules = sheet.cssRules || []; } catch (error) { continue; }
+      scanRules(rules);
+    }
+    for (const host of [document.documentElement, document.body]) {
+      if (!host) continue;
+      const style = getComputedStyle(host);
+      for (let index = 0; index < style.length; index += 1) {
+        if (String(style[index]).startsWith('--')) tokenNames.add(style[index]);
+      }
+    }
+    const rootStyle = getComputedStyle(document.documentElement);
+    const bodyStyle = document.body ? getComputedStyle(document.body) : rootStyle;
+    for (const name of tokenNames) {
+      collect(rootStyle.getPropertyValue(name) || bodyStyle.getPropertyValue(name), tokenColors);
+    }
+    const near = (list, color) => list.some((item) => Math.abs(item[0] - color[0]) <= 2
+      && Math.abs(item[1] - color[1]) <= 2 && Math.abs(item[2] - color[2]) <= 2);
+    const tokenCount = new Set(tokenColors.map((color) => hex(color))).size;
+
+    const used = new Map();
+    const record = (value, element) => {
+      const color = parseColor(value);
+      if (!color || color[3] <= 0) return;
+      const key = hex(color);
+      const entry = used.get(key);
+      if (entry) entry.count += 1;
+      else used.set(key, { color, count: 1, where: selector(element) });
+    };
+
+    const white = [255, 255, 255, 1];
+    const blend = (top, bottom) => [0, 1, 2]
+      .map((index) => top[index] * top[3] + bottom[index] * (1 - top[3]))
+      .concat(1);
+    const backgrounds = new Map();
+    // Composited background behind an element's text, or null when an image
+    // or gradient makes it unknowable from computed colors.
+    const backgroundOf = (element) => {
+      if (!element) return white;
+      if (backgrounds.has(element)) return backgrounds.get(element);
+      const style = getComputedStyle(element);
+      let result = null;
+      if (!style.backgroundImage || style.backgroundImage === 'none') {
+        const own = parseColor(style.backgroundColor);
+        if (own && own[3] >= 1) result = own;
+        else {
+          const below = backgroundOf(element.parentElement);
+          result = below && own && own[3] > 0 ? blend(own, below) : below;
+        }
+      }
+      backgrounds.set(element, result);
+      return result;
+    };
+    const channel = (value) => {
+      const unit = value / 255;
+      return unit <= 0.03928 ? unit / 12.92 : Math.pow((unit + 0.055) / 1.055, 2.4);
+    };
+    const luminance = (color) => 0.2126 * channel(color[0]) + 0.7152 * channel(color[1])
+      + 0.0722 * channel(color[2]);
+    const contrast = (left, right) => {
+      const a = luminance(left);
+      const b = luminance(right);
+      return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    };
+
+    const clips = new Map();
+    const clipOf = (element) => {
+      if (clips.has(element)) return clips.get(element);
+      const style = getComputedStyle(element);
+      let clip = null;
+      if (!(element instanceof SVGElement) && !/^(inline|contents)$/.test(style.display)
+        && (style.overflowX !== 'visible' || style.overflowY !== 'visible')) {
+        const rect = element.getBoundingClientRect();
+        const left = rect.left + element.clientLeft;
+        const top = rect.top + element.clientTop;
+        clip = { left, top, right: left + element.clientWidth, bottom: top + element.clientHeight };
+      }
+      clips.set(element, clip);
+      return clip;
+    };
+    const clipped = (rect, from) => {
+      let box = { left: rect.left, top: rect.top, right: rect.right, bottom: rect.bottom };
+      for (let node = from; node && node !== document.body && node !== document.documentElement;
+        node = node.parentElement) {
+        const clip = clipOf(node);
+        if (!clip) continue;
+        box = {
+          left: Math.max(box.left, clip.left),
+          top: Math.max(box.top, clip.top),
+          right: Math.min(box.right, clip.right),
+          bottom: Math.min(box.bottom, clip.bottom),
+        };
+        if (box.right - box.left < 1 || box.bottom - box.top < 1) return null;
+      }
+      return box;
+    };
+
+    const ownText = (element) => Array.from(element.childNodes)
+      .some((node) => node.nodeType === 3 && /\\S/.test(node.nodeValue || ''));
+    const textRects = (element) => {
+      const rects = [];
+      for (const node of Array.from(element.childNodes)) {
+        if (node.nodeType !== 3 || !/\\S/.test(node.nodeValue || '')) continue;
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const list = range.getClientRects();
+        for (let index = 0; index < list.length; index += 1) {
+          const rect = list[index];
+          if (rect.width >= 1 && rect.height >= 1) {
+            if (rects.length >= 24) { incomplete.add('text_rectangle_limit'); return rects; }
+            rects.push(rect);
+          }
+        }
+      }
+      return rects;
+    };
+    const shown = (element) => (typeof element.checkVisibility === 'function'
+      ? element.checkVisibility({ opacityProperty: true, visibilityProperty: true })
+      : visible(element));
+    const sides = ['Top', 'Right', 'Bottom', 'Left'];
+    const controlSelector = 'button, input:not([type="hidden"]), select, textarea, a[href], [role="button"], [role="link"]';
+    const fieldSelector = 'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])'
+      + ':not([type="range"]):not([type="color"]):not([type="file"]), textarea, select';
+
+    const fontSizes = new Set();
+    const textBoxes = [];
+    const controls = [];
+    const lowContrast = [];
+    const nodes = document.body?.querySelectorAll('*') || [];
+    if (nodes.length > ${HTML_PREVIEW_DESIGN_MAX_ELEMENTS}) incomplete.add('element_limit');
+    const elements = Array.from({ length: Math.min(nodes.length, ${HTML_PREVIEW_DESIGN_MAX_ELEMENTS}) },
+      (_, index) => nodes[index]);
+    for (const element of elements) {
+      if (element.hasAttribute('style')) scanDeclarations(element.style);
+      if (element instanceof SVGElement) {
+        collect(element.getAttribute('fill'), literalColors);
+        collect(element.getAttribute('stroke'), literalColors);
+      }
+      if (!shown(element)) continue;
+      const style = getComputedStyle(element);
+      record(style.backgroundColor, element);
+      for (const side of sides) {
+        const borderStyle = style['border' + side + 'Style'];
+        if (parseFloat(style['border' + side + 'Width']) > 0 && borderStyle !== 'none' && borderStyle !== 'hidden') {
+          record(style['border' + side + 'Color'], element);
+        }
+      }
+      if (element instanceof SVGElement && !(element instanceof SVGSVGElement)) {
+        if (!/^(none|url)/.test(style.fill)) record(style.fill, element);
+        if (!/^(none|url)/.test(style.stroke)) record(style.stroke, element);
+      }
+      const box = element.getBoundingClientRect();
+      const hasText = ownText(element);
+      const field = element.matches(fieldSelector);
+      if (element.matches(controlSelector) && controls.length < maxBoxes) {
+        // A transparent, empty overlay link paints nothing text could collide with.
+        const paints = hasText || field || Boolean(element.querySelector('svg, img'))
+          || (parseColor(style.backgroundColor) || [0, 0, 0, 0])[3] > 0
+          || sides.some((side) => parseFloat(style['border' + side + 'Width']) > 0);
+        const area = paints ? clipped(box, element.parentElement) : null;
+        if (area) controls.push({ element, area });
+      } else if (element.matches(controlSelector) && controls.length >= maxBoxes) {
+        incomplete.add('control_box_limit');
+      }
+      // A 1-2px box is visually hidden (sr-only) text: no size, color, or collision.
+      if ((!hasText && !field) || box.width <= 2 || box.height <= 2) continue;
+      const rects = hasText ? textRects(element) : [box];
+      if (!rects.length) continue;
+      const size = Math.round(parseFloat(style.fontSize) * 2) / 2;
+      if (size > 0) fontSizes.add(size);
+      record(style.color, element);
+      if (!hasText) continue;
+      if (textBoxes.length < maxBoxes) {
+        const lines = rects.map((rect) => clipped(rect, element)).filter(Boolean);
+        if (lines.length) {
+          textBoxes.push({
+            element,
+            lines,
+            bounds: {
+              left: Math.min(...lines.map((line) => line.left)),
+              top: Math.min(...lines.map((line) => line.top)),
+              right: Math.max(...lines.map((line) => line.right)),
+              bottom: Math.max(...lines.map((line) => line.bottom)),
+            },
+          });
+        }
+      } else {
+        incomplete.add('text_box_limit');
+      }
+      if (element.closest(':disabled, [aria-disabled="true"]')) continue;
+      const ink = parseColor(style.color);
+      const ground = backgroundOf(element);
+      if (!ink || ink[3] <= 0 || !ground) continue;
+      const text = ink[3] < 1 ? blend(ink, ground) : ink;
+      const ratio = contrast(text, ground);
+      const px = parseFloat(style.fontSize) || 16;
+      const weight = parseFloat(style.fontWeight) || 400;
+      const required = px >= 24 || (px >= 18.66 && weight >= 700) ? 3 : 4.5;
+      if (ratio + 0.005 < required) {
+        lowContrast.push({
+          selector: selector(element),
+          ratio: Math.floor(ratio * 100) / 100,
+          required,
+          color: hex(text),
+          background: hex(ground),
+          fontSize: px,
+        });
+      }
+    }
+
+    const overlaps = [];
+    const reported = new Set();
+    const ids = new Map();
+    const idOf = (element) => {
+      if (!ids.has(element)) ids.set(element, ids.size);
+      return ids.get(element);
+    };
+    const overlap = (left, right) => {
+      const width = Math.min(left.right, right.right) - Math.max(left.left, right.left);
+      const height = Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top);
+      return width > 2 && height > 2 ? { width, height } : null;
+    };
+    // Tight line-height lets neighbouring glyph boxes touch; only a quarter of
+    // a line or more counts as a collision.
+    const collides = (line, other) => {
+      const hit = overlap(line, other);
+      return hit && hit.height > Math.min(line.bottom - line.top, other.bottom - other.top) * 0.25 ? hit : null;
+    };
+    const labelFor = (element) => {
+      const label = element.closest('label');
+      return label ? label.control : null;
+    };
+    const related = (left, right) => left === right || left.contains(right) || right.contains(left)
+      || labelFor(left) === right || labelFor(right) === left;
+    // One entry per colliding pair: text-on-text and text-on-control can both
+    // fire for the same two elements.
+    const note = (element, other, hit) => {
+      const key = [idOf(element), idOf(other)].sort((left, right) => left - right).join('|');
+      if (reported.has(key) || overlaps.length >= maxSamples) return;
+      reported.add(key);
+      overlaps.push({
+        selector: selector(element),
+        other: selector(other),
+        width: Math.round(hit.width),
+        height: Math.round(hit.height),
+      });
+    };
+    for (let index = 0; index < textBoxes.length && overlaps.length < maxSamples; index += 1) {
+      const current = textBoxes[index];
+      for (let next = index + 1; next < textBoxes.length; next += 1) {
+        const candidate = textBoxes[next];
+        if (!overlap(current.bounds, candidate.bounds) || related(current.element, candidate.element)) continue;
+        let hit = null;
+        for (const line of current.lines) {
+          for (const other of candidate.lines) {
+            hit = collides(line, other);
+            if (hit) break;
+          }
+          if (hit) break;
+        }
+        if (hit) note(current.element, candidate.element, hit);
+      }
+      for (const control of controls) {
+        if (!overlap(current.bounds, control.area) || related(current.element, control.element)) continue;
+        let hit = null;
+        for (const line of current.lines) {
+          hit = collides(line, control.area);
+          if (hit) break;
+        }
+        if (hit) note(current.element, control.element, hit);
+      }
+    }
+
+    const nonToken = Array.from(used.entries())
+      .filter(([, entry]) => near(literalColors, entry.color) && !near(tokenColors, entry.color))
+      .sort((left, right) => right[1].count - left[1].count);
+    return {
+      fontSizes: Array.from(fontSizes).sort((left, right) => right - left),
+      colorTokenCount: tokenCount,
+      nonTokenColorCount: nonToken.length,
+      nonTokenColors: nonToken.slice(0, maxSamples).map(([key, entry]) => key + ' (' + entry.where + ')'),
+      textOverlaps: overlaps,
+      lowContrastCount: lowContrast.length,
+      // Repeated rows of one component share a sample.
+      lowContrastText: lowContrast
+        .sort((left, right) => left.ratio - right.ratio)
+        .filter((item, index, list) => list.findIndex((other) => other.selector === item.selector
+          && other.color === item.color && other.background === item.background
+          && other.fontSize === item.fontSize) === index)
+        .slice(0, maxSamples),
+      ...(incomplete.size ? { incomplete: Array.from(incomplete) } : {}),
+    };
+  };
+  const safeDesignEvidence = () => {
+    try {
+      return designEvidence();
+    } catch (error) {
+      return {
+        fontSizes: [],
+        colorTokenCount: 0,
+        nonTokenColorCount: 0,
+        nonTokenColors: [],
+        textOverlaps: [],
+        lowContrastCount: 0,
+        lowContrastText: [],
+        error: String((error && error.message) || error).slice(0, ${HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS}),
+      };
+    }
+  };
+`;
+
+function evidenceScript(designAudit: boolean): string {
+  return `(() => {
   ${INEFFECTIVE_TRANSFORMS_SCRIPT}
   const viewportWidth = Math.max(1, document.documentElement.clientWidth || window.innerWidth || 1);
   const viewportHeight = Math.max(1, document.documentElement.clientHeight || window.innerHeight || 1);
@@ -227,6 +679,7 @@ const EVIDENCE_SCRIPT = `(() => {
     const classes = Array.from(element.classList || []).slice(0, 2).map((value) => '.' + CSS.escape(value)).join('');
     return String(element.tagName || 'element').toLowerCase() + classes;
   };
+  ${designAudit ? DESIGN_EVIDENCE_SCRIPT : ''}
   const issues = [];
   for (const element of Array.from(document.body?.querySelectorAll('*') || [])) {
     if (issues.length >= ${HTML_PREVIEW_MAX_DIAGNOSTICS} || !visible(element)) continue;
@@ -285,9 +738,14 @@ const EVIDENCE_SCRIPT = `(() => {
     missingAltCount: images.filter((img) => !img.hasAttribute('alt')).length,
     failedImageCount: images.filter((img) => img.complete && img.naturalWidth === 0).length,
     layoutIssues: issues,
-    ineffectiveTransforms: ineffectiveTransforms()
+    ineffectiveTransforms: ineffectiveTransforms()${designAudit ? `,
+    design: safeDesignEvidence()` : ''}
   };
 })()`;
+}
+
+const EVIDENCE_SCRIPT = evidenceScript(false);
+const DESIGN_AUDIT_EVIDENCE_SCRIPT = evidenceScript(true);
 
 const INTERACTION_SCRIPT = `(async () => {
   ${INEFFECTIVE_TRANSFORMS_SCRIPT}
@@ -390,6 +848,54 @@ const INTERACTION_SCRIPT = `(async () => {
       failures.push('invalid mailto target for ' + label(link));
     }
   }
+
+  // Exercise each standalone field once before controls consume its value.
+  // Recheck after state changes for newly revealed fields, sharing one budget.
+  const exercisedFields = new WeakSet();
+  let fieldsExercised = 0;
+  const exerciseVisibleFields = async () => {
+    if (fieldsExercised >= maxGenericControls) return;
+    const fields = Array.from(document.querySelectorAll('input,textarea,select'))
+      .filter((field) => visible(field) && !field.disabled && !field.readOnly && !field.closest('form')
+        && !exercisedFields.has(field))
+      .slice(0, maxGenericControls - fieldsExercised);
+    for (const field of fields) {
+      exercisedFields.add(field);
+      fieldsExercised += 1;
+      try {
+        const before = visibleState();
+        if (field instanceof HTMLSelectElement) {
+          const alternatives = Array.from(field.options).filter((option) => !option.disabled);
+          const next = alternatives.find((option) => option.value !== field.value);
+          if (next) field.value = next.value;
+        } else if (field instanceof HTMLInputElement) {
+          const type = String(field.type || '').toLowerCase();
+          if (type === 'checkbox') field.checked = !field.checked;
+          else if (type === 'radio') field.checked = true;
+          else if (type === 'number' || type === 'range') {
+            const current = Number(field.value || 0);
+            const step = Math.max(1, Number(field.step || 1) || 1);
+            field.value = String(current + step);
+          } else if (!['button', 'submit', 'reset', 'file', 'hidden'].includes(type)) {
+            field.value = String(field.value || '') + ' preview';
+          }
+        } else if (field instanceof HTMLTextAreaElement) {
+          field.value = String(field.value || '') + ' preview';
+        }
+        field.dispatchEvent(new Event('input', { bubbles: true }));
+        field.dispatchEvent(new Event('change', { bubbles: true }));
+        controlsExercised += 1;
+        const after = await settleVisibleState(before, 500);
+        auditTransforms();
+        if (after !== before) stateChangesObserved += 1;
+        else warnings.push('standalone field produced no observable outcome: ' + label(field));
+      } catch (error) {
+        failures.push('control interaction failed for ' + label(field) + ': ' + String(error?.message || error));
+      }
+    }
+  };
+
+  await exerciseVisibleFields();
 
   const explicitDownloads = Array.from(document.querySelectorAll('a[download]')).filter(visible);
   const namedDownloadButtons = Array.from(document.querySelectorAll('button,[role="button"]'))
@@ -522,6 +1028,7 @@ const INTERACTION_SCRIPT = `(async () => {
 
   enqueueVisibleStateControls();
   await exerciseVisibleForms();
+  await exerciseVisibleFields();
   enqueueVisibleStateControls();
   for (let index = 0; index < stateControlQueue.length && index < maxStateControls; index += 1) {
     const control = stateControlQueue[index];
@@ -548,47 +1055,14 @@ const INTERACTION_SCRIPT = `(async () => {
       }
       enqueueVisibleStateControls();
       await exerciseVisibleForms();
+      await exerciseVisibleFields();
       enqueueVisibleStateControls();
     } catch (error) {
       failures.push('control interaction failed for ' + label(control) + ': ' + String(error?.message || error));
     }
   }
 
-  const fields = Array.from(document.querySelectorAll('input,textarea,select'))
-    .filter((field) => visible(field) && !field.disabled && !field.readOnly && !field.closest('form'))
-    .slice(0, maxGenericControls);
-  for (const field of fields) {
-    try {
-      const before = visibleState();
-      if (field instanceof HTMLSelectElement) {
-        const alternatives = Array.from(field.options).filter((option) => !option.disabled);
-        const next = alternatives.find((option) => option.value !== field.value);
-        if (next) field.value = next.value;
-      } else if (field instanceof HTMLInputElement) {
-        const type = String(field.type || '').toLowerCase();
-        if (type === 'checkbox') field.checked = !field.checked;
-        else if (type === 'radio') field.checked = true;
-        else if (type === 'number' || type === 'range') {
-          const current = Number(field.value || 0);
-          const step = Math.max(1, Number(field.step || 1) || 1);
-          field.value = String(current + step);
-        } else if (!['button', 'submit', 'reset', 'file', 'hidden'].includes(type)) {
-          field.value = String(field.value || '') + ' preview';
-        }
-      } else if (field instanceof HTMLTextAreaElement) {
-        field.value = String(field.value || '') + ' preview';
-      }
-      field.dispatchEvent(new Event('input', { bubbles: true }));
-      field.dispatchEvent(new Event('change', { bubbles: true }));
-      controlsExercised += 1;
-      const after = await settleVisibleState(before, 500);
-      auditTransforms();
-      if (after !== before) stateChangesObserved += 1;
-      else warnings.push('standalone field produced no observable outcome: ' + label(field));
-    } catch (error) {
-      failures.push('control interaction failed for ' + label(field) + ': ' + String(error?.message || error));
-    }
-  }
+  await exerciseVisibleFields();
   await sleep(40);
 
   return {
@@ -740,6 +1214,43 @@ function withTimeout<T>(promise: Promise<T>, message: string): Promise<T> {
 
 function boundedDiagnostic(value: unknown): string {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, HTML_PREVIEW_MAX_DIAGNOSTIC_CHARS);
+}
+
+/** Review prompts from one viewport's design audit. They name the element
+ *  and the measured value; none of them blocks the preview or its screenshots. */
+function designWarnings(view: HtmlPreviewViewportEvidence): string[] {
+  const design = view.design;
+  if (!design) return [];
+  if (design.error) return [`${view.name}: design audit did not run: ${boundedDiagnostic(design.error)}`];
+  const warnings: string[] = [];
+  if (design.incomplete?.length) {
+    warnings.push(boundedDiagnostic(`${view.name}: design audit coverage is partial: ${design.incomplete.join(', ')}`));
+  }
+  if (design.fontSizes.length > HTML_PREVIEW_FONT_SIZE_LIMIT) {
+    warnings.push(boundedDiagnostic(
+      `${view.name}: ${design.fontSizes.length} distinct font sizes on visible text `
+      + `(${design.fontSizes.join(', ')}px); a type scale needs ${HTML_PREVIEW_FONT_SIZE_LIMIT} or fewer`,
+    ));
+  }
+  if (design.nonTokenColorCount) {
+    const samples = design.nonTokenColors.join(', ');
+    warnings.push(boundedDiagnostic(design.colorTokenCount
+      ? `${view.name}: ${design.nonTokenColorCount} hard-coded color(s) match no color variable: ${samples}`
+      : `${view.name}: no color variables; ${design.nonTokenColorCount} hard-coded color(s): ${samples}`));
+  }
+  if (design.textOverlaps.length) {
+    warnings.push(boundedDiagnostic(
+      `${view.name}: ${design.textOverlaps.length} text overlap(s): `
+      + design.textOverlaps.map((item) => `${item.selector} × ${item.other}`).join(', '),
+    ));
+  }
+  if (design.lowContrastCount) {
+    warnings.push(boundedDiagnostic(
+      `${view.name}: ${design.lowContrastCount} text element(s) below WCAG AA contrast: `
+      + design.lowContrastText.map((item) => `${item.selector} ${item.ratio}:1 < ${item.required}:1`).join(', '),
+    ));
+  }
+  return warnings;
 }
 
 function blockedResourceLabel(raw: string): string {
@@ -907,6 +1418,7 @@ async function renderViewport(
   viewport: HtmlPreviewViewport,
   auditKeyboard: boolean,
   exerciseInteractions: boolean,
+  designAudit: boolean,
   bundle: Bundle | null,
   sdkOrigin: { current?: string },
 ): Promise<{
@@ -946,11 +1458,19 @@ async function renderViewport(
     );
     const inspected = sdk ? await withTimeout(sdk.attach(), 'E_HTML_PREVIEW_SDK_TIMEOUT: SDK frame did not load') : webContents;
     await withTimeout(
-      inspected.executeJavaScript(READY_SCRIPT, true),
+      (async () => {
+        await inspected.executeJavaScript(READY_SCRIPT, true);
+        await sdk?.settle();
+        // Completed SDK calls can add fonts/images and change the layout.
+        if (sdk) await inspected.executeJavaScript(READY_SCRIPT, true);
+      })(),
       `E_HTML_PREVIEW_READY_TIMEOUT: ${viewport.name} fonts or images did not settle`,
     );
     const page = await withTimeout(
-      inspected.executeJavaScript(EVIDENCE_SCRIPT, true) as Promise<PageEvidence>,
+      inspected.executeJavaScript(
+        designAudit ? DESIGN_AUDIT_EVIDENCE_SCRIPT : EVIDENCE_SCRIPT,
+        true,
+      ) as Promise<PageEvidence>,
       `E_HTML_PREVIEW_INSPECT_TIMEOUT: ${viewport.name} layout inspection timed out`,
     );
     const image = await withTimeout(
@@ -981,6 +1501,7 @@ async function renderViewport(
         `E_HTML_PREVIEW_AUDIT_TIMEOUT: ${viewport.name} preview audit timed out`,
       )
       : undefined;
+    if (sdk) await withTimeout(sdk.settle(), 'E_HTML_PREVIEW_SDK_TIMEOUT: SDK requests did not settle');
     const size = image.getSize();
     return {
       evidence: {
@@ -1068,6 +1589,7 @@ export async function renderResponsiveHtmlPreview(
       interactions?: RenderInteractionEvidence;
     }> = [];
     const exerciseInteractions = options.interactions !== false;
+    const designAudit = options.designAudit !== false;
     for (const [index, viewport] of viewports.entries()) {
       rendered.push(await renderViewport(
         BrowserWindow,
@@ -1076,6 +1598,7 @@ export async function renderResponsiveHtmlPreview(
         viewport,
         index === 0,
         index === 0 && exerciseInteractions,
+        designAudit,
         bundle,
         sdkOrigin,
       ));
@@ -1107,6 +1630,7 @@ export async function renderResponsiveHtmlPreview(
       if (!view.focusableCount) {
         warnings.push(`${view.name}: no keyboard-focusable control was detected`);
       }
+      warnings.push(...designWarnings(view));
     }
     if (blocked.count) {
       blockers.push(`${blocked.count} external or out-of-directory resource request(s) were blocked`);
@@ -1255,7 +1779,7 @@ export async function renderInteractiveHtmlSmoke(
       previewEntry,
       ARTIFACT_SMOKE_VIEWPORTS,
       deps,
-      { interactions: true },
+      { interactions: true, designAudit: false },
     );
   } finally {
     if (previewRoot) fs.rmSync(previewRoot, { recursive: true, force: true });

@@ -1,4 +1,5 @@
 /** Web-only API contract. This is not a second model-visible Tool catalog. */
+import { DATA_INPUTS, dataDefinitionSchema, commonMethod, type AppType } from './data-contract';
 import { isAtomicWriteTempPath } from '../../storage';
 import { z } from 'zod';
 import { MAX_TEXT_FILE_BYTES } from '../../util/file-size-limits';
@@ -20,8 +21,13 @@ const text = z.string().max(MAX_TEXT_FILE_BYTES);
 const define = (capability: string | null, description: string, input: z.ZodTypeAny, result: string, example: object) =>
   ({ capability, description, input, result, example });
 export const METHODS = {
+  'data.query':define('data','Read declared fields under readFilters; default limit 20, maximum 100, offset maximum 100000. Ordering adds id as a stable tie-breaker; include reads at most four declared one-hop relations.',DATA_INPUTS['data.query'],'{records:object[]}; include adds relations keyed by reference field.',{table:'messages',fields:['body'],limit:20}),
+  'data.count':define('data','Count records under declared readFilters and caller filters; requires count permission.',DATA_INPUTS['data.count'],'{count:number}',{table:'messages'}),
+  'data.insert':define('data','Insert declared fields, apply defaults and meter canonical UTF-8 bytes atomically. requestId deduplicates the latest 2048 insert requests across reopening.',DATA_INPUTS['data.insert'],'{id:string}; generated record ID, never the private row.',{table:'messages',values:{body:'Hello'},requestId:'message-1'}),
+  'data.insertIf':define('data','Atomically check whole-table count and insert. maxCount can only tighten the application declaration; full capacity returns E_CONDITION.',DATA_INPUTS['data.insertIf'],'{id:string}; no partial insertion on failure.',{table:'messages',values:{body:'Hello'},maxCount:100,requestId:'message-2'}),
+  'data.aggregate':define('data','Compute a declared aggregate under readFilters and caller filters; groupBy requires read permission. Up to 100 groups; larger results fail with E_LIMIT.',DATA_INPUTS['data.aggregate'],'{value:number|string|null} or {groups:[{key,value}]} when groupBy is supplied.',{table:'messages',field:'score',op:'sum'}),
   'capabilities.list': define(null, 'Discover supported methods, current availability and authorization requirements.', empty, '{sdkVersion, methods, unsupported}', {}),
-  'capabilities.describe': define(null, 'Read one method schema, result contract and example.', z.object({ method: key }).strict(), 'Method documentation.', { method: 'ai.generate' }),
+  'capabilities.describe': define(null, 'Read one method schema, result contract and example.', z.object({ method: key }).strict(), 'Method documentation.', { method: 'data.query' }),
   'host.getContext': define(null, 'Read the current application language and SDK version.', empty, '{language, sdkVersion}', {}),
   'permissions.revoke': define(null, 'Revoke this instance grants and cancel pending work. Reopening starts fresh.', empty, '{revoked:true}', {}),
   'storage.get': define('storage', 'Read app-private JSON; scope defaults to local for compatibility. cloud participates in account sync.', z.object({ key, scope }).strict(), '{value}; null when missing.', { key: 'draft' }),
@@ -44,10 +50,12 @@ export const METHODS = {
   'tools.call': define(null, 'Execute an eligible existing tool under its original operation permissions. Sensitive actions use host approval; Trusted mode skips confirmation. Unknown tools fail closed.', z.object({ name: key, arguments: z.record(z.unknown()) }).strict(), '{content,isError?}; inspect isError. Oversized results fail without replay.', { name: 'library', arguments: { action: 'list', scope: 'global', limit: 10 } }),
 } as const;
 export type Method = keyof typeof METHODS;
-export const CAPABILITIES = ['storage', 'appFiles', 'files', 'ai', 'library', 'connectors'] as const;
-export const manifestSchema = z.object({ sdkVersion: z.literal(SDK_VERSION), capabilities: z.array(z.enum(CAPABILITIES)).max(CAPABILITIES.length) }).strict();
+export const CAPABILITIES = ['storage', 'appFiles', 'files', 'ai', 'library', 'connectors', 'data'] as const;
+export const manifestSchema = z.object({ sdkVersion: z.literal(SDK_VERSION), minimumClient:z.literal('1.9.0').optional(), capabilities: z.array(z.enum(CAPABILITIES)).max(CAPABILITIES.length), data: dataDefinitionSchema.optional() }).strict();
 export type AppManifest = z.infer<typeof manifestSchema>;
 export const UNSUPPORTED = [
+  { capability: 'account.renewalReminders', reason: 'Host-only: account-wide reminder claims and billing navigation belong to the signed-in desktop account UI, not saved applications.' },
+  { capability: 'browser', reason: 'Host-only: task browser control, native file selection and site consent require a live conversation and its user-owned Chromium profile.' },
   { capability: 'files.writeInPlace', reason: 'Deferred: needs shared revision/lock/indexer integration; export through files.saveAs.' },
   { capability: 'projects', reason: 'Deferred: apps have no user-selected project binding; source conversation is not authority.' },
   { capability: 'memory', reason: 'Deferred: needs a user-selected scope; Agent-private and global memories are not app state.' },
@@ -61,8 +69,23 @@ export function describeMethod(method: string) {
   if (!Object.hasOwn(METHODS, method)) return null;
   const def = METHODS[method as Method];
   return { name: method, capability: def.capability, description: def.description,
+    appTypes:commonMethod(method)?['local','web']:['local'],environments:commonMethod(method)?['desktop','preview','online']:['desktop','preview'],status:'supported',
     inputSchema: zodToJsonSchema(def.input, { $refStrategy: 'none' }), result: def.result, example: def.example };
 }
-export function catalogDocument() {
-  return { sdkVersion: SDK_VERSION, methods: Object.keys(METHODS).map(name => describeMethod(name)), unsupported: UNSUPPORTED };
+export function catalogDocument(appType:AppType='local') {
+  const starter = appType === 'web' ? 'web' : 'starter';
+  // Web creators and runtimes already reject host capabilities; retain the
+  // shared array bound while documenting their data-only declaration.
+  const schema = appType === 'web'
+    ? manifestSchema.extend({ capabilities: z.array(z.enum(['data'])).max(CAPABILITIES.length) })
+    : manifestSchema;
+  return { sdkVersion: SDK_VERSION,
+    manifest: { file: MANIFEST_FILE, schema: {
+        ...zodToJsonSchema(schema, { $refStrategy: 'none' }),
+        // Both creators and runtimes require a definition for declared data.
+        allOf: [{ if: { properties: { capabilities: { contains: { const: 'data' } } }, required: ['capabilities'] }, then: { required: ['data'] } }],
+      },
+      starter: { entry: `@skill/web-app-sdk/assets/${starter}/index.html`,
+        manifest: `@skill/web-app-sdk/assets/${starter}/${MANIFEST_FILE}` } },
+    dataDefinition:zodToJsonSchema(dataDefinitionSchema,{$refStrategy:'none'}), methods: Object.keys(METHODS).filter(name=>appType==='local'||commonMethod(name)).map(name => describeMethod(name)), unsupported: UNSUPPORTED };
 }

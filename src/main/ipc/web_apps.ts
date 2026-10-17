@@ -16,6 +16,23 @@ function bindOwner(sender: WebContents) {
   owners.add(sender);
   sender.once('destroyed', () => runtime.closeOwner(sender.id));
   sender.on('render-process-gone', () => runtime.closeOwner(sender.id));
+  // FrameTreeNode identity survives a cross-process document replacement.
+  // Track committed app documents, never a URL merely proposed for download.
+  const documents = new Map<number, string>();
+  sender.on('did-frame-navigate', (_event, url, _code, _status, isMainFrame, processId, routingId) => {
+    if (isMainFrame) { documents.clear(); runtime.closeOwner(sender.id); return; }
+    const frames = sender.mainFrame.framesInSubtree;
+    const current = frames.find(frame => frame.processId === processId && frame.routingId === routingId);
+    const live = new Set(frames.map(frame => frame.frameTreeNodeId));
+    for (const [node, source] of documents) {
+      if (!live.has(node)) { documents.delete(node); runtime.closeOrigin(sender.id, source); }
+    }
+    if (!current) return;
+    const node = current.frameTreeNodeId, previous = documents.get(node);
+    if (previous && (new URL(previous).protocol !== new URL(url).protocol || new URL(previous).host !== new URL(url).host)) runtime.closeOrigin(sender.id, previous);
+    if (url.startsWith('chat-app://app-')) documents.set(node, url);
+    else documents.delete(node);
+  });
   sender.on('will-frame-navigate', event => {
     if (event.isMainFrame) runtime.closeOwner(sender.id);
     else {
@@ -29,7 +46,7 @@ function bindOwner(sender: WebContents) {
         // Rejected navigation leaves the current document usable. Only an
         // actual departure to a website revokes this application's authority.
         if (!safeExternalHttpUrl(event.url)) event.preventDefault();
-        else runtime.closeOrigin(sender.id, source);
+        // Actual departure is handled by did-frame-navigate above.
       }
     }
   });
@@ -38,7 +55,7 @@ function credential(payload: any): string {
   if (!payload || typeof payload.token !== 'string' || !/^[a-f0-9]{32}$/.test(payload.token)) throw new AppError('E_INPUT');
   return payload.token;
 }
-function failure(err: unknown) { const value = safeFailure(err); return { ok: false, error: value.message, code: value.code }; }
+function failure(err: unknown) { const value = safeFailure(err); return { ...value, ok: false, error: value.message }; }
 export const webAppInvokeHandlers = {
   'webApps.catalog': async () => ({ catalog: catalogDocument() }),
   'webApps.open': async (payload: any, ctx: Context) => {
@@ -53,6 +70,10 @@ export const webAppInvokeHandlers = {
       }
       return opened;
     } catch (err) { return failure(err); }
+  },
+  'webApps.canSubmitArtifact': async (payload: any, ctx: Context) => {
+    try { return { allowed: runtime.canSubmitArtifact(ctx.userId, ctx.sender.id, credential(payload)) }; }
+    catch { return { allowed: false }; }
   },
   'webApps.close': async (payload: any, ctx: Context) => {
     try { runtime.close(ctx.userId, ctx.sender.id, credential(payload)); return {}; } catch (err) { return failure(err); }

@@ -8,9 +8,8 @@
 // Round-trip: the artifact talks to the chat by posting to its parent —
 //   parent.postMessage({ __orkasArtifact: true, type: 'submit'|'resize'|'open-external', ... }, '*')
 // A single global `message` listener (registered once) validates that
-// `event.source` is one of our live artifact iframes (the iframe is
-// cross-origin — `chat-app://cid` ≠ `file://` — so origin-string checks are
-// brittle; identity of the contentWindow is the robust check) and that
+// `event.source` is one of our live artifact iframes, its origin matches
+// the registered chat-app origin (even after iframe navigation), and that
 // `event.data.__orkasArtifact === true`, then:
 //   - `submit` / `sendToChat` → compose a user message (readable summary +
 //     `<artifact-result>` machine tag, `@`-routed to the creating actor) and
@@ -43,15 +42,15 @@
   // for localStorage / same-origin sibling fetch. We deliberately omit
   // `allow-popups` / `allow-top-navigation`.
 
-  function _t(key, fallback) {
-    try { if (typeof t === 'function') { const v = t(key); if (v && v !== key) return v; } } catch (_) {}
+  function _t(key, fallback, vars) {
+    try { if (typeof t === 'function') { const v = t(key, vars); if (v && v !== key) return v; } } catch (_) {}
     return fallback;
   }
 
   function _notifyFail(prefix, err) {
     const msg = (err && err.message) ? err.message : String(err || '');
     try {
-      if (typeof uiAlert === 'function') uiAlert(msg ? `${prefix}: ${msg}` : prefix);
+      if (typeof uiAlert === 'function') uiAlert(msg ? _t('artifact.failure_detail', `${prefix}: ${msg}`, { action: prefix, detail: msg }) : prefix);
       else _convLog.warn(prefix, msg);
     } catch (_) {}
   }
@@ -80,24 +79,6 @@
     return { error_type: errorType, error_code: errorCode };
   }
 
-  function _artifactSaveSourceView(cid) {
-    try {
-      return (typeof _projectIdForConversation === 'function' && _projectIdForConversation(cid))
-        ? 'project'
-        : 'conversation';
-    } catch (_) {
-      return 'conversation';
-    }
-  }
-
-  function _logArtifactSaveResult(startedAt, result, sourceView, failure = {}) {
-    if (result === 'success') return;
-    _logArtifactFailure('artifact_save', {
-      source_view: sourceView,
-      duration_ms: Math.max(0, Date.now() - startedAt),
-      ...failure,
-    });
-  }
 
   function _logArtifactSaveFailure(failure) {
     _logArtifactFailure('artifact_save', failure);
@@ -123,6 +104,8 @@
     let json = '';
     try { json = JSON.stringify(payload); } catch (_) { json = '"<unserialisable>"'; }
     if (typeof json !== 'string') json = String(json);
+    // JSON Unicode escapes preserve values while keeping payload text inside its tag.
+    json = json.replace(/</g, '\\u003c');
     const aid = String(agentId || '').trim();
     // commander / unknown → no @-mention (a plain user message goes to the
     // commander by default); a real agent id gets `@<id>` so the bus routes
@@ -148,7 +131,12 @@
   function _bindGlobalListener() {
     if (_listenerBound) return;
     _listenerBound = true;
-    window.addEventListener('message', (ev) => {
+    window.addEventListener('i18n-change', () => {
+      for (const tag of document.querySelectorAll('.chat-artifact-header .chat-app-type-tag')) {
+        _updateAppTypeTag(tag, tag.dataset.appType);
+      }
+    });
+    window.addEventListener('message', async (ev) => {
       const frame = _findArtifactFrame(ev.source);
       if (!frame || !artifactSecurity.trustedArtifactMessage(ev, frame)) return;
       const data = ev.data;
@@ -157,7 +145,7 @@
       const agentId = frame.dataset.artifactAgent || '';
       const title = frame.dataset.artifactTitle || '';
       const type = String(data.type || '');
-      if (window.OrkasWebAppHost.isManaged(frame) && type !== 'resize') return;
+      if (window.OrkasWebAppHost.isManaged(frame) && !['resize', 'submit', 'sendToChat'].includes(type)) return;
       if (type === 'resize') {
         if (frame.classList && frame.classList.contains('chat-artifact-viewer-frame')) return;
         frame.style.height = `${_clampHeight(data.height)}px`;
@@ -172,8 +160,14 @@
         // Only the currently-viewed conversation has live iframes in the DOM,
         // but guard anyway — a result for a non-current cid is a stale fire.
         if (!cid || cid !== currentCid) return;
-        const text = encodeArtifactResult(artifactId, agentId, title, data.payload);
-        try { sendInCurrentConversation(text); }
+        try {
+          if (window.OrkasWebAppHost.isManaged(frame) && !await window.OrkasWebAppHost.canSubmitArtifact(frame)) return;
+          // An async lifetime check must not redirect a result after a task switch or reload.
+          if (!frame.isConnected || cid !== currentCid || frame.dataset.artifactCid !== cid
+            || frame.dataset.artifactId !== artifactId || !artifactSecurity.trustedArtifactMessage(ev, frame)) return;
+          const text = encodeArtifactResult(artifactId, agentId, title, data.payload);
+          await sendInCurrentConversation(text);
+        }
         catch (err) { try { _convLog.warn('artifact result send failed', err && err.message ? err.message : err); } catch (_) {} }
         return;
       }
@@ -256,9 +250,14 @@
     return el;
   }
 
-  function _openViewer(ctx) {
+  async function _openViewer(ctx) {
     if (!ctx || !ctx.cid || !ctx.artifactId) return;
-    if (window.OrkasPreviewWindows) return window.OrkasPreviewWindows.open({ kind: 'artifact', cid: ctx.cid, artifactId: ctx.artifactId, agentId: ctx.agentId || '', title: ctx.title || _t('artifact.title', 'Interactive app') });
+    if (ctx.frame?._orkasCommercial || ctx.frame?.dataset.appType === 'web') return window.OrkasCommercialEntry.show();
+    if (window.OrkasPreviewWindows) {
+      const result = await window.OrkasPreviewWindows.open({ kind: 'artifact', cid: ctx.cid, artifactId: ctx.artifactId, agentId: ctx.agentId || '', title: ctx.title || _t('artifact.title', 'Interactive app') });
+      if (window.OrkasCommercialEntry.isFailure(result)) return window.OrkasCommercialEntry.show();
+      return result;
+    }
     _bindGlobalListener();
     const el = _ensureViewer();
     const title = ctx.title || _t('artifact.title', 'Interactive app');
@@ -268,12 +267,14 @@
       _viewerFrame.dataset.artifactId = String(ctx.artifactId);
       _viewerFrame.dataset.artifactAgent = String(ctx.agentId || '');
       _viewerFrame.dataset.artifactTitle = title;
+      _viewerFrame.dataset.appType = '';
       _viewerFrame.setAttribute('title', title);
       window.OrkasWebAppHost.open(_viewerFrame, { cid: ctx.cid, artifactId: ctx.artifactId });
+      _checkArtifactAvailability(_viewerFrame, ctx);
     }
     el.classList.add('is-open');
     if (!_viewerKeyHandler) {
-      _viewerKeyHandler = (e) => { if (e.key === 'Escape' && !document.querySelector('.chat-share-overlay')) _closeViewer(); };
+      _viewerKeyHandler = (e) => { if (e.key === 'Escape') _closeViewer(); };
       document.addEventListener('keydown', _viewerKeyHandler);
     }
   }
@@ -350,15 +351,29 @@
     el.style.top = top + 'px';
   }
 
-  function _openMenu(anchorBtn, ctx) {
+  async function _openMenu(anchorBtn, ctx) {
     const el = _ensureMenuEl();
     if (el.style.display !== 'none' && _menuAnchor === anchorBtn) { _closeMenu(); return; }
     _closeMenu();
     _menuCtx = ctx;
     _menuAnchor = anchorBtn;
     anchorBtn.classList.add('is-menu-open');
+    await _checkArtifactAvailability(ctx.frame, ctx);
+    if (_menuCtx !== ctx || _menuAnchor !== anchorBtn) return;
     _renderMenuItems(el);
     _positionMenu(el, anchorBtn);
+    try {
+      const result = await window.orkas.invoke('conversations.artifacts.editTarget', { cid: String(ctx.cid) });
+      if (result?.target && _menuCtx === ctx && el.style.display !== 'none') {
+        const save = el.querySelector('[data-action="save"]');
+        if (save) save.textContent = _t('apps.save_new', 'Save new app');
+        const update = document.createElement('div');update.className='chat-artifact-menu-item';update.dataset.action='update';
+        update.textContent=_t('apps.update_original', 'Update original app');update.title=result.target.title;
+        update.onclick=event=>{event.stopPropagation();_closeMenu();_doSave({...ctx,saveMode:'update'});};
+        if (save) el.insertBefore(update,save);else el.appendChild(update);
+      }
+    } catch (_) { /* Older hosts preserve the existing Save action. */ }
+    if (_menuCtx === ctx && _menuAnchor === anchorBtn) _positionMenu(el, anchorBtn);
   }
 
   function _clearArtifactUnavailable(frame) {
@@ -369,7 +384,20 @@
     frame.style.display = 'block';
   }
 
-  function _showArtifactUnavailable(frame, reason) {
+  function _showCommercialUnavailable(frame) {
+    frame._orkasCommercial = true;
+    frame.dataset.appType = 'web';
+    _updateAppTypeTag(frame.parentNode?.querySelector('.chat-app-type-tag'), 'web');
+    _clearArtifactUnavailable(frame);
+    const panel = document.createElement('div');
+    panel.className = 'chat-artifact-unavailable';
+    window.OrkasCommercialEntry.appendNotice(panel);
+    frame._orkasUnavailablePanel = panel;
+    frame.parentNode?.insertBefore(panel, frame.nextSibling);
+    frame.style.display = 'none';
+  }
+
+  function _showArtifactUnavailable(frame, reason, retry) {
     if (!frame || !frame.parentNode) return;
     let panel = frame._orkasUnavailablePanel;
     if (!panel) {
@@ -381,20 +409,42 @@
     panel.innerHTML = '';
     const title = document.createElement('div');
     title.className = 'chat-artifact-unavailable-title';
-    title.textContent = _t('artifact.unavailable_title', 'App content incomplete');
+    title.textContent = retry ? _t('artifact.open_failed', 'Could not open') : _t('artifact.unavailable_title', 'App content incomplete');
     const detail = document.createElement('div');
     detail.className = 'chat-artifact-unavailable-detail';
     detail.textContent = _t('artifact.unavailable_detail', 'This saved app only retains a summarized conversation record, not the complete app. Regenerate the app to preview it.');
     panel.appendChild(title);
-    panel.appendChild(detail);
+    if (!retry) panel.appendChild(detail);
+    if (retry) {
+      const button = document.createElement('button');
+      button.className = 'btn btn-sm';
+      button.type = 'button';
+      button.textContent = _t('artifact.reload', 'Reload');
+      button.addEventListener('click', retry);
+      const actions = document.createElement('div');
+      actions.className = 'header-actions';
+      actions.appendChild(button);
+      panel.appendChild(actions);
+    }
     if (reason) panel.title = String(reason);
     frame.removeAttribute('src');
     frame.style.display = 'none';
   }
 
+  function _updateAppTypeTag(tag, type) {
+    if (!tag) return;
+    if (type === 'cloud') type = 'web';
+    const known = type === 'local' || type === 'web';
+    tag.hidden = !known;
+    tag.dataset.appType = known ? type : '';
+    tag.textContent = known ? _t('apps.type_' + type, type === 'web' ? 'Web app' : 'Local app') : '';
+  }
+
   async function _checkArtifactAvailability(frame, ctx) {
     if (!frame || !ctx || !ctx.cid || !ctx.artifactId) return;
     if (!window.orkas || typeof window.orkas.invoke !== 'function') return;
+    const inspection = {};
+    frame._orkasInspection = inspection;
     const expectedCid = String(ctx.cid);
     const expectedArtifactId = String(ctx.artifactId);
     try {
@@ -402,12 +452,18 @@
         cid: expectedCid,
         artifactId: expectedArtifactId,
       });
-      if (!frame.isConnected) return;
+      if (!frame.isConnected || frame._orkasInspection !== inspection) return;
       if (frame.dataset.artifactCid !== expectedCid || frame.dataset.artifactId !== expectedArtifactId) return;
+      if (frame._orkasLoadFailed) return;
       if (r && r.ok === true && r.status === 'unavailable') {
+        frame.dataset.appType = '';
+        _updateAppTypeTag(frame.parentNode?.querySelector('.chat-app-type-tag'), '');
         _showArtifactUnavailable(frame, r.reason || '');
       } else if (r && r.ok === true && r.status === 'ok') {
+        frame.dataset.appType = r.appType || '';
+        if (r.appType === 'web' || r.appType === 'cloud') { _showCommercialUnavailable(frame); return; }
         _clearArtifactUnavailable(frame);
+        _updateAppTypeTag(frame.parentNode?.querySelector('.chat-app-type-tag'), r.appType);
       }
     } catch (err) {
       _logArtifactFailure('artifact_inspect', { error_message: String(err && err.message || err) });
@@ -416,47 +472,72 @@
 
   function _doReload(ctx) {
     const f = ctx && ctx.frame;
+    if (f?._orkasCommercial || f?.dataset.appType === 'web') return window.OrkasCommercialEntry.show();
     if (!f || !f.isConnected) return;
     // Reset height to default; the artifact re-reports on load. Reassigning
     // `src` forces a fresh load (the protocol handler sends `Cache-Control:
     // private` and dev reload ignores cache; this just re-runs the app).
+    f._orkasLoadFailed = false;
     _clearArtifactUnavailable(f);
     f.style.height = `${DEFAULT_FRAME_HEIGHT}px`;
     window.OrkasWebAppHost.open(f, { cid: ctx.cid, artifactId: ctx.artifactId });
     _checkArtifactAvailability(f, ctx);
   }
 
-  function _doOpen(ctx) {
-    try { _openViewer(ctx); }
+  async function _doOpen(ctx) {
+    try { await _openViewer(ctx); }
     catch (err) { _logArtifactFailure('artifact_open_viewer', { error_message: String(err && err.message || err) }); _notifyFail(_t('artifact.open_failed', 'Could not open'), err); }
   }
 
   async function _doSave(ctx) {
-    const startedAt = Date.now();
-    const sourceView = _artifactSaveSourceView(ctx?.cid);
+    if (ctx.frame?._orkasCommercial || ctx.frame?.dataset.appType === 'web') return window.OrkasCommercialEntry.show();
+
+
     let r;
     try {
       r = await window.orkas.invoke('conversations.artifacts.save', {
         cid: String(ctx.cid), artifactId: String(ctx.artifactId),
+        mode: ctx.saveMode || 'new',
       });
+      if(r?.code==='app_edit_data_migration'&&ctx.saveMode==='update'){
+        const args={cid:String(ctx.cid),artifactId:String(ctx.artifactId)};
+        const impact=await window.orkas.invoke('conversations.artifacts.dataImpact',args);
+        if(window.OrkasCommercialEntry.isFailure(impact)) return window.OrkasCommercialEntry.show();
+        if(impact.ok){
+          const scope=impact.tables.map(table=>`${table.name}: ${table.count} (${table.fields.join(', ')})`).join('\n');
+          const exportFirst=await uiConfirm({message:_t('apps.migration_export')+'\n'+scope,okLabel:_t('apps.migration_export_action'),cancelLabel:_t('apps.migration_continue')});
+          if(exportFirst){const exported=await window.orkas.invoke('conversations.artifacts.exportData',args);if(window.OrkasCommercialEntry.isFailure(exported)) return window.OrkasCommercialEntry.show();if(!exported.ok||exported.canceled){if(!exported.canceled)_logArtifactSaveFailure(_artifactSaveFailure(exported,'operation'));return;}}
+          const confirmed=await uiConfirmDanger({message:_t('apps.migration_clear')+'\n'+scope,dangerLabel:_t('apps.migration_retry')});
+          if(!confirmed){return;}
+          r=await window.orkas.invoke('conversations.artifacts.save',{...args,mode:'update',recovery:{clearVersion:impact.version,clearFingerprint:impact.fingerprint}});
+        }
+      }
     } catch (err) {
       const failure = _artifactSaveFailure(err, 'ipc');
-      _logArtifactSaveResult(startedAt, 'failure', sourceView, failure);
+
       _logArtifactSaveFailure(failure);
       _notifyFail(_t('apps.save_failed', 'Could not save the app'), err);
       return;
     }
     if (!r || r.ok === false) {
+      if (window.OrkasCommercialEntry.isFailure(r)) return window.OrkasCommercialEntry.show();
       const failure = _artifactSaveFailure(r, 'operation');
-      _logArtifactSaveResult(startedAt, 'failure', sourceView, failure);
+
       _logArtifactSaveFailure(failure);
-      _notifyFail(_t('apps.save_failed', 'Could not save the app'), { message: (r && r.error) || 'save failed' });
+      const recovery = r?.code === 'app_type_mismatch'
+        ? _t('apps.save_type_mismatch', 'This version is a different app type from the original app, so it can’t replace it. Save it as a new app instead.')
+        : r?.code === 'app_edit_conflict' || r?.code === 'app_edit_target_missing'
+        ? _t('apps.edit_conflict', 'The original app changed or was deleted. Reopen it to edit, or save a new app.') : (r && r.error) || '';
+      _notifyFail(_t('apps.save_failed', 'Could not save the app'), { message: recovery });
       return;
     }
 
-    _logArtifactSaveResult(startedAt, 'success', sourceView);
+
     try {
-      const message = _t('apps.saved_toast', 'Saved to Apps');
+      const name = r.title || ctx.title || _t('artifact.title', 'Interactive app');
+      const message = ctx.saveMode === 'update'
+        ? _t('apps.updated_toast', `Updated ${name}`, { name })
+        : _t('apps.saved_toast', 'Saved to Apps');
       if (typeof uiToast === 'function') uiToast(message, { variant: 'success' });
       else if (typeof uiAlert === 'function') uiAlert(message);
       // Refresh the "My Apps" tab if its module is loaded.
@@ -487,6 +568,9 @@
     titleEl.className = 'chat-artifact-title';
     titleEl.textContent = title;
     titleEl.title = title;
+    const typeTag = document.createElement('span');
+    typeTag.className = 'conv-status-badge chat-app-type-tag';
+    typeTag.hidden = true;
     const spacer = document.createElement('span');
     spacer.className = 'chat-artifact-spacer';
     // All header actions live behind a single "⋯" popover (reload / open /
@@ -498,6 +582,7 @@
     moreBtn.title = _t('artifact.more', 'More');
     moreBtn.setAttribute('aria-label', _t('artifact.more', 'More'));
     header.appendChild(titleEl);
+    header.appendChild(typeTag);
     header.appendChild(spacer);
     header.appendChild(moreBtn);
 
@@ -511,6 +596,12 @@
     frame.dataset.artifactAgent = String(ctx.agentId || '');
     frame.dataset.artifactTitle = title;
     frame.style.height = `${DEFAULT_FRAME_HEIGHT}px`;
+    frame.addEventListener('orkas-app-error', event => {
+      event.preventDefault();
+      if (window.OrkasCommercialEntry.isFailure(event.detail)) { _showCommercialUnavailable(frame); return; }
+      frame._orkasLoadFailed = true;
+      _showArtifactUnavailable(frame, '', () => _doReload({ ...ctx, frame }));
+    });
     window.OrkasWebAppHost.open(frame, { cid: ctx.cid, artifactId: ctx.artifactId });
 
     moreBtn.addEventListener('click', (e) => {

@@ -6,6 +6,16 @@ import * as path from 'node:path';
 import { EventEmitter } from 'node:events';
 
 const connector = vi.hoisted(() => ({ instances: [] as any[], call: vi.fn(async () => ({ content: [{ type: 'text', text: 'Verified remote result' }] })), approve: vi.fn(async () => false) }));
+
+it('keeps structured data errors while returning readable localized recovery instead of raw keys', async () => {
+  const {safeFailure}=await import('../../../src/main/features/web_apps/host');
+  const {AppError}=await import('../../../src/main/features/web_apps/runtime');
+  const {t}=await import('../../../src/main/i18n');
+  for(const code of ['E_DATA','E_SCHEMA','E_CONFLICT','E_PERMISSION','E_MIGRATION','E_RELATION','E_TABLE','E_CONDITION']){
+    const result=safeFailure(new AppError(code));expect(result.code).toBe(code);
+    expect(result.message).not.toMatch(/^web_apps\./);expect(result.message).toBe(t('web_apps.error_E_FAILED'));
+  }
+});
 vi.mock('electron', () => ({ dialog: {}, app: { isPackaged: false } }));
 vi.mock('../../../src/main/features/connectors/manager', () => ({
   listInstances: () => connector.instances, restoreComposioConnectionsFromServer: async () => 0,
@@ -100,7 +110,8 @@ describe('Web host reuses owning services', () => {
       { path: 'orkas-app.json', content: JSON.stringify({ sdkVersion: 1, capabilities: ['storage'] }) },
     ] });
     if (!created.ok) throw new Error(created.error);
-    const sender = Object.assign(new EventEmitter(), { id: 10, isDestroyed: () => false });
+    const liveFrames: any[] = [];
+    const sender = Object.assign(new EventEmitter(), { id: 10, isDestroyed: () => false, mainFrame: { framesInSubtree: liveFrames } });
     const open = () => webAppInvokeHandlers['webApps.open'](
       { source: { cid: 'navigation-test', artifactId: created.artifactId } }, { userId: uid, sender: sender as any },
     ) as Promise<any>;
@@ -114,11 +125,19 @@ describe('Web host reuses owning services', () => {
       for (const frameAvailable of [true, false]) {
         const app = await open();
         await runtime.call(uid, sender.id, app.token, 'before', 'host.getContext', {});
+        const frame = { url: app.url, frameTreeNodeId: liveFrames.length + 1, processId: 20, routingId: liveFrames.length + 1 };
+        liveFrames.push(frame);
+        sender.emit('did-frame-navigate', {}, app.url, 200, 'OK', false, frame.processId, frame.routingId);
         const event = { url, isMainFrame: false, preventDefault: vi.fn(),
-          ...(frameAvailable ? { frame: { url: app.url } } : { initiator: { url: app.url } }) };
+          ...(frameAvailable ? { frame } : { initiator: frame }) };
         sender.emit('will-frame-navigate', event);
         expect(event.preventDefault.mock.calls.length, url).toBe(allowed ? 0 : 1);
         if (allowed) {
+          // A navigation attempt may become a download or be aborted.
+          expect(await runtime.call(uid, sender.id, app.token, 'download-still-open', 'storage.keys', {})).toEqual({ keys: [] });
+          // A committed document can have new process/routing IDs.
+          frame.url = url; frame.processId = 30; frame.routingId += 1000;
+          sender.emit('did-frame-navigate', {}, url, 200, 'OK', false, frame.processId, frame.routingId);
           await expect(runtime.call(uid, sender.id, app.token, 'after', 'storage.keys', {})).rejects.toMatchObject({ code: 'E_CLOSED' });
           expect(appResource(new Request(app.url))).toEqual({ status: 403 });
         } else {
@@ -184,8 +203,16 @@ describe('Web host reuses owning services', () => {
     const files = [{ path: 'index.html', content: '<h1>Original</h1>' }];
     const old: any = (await artifact.createArtifact(uid, 'cid-test', 'agent', { title: 'Legacy', files }));
     expect(old.ok).toBe(true);
+    const oldFile: any = artifact.resolveArtifactFilePath(uid, 'cid-test', old.artifactId, 'index.html');
+    const oldMeta = path.join(path.dirname(oldFile.absPath), '__orkas-meta.json');
+    const metadata = JSON.parse(fs.readFileSync(oldMeta, 'utf8')); delete metadata.browserStorage;
+    fs.writeFileSync(oldMeta, JSON.stringify(metadata));
     const legacy = (await openApp(uid, 1, { cid: 'cid-test', artifactId: old.artifactId }));
     expect(legacy).not.toHaveProperty('token'); expect(legacy).toMatchObject({ entry: 'index.html' });
+    expect(legacy.url).toBe(`chat-app://cid/cid-test/${old.artifactId}/index.html`);
+    const copied = await (await import('../../../src/main/features/saved_apps')).saveFromArtifact(uid, 'cid-test', old.artifactId);
+    if (!copied.ok) throw new Error(copied.error);
+    expect(await openApp(uid, 1, { appId: copied.id })).toMatchObject({ browserOnly: true, url: expect.stringMatching(/^chat-app:\/\/a-/) });
     const created: any = (await artifact.createArtifact(uid, 'cid-test', 'agent', { title: 'SDK', files: [...files,
       { path: 'orkas-app.json', content: JSON.stringify({ sdkVersion: 1, capabilities: ['storage'] }) }] }));
     const app: any = (await openApp(uid, 1, { cid: 'cid-test', artifactId: created.artifactId }));
@@ -198,4 +225,55 @@ describe('Web host reuses owning services', () => {
     await expect(runtime.call(uid, 1, app.token, 'stale', 'storage.keys', {})).rejects.toMatchObject({ code: 'E_CLOSED' });
     expect(appResource(new Request(app.url))).toEqual({ status: 403 });
   });
+});
+
+
+it('isolates new ordinary objects and accounts with short stable origins and no SDK authority', async () => {
+  const artifacts = await import('../../../src/main/features/chat_artifacts');
+  const saved = await import('../../../src/main/features/saved_apps');
+  const { openApp, appResource, runtime } = await import('../../../src/main/features/web_apps/host');
+  const users = await import('../../../src/main/features/users');
+  const paths = await import('../../../src/main/paths');
+  const sources: any[] = [];
+  for (const cid of ['same-task', 'same-task', 'other-task']) {
+    const a = await artifacts.createArtifact(uid, cid, 'agent', { files: [{ path: 'index.html', content: '<h1>Ordinary</h1>' }] });
+    if (!a.ok) throw new Error(a.error);
+    sources.push({ cid, artifactId: a.artifactId });
+  }
+  const copy = await saved.saveFromArtifact(uid, sources[0].cid, sources[0].artifactId);
+  if (!copy.ok) throw new Error(copy.error);
+  sources.push({ appId: copy.id });
+  const apps: any[] = [];
+  for (const source of sources) {
+    const app: any = await openApp(uid, 1, source); apps.push(app);
+    expect(new URL(app.url).host).toMatch(/^a-[a-f0-9]{20}$/);
+    expect(app.url.length).toBeLessThan(50);
+    expect(app).toMatchObject({ browserOnly: true });
+    expect(app).not.toHaveProperty('sdkVersion');
+    expect(appResource(new Request(app.url))).toMatchObject({ status: 200 });
+    expect(appResource(new Request(new URL('__orkas/bridge.js', app.url)))).toMatchObject({ status: 200, body: artifacts.BRIDGE_JS });
+    for (const rel of ['__orkas/sdk.js', '__orkas/capabilities.json'])
+      expect(appResource(new Request(new URL(rel, app.url)))).toMatchObject({ status: 403 });
+    expect(appResource(new Request(app.url, { headers: { Origin: 'chat-app://cid' } }))).toMatchObject({ status: 403 });
+    await expect(runtime.call(uid, 1, app.token, 'probe', 'host.getContext', {})).rejects.toMatchObject({ code: 'E_UNAVAILABLE' });
+    expect(() => runtime.cancel(uid, 1, app.token, 'probe')).toThrow('E_UNAVAILABLE');
+    const second: any = await openApp(uid, 2, source);
+    runtime.close(uid, 1, app.token);
+    expect(second.url).toBe(app.url);
+    expect(appResource(new Request(second.url))).toMatchObject({ status: 200 });
+    runtime.close(uid, 2, second.token);
+    expect(appResource(new Request(second.url))).toMatchObject({ status: 403 });
+    expect((await openApp(uid, 1, source)).url).toBe(app.url);
+  }
+  expect(new Set(apps.map(a => new URL(a.url).host)).size).toBe(4);
+  const other = 'other-browser-account';
+  fs.mkdirSync(path.dirname(paths.savedAppDir(other, copy.id)), { recursive: true });
+  fs.cpSync(paths.savedAppDir(uid, copy.id), paths.savedAppDir(other, copy.id), { recursive: true });
+  users.activateUser(other);
+  expect(appResource(new Request(apps[3].url))).toMatchObject({ status: 403 });
+  const foreign: any = await openApp(other, 1, { appId: copy.id });
+  expect(foreign.url).not.toBe(apps[3].url);
+  users.activateUser(uid);
+  expect(appResource(new Request(foreign.url))).toMatchObject({ status: 403 });
+  expect((await openApp(uid, 1, { appId: copy.id })).url).toBe(apps[3].url);
 });

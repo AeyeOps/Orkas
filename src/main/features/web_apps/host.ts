@@ -16,6 +16,7 @@ import type { AgentTool } from '#core-agent';
 import { appResource as scopedAppResource } from './resources';
 import { cancelForApp, type AppUsageScope } from '../connectors/action_confirm';
 import { bundleRevision } from './bundle-revision';
+import { requireLocalAppType, isCommercialWebAppFailure, commercialWebAppFailure } from './commercial-entry';
 
 let dialogBusy = false;
 async function nativeDialog<T>(run: () => Promise<T>): Promise<T> {
@@ -72,6 +73,11 @@ export const runtime = new WebAppRuntime({
 registerUserSwitchHook('web-apps', previousUid => runtime.closeUser(previousUid));
 
 export type Source = { appId: string } | { cid: string; artifactId: string };
+/** Also used by the protocol handler to reject shared-origin aliases. */
+export function hasIsolatedBrowserStorage(uid: string, source: Source): boolean {
+  return 'appId' in source ? saved.hasIsolatedBrowserStorage(uid, source.appId)
+    : artifacts.readArtifactMeta(uid, source.cid, source.artifactId)?.browserStorage === 'isolated-v1';
+}
 export async function resolveBundle(uid: string, source: Source): Promise<{ bundle: Bundle | null; url: string; entry: string }> {
   const isSaved = 'appId' in source;
   const resolve = (rel: string) => {
@@ -86,9 +92,23 @@ export async function resolveBundle(uid: string, source: Source): Promise<{ bund
     : `chat-app://cid/${encodeURIComponent(source.cid)}/${encodeURIComponent(source.artifactId)}`;
   const url = base + '/' + entry.split('/').map(encodeURIComponent).join('/');
   const manifestFile = resolve(MANIFEST_FILE);
-  if (!manifestFile) return { bundle: null, url, entry };
+  let appType: 'local'|'web'='local';
+  if (isSaved) appType = await saved.resolveSavedAppType(uid, source.appId);
+  else appType = await saved.resolveArtifactAppType(uid, source.cid, source.artifactId);
+  requireLocalAppType(appType);
+  if (!manifestFile && appType === 'local') {
+    if (!hasIsolatedBrowserStorage(uid, source)) return { bundle: null, url, entry };
+    const key = crypto.createHash('sha256').update(JSON.stringify(isSaved ? ['saved', source.appId] : ['artifact', source.cid, source.artifactId])).digest('hex');
+    // Ordinary pages reuse resource lifetime tracking, without receiving SDK authority.
+    return { url, entry, bundle: { browserOnly: true, kind: isSaved ? 'saved' : 'artifact',
+      key, title: t('artifact.title'), entry, appType, manifest: { sdkVersion: 1, capabilities: [] }, resolve } };
+  }
+  if(!manifestFile) {
+    const key=crypto.createHash('sha256').update(JSON.stringify(isSaved?['saved',source.appId]:['artifact',source.cid,source.artifactId])).digest('hex');
+    return {url,entry,bundle:{kind:isSaved?'saved' as const:'artifact' as const,key,title:'Interactive app',entry,appType,manifest:{sdkVersion:1,capabilities:[]},resolve}};
+  }
   const stat = fs.statSync(manifestFile.absPath);
-  if (stat.size > 16 * 1024) throw new AppError('E_MANIFEST');
+  if (stat.size > 64 * 1024) throw new AppError('E_MANIFEST');
   let manifest: unknown;
   try { manifest = JSON.parse(fs.readFileSync(manifestFile.absPath, 'utf8')); } catch { throw new AppError('E_MANIFEST'); }
   const key = crypto.createHash('sha256').update(JSON.stringify(isSaved ? ['saved', source.appId] : ['artifact', source.cid, source.artifactId])).digest('hex');
@@ -102,7 +122,7 @@ export async function resolveBundle(uid: string, source: Source): Promise<{ bund
   let revision: Awaited<ReturnType<typeof bundleRevision>>;
   try { revision = await bundleRevision(path.dirname(manifestFile.absPath), [initial.absPath, manifestFile.absPath]); }
   catch { throw new AppError('E_BUNDLE'); }
-  return { url, entry, bundle: { kind: isSaved ? 'saved' : 'artifact', key, title, entry, manifest, valid: () => revision.valid(),
+  return { url, entry, bundle: { appType, kind: isSaved ? 'saved' : 'artifact', key, title, entry, manifest, valid: () => revision.valid(),
     resolve: rel => { const file = resolve(rel); return file && revision.accept(file.absPath) ? file : null; } } };
 }
 export async function openApp(uid: string, owner: number, source: Source) {
@@ -112,6 +132,8 @@ export async function openApp(uid: string, owner: number, source: Source) {
 export { sdkScript, APP_CSP } from './resources';
 export function appResource(request: Request) { return scopedAppResource(request, runtime); }
 export function safeFailure(err: unknown) {
+  if (isCommercialWebAppFailure(err)) return commercialWebAppFailure();
   const code = err instanceof AppError ? err.code : (err as NodeJS.ErrnoException)?.code === 'EEXIST' ? 'E_EXISTS' : 'E_FAILED';
-  return { code, message: t(`web_apps.error_${code}`) };
+  const key=`web_apps.error_${code}`, message=t(key);
+  return { code, message:message===key?t('web_apps.error_E_FAILED'):message };
 }

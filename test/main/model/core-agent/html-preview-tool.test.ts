@@ -560,7 +560,7 @@ describe('html_preview tool', () => {
     const invalidViewport = await tool.execute({
       path: 'index.html',
       target: 'responsive',
-      mobile: { width: 768, height: 844 },
+      mobile: { width: 360.5, height: 844 },
     }, context);
     const missing = await tool.execute({ path: 'missing.html' }, context);
     const outOfScope = await tool.execute({ path: outside }, context);
@@ -572,5 +572,21 @@ describe('html_preview tool', () => {
     expect(outOfScope).toMatchObject({ isError: true });
     expect(outOfScope.content).toContain('E_PATH_OUT_OF_SCOPE');
     expect(render).not.toHaveBeenCalled();
+  });
+
+  it('renders with default out-of-range viewport dimensions and preserves valid dimensions', async () => {
+    const { render, tool, workspace, context } = await buildTool();
+    fs.writeFileSync(path.join(workspace, 'index.html'), '<!doctype html><main>OK</main>');
+    const result = await tool.execute({ path: 'index.html', target: 'responsive',
+      desktop: { width: 100, height: 720 }, mobile: { width: 768, height: 10000 } }, context);
+    expect(result.isError).toBeFalsy();
+    expect(render).toHaveBeenCalledOnce();
+    expect(render.mock.calls[0][1]).toEqual([
+      { name: 'desktop', width: 1440, height: 720 }, { name: 'mobile', width: 390, height: 844 },
+    ]);
+    for (const width of [null, 'wide', '100000', 360.5]) {
+      expect((await tool.execute({ path: 'index.html', target: 'mobile', mobile: { width } }, context)).isError).toBe(true);
+    }
+    expect(render).toHaveBeenCalledOnce();
   });
 });

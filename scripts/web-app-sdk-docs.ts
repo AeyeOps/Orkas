@@ -4,11 +4,13 @@ import * as path from 'node:path';
 import { catalogDocument } from '../src/main/features/web_apps/catalog';
 
 const targets = [
+  'docs/reference/web-app-sdk.json',
   'resources/builtin/system/skills/web-app-sdk/references/api.json',
 ];
 export function syncWebAppSdkDocs(root: string, check: boolean): void {
-  const expected = JSON.stringify(catalogDocument(), null, 2) + '\n';
-  for (const relative of targets) {
+  const web=JSON.stringify(catalogDocument('web'),null,2)+'\n';
+  const copies=[...targets.map(relative=>({relative,content:JSON.stringify(catalogDocument(),null,2)+'\n'})),{relative:'resources/builtin/system/skills/web-app-sdk/references/web-api.json',content:web}];
+  for (const {relative,content:expected} of copies) {
     const target = path.resolve(root, relative);
     if (check) {
       if (!fs.existsSync(target) || fs.readFileSync(target, 'utf8') !== expected) {

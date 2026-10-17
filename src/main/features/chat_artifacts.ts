@@ -42,6 +42,9 @@ import {
   chatArtifactCidDirForConversation,
   chatArtifactRelPath,
 } from '../util/project-layout';
+import { appTypeSchema, metadataAppType, type AppType } from './web_apps/data-contract';
+import { manifestSchema } from './web_apps/catalog';
+import type { ZodIssue } from 'zod';
 import { createLogger } from '../logger';
 import { logErrorSummary, maskId } from '../util/log-redact';
 import { isPathAllowed } from '../util/path-sandbox';
@@ -100,7 +103,7 @@ export const ARTIFACT_FRAME = Object.freeze({
 
 // ── Types ────────────────────────────────────────────────────────────────
 
-export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string };
+export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string; code?: string; feature?: string; message?: string };
 
 export interface ArtifactFileInput {
   path: string;
@@ -109,6 +112,8 @@ export interface ArtifactFileInput {
 }
 
 export interface ArtifactMeta {
+  browserStorage?: 'isolated-v1';
+  appType?: AppType;
   title: string;
   agentId: string;
   createdAt: string; // ISO
@@ -118,7 +123,7 @@ interface ResolveOk { ok: true; absPath: string; mime: string }
 interface ResolveErr { ok: false; code: 'bad_input' | 'forbidden' | 'not_found'; error: string }
 export type ResolveResult = ResolveOk | ResolveErr;
 export type ArtifactInspection =
-  | { ok: true; status: 'ok' }
+  | { ok: true; status: 'ok'; appType: AppType }
   | { ok: true; status: 'unavailable'; reason: string }
   | { ok: false; error: string };
 
@@ -293,6 +298,74 @@ export function ensureBridgeScript(html: string): string {
   return `${html}\n${tag}`;
 }
 
+// ── Declaration rejection detail ─────────────────────────────────────────
+
+// The author corrects and resubmits from this text, so it names the failing
+// member and the schema-side expectation. It never echoes rejected values;
+// unsupported keys appear only when they are identifier-shaped. Bounded so a
+// pathological manifest cannot flood the tool result or the reject log.
+const DECLARATION_ERROR_PREFIX = 'invalid application interface declaration in orkas-app.json: ';
+const DECLARATION_ISSUE_LIMIT = 3;
+const DECLARATION_ERROR_MAX = 600;
+const IDENTIFIER_KEY = /^[A-Za-z_][A-Za-z0-9_]{0,39}$/;
+
+function declarationError(detail: string): string {
+  const text = DECLARATION_ERROR_PREFIX + detail;
+  return text.length <= DECLARATION_ERROR_MAX ? text : text.slice(0, DECLARATION_ERROR_MAX - 3) + '...';
+}
+
+function declarationPath(issuePath: ReadonlyArray<string | number>): string {
+  let out = '';
+  for (const part of issuePath) {
+    if (typeof part === 'number') out += `[${part}]`;
+    else out += (out ? '.' : '') + (IDENTIFIER_KEY.test(part) ? part : '<key>');
+  }
+  return out || 'root';
+}
+
+/** The schema-side reason for one issue, without its location. */
+function declarationReason(issue: ZodIssue): string {
+  switch (issue.code) {
+    case 'invalid_type':
+      return issue.received === 'undefined' ? 'is required' : `must be ${issue.expected}, received ${issue.received}`;
+    case 'invalid_literal':
+      return issue.received === undefined ? 'is required' : `must be ${JSON.stringify(issue.expected)}`;
+    case 'invalid_enum_value':
+      return `must be one of ${issue.options.join(', ')}`;
+    case 'unrecognized_keys': {
+      const named = issue.keys.filter(key => IDENTIFIER_KEY.test(key));
+      const unnamed = issue.keys.length - named.length;
+      const list = [...named.slice(0, 5), ...(named.length > 5 ? [`+${named.length - 5} more`] : []),
+        ...(unnamed ? [`${unnamed} other key(s)`] : [])];
+      return `has unsupported field(s) ${list.join(', ')}`;
+    }
+    case 'invalid_string':
+      return 'has an invalid format';
+    default:
+      // Remaining zod messages and data-contract refinements are schema-authored.
+      return `: ${issue.message}`;
+  }
+}
+
+/** Group identical reasons; unsupported fields first because an invented
+ *  member (e.g. `interfaces`) usually explains the missing required ones. */
+function describeDeclarationIssues(issues: readonly ZodIssue[]): string {
+  const groups = new Map<string, string[]>();
+  const ordered = [...issues].sort((a, b) => Number(b.code === 'unrecognized_keys') - Number(a.code === 'unrecognized_keys'));
+  for (const issue of ordered) {
+    const reason = declarationReason(issue);
+    const paths = groups.get(reason) ?? [];
+    paths.push(declarationPath(issue.path));
+    groups.set(reason, paths);
+  }
+  const rendered = [...groups].map(([reason, paths]) => {
+    const where = paths.slice(0, DECLARATION_ISSUE_LIMIT).join(', ') + (paths.length > DECLARATION_ISSUE_LIMIT ? ` (+${paths.length - DECLARATION_ISSUE_LIMIT} more)` : '');
+    return reason.startsWith(':') ? where + reason : `${where} ${reason}`;
+  });
+  const shown = rendered.slice(0, DECLARATION_ISSUE_LIMIT).join('; ');
+  return rendered.length > DECLARATION_ISSUE_LIMIT ? `${shown} (+${rendered.length - DECLARATION_ISSUE_LIMIT} more)` : shown;
+}
+
 // ── Public API ───────────────────────────────────────────────────────────
 
 /**
@@ -305,12 +378,24 @@ export async function createArtifact(
   userId: string,
   cid: string,
   agentId: string,
-  input: { title?: unknown; files?: unknown },
+  input: { title?: unknown; files?: unknown; appType?: unknown },
 ): Promise<Result<{ artifactId: string; title: string }>> {
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
 
+  let boundType:AppType|undefined;
+  try{boundType=await (await import('./saved_apps')).boundAppType(userId,cid);}
+  catch(err){
+    log.warn('createArtifact app binding unavailable',{user_id:maskId(userId),conversation_id:maskId(safeConvId),error:logErrorSummary(err)});
+    return {ok:false,error:'app editing source unavailable; reopen editing from the app or save as a new app'};
+  }
+  const selectedType=appTypeSchema.safeParse((input.appType === 'cloud' ? 'web' : input.appType) ?? boundType ?? 'local');
+  if (boundType === 'web' || input?.appType === 'web' || input?.appType === 'cloud') {
+    return (await import('./web_apps/commercial-entry')).commercialWebAppFailure();
+  }
+  if(!selectedType.success || (boundType && selectedType.data!==boundType))return {ok:false,error:'app type must match the task or editing source'};
+  const appType=selectedType.data;
   const title = (typeof input?.title === 'string' && input.title.trim())
     ? input.title.trim().slice(0, 120)
     : 'Interactive app';
@@ -352,9 +437,31 @@ export async function createArtifact(
     prepared.push({ rel, content: f.content, encoding });
     if (prepared.length % 256 === 0) await yieldToHost();
   }
+  const declared=prepared.find(f=>f.rel==='orkas-app.json');
+  let declaredText='';
+  if(declared){
+    const bytes=Buffer.from(declared.content,declared.encoding);declaredText=bytes.toString('utf8');
+    if(!Buffer.from(declaredText,'utf8').equals(bytes))return {ok:false,error:declarationError('content must be UTF-8 text')};
+    let parsedJson:unknown;
+    try{parsedJson=JSON.parse(declaredText);}catch{return {ok:false,error:declarationError('content must be valid JSON')};}
+    const parsed=manifestSchema.safeParse(parsedJson);
+    if(!parsed.success)return {ok:false,error:declarationError(describeDeclarationIssues(parsed.error.issues))};
+    const manifest=parsed.data;
+    const hostOnly=manifest.capabilities.filter(c=>c!=='data');
+    if(appType==='web'&&hostOnly.length)return {ok:false,error:`web applications cannot use host interfaces: declared local-only capabilities ${hostOnly.join(', ')}; web apps may declare only data`};
+    if(manifest.capabilities.includes('data')&&!manifest.data)return {ok:false,error:'data definition is required'};
+  }
+  // Older strict manifest readers reject this additive protocol marker before
+  // running a web bundle; they cannot silently treat it as a host app.
+  if(appType==='web'){
+    if(declared){declared.content=JSON.stringify({...JSON.parse(declaredText),minimumClient:'1.9.0'});declared.encoding='utf8';}
+    else prepared.push({rel:'orkas-app.json',encoding:'utf8',content:JSON.stringify({sdkVersion:1,minimumClient:'1.9.0',capabilities:[]})});
+  }
   if (!hasIndex) return { ok: false, error: 'files must include a top-level "index.html"' };
 
   const meta: ArtifactMeta = {
+    browserStorage: 'isolated-v1',
+    appType,
     title,
     agentId: typeof agentId === 'string' ? agentId : '',
     createdAt: new Date().toISOString(),
@@ -378,7 +485,7 @@ export async function createArtifact(
       let buf = Buffer.from(content, encoding);
       if (encoding === 'utf8') {
         if (buf.toString('utf8') !== content) throw new Error(`file "${rel}": content is not valid UTF-8`);
-        if (rel === 'index.html') buf = Buffer.from(ensureBridgeScript(content), 'utf8');
+        if (rel === 'index.html' && appType === 'local') buf = Buffer.from(ensureBridgeScript(content), 'utf8');
       }
       const dst = path.join(tmpDir, rel);
       await fsp.mkdir(path.dirname(dst), { recursive: true });
@@ -399,16 +506,21 @@ export async function createArtifact(
   return { ok: true, artifactId, title };
 }
 
-export function inspectArtifactIndex(userId: string, cid: string, artifactId: string): ArtifactInspection {
+export async function inspectArtifactIndex(userId: string, cid: string, artifactId: string): Promise<ArtifactInspection> {
   const resolved = resolveArtifactFilePath(userId, cid, artifactId, 'index.html');
   if (!resolved.ok) {
     return { ok: true, status: 'unavailable', reason: (resolved as { error?: string }).error || 'artifact index is unavailable' };
   }
   try {
     fs.accessSync((resolved as { absPath: string }).absPath, fs.constants.R_OK);
-    return { ok: true, status: 'ok' };
   } catch (err) {
     return { ok: false, error: (err as Error).message || 'failed to inspect artifact index' };
+  }
+  // An unresolvable editing binding leaves the bubble unlabelled, never local.
+  try { return { ok: true, status: 'ok', appType: await (await import('./saved_apps')).resolveArtifactAppType(userId, cid, artifactId) }; }
+  catch (err) {
+    log.warn('inspectArtifactIndex app binding unavailable', { error: logErrorSummary(err) });
+    return { ok: false, error: 'app editing source unavailable' };
   }
 }
 
@@ -497,6 +609,8 @@ export function readArtifactMeta(userId: string, cid: string, artifactId: string
     const obj = JSON.parse(raw) as Partial<ArtifactMeta>;
     if (obj && typeof obj === 'object') {
       return {
+        appType: metadataAppType(obj.appType),
+        ...(obj.browserStorage === 'isolated-v1' ? { browserStorage: obj.browserStorage } : {}),
         title: typeof obj.title === 'string' ? obj.title : 'Interactive app',
         agentId: typeof obj.agentId === 'string' ? obj.agentId : '',
         createdAt: typeof obj.createdAt === 'string' ? obj.createdAt : '',

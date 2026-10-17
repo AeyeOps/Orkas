@@ -13,7 +13,10 @@ import { mimeFor } from '../chat_artifacts';
 import { bundleRevision } from './bundle-revision';
 import { MANIFEST_FILE, manifestSchema } from './catalog';
 import { AppError, WebAppRuntime, type Bundle } from './runtime';
+import { normalizeAppType } from './data-contract';
 import { appResource } from './resources';
+import { storedAppType, requireLocalAppType } from './commercial-entry';
+import { getActiveUserId, hasActiveUser } from '../users';
 
 export const previewPreload = path.join(SRC_ROOT, 'main/features/web_apps/preview-preload.js');
 export interface PreviewSdkEvidence {
@@ -26,18 +29,21 @@ export interface PreviewSdkEvidence {
 /** Absence preserves legacy HTML; an invalid opt-in must never downgrade. */
 export async function previewBundle(entry: string): Promise<Bundle | null> {
   const root = path.dirname(entry);
+  if (hasActiveUser()) requireLocalAppType(await (await import('../saved_apps')).managedPathAppType(getActiveUserId(), entry));
+  const appType = storedAppType(root) ?? 'local';
+  requireLocalAppType(appType);
   const manifestPath = path.join(root, MANIFEST_FILE);
   let stat: fs.Stats;
   try { stat = fs.lstatSync(manifestPath); }
   catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
-  if (!stat.isFile() || stat.size > 16 * 1024) throw new AppError('E_MANIFEST');
+  if (!stat.isFile() || stat.size > 64 * 1024) throw new AppError('E_MANIFEST');
   let manifest: unknown;
   try { manifest = manifestSchema.parse(JSON.parse(fs.readFileSync(manifestPath, 'utf8'))); }
   catch { throw new AppError('E_MANIFEST'); }
   let revision: Awaited<ReturnType<typeof bundleRevision>>;
   try { revision = await bundleRevision(root, [entry, manifestPath]); }
   catch { throw new AppError('E_BUNDLE'); }
-  return { key: 'preview', title: 'HTML preview', entry: path.basename(entry), manifest,
+  return { appType, key: 'preview', title: 'HTML preview', entry: path.basename(entry), manifest,
     valid: () => revision.valid(),
     resolve(rel) {
       if (!rel || rel.includes('\\') || rel.split('/').some(p => !p || p === '.' || p === '..' || p.startsWith('.'))) return null;
@@ -52,6 +58,7 @@ export async function previewBundle(entry: string): Promise<Bundle | null> {
 }
 
 export async function createPreviewSdk(ses: Session, contents: WebContents, bundle: Bundle) {
+  requireLocalAppType(bundle.appType);
   const storageRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'orkas-preview-storage-'));
   // This identity belongs only to this in-memory runtime; no account is created/read.
   const uid = 'preview';
@@ -70,6 +77,7 @@ export async function createPreviewSdk(ses: Session, contents: WebContents, bund
     runtime.closeOwner(contents.id);
     if (listener) contents.removeListener('ipc-message', listener);
     await Promise.allSettled([...pending]);
+    await runtime.drainData();
     if (installed) { ses.protocol.unhandle('chat-app'); installed = false; }
     await fsp.rm(storageRoot, { recursive: true, force: true });
   }
@@ -139,6 +147,18 @@ export async function createPreviewSdk(ses: Session, contents: WebContents, bund
     });
     installed = true;
     return { shellUrl, origin, evidence, dispose,
+      async settle() {
+        // Let replies reach the document and its promise continuations enqueue
+        // any follow-up calls. A quiet painted frame, not merely load, ends
+        // startup work. The renderer owns the existing preview timeout.
+        for (;;) {
+          const frame = contents.mainFrame.frames.find(frame => runtime.canNavigate(contents.id, open.url, frame.url));
+          if (!frame) throw new AppError('E_BUNDLE');
+          await frame.executeJavaScript('new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))');
+          if (!pending.size) return;
+          await Promise.allSettled([...pending]);
+        }
+      },
       async attach() {
         await contents.executeJavaScript(`new Promise((resolve, reject) => {
           const frame = document.querySelector('iframe');
