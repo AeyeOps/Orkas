@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import mutableFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import AdmZip from 'adm-zip';
@@ -1713,6 +1715,50 @@ describe('skills › selected batch package import', () => {
     for (let i = 0; i < extraFiles; i++) fs.writeFileSync(path.join(dir, 'references', `${i}.md`), `Reference ${i}.\n`);
     return dir;
   }
+
+  it.each([false, true])('keeps native path identity across legacy aliases; source redirected=%s', async redirected => {
+    const dir = skill('selected', 'selected', 1);
+    const nativeRealpath = fs.realpathSync.native;
+    const legacyRealpath = fs.realpathSync;
+    const promiseRealpath = fs.promises.realpath;
+    const canonicalSource = nativeRealpath(source);
+    const alias = `${canonicalSource}-legacy-alias`;
+    fs.symlinkSync(source, alias, 'junction');
+    let redirectObserved = false;
+    // Windows legacy realpathSync preserves short names/casing that the
+    // native promise API expands. Both spellings still name the same source.
+    const legacy = vi.spyOn(mutableFs, 'realpathSync').mockImplementation(((value: fs.PathLike, options?: any) => {
+      const resolved = legacyRealpath(value, options);
+      return typeof resolved === 'string' && (resolved === canonicalSource || resolved.startsWith(canonicalSource + path.sep))
+        ? alias + resolved.slice(canonicalSource.length) : resolved;
+    }) as typeof fs.realpathSync);
+    Object.assign(legacy, { native: nativeRealpath });
+    syncBuiltinESMExports();
+    const canonical = vi.spyOn(fs.promises, 'realpath').mockImplementation((async (value: fs.PathLike, options?: any) => {
+      if (redirected && String(value) === nativeRealpath(dir)) {
+        redirectObserved = true;
+        return canonicalSource;
+      }
+      return promiseRealpath(value, options);
+    }) as typeof fs.promises.realpath);
+    syncBuiltinESMExports();
+    try {
+      const s = await loadSkills();
+      const result = await s.importSkillPackageFromPath(source, { all: true });
+      expect(result.ok, JSON.stringify(result)).toBe(!redirected);
+      if (redirected) {
+        expect(redirectObserved).toBe(true);
+        expect(fs.existsSync(path.join(customSkillsDir(), 'selected'))).toBe(false);
+      } else {
+        expect(fs.readFileSync(path.join(customSkillsDir(), 'selected', 'references', '0.md'), 'utf8')).toBe('Reference 0.\n');
+      }
+    } finally {
+      canonical.mockRestore();
+      legacy.mockRestore();
+      syncBuiltinESMExports();
+      fs.rmSync(alias, { recursive: true, force: true });
+    }
+  });
 
   it('previews 265 Skills without writes, imports only selected roots and preserves nested references', async () => {
     for (let i = 0; i < 265; i++) skill(`skills/item-${String(i).padStart(3, '0')}`);

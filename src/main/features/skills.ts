@@ -1397,7 +1397,7 @@ interface ImportPathPolicyOptions {
 }
 
 function _realPathForImportPolicy(value: string): string {
-  try { return fs.realpathSync(value); }
+  try { return fs.realpathSync.native(value); }
   catch { return value; }
 }
 
@@ -2122,7 +2122,8 @@ async function _withSkillPackage<T extends ImportResult>(sourcePath: string, vis
   let realSource: string;
   let st: fs.Stats;
   try {
-    realSource = fs.realpathSync(trimmed);
+    // Match promises.realpath during discovery, including Windows short names.
+    realSource = fs.realpathSync.native(trimmed);
     st = fs.statSync(realSource);
   } catch {
     return { ok: false, error: t('skills.errors.dir_inaccessible') };
@@ -2169,7 +2170,7 @@ async function _withSkillPackage<T extends ImportResult>(sourcePath: string, vis
 
     extractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skill-package-'));
     extractBundleSafely(zip, extractDir);
-    return await visit(fs.realpathSync(extractDir), crypto.createHash('sha256').update(archiveBytes).digest('hex'));
+    return await visit(fs.realpathSync.native(extractDir), crypto.createHash('sha256').update(archiveBytes).digest('hex'));
   } catch (err) {
     log.warn('skill package archive import failed', {
       source_type: 'zip',
@@ -2326,7 +2327,7 @@ export async function importSkillPackageFromPath(sourcePath: string, options: {
             if (getActiveUserId() !== uid || options.signal?.aborted) throw new Error('Skill import cancelled.');
             for (const file of item.files) {
               const st = fs.lstatSync(file.src);
-              if (!st.isFile() || fs.realpathSync(file.src) !== file.src
+              if (!st.isFile() || fs.realpathSync.native(file.src) !== file.src
                 || JSON.stringify([st.size, st.mtimeMs, st.ctimeMs, st.ino]) !== file.stamp) {
                 throw new Error('The source changed before copying.');
               }
