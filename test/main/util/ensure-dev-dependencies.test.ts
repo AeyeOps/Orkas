@@ -85,7 +85,7 @@ async function prepare(platform = 'darwin', fail = '', fault = 'exit') {
 describe('development dependency preparation', () => {
   it.each(['darwin', 'win32'])('overlaps independent preparation on %s and waits for every prerequisite', async platform => {
     const run = await prepare(platform);
-    expect(run.peak).toBe(2);
+    expect(run.peak, run.messages.join('\n')).toBe(2);
     expect(run.readyWhileActive).toBe(false);
     expect(run.exitCode).toBe(0);
     expect(run.nativePrerequisites).toEqual(expect.arrayContaining([
@@ -104,6 +104,7 @@ describe('development dependency preparation', () => {
   it.each(['verify-native-dependencies.cjs:host', 'build-phone-passkey.cjs', 'verify-native-dependencies.cjs', 'fetch-embedding-model.mjs'])(
     'fails readiness and drains running preparation after %s fails', async fail => {
       const run = await prepare('darwin', fail);
+      expect(run.calls).toContain(fail);
       expect(run.exitCode).toBe(1);
       expect(run.exitWhileActive).toBe(false);
       expect(run.messages.join('\n')).not.toContain('built-in dependencies ready');
@@ -123,6 +124,7 @@ describe('development dependency preparation', () => {
 
   it.each(['spawn', 'signal'])('drains the other lane after a child %s failure', async fault => {
     const run = await prepare('darwin', 'fetch-embedding-model.mjs', fault);
+    expect(run.calls).toContain('fetch-embedding-model.mjs');
     expect(run.exitCode).toBe(1);
     expect(run.exitWhileActive).toBe(false);
     expect(run.calls).not.toContain('fetch-officecli.cjs');

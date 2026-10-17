@@ -3015,8 +3015,11 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     });
     try {
       const bash = lt.createLocalTools(OPTS).find((tool) => tool.name === 'bash')!;
-      const res = await bash.execute({ command: 'source .venv/bin/activate && wc -l data/input.csv', timeoutMs: 5000 }, makeCtx());
+      // The default host shell is /bin/sh, which is dash on Linux. This
+      // Bash-specific activation fixture must select Bash explicitly.
+      const res = await bash.execute({ command: "bash -c 'source .venv/bin/activate && wc -l data/input.csv'", timeoutMs: 5000 }, makeCtx());
       expect(prompts).toEqual([]);
+      expect(res.isError, String(res.content)).toBeFalsy();
       expect(String(res.content)).toContain('input.csv');
     } finally {
       bashPerms._setBroadcastForTest(null);
