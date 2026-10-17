@@ -66,6 +66,10 @@ function _projectUiIconHtml(name, className) {
 // `_skillsCache` patterns. `null` = not yet fetched.
 let _projectsCache = null;
 let _projectsLoadRequestId = 0;
+// Navigation is eager; the detail module may still be loading or showing the
+// previous project. Keep sidebar selection independent of its loaded data.
+let _projectSidebarPid = '';
+let _projectSidebarRevealPid = '';
 
 // Per-project expand/collapse state, persisted across sessions so the user's
 // layout sticks. Default: collapsed.
@@ -167,6 +171,7 @@ function _convsByProject() {
 /** Project list at the top of the sidebar. Auto-expands the project that
  *  owns the active conversation so the live row is visible. */
 function renderProjectsSection() {
+  if (currentView !== 'project') _projectSidebarRevealPid = '';
   const container = document.getElementById('projects-list');
   if (!container) return;
   if (typeof _conversationInlineRenameBlocksRender === 'function'
@@ -249,6 +254,17 @@ function renderProjectsSection() {
   }
   // Re-paint pending / queued badges on the conv items we just (re)rendered.
   if (typeof _refreshAllConvBadges === 'function') _refreshAllConvBadges();
+  if (_projectSidebarRevealPid && _isProjectSelected(_projectSidebarRevealPid)) {
+    const row = container.querySelector('.project-row.active');
+    if (row) {
+      // Reveal once per navigation, including when the project list arrives
+      // later. Background refreshes must respect subsequent manual scrolling.
+      _projectSidebarRevealPid = '';
+      const toggle = document.getElementById('projects-section-toggle');
+      if (toggle?.getAttribute('aria-expanded') === 'false') toggle.click();
+      row.scrollIntoView?.({ block: 'nearest', inline: 'nearest' });
+    }
+  }
 }
 
 function _renderInlineCreateRow() {
@@ -339,15 +355,15 @@ function _renderProjectRow(p, convs) {
 }
 
 function _isProjectSelected(pid) {
-  return currentView === 'project'
-    && typeof _projectDetailPid !== 'undefined'
-    && _projectDetailPid === pid;
+  return currentView === 'project' && _projectSidebarPid === pid;
 }
 
 /** Paint cached identity before the deferred project-detail script is parsed.
  * The panel markup is already eager, so first click can acknowledge the target
  * in the same frame instead of showing an anonymous blank surface. */
 function primeProjectDetailShell(pid) {
+  _projectSidebarPid = pid;
+  _projectSidebarRevealPid = pid;
   const project = Array.isArray(_projectsCache)
     ? _projectsCache.find((item) => item && item.project_id === pid)
     : null;

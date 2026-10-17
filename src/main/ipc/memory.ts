@@ -3,7 +3,7 @@
  * `window.orkas.invoke('memory.*', …)` (see preload's generic invoke).
  *
  *   memory.list        → { entries, usage:{current,limit}, path }     (one scope)
- *   memory.add         → MemoryOpResult                               (scanned + deduped + truncated by features/memory.ts)
+ *   memory.add         → MemoryOpResult                               (scanned + deduped; a full store refuses growth)
  *   memory.replace     → MemoryOpResult
  *   memory.remove      → MemoryOpResult
  *   memory.exportInfo  → { dir, files:{ user, shared, agents:[{agentId,…}] } }
@@ -16,7 +16,7 @@
  * `ctx.userId`). This is a VIEW over `features/memory.ts` — it never
  * re-implements limits/separator/scanner/dedup. See PC/CLAUDE.md §3.
  */
-import { addEntryWithMaintenance, replaceEntryWithMaintenance } from '../features/memory-maintenance';
+import { addMemoryEntry, replaceMemoryEntry, removeMemoryEntry } from '../features/memory-writes';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { shell } from 'electron';
@@ -116,11 +116,11 @@ export const invokeHandlers = {
   },
 
   'memory.add': async (payload: any, ctx: any) => {
-    return addEntryWithMaintenance(ctx.userId, await resolveScope(ctx.userId, payload), String(payload?.content || ''));
+    return addMemoryEntry(ctx.userId, await resolveScope(ctx.userId, payload), String(payload?.content || ''));
   },
 
   'memory.replace': async (payload: any, ctx: any) => {
-    return replaceEntryWithMaintenance(
+    return replaceMemoryEntry(
       ctx.userId,
       await resolveScope(ctx.userId, payload),
       String(payload?.oldText || ''),
@@ -129,7 +129,7 @@ export const invokeHandlers = {
   },
 
   'memory.remove': async (payload: any, ctx: any) => {
-    return memory.removeEntry(ctx.userId, await resolveScope(ctx.userId, payload), String(payload?.oldText || ''));
+    return removeMemoryEntry(ctx.userId, await resolveScope(ctx.userId, payload), String(payload?.oldText || ''));
   },
 
   'memory.exportInfo': async (_payload: any, ctx: any) => ({

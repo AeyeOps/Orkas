@@ -23,7 +23,8 @@ test.describe('Commander orchestration', () => {
     timeout: process.platform === 'win32' ? 120_000 : 60_000,
   });
 
-  test('hands a finished deliverable to a shipped agent without an empty Commander tail', async ({
+  for (const protocol of ['responses', 'chat'] as const) {
+  test(`hands a finished deliverable to a shipped agent without an empty Commander tail (${protocol})`, async ({
     modelOrkas,
   }, testInfo) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
@@ -31,6 +32,9 @@ test.describe('Commander orchestration', () => {
     const delegatedTask = 'Write the final launch announcement with a concise title and two paragraphs.';
     const agentReply = 'E2E ContentWriter final delivery: Launch day is ready.';
     const commanderNarration = 'I am handing this launch announcement to ContentWriter now.';
+    if (protocol === 'chat') {
+      await modelOrkas.setChatCommentaryScenario({ reads: [], finalText: '' });
+    }
     modelOrkas.setAgentHandoffScenario(CONTENT_WRITER_ID, delegatedTask, agentReply, {
       commanderNarration,
       // Hold the nested Agent at a deterministic gate so assertions cannot
@@ -64,9 +68,10 @@ test.describe('Commander orchestration', () => {
       // narrated segment is the only Commander bubble. A process replay or
       // active-turn snapshot must not recreate the duplicate live placeholder.
       await expect(commanderBubbles).toHaveCount(1);
+      await expect(page.locator('#chat-recipient-name')).toHaveText('ContentWriter');
       const process = commanderBubbles.locator('.stream-process');
       if (!(await process.evaluate((element) => (element as HTMLDetailsElement).open))) {
-        await process.locator('summary').click();
+        await process.locator(':scope > summary').click();
       }
       await expect(commanderBubbles.locator('.stream-process-body')).toBeVisible();
       await expect(commanderBubbles.locator('.stream-process-body')).toContainText('ContentWriter');
@@ -108,6 +113,7 @@ test.describe('Commander orchestration', () => {
       await expect(page.locator(
         `#chat-history .chat-message.assistant[data-from-actor="${CONTENT_WRITER_ID}"]`,
       )).toHaveCount(1);
+      await expect(page.locator('#chat-recipient-name')).toHaveText('ContentWriter');
     } finally {
       modelOrkas.releaseAgentHandoffReply();
     }
@@ -119,6 +125,7 @@ test.describe('Commander orchestration', () => {
       timeout: 20_000,
     });
     await expect(agentBubble.locator('[data-role="final"]')).toContainText(agentReply);
+    await expect(page.locator('#chat-recipient-name')).toHaveText('Commander');
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
     await expect(commanderBubbles).toHaveCount(1);
     await expect.poll(() => modelOrkas.modelRequests.length).toBe(2);
@@ -141,14 +148,17 @@ test.describe('Commander orchestration', () => {
     );
     await expect(restoredCommanderBubble).toHaveCount(1);
     await expect(restoredCommanderBubble).toContainText(commanderNarration);
-    // Persisted process rows materialize when the user opens the disclosure.
-    await restoredCommanderBubble.locator('.stream-process summary').click();
+    const restoredProcess = restoredCommanderBubble.locator('.stream-process');
+    if (!(await restoredProcess.evaluate(element => (element as HTMLDetailsElement).open))) {
+      await restoredProcess.locator(':scope > summary').click();
+    }
     await expect(restoredCommanderBubble.locator('.stream-process-body')).toContainText('ContentWriter');
     await expect(restoredCommanderBubble.locator('.stream-process-body')).not.toContainText(CONTENT_WRITER_ID);
     await restoredCommanderBubble.locator('.stream-process-compact-summary').click();
     await expect(restoredCommanderBubble.locator('.stream-process-compact-body').getByText(/Call agent.*ContentWriter/)).toBeVisible();
     expect(modelOrkas.modelRequests).toHaveLength(requestsBeforeRelaunch);
   });
+  }
 
   test('keeps a narration-free hand-off free of Commander placeholders while the Agent runs', async ({
     modelOrkas,
@@ -239,6 +249,14 @@ test.describe('Commander orchestration', () => {
 
     const form = page.locator('#chat-history .chat-input-form');
     await expect(form).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator('#chat-recipient-name')).toHaveText('DeepResearcher');
+    const pendingConversationId = await page.locator('#conversation-list .conv-item').first().getAttribute('data-cid');
+    const callsBeforeReload = modelOrkas.modelRequests.length;
+    await page.reload();
+    await page.locator(`#conversation-list .conv-item[data-cid="${pendingConversationId}"]`).click();
+    await expect(form).toBeVisible();
+    await expect(page.locator('#chat-recipient-name')).toHaveText('DeepResearcher');
+    expect(modelOrkas.modelRequests).toHaveLength(callsBeforeReload);
     const questionField = form.locator('.form-field', { hasText: 'Research question' });
     await questionField.locator('.form-field-textarea').fill(researchQuestion);
     await form.locator('.form-actions .btn-primary').click();
@@ -255,6 +273,7 @@ test.describe('Commander orchestration', () => {
     );
     await expect(commanderBubble).toHaveCount(1, { timeout: 20_000 });
     await expect(commanderBubble).toBeVisible();
+    await expect(page.locator('#chat-recipient-name')).toHaveText('Commander');
     await expect(page.locator('#chat-history')).not.toContainText('<handback');
     await expect(page.locator('#chat-history')).not.toContainText('<orchestration-resume');
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
@@ -312,6 +331,11 @@ test.describe('Commander orchestration', () => {
     ).toHaveCount(0);
     const requestsBeforeRetry = modelOrkas.modelRequests.length;
     expect(requestsBeforeRetry).toBeGreaterThan(2);
+    // After the successful Commander request, this fixture deliberately fails
+    // every Agent attempt until the user invokes recovery.
+    for (let index = 1; index < requestsBeforeRetry; index++) {
+      modelOrkas.expectApiFailure('POST', '/api/v1/chat/completions', 500);
+    }
 
     modelOrkas.allowAgentHandoffRetryRecovery();
     await failedAgentBubble.hover();
@@ -403,6 +427,7 @@ test.describe('Commander orchestration', () => {
       actorOrder.lastIndexOf(UI_DESIGNER_ID),
     );
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    await expect(page.locator('#chat-recipient-name')).toHaveText('Commander');
     await expect.poll(() => modelOrkas.modelRequests.length).toBe(4);
     expect(JSON.stringify(modelOrkas.modelRequests)).toContain(writerTask);
     expect(JSON.stringify(modelOrkas.modelRequests)).toContain(designerTask);
@@ -432,7 +457,7 @@ test.describe('Commander orchestration', () => {
   // dispatch belongs to the synthesis row's process history, not a standalone
   // answer. The temporary Commander row must retire while the Agent runs and
   // must not reappear as a duplicate after settlement or restart.
-  test('keeps pre-dispatch Commander commentary in one synthesis through restart', async ({
+  test('keeps pre-dispatch Commander commentary before Agent results and synthesis through restart', async ({
     modelOrkas,
   }) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
@@ -469,23 +494,26 @@ test.describe('Commander orchestration', () => {
 
     await expect(synthesisBubble).toBeVisible({ timeout: 20_000 });
     await expect(synthesisBubble).toHaveAttribute('data-msg-id', /\S+/, { timeout: 20_000 });
+    const narrationBubble = page.locator('#chat-history .chat-message.assistant[data-from-actor="commander"]', { hasText: narration });
+    await expect(narrationBubble).toHaveCount(1);
+    await expect(narrationBubble.locator('.stream-process-body')).toBeVisible();
     await synthesisBubble.locator('.stream-process-summary').click();
-    await expect(synthesisBubble.locator('.stream-process-body')).toContainText(narration);
+    await expect(synthesisBubble.locator('.stream-process-body')).not.toContainText(narration);
     await expect(synthesisBubble).toHaveCount(1);
 
-    // The final Commander answer has one stable segment identity; commentary
-    // is nested in its process disclosure rather than duplicated as a row.
+    // Commander keeps distinct visible dispatch segments: the narration
+    // precedes the Agent; the final answer follows it without repeating text.
     const commanderKeys = await page.locator(
       '#chat-history .chat-message.assistant[data-from-actor="commander"]',
     ).evaluateAll((rows) => rows.map((row) => (row as HTMLElement).dataset.renderKey || ''));
-    expect(commanderKeys).toHaveLength(1);
+    expect(commanderKeys).toHaveLength(2);
     expect(commanderKeys.every((key) => key.startsWith('s:'))).toBe(true);
 
     // The Agent reply remains before the final Commander synthesis.
     const actorOrder = await page.locator(
       '#chat-history .chat-message.assistant[data-from-actor]',
     ).evaluateAll((rows) => rows.map((row) => (row as HTMLElement).dataset.fromActor || ''));
-    expect(actorOrder).toEqual([DEEP_RESEARCHER_ID, 'commander']);
+    expect(actorOrder).toEqual(['commander', DEEP_RESEARCHER_ID, 'commander']);
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
 
     // Reload from persisted jsonl: the transcript must match what was streamed,
@@ -502,7 +530,10 @@ test.describe('Commander orchestration', () => {
     );
     await expect(persistedSynthesis).toHaveCount(1);
     await persistedSynthesis.locator('.stream-process-summary').click();
-    await expect(persistedSynthesis.locator('.stream-process-body')).toContainText(narration);
+    await expect(persistedSynthesis.locator('.stream-process-body')).not.toContainText(narration);
+    const restoredNarration = page.locator('#chat-history .chat-message.assistant[data-from-actor="commander"]', { hasText: narration });
+    await expect(restoredNarration).toHaveCount(1);
+    await expect(restoredNarration.locator('.stream-process-body')).toBeVisible();
     await expect(page.locator(
       `#chat-history .chat-message.assistant[data-from-actor="${DEEP_RESEARCHER_ID}"]`,
       { hasText: agentReply },

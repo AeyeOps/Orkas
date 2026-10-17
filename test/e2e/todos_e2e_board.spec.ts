@@ -1,4 +1,5 @@
-import { expect, test } from './fixtures/orkas';
+import { openSidebarEntry, expect, test } from './fixtures/orkas';
+import path from 'node:path';
 
 for (const scope of ['global', 'project'] as const) {
   test(`gives long ${scope} todo content room while keeping editor actions reachable`, async ({ orkas }, info) => {
@@ -18,7 +19,9 @@ for (const scope of ['global', 'project'] as const) {
       await page.locator('[data-project-tab="todo"]').click();
     } else await page.locator('#todos-btn').click();
     const card = page.locator(`.project-todo-item[data-tid="${taskId}"]:visible`);
-    await card.locator('[data-action="todo-edit"]').click();
+    await card.hover();
+    await card.locator('[data-action="todo-menu"]').click();
+    await page.locator('.context-menu-item').filter({ hasText: /^Edit$/ }).click();
     const field = page.locator('#project-todo-input');
     await expect(field).toHaveValue(content);
     await expect(page.locator('#project-todo-attachments')).toContainText('brief.txt');
@@ -58,6 +61,400 @@ for (const scope of ['global', 'project'] as const) {
 
 // The assignment journey exercises both account-scoped agents and execution.
 
+for (const language of ['en', 'zh']) {
+test(`creates todos in the selected project and defaults status grouping to global (${language})`, async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  await page.evaluate(lang => (window as any).setLang(lang), language);
+  const { project: alpha } = await orkas.invoke<any>('projects.create', { name: 'Alpha' });
+  const { project: beta } = await orkas.invoke<any>('projects.create', { name: 'Beta' });
+  for (const projectId of ['', alpha.project_id, beta.project_id]) {
+    await orkas.invoke('projects.tasks.create', { projectId, content: `Existing ${projectId || 'global'}` });
+  }
+  await openSidebarEntry(page, '#todos-btn');
+  const picker = page.locator('#project-todo-project');
+  const input = page.locator('#project-todo-input');
+  const modal = page.locator('#todo-editor-modal');
+  const selectProject = async (pid: string) => {
+    await picker.locator('.ai-select-trigger').click();
+    await page.locator(`#project-todo-project-listbox .ai-select-item[data-value="${pid}"]`).click();
+  };
+  await page.locator(`#todos-content .todo-scope-chip[data-pid="${alpha.project_id}"]`).click();
+  await page.locator('#todos-add-btn').click();
+  await expect(picker).toHaveAttribute('data-value', alpha.project_id);
+  await expect(picker.locator('.ai-select-trigger')).toBeEnabled();
+  await selectProject(beta.project_id);
+  await input.fill('Cancelled draft');
+  await page.evaluate(async () => (window as any)._refreshGlobalTodos());
+  await expect(picker).toHaveAttribute('data-value', beta.project_id);
+  await expect(input).toHaveValue('Cancelled draft');
+  await page.locator('#project-todo-cancel').click();
+
+  await page.locator('#todos-add-btn').click();
+  await expect(picker).toHaveAttribute('data-value', alpha.project_id);
+  await expect(input).toHaveValue('');
+  await input.fill('Default Alpha task');
+  await page.setViewportSize({ width: language === 'en' ? 1440 : 1024, height: 900 });
+  await modal.screenshot({ path: testInfo.outputPath(`todo-default-project-${language}.png`) });
+  await page.locator('#project-todo-save').click();
+  await expect(modal).not.toHaveClass(/\bopen\b/);
+  const alphaTasks = await orkas.invoke<any>('projects.tasks.list', { projectId: alpha.project_id });
+  expect(alphaTasks.tasks.filter((task: any) => task.content === 'Default Alpha task')).toHaveLength(1);
+
+  await page.locator('[data-todo-group="status"]').click();
+  await page.locator('#todos-add-btn').click();
+  await expect(picker).toHaveAttribute('data-value', '');
+  await input.fill('Default global task');
+  await page.locator('#project-todo-save').click();
+  await expect(modal).not.toHaveClass(/\bopen\b/);
+  const globalTasks = await orkas.invoke<any>('projects.tasks.list', {});
+  expect(globalTasks.tasks.filter((task: any) => task.content === 'Default global task')).toHaveLength(1);
+  expect(globalTasks.tasks.some((task: any) => task.content === 'Default Alpha task')).toBe(false);
+
+  await page.locator('[data-todo-group="project"]').click();
+  await page.locator('#todos-add-btn').click();
+  await expect(picker).toHaveAttribute('data-value', alpha.project_id);
+  await selectProject(beta.project_id);
+  await input.fill('Explicit Beta task');
+  await page.locator('#project-todo-save').click();
+  await expect(modal).not.toHaveClass(/\bopen\b/);
+  const betaTasks = await orkas.invoke<any>('projects.tasks.list', { projectId: beta.project_id });
+  expect(betaTasks.tasks.filter((task: any) => task.content === 'Explicit Beta task')).toHaveLength(1);
+  await page.locator('#todos-content .todo-scope-chip[data-pid=""]').click();
+  await page.locator('#todos-add-btn').click();
+  await expect(picker).toHaveAttribute('data-value', '');
+  await page.locator('#project-todo-cancel').click();
+});
+}
+
+test('keeps todo card appearance and unfinished processing consistent across both entry points', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  await page.evaluate(() => (window as any).setLang('zh'));
+  const project = await orkas.invoke<any>('projects.create', { name: 'Consistent cards' });
+  const pid = project.project.project_id;
+  const tasks = [];
+  for (const status of ['todo', 'progress', 'review', 'done']) {
+    const created = await orkas.invoke<any>('projects.tasks.create', {
+      projectId: pid, content: `Check ${status} work\nKeep its full brief`, status,
+    });
+    tasks.push(created.task);
+  }
+  const before = await orkas.invoke<any>('projects.tasks.list', { projectId: pid });
+  const appearance = (card: ReturnType<typeof page.locator>) => card.evaluate(element => {
+    const properties = ['display', 'gap', 'padding', 'borderRadius', 'backgroundColor', 'fontSize',
+      'fontWeight', 'lineHeight', 'opacity', 'order'];
+    return ['.project-todo-title', '.todo-card-meta', '.project-todo-assign',
+      '.project-todo-status-select'].map(selector => {
+      const control = element.querySelector(selector)!;
+      const style = getComputedStyle(control);
+      return { text: control.textContent, style: Object.fromEntries(properties.map(key => [key, (style as any)[key]])) };
+    });
+  });
+  for (const width of [1440, 1024]) {
+    await page.setViewportSize({ width, height: 900 });
+    const appearances = [];
+    for (const entry of ['account', 'project']) {
+      if (entry === 'account') {
+        await openSidebarEntry(page, '#todos-btn');
+        await page.locator(`#todos-content .todo-scope-chip[data-pid="${pid}"]`).click();
+      } else {
+        await page.evaluate(async id => (window as any).setView('project', id), pid);
+        await page.locator('[data-project-tab="todo"]').click();
+      }
+      const host = page.locator(entry === 'account' ? '#todos-content' : '#project-todo-list');
+      await host.locator('.todo-column.is-done .todo-collapse').click();
+      for (const [index, task] of tasks.entries()) {
+        const card = host.locator(`.project-todo-item[data-tid="${task.id}"]`);
+        const statusControl = card.locator('[data-action="todo-status"]');
+        await page.mouse.move(0, 0);
+        await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+        await expect(card.locator('.todo-card-meta')).toHaveCount(1);
+        // Both entry points reveal the status control only with the card's hover/focus controls.
+        await expect(statusControl).toHaveCSS('opacity', '0');
+        await expect(statusControl).toHaveCSS('pointer-events', 'none');
+        const layout = () => card.evaluate(element => {
+          const bounds = element.getBoundingClientRect();
+          const status = element.querySelector('[data-action="todo-status"]')!.getBoundingClientRect();
+          return { width: bounds.width, height: bounds.height, statusX: status.x - bounds.x, statusY: status.y - bounds.y };
+        });
+        const restingLayout = await layout();
+        await card.hover();
+        await expect(statusControl).toHaveCSS('opacity', '1');
+        await expect(statusControl).toHaveCSS('pointer-events', 'auto');
+        // Narrow boards may scroll horizontally to reveal a hovered card.
+        const hoveredLayout = await layout();
+        // Scrolling can change floating-point subtraction without moving a control.
+        for (const key of ['width', 'height', 'statusX', 'statusY'] as const) {
+          expect(hoveredLayout[key]).toBeCloseTo(restingLayout[key], 2);
+        }
+        expect(await card.evaluate(element => {
+          const footer = element.querySelector('.todo-card-meta')!.getBoundingClientRect();
+          const status = element.querySelector('[data-action="todo-status"]')!.getBoundingClientRect();
+          return Math.abs(footer.right - status.right);
+        })).toBeLessThanOrEqual(1);
+        if (entry === 'account') appearances[index] = await appearance(card);
+        else expect(await appearance(card)).toEqual(appearances[index]);
+        await card.locator('[data-action="todo-menu"]').click();
+        await expect(page.locator('.context-menu-item', { hasText: '立即处理' })).toHaveCount(task.status === 'done' ? 0 : 1);
+        await page.keyboard.press('Escape');
+      }
+      await host.screenshot({ path: testInfo.outputPath(`todo-cards-${entry}-${width}.png`) });
+      const firstCard = host.locator(`.project-todo-item[data-tid="${tasks[0].id}"]`);
+      const statusControl = firstCard.locator('[data-action="todo-status"]');
+      for (const locale of ['zh', 'en']) {
+        await page.evaluate(lang => (window as any).setLang(lang), locale);
+        await page.mouse.move(0, 0);
+        await page.evaluate(() => (document.activeElement as HTMLElement)?.blur());
+        await expect(statusControl).toHaveCSS('opacity', '0');
+        await expect.poll(() => host.locator('[data-action="todo-status"]').evaluateAll(elements =>
+          elements.map(element => getComputedStyle(element).opacity)))
+          .toEqual(tasks.map(() => '0'));
+        await host.screenshot({ path: testInfo.outputPath(`todo-resting-${entry}-${width}-${locale}.png`) });
+        await firstCard.locator('.project-todo-title').focus();
+        // Tab through the card's real controls to the status menu.
+        for (let step = 0; step < 5 && !(await statusControl.evaluate(el => el === document.activeElement)); step++) {
+          await page.keyboard.press('Tab');
+        }
+        await expect(statusControl).toBeFocused();
+        await expect(statusControl).toHaveCSS('opacity', '1');
+        await page.keyboard.press('Enter');
+        await expect(page.locator('.context-menu')).toBeVisible();
+        await page.keyboard.press('Escape');
+        await host.screenshot({ path: testInfo.outputPath(`todo-focused-${entry}-${width}-${locale}.png`) });
+      }
+      await page.evaluate(() => (window as any).setLang('zh'));
+      // Restore the collapse preference before the next visit.
+      await host.locator('.todo-column.is-done .todo-collapse').click();
+    }
+  }
+  expect(await orkas.invoke('projects.tasks.list', { projectId: pid })).toEqual(before);
+});
+
+test('binds auto-advance locally and lets another device disable then re-enable it', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  await page.evaluate(() => (window as any).setLang('zh'));
+  // Completed backlog: this UI/IPC journey must not enqueue model work.
+  const created = await orkas.invoke<any>('projects.create', { name: 'Auto-advance device' });
+  const pid = created.project.project_id;
+  await orkas.invoke('projects.tasks.create', { projectId: pid, content: 'Completed project work', status: 'done' });
+  await orkas.invoke('projects.tasks.create', { content: 'Completed global work', status: 'done' });
+  const writeCloudConfig = (config: Record<string, unknown>) => orkas.electronApp!.evaluate(async (_electron, input) => {
+    const require = (process as any).mainModule.require.bind((process as any).mainModule);
+    const fs = require('node:fs/promises'), path = require('node:path');
+    const uid = require(path.join(input.main, 'features/users.ts')).getActiveUserId();
+    const file = require(path.join(input.main, 'paths.ts')).projectDriverFile(uid, input.pid);
+    await fs.writeFile(file, JSON.stringify(input.config));
+  }, { main: path.resolve(__dirname, '../../src/main'), pid, config });
+  // Upgrading an enabled legacy project must display off until the user enables it.
+  await writeCloudConfig({ enabled: true, max_advances_per_day: 20 });
+  expect((await orkas.invoke<any>('projects.driver.get', { projectId: pid })).config.enabled).toBe(false);
+  await page.evaluate(async id => (window as any).setView('project', id), pid);
+  await page.locator('[data-project-tab="todo"]').click();
+  const toggle = page.locator('#project-driver-toggle');
+  await expect(toggle).toBeEnabled();
+  await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+  const local = await orkas.invoke<any>('projects.driver.get', { projectId: pid });
+  await expect(toggle).toHaveText('自动推进 · 本机');
+  expect(local.config).toMatchObject({ enabled: true, device_id: local.device.id, device_name: local.device.name });
+
+  await openSidebarEntry(page, '#todos-btn');
+  await page.locator(`#todos-content .todo-scope-chip[data-pid="${pid}"]`).click();
+  const scopeToggle = page.locator(`#todos-content .todo-scope-driver-toggle[data-pid="${pid}"]`);
+  await expect(scopeToggle).toHaveText('自动推进 · 本机');
+  await page.locator('#todos-content .todo-scope-chip[data-pid=""]').click();
+  const globalToggle = page.locator('#todos-content .todo-scope-driver-toggle[data-pid=""]');
+  await globalToggle.click();
+  await expect(globalToggle).toHaveText('自动推进 · 本机');
+  await page.locator('[data-todo-group="status"]').click();
+  await expect(scopeToggle).toHaveText('Auto-advance device · 本机');
+  await expect(globalToggle).toHaveText('全局 · 本机');
+  await page.evaluate(() => (window as any).setLang('en'));
+  await expect(scopeToggle).toContainText(' · This device');
+  await expect(globalToggle).toContainText(' · This device');
+  await page.evaluate(() => (window as any).setLang('zh'));
+
+  // A sync pull replaces the cloud config with another installation's opt-in.
+  await writeCloudConfig({ enabled: true, max_advances_per_day: 20,
+    device_id: 'another-installation', device_name: 'Office Mac' });
+  await page.evaluate(async id => (window as any)._refreshGlobalTodos(id), pid);
+  await expect(scopeToggle).toHaveText('Auto-advance device · Office Mac');
+  await page.locator('[data-todo-group="project"]').click();
+  await page.locator(`#todos-content .todo-scope-chip[data-pid="${pid}"]`).click();
+  await expect(scopeToggle).toHaveText('自动推进 · Office Mac');
+  await page.evaluate(async id => (window as any).setView('project', id), pid);
+  await page.locator('[data-project-tab="todo"]').click();
+  await expect(toggle).toHaveText('自动推进 · Office Mac');
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+  await toggle.screenshot({ path: testInfo.outputPath('auto-advance-remote-device.png') });
+  await page.evaluate(() => (window as any).setLang('en'));
+  await expect(toggle).toContainText(' · Office Mac');
+  await page.evaluate(() => (window as any).setLang('zh'));
+  await expect(toggle).toBeEnabled();
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-pressed', 'false');
+  await expect(toggle).toHaveText('自动推进');
+  expect((await orkas.invoke<any>('projects.driver.get', { projectId: pid })).config.enabled).toBe(false);
+  await toggle.click();
+  await expect(toggle).toHaveAttribute('aria-pressed', 'true');
+  await expect(toggle).toHaveText('自动推进 · 本机');
+  expect((await orkas.invoke<any>('projects.driver.get', { projectId: pid })).config.device_id).toBe(local.device.id);
+  await toggle.screenshot({ path: testInfo.outputPath('auto-advance-local-device.png') });
+});
+
+test('hides human responsibility and keeps optional Agent assignment on both boards and in the editor', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  await page.evaluate(() => (window as any).setLang('zh'));
+  const project = await orkas.invoke<any>('projects.create', { name: 'Private responsibility' });
+  const pid = project.project.project_id;
+  const created = await orkas.invoke<any>('projects.tasks.create', { projectId: pid, content: 'Review private work' });
+  const global = await orkas.invoke<any>('projects.tasks.create', { content: 'Review global work' });
+  await openSidebarEntry(page, '#todos-btn');
+  for (const [scope, tid] of [['', global.task.id], [pid, created.task.id]]) {
+    await page.locator(`#todos-content .todo-scope-chip[data-pid="${scope}"]`).click();
+    const card = page.locator(`#todos-content .project-todo-item[data-tid="${tid}"]`);
+    await expect(card.getByText('E2E Member', { exact: true })).toHaveCount(0);
+    await expect(card.locator('.project-todo-assign')).toHaveText('未指定');
+    await expect(card.locator('.project-todo-assign')).toBeVisible();
+  }
+  await page.evaluate(async id => (window as any).setView('project', id), pid);
+  await page.locator('[data-project-tab="todo"]').click();
+  const card = page.locator(`#project-todo-list .project-todo-item[data-tid="${created.task.id}"]`);
+  await expect(card.getByText('E2E Member', { exact: true })).toHaveCount(0);
+  await expect(card.locator('.project-todo-assign')).toHaveText('未指定');
+  await card.screenshot({ path: testInfo.outputPath('private-todo-responsibility.png') });
+  for (const editing of [false, true]) {
+    if (editing) {
+      await card.hover();
+      await card.locator('[data-action="todo-menu"]').click();
+      await page.locator('.context-menu-item', { hasText: '编辑' }).click();
+    } else {
+      await page.locator('#project-todo-add-btn').click();
+    }
+    await expect(page.locator('#todo-editor-modal').getByText('E2E Member', { exact: true })).toHaveCount(0);
+    await expect(page.locator('#project-todo-agent .ai-select-trigger')).toContainText('未指定');
+    await expect(page.locator('#project-todo-agent .ai-select-trigger')).toBeEnabled();
+    await page.locator('#todo-editor-modal').screenshot({ path: testInfo.outputPath(`private-todo-${editing ? 'edit' : 'create'}.png`) });
+    if (editing) {
+      await page.setViewportSize({ width: 1024, height: 720 });
+      await page.evaluate(() => (window as any).setLang('en'));
+      await expect(page.locator('#todo-editor-modal').getByText('E2E Member', { exact: true })).toHaveCount(0);
+      await page.locator('#todo-editor-modal').screenshot({ path: testInfo.outputPath('private-todo-edit-en-narrow.png') });
+      await page.locator('#project-todo-input').fill('Reviewed private work');
+      await page.locator('#project-todo-save').click();
+    } else {
+      await page.locator('#project-todo-cancel').click();
+    }
+  }
+  const saved = await orkas.invoke<any>('projects.tasks.list', { projectId: pid });
+  expect(saved.tasks).toHaveLength(1);
+  expect(saved.tasks[0]).toMatchObject({ id: created.task.id, content: 'Reviewed private work' });
+  for (const task of [created.task, global.task, saved.tasks[0]]) {
+    expect(task).not.toHaveProperty('assignee_uid');
+    expect(task).not.toHaveProperty('assignee_name');
+  }
+  expect(saved.tasks[0].owner_agent_id).toBeUndefined();
+});
+
+test('reads full todo card text with repeatable mouse and keyboard disclosure on both boards', async ({ orkas }, testInfo) => {
+  const page = orkas.page!;
+  await page.evaluate(() => (window as any).setLang('zh'));
+  const project = await orkas.invoke<any>('projects.create', { name: '阅读待办' });
+  const pid = project.project.project_id;
+  // An expanded card must exceed the project viewport to exercise the header
+  // and scrolling boundary, rather than only checking text inside the button.
+  const text = '核对完整说明\n第一段：保留换行，说明详细目标。\n第二段：' + '长文本'.repeat(1000) + '\n最后一行：<literal> & 保留原文';
+  const created = await orkas.invoke<any>('projects.tasks.create', { projectId: pid, content: text });
+  const global = await orkas.invoke<any>('projects.tasks.create', { content: text });
+  const before = await orkas.invoke<any>('projects.tasks.list', { projectId: pid });
+  await openSidebarEntry(page, '#todos-btn');
+  for (const [scope, tid] of [['', global.task.id], [pid, created.task.id]]) {
+    await page.locator(`#todos-content .todo-scope-chip[data-pid="${scope}"]`).click();
+    const card = page.locator(`#todos-content .project-todo-item[data-tid="${tid}"]`);
+    const title = card.locator('.project-todo-title');
+    await expect(title).toHaveAttribute('aria-expanded', 'false');
+    const collapsedHeight = await title.evaluate(element => element.clientHeight);
+    await title.click();
+    await expect(title).toHaveAttribute('aria-expanded', 'true');
+    expect(await title.textContent()).toBe(text);
+    expect(await title.evaluate(element => element.clientHeight >= element.scrollHeight)).toBe(true);
+    expect(await title.evaluate(element => element.clientHeight)).toBeGreaterThan(collapsedHeight);
+    await expect(page.locator('#todo-editor-modal')).not.toHaveClass(/\bopen\b/);
+    // The footer control keeps its original action without closing the content.
+    const status = card.locator('[data-action="todo-status"]');
+    await status.scrollIntoViewIfNeeded();
+    // Let the scroll event dismiss existing popups before the next gesture,
+    // as when a reader scrolls down to the footer and then opens its menu.
+    await status.evaluate(() => new Promise<void>(resolve =>
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    await status.click();
+    await expect(page.locator('.context-menu-item')).toHaveCount(4);
+    await expect(title).toHaveAttribute('aria-expanded', 'true');
+    await page.keyboard.press('Escape');
+    await title.press('Space');
+    await expect(title).toHaveAttribute('aria-expanded', 'false');
+    await title.press('Enter');
+    await expect(title).toHaveAttribute('aria-expanded', 'true');
+    await page.evaluate(async () => (window as any)._refreshGlobalTodos(''));
+    await expect(title).toHaveAttribute('aria-expanded', 'true');
+    // Clicking the card padding is also a disclosure gesture.
+    await card.click({ position: { x: 3, y: 3 } });
+    await expect(title).toHaveAttribute('aria-expanded', 'false');
+  }
+  await page.evaluate(async (id) => (window as any).setView('project', id), pid);
+  await page.locator('[data-project-tab="todo"]').click();
+  const card = page.locator(`#project-todo-list .project-todo-item[data-tid="${created.task.id}"]`);
+  const title = card.locator('.project-todo-title');
+  const column = page.locator('#project-todo-list .todo-column.is-todo');
+  const header = column.locator('.todo-column-head');
+  const headerHeight = (await header.boundingBox())!.height;
+  await title.click();
+  await expect(title).toHaveAttribute('aria-expanded', 'true');
+  expect((await header.boundingBox())!.height).toBeGreaterThanOrEqual(headerHeight - 1);
+  const body = card.locator('..');
+  await body.evaluate(element => { element.scrollTop = 0; });
+  const [headerBox, bodyStart, cardStart] = await Promise.all([
+    header.boundingBox(), body.boundingBox(), card.boundingBox(),
+  ]);
+  expect(bodyStart!.y).toBeGreaterThanOrEqual(headerBox!.y + headerBox!.height - 1);
+  expect(cardStart!.y).toBeGreaterThanOrEqual(headerBox!.y + headerBox!.height);
+  expect(await title.evaluate(element => element.clientHeight >= element.scrollHeight)).toBe(true);
+  await page.evaluate(async (id) => (window as any)._loadProjectTodos(id), pid);
+  await expect(title).toHaveAttribute('aria-expanded', 'true');
+  await page.screenshot({ path: testInfo.outputPath('expanded-todo-card.png') });
+  await body.evaluate(element => { element.scrollTop = element.scrollHeight; });
+  const [titleBox, bodyBox] = await Promise.all([title.boundingBox(), body.boundingBox()]);
+  expect(titleBox!.y + titleBox!.height).toBeLessThanOrEqual(bodyBox!.y + bodyBox!.height + 1);
+  expect(titleBox!.y + titleBox!.height).toBeGreaterThan(bodyBox!.y);
+  await page.screenshot({ path: testInfo.outputPath('expanded-todo-card-end.png') });
+  await title.click();
+  await expect(title).toHaveAttribute('aria-expanded', 'false');
+  await card.hover();
+  await card.locator('[data-action="todo-menu"]').click();
+  await page.locator('.context-menu-item', { hasText: '编辑' }).click();
+  await expect(page.locator('#project-todo-input')).toHaveValue(text);
+  // Long content gets the room the dialog has: the field grows to the dialog's
+  // height cap and scrolls inside, while the dialog itself does not scroll.
+  const editorRoom = () => page.evaluate(() => {
+    const dialog = document.querySelector('#todo-editor-modal .todo-editor-dialog') as HTMLElement;
+    const field = document.getElementById('project-todo-input') as HTMLTextAreaElement;
+    return {
+      lines: Math.floor(field.clientHeight / parseFloat(getComputedStyle(field).lineHeight)),
+      fieldScrolls: field.scrollHeight > field.clientHeight,
+      dialogScrolls: dialog.scrollHeight > dialog.clientHeight + 1,
+    };
+  });
+  const longRoom = await editorRoom();
+  expect(longRoom.lines).toBeGreaterThanOrEqual(8);
+  expect(longRoom).toMatchObject({ fieldScrolls: true, dialogScrolls: false });
+  await page.locator('#project-todo-cancel').click();
+  // An empty field still offers six lines.
+  await page.locator('#project-todo-add-btn').click();
+  await expect(page.locator('#project-todo-input')).toHaveValue('');
+  expect(await editorRoom()).toEqual({ lines: 6, fieldScrolls: false, dialogScrolls: false });
+  await page.locator('#project-todo-cancel').click();
+  expect(await orkas.invoke('projects.tasks.list', { projectId: pid })).toEqual(before);
+});
 
 test('manages the same backlog from global and project boards without a duplicate project disclosure', async ({ orkas }, testInfo) => {
   const page = orkas.page!;
@@ -87,7 +484,7 @@ test('manages the same backlog from global and project boards without a duplicat
     owner_agent: agent.name,
     owner_agent_id: agent.agent_id,
   });
-  await page.locator('#todos-btn').click();
+  await openSidebarEntry(page, '#todos-btn');
   const content = page.locator('#todos-content');
   const header = page.locator('#panel-todos .project-detail-header');
   await expect(header.locator('.todo-page-actions')).toBeVisible();
@@ -104,7 +501,7 @@ test('manages the same backlog from global and project boards without a duplicat
   await expect(content.locator('.todo-project-group')).toHaveCount(1);
   await expect(content.locator('.todo-project-group')).toHaveAttribute('data-pid', a);
   await expect(content.locator('.todo-project-head')).toHaveCount(0);
-  await expect(content.locator('.todo-scope-actions .todo-project-add')).toHaveCount(1);
+  await expect(content.locator('.todo-scope-actions .todo-project-add')).toHaveCount(0);
   await expect(content.locator('.todo-scope-actions .todo-scope-driver-toggle')).toHaveCount(1);
   await expect(content.locator('.todo-column-head .project-todo-menu')).toHaveCount(0);
   await expect(content.locator('.project-todo-item [data-action="todo-menu"]')).toHaveCount(4);
@@ -130,11 +527,12 @@ test('manages the same backlog from global and project boards without a duplicat
   await expect(alphaGroup.locator('.todo-board')).toBeVisible();
   await expect(doneToggle).toHaveAttribute('aria-expanded', 'true');
 
-  // One project-level + replaces the four status-level buttons and creates in
-  // the project whose title owns it.
-  await alphaGroup.locator('.todo-project-add').click();
+  // The single page-level Create entry lets the user choose the target scope.
+  await page.locator('#todos-add-btn').click();
+  await page.locator('#project-todo-project .ai-select-trigger').click();
+  await page.locator(`#project-todo-project-listbox .ai-select-item[data-value="${a}"]`).click();
   await expect(page.locator('#project-todo-project')).toHaveAttribute('data-value', a);
-  await expect(page.locator('#project-todo-project .ai-select-trigger')).toBeDisabled();
+  await expect(page.locator('#project-todo-project .ai-select-trigger')).toBeEnabled();
   await page.locator('#project-todo-cancel').click();
 
   // Card controls follow reading order: Agent on the left, status on the right.
@@ -203,8 +601,9 @@ test('manages the same backlog from global and project boards without a duplicat
   await expect(alphaGroup.getByText('确认视觉规范', { exact: true })).toBeInViewport();
   await page.setViewportSize({ width: 1440, height: 900 });
 
-  // The global page defaults to an account-level to-do. Dropped files use the
-  // same attachment path as the + button in the composer.
+  // Status grouping defaults to an account-level to-do even after selecting a
+  // project. Dropped files use the same path as the composer's + button.
+  await page.locator('[data-todo-group="status"]').click();
   await page.locator('#todos-add-btn').click();
   await expect(page.locator('#project-todo-project')).toHaveAttribute('data-value', '');
   await expect(page.locator('#project-todo-project .ai-select-label')).toHaveText('全局');
@@ -243,12 +642,13 @@ test('manages the same backlog from global and project boards without a duplicat
     attachments: ['global-notes.txt'],
   });
   expect(globalTask.detail).toBeUndefined();
+  await page.locator('[data-todo-group="project"]').click();
   await expect(content.locator('.todo-scope-chip')).toHaveCount(3);
   await content.locator('.todo-scope-chip[data-pid=""]').click();
   await expect(content.locator('.todo-project-group')).toHaveCount(1);
   const globalGroup = content.locator('.todo-project-group[data-pid=""]');
   await expect(globalGroup).toContainText('全局跟进发票');
-  await expect(globalGroup.locator('.todo-scope-driver-toggle')).toBeVisible();
+  await expect(content.locator('.todo-scope-row .todo-scope-driver-toggle[data-pid=""]')).toBeVisible();
   await expect(globalGroup.locator('.todo-column.is-progress .todo-column-empty')).toHaveCSS('text-align', 'center');
   await expect(globalGroup.locator('.todo-board')).toBeVisible();
   await content.locator(`.todo-scope-chip[data-pid="${a}"]`).click();
@@ -291,25 +691,37 @@ test('manages the same backlog from global and project boards without a duplicat
   const activeTitleColor = await task.locator('.project-todo-title')
     .evaluate((element) => getComputedStyle(element).color);
   expect(completedTitleColor).toBe(activeTitleColor);
-  const projectMeta = task.locator('.todo-card-project');
-  const agentMeta = task.locator('.project-todo-assign');
-  const statusMeta = task.locator('.project-todo-status-select');
-  const [projectMetaBox, agentMetaBox, statusMetaBox] = await Promise.all([
-    projectMeta.boundingBox(),
-    agentMeta.boundingBox(),
-    statusMeta.boundingBox(),
-  ]);
-  expect(projectMetaBox).not.toBeNull();
-  expect(agentMetaBox).not.toBeNull();
-  expect(statusMetaBox).not.toBeNull();
-  expect(Math.abs((projectMetaBox!.y + projectMetaBox!.height / 2) - (agentMetaBox!.y + agentMetaBox!.height / 2))).toBeLessThan(4);
-  expect(projectMetaBox!.x).toBeLessThan(agentMetaBox!.x);
-  expect(agentMetaBox!.x).toBeLessThan(statusMetaBox!.x);
+  // Flex wrapping retains the public project, optional Agent and status reading order.
+  const metadata = await task.locator('.todo-card-meta').evaluate((element) => {
+    const box = (node: Element) => {
+      const rect = node.getBoundingClientRect();
+      return { x: rect.x, y: rect.y, right: rect.right, bottom: rect.bottom, height: rect.height };
+    };
+    return {
+      bounds: box(element),
+      controls: Array.from(element.querySelectorAll('.todo-card-project, .project-todo-assign, .project-todo-status-select')).map(box),
+    };
+  });
+  expect(metadata.controls).toHaveLength(3);
+  for (const control of metadata.controls) {
+    expect(control.height).toBeGreaterThan(0);
+    expect(control.x).toBeGreaterThanOrEqual(metadata.bounds.x - 1);
+    expect(control.right).toBeLessThanOrEqual(metadata.bounds.right + 1);
+    expect(control.y).toBeGreaterThanOrEqual(metadata.bounds.y - 1);
+    expect(control.bottom).toBeLessThanOrEqual(metadata.bounds.bottom + 1);
+  }
+  expect(metadata.bounds.height).toBeLessThanOrEqual(3 * Math.max(...metadata.controls.map(control => control.height)) + 24);
+  for (let index = 1; index < metadata.controls.length; index++) {
+    const previous = metadata.controls[index - 1], current = metadata.controls[index];
+    if (Math.abs(current.y - previous.y) < 4) expect(current.x).toBeGreaterThanOrEqual(previous.right);
+    else expect(current.y).toBeGreaterThanOrEqual(previous.bottom);
+  }
   const globalCard = content.locator(`.project-todo-item[data-tid="${globalTask.id}"]`);
   await expect(globalCard).toHaveAttribute('data-todo-scope', 'global');
   await expect(globalCard.locator('span.todo-card-project')).toHaveText('全局');
   await expect(globalCard.locator('.todo-card-project-icon')).toHaveCount(1);
   await expect(globalCard.locator('button.todo-card-project')).toHaveCount(0);
+  await task.hover();
   await task.locator('[data-action="todo-status"]').click();
   const selectedStatusOption = page.locator('.context-menu-item', { hasText: '待确认' });
   const selectedStatusCheck = selectedStatusOption.locator('.context-menu-trailing-icon');
@@ -380,7 +792,16 @@ test('manages the same backlog from global and project boards without a duplicat
   expect(boardBox).not.toBeNull();
   expect(boardBox!.x).toBeGreaterThanOrEqual(listBox!.x - 1);
   expect(boardBox!.x + boardBox!.width).toBeLessThanOrEqual(listBox!.x + listBox!.width + 1);
-  expect(await projectBoard.evaluate((board) => getComputedStyle(board).gridTemplateColumns.split(' ').length)).toBe(4);
+  // Four lanes in one row; the collapsed Completed lane narrows to a strip
+  // and the open lanes share the rest.
+  const projectLanes = await projectBoard.evaluate((board) => Array.from(board.children).map((lane) => {
+    const box = lane.getBoundingClientRect();
+    return { status: (lane as HTMLElement).dataset.status, top: Math.round(box.top), width: Math.round(box.width) };
+  }));
+  expect(projectLanes.map((lane) => lane.status)).toEqual(['todo', 'progress', 'review', 'done']);
+  expect(new Set(projectLanes.map((lane) => lane.top)).size).toBe(1);
+  expect(projectLanes[3].width).toBe(40);
+  expect(Math.min(...projectLanes.slice(0, 3).map((lane) => lane.width))).toBeGreaterThanOrEqual(190);
   const projectCard = projectList.locator(`.project-todo-item[data-tid="${created.id}"]`);
   await expect(projectList.locator('.todo-column.is-progress').getByText('完善价格页', { exact: true })).toBeVisible();
   await expect(projectList.getByText('设计项目看板', { exact: true })).toHaveCount(0);
@@ -403,13 +824,13 @@ test('manages the same backlog from global and project boards without a duplicat
       listRight: list.getBoundingClientRect().right,
       boardRight: board.getBoundingClientRect().right,
       lastRight: last.getBoundingClientRect().right,
-      columnCount: getComputedStyle(board).gridTemplateColumns.split(' ').length,
+      rows: new Set(Array.from(board.children).map((lane) => Math.round(lane.getBoundingClientRect().top))).size,
       boardOverflow: board.scrollWidth - board.clientWidth,
     };
   });
   expect(narrowGeometry.boardRight).toBeLessThanOrEqual(narrowGeometry.listRight + 1);
   expect(narrowGeometry.lastRight).toBeLessThanOrEqual(narrowGeometry.boardRight + 1);
-  expect(narrowGeometry.columnCount).toBe(4);
+  expect(narrowGeometry.rows).toBe(1);
   expect(narrowGeometry.boardOverflow).toBeGreaterThan(1);
   await page.setViewportSize({ width: 1440, height: 900 });
   // Counts include completed/legacy tasks and reconcile external writes even
@@ -425,15 +846,18 @@ test('manages the same backlog from global and project boards without a duplicat
   await expect(todoTabCount).toHaveText('4');
   await page.locator('[data-project-tab="todo"]').click();
   await page.screenshot({ path: testInfo.outputPath('project-todos.png') });
-  await projectList.getByText('完善价格页', { exact: true }).click();
+  const editedCard = projectList.locator('.project-todo-item', { hasText: '完善价格页' });
+  await editedCard.hover();
+  await editedCard.locator('[data-action="todo-menu"]').click();
+  await page.locator('.context-menu-item', { hasText: '编辑' }).click();
   await page.locator('#project-todo-input').fill('完善价格页与导航');
   await page.locator('#project-todo-save').click();
-  await page.locator('#todos-btn').click();
+  await openSidebarEntry(page, '#todos-btn');
   await expect(content.getByText('完善价格页与导航', { exact: true })).toBeVisible();
 
   // Reopening the app reads persisted tasks and restores default disclosure states.
   const reloaded = await orkas.relaunch();
-  await reloaded.locator('#todos-btn').click();
+  await openSidebarEntry(reloaded, '#todos-btn');
   // A fresh launch focuses the first scope; the rest stay one chip away.
   await expect(reloaded.locator('#todos-content').getByText('全局跟进发票', { exact: true })).toBeVisible();
   await reloaded.locator(`#todos-content .todo-scope-chip[data-pid="${b}"]`).click();
@@ -465,7 +889,7 @@ test('processes an assigned Codex todo from its card with one execution and no C
     const { task } = await orkas.invoke<{ task: { id: string } }>('projects.tasks.create', {
       projectId: pid, content, owner_agent_id: agent.agent_id,
     });
-    await page.locator('#todos-btn').click();
+    await openSidebarEntry(page, '#todos-btn');
     const card = page.locator('#todos-content .project-todo-item', { hasText: content });
     await card.hover();
     await card.locator('[data-action="todo-menu"]').click();
@@ -511,7 +935,7 @@ test('assigns global and project todos in the editor and keeps cards and saved o
   const { project } = await orkas.invoke<{ project: { project_id: string } }>('projects.create', { name: 'Assignment project' });
   const pid = project.project_id;
   await orkas.invoke('projects.bindings.add', { projectId: pid, kind: 'agent', id: agent.agent_id });
-  await page.locator('#todos-btn').click();
+  await openSidebarEntry(page, '#todos-btn');
   const agentControl = page.locator('#project-todo-agent');
   const chooseAgent = async (value: string) => {
     await expect(agentControl.locator('.ai-select-trigger')).toBeEnabled();
@@ -536,7 +960,9 @@ test('assigns global and project todos in the editor and keeps cards and saved o
     await expect(card.locator('.project-todo-assign')).toContainText(agent.name);
     let tasks = await orkas.invoke<{ tasks: any[] }>('projects.tasks.list', { projectId: scope });
     expect(tasks.tasks.find((t) => t.content === title)).toMatchObject({ owner_agent_id: agent.agent_id, owner_agent: agent.name });
-    await card.locator('[data-action="todo-edit"]').click();
+    await card.hover();
+    await card.locator('[data-action="todo-menu"]').click();
+    await page.locator('.context-menu-item', { hasText: '编辑' }).click();
     await expect(agentControl).toHaveAttribute('data-value', agent.agent_id);
     await chooseAgent('');
     await page.locator('#project-todo-save').click();
@@ -571,7 +997,7 @@ test('assigns global and project todos in the editor and keeps cards and saved o
 // column that cannot overflow is the oracle for "kept its own height": a body
 // that fits by squashing its cards would scroll too, and would be just as
 // unusable.
-test('reaches every to-do in a column taller than the board', async ({ connectorOrkas: orkas }, testInfo) => {
+test('reaches every to-do and keeps reading positions through background refreshes', async ({ connectorOrkas: orkas }, testInfo) => {
   const page = orkas.page!;
   await page.setViewportSize({ width: 1440, height: 900 });
   await page.evaluate(() => (window as any).setLang('zh'));
@@ -581,7 +1007,7 @@ test('reaches every to-do in a column taller than the board', async ({ connector
   for (let index = 1; index <= 15; index += 1) {
     await orkas.invoke('projects.tasks.create', { projectId: pid, title: `待办 ${index}`, status: 'todo', detail });
   }
-  await orkas.invoke('projects.tasks.create', { projectId: pid, title: '对照待办', status: 'progress', detail });
+  const referenceTask = await orkas.invoke<any>('projects.tasks.create', { projectId: pid, title: '对照待办', status: 'progress', detail });
   const measure = (sel: string, viewSel: string) => page.evaluate(({ sel, viewSel }) => {
     const column = document.querySelector(`${sel} .todo-column.is-todo`) as HTMLElement;
     const body = column.querySelector('.todo-column-body') as HTMLElement;
@@ -602,7 +1028,7 @@ test('reaches every to-do in a column taller than the board', async ({ connector
 
   // The global page scrolls as one list, so a column there must not turn into a
   // second scroller nested inside it.
-  await page.locator('#todos-btn').click();
+  await openSidebarEntry(page, '#todos-btn');
   await page.locator('[data-todo-group="status"]').click();
   await expect(page.locator('#todos-content .todo-column.is-todo .project-todo-item')).toHaveCount(15);
   const globalBefore = await measure('#todos-content', '#todos-content');
@@ -613,6 +1039,18 @@ test('reaches every to-do in a column taller than the board', async ({ connector
     list.scrollTop = list.scrollHeight;
   });
   expect((await measure('#todos-content', '#todos-content')).lastVisible).toBe(true);
+  const globalList = page.locator('#todos-content');
+  const globalTop = await globalList.evaluate(element => element.scrollTop);
+  expect(globalTop).toBeGreaterThan(100);
+  // A sync reload and a real task-change push both update data while the
+  // reader stays at the same place in the account-wide list.
+  await page.evaluate(async () => (window as any)._refreshGlobalTodos());
+  expect(await globalList.evaluate(element => element.scrollTop)).toBeCloseTo(globalTop, 0);
+  await orkas.invoke('projects.tasks.update', {
+    projectId: pid, taskId: referenceTask.task.id, content: '同步后的对照待办\n' + detail,
+  });
+  await expect(globalList.locator('.todo-column.is-progress .project-todo-title')).toContainText('同步后的对照待办');
+  expect(await globalList.evaluate(element => element.scrollTop)).toBeCloseTo(globalTop, 0);
 
   // The project board gives each column its own scroller instead.
   await page.locator('#todos-content .project-todo-item').first().locator('.todo-card-project').click();
@@ -620,6 +1058,9 @@ test('reaches every to-do in a column taller than the board', async ({ connector
   await page.locator('[data-project-tab="todo"]').click();
   const body = page.locator('#project-todo-list .todo-column.is-todo .todo-column-body');
   await expect(page.locator('#project-todo-list .todo-column.is-todo .project-todo-item')).toHaveCount(15);
+  // Completed starts as a narrow strip and the board fits; with every lane
+  // open the board also scrolls sideways.
+  await page.locator('#project-todo-list .todo-column.is-done .todo-collapse').click();
   const before = await measure('#project-todo-list', '#project-todo-list .todo-column.is-todo');
   expect(before.cards).toBe(15);
   expect(before.cardHeight).toBeGreaterThanOrEqual(before.referenceHeight - 2);
@@ -634,5 +1075,19 @@ test('reaches every to-do in a column taller than the board', async ({ connector
   expect(after.lastVisible).toBe(true);
   expect(after.cardHeight).toBeGreaterThanOrEqual(after.referenceHeight - 2);
   expect(after.headTop).toBe(before.headTop);
+  const projectTop = await body.evaluate(element => element.scrollTop);
+  const board = page.locator('#project-todo-list .todo-board');
+  await board.evaluate(element => { element.scrollLeft = 60; });
+  const boardLeft = await board.evaluate(element => element.scrollLeft);
+  expect(boardLeft).toBeGreaterThan(0);
+  await orkas.invoke('projects.tasks.update', {
+    projectId: pid, taskId: referenceTask.task.id, content: '再次更新的对照待办\n' + detail,
+  });
+  await expect(page.locator('#project-todo-list .todo-column.is-progress .project-todo-title')).toContainText('再次更新的对照待办');
+  expect(await body.evaluate(element => element.scrollTop)).toBeCloseTo(projectTop, 0);
+  expect(await board.evaluate(element => element.scrollLeft)).toBeCloseTo(boardLeft, 0);
+  await page.evaluate(async id => (window as any)._loadProjectTodos(id), pid);
+  expect(await body.evaluate(element => element.scrollTop)).toBeCloseTo(projectTop, 0);
+  expect(await board.evaluate(element => element.scrollLeft)).toBeCloseTo(boardLeft, 0);
   await page.screenshot({ path: testInfo.outputPath('todo-column-scroll.png') });
 });

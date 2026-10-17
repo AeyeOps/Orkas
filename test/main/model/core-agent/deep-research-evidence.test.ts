@@ -143,6 +143,45 @@ describe('deep research evidence capture', () => {
     }
   });
 
+  it('captures a continuation window of a long page as another snapshot of the same source', async () => {
+    // A decisive passage below the first 12,000 characters must remain
+    // verifiable after the Agent reads it through an offset window.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-deep-evidence-window-'));
+    const html = '<html><head><title>Model release</title></head><body>'
+      + `<p>${'Opening background sentence. '.repeat(500)}</p>`
+      + '<h2>Results</h2><p>LATE_RESULT_QUOTE: the model scored 95.9 on the held-out suite.</p>'
+      + '</body></html>';
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(html, {
+      status: 200,
+      headers: { 'content-type': 'text/html; charset=utf-8' },
+    })));
+    try {
+      const { webFetchTool } = await import('../../../../src/core-agent/src/tools/web-fetch');
+      const file = deepResearchEvidenceFile(root);
+      const ctx = { state: { runScopedLedger: new Map<string, unknown>() } };
+      const first = await webFetchTool.execute({ url: 'https://example.test/release', maxChars: 12_000 }, ctx);
+      const offset = Number(/"offset": (\d+)/.exec(first.content)?.[1]);
+      const window = await webFetchTool.execute(
+        { url: 'https://example.test/release', maxChars: 12_000, offset },
+        ctx,
+      );
+
+      expect(captureDeepResearchWebFetchEvidence(first, file)).toEqual({ captured: true });
+      expect(captureDeepResearchWebFetchEvidence(window, file)).toEqual({ captured: true });
+      const rows = fs.readFileSync(file, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+      expect(rows.map((row) => row.canonical_url)).toEqual([
+        'https://example.test/release',
+        'https://example.test/release',
+      ]);
+      expect(rows[0].text).not.toContain('LATE_RESULT_QUOTE');
+      expect(rows[1].text).toContain('LATE_RESULT_QUOTE: the model scored 95.9 on the held-out suite.');
+    } finally {
+      vi.unstubAllGlobals();
+      _resetDeepResearchEvidenceIndexForTest();
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not persist failed or URL-less tool output as source evidence', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-deep-evidence-'));
     try {

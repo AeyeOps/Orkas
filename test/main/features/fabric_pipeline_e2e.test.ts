@@ -15,7 +15,7 @@ import * as path from 'node:path';
  * (via the runner's `deps.advance`), because the real commander's decisions are
  * covered separately by the L4 benchmark. Everything else is exercised for real.
  *
- * Code-task deliverables are represented as `result_ref` pointers (PR refs) — the
+ * Code-task completion is represented by review and human approval — the
  * code-vertical convention (code lives in the repo, not 资料库). The 资料库
  * write-back tool (`library_save`) is unit-tested in library-save-tool.test.ts.
  */
@@ -105,7 +105,7 @@ describe('fabric pipeline e2e', () => {
     // 5. The commander turn works A on the board: progress → deliver → review.
     //    Deliverable is a PR ref (code lives in the repo).
     await pt.updateTask(UID, pid, A.task.id, { status: 'progress' });
-    await pt.updateTask(UID, pid, A.task.id, { status: 'review', result_ref: 'pr#101' });
+    await pt.updateTask(UID, pid, A.task.id, { status: 'review' });
     convoRunning = false; // the advance conversation finished its turn
 
     // 6. A awaits human review and B is still dep-blocked → nothing actionable.
@@ -125,7 +125,7 @@ describe('fabric pipeline e2e', () => {
     expect(await runner.advanceProjectIfDue(UID, pid, deps)).toBe('advanced');
     expect(fired).toEqual([A.task.id, B.task.id]);
     await pt.updateTask(UID, pid, B.task.id, { status: 'progress' });
-    await pt.updateTask(UID, pid, B.task.id, { status: 'review', result_ref: 'pr#102' });
+    await pt.updateTask(UID, pid, B.task.id, { status: 'review' });
     convoRunning = false;
 
     // 9. Human requests changes on B → back to progress (not done).
@@ -135,7 +135,7 @@ describe('fabric pipeline e2e', () => {
     expect(pt.computeProgress(await pt.listTasks(UID, pid))).toMatchObject({ total: 2, done: 1, open: 1 });
 
     // 10. Rework → review again → approve → done. Backlog complete.
-    await pt.updateTask(UID, pid, B.task.id, { status: 'review', result_ref: 'pr#102-v2' });
+    await pt.updateTask(UID, pid, B.task.id, { status: 'review' });
     const decB2 = await pt.decideReview(UID, pid, B.task.id, 'approved');
     expect(decB2.ok).toBe(true);
     if (decB2.ok) expect(decB2.task.status).toBe('done');

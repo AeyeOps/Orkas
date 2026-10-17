@@ -6,44 +6,7 @@
  * receives only short snapshot-scoped references.
  */
 
-const HIGH_IMPACT_CONTROL_SCRIPT = String.raw`
-  const highImpactControl = (element) => {
-    const tag = element.tagName.toLowerCase();
-    const role = String(element.getAttribute('role') || '').toLowerCase();
-    if (!['a', 'button', 'input'].includes(tag) && !['button', 'link', 'menuitem'].includes(role)) return false;
-    const label = labelFor(element).toLowerCase();
-    const terms = [
-      'delete', 'remove', 'buy', 'purchase', 'pay', 'checkout', 'place order',
-      'post', 'publish', 'authorize', 'approve',
-      'grant access', 'allow access', 'transfer', 'trade', 'book',
-      'reserve', 'subscribe', 'unsubscribe', 'cancel subscription', 'captcha',
-      '删除', '移除', '购买', '支付', '下单', '结账', '发布',
-      '授权', '同意', '转账', '交易', '预订', '预约', '验证码',
-      '削除', '購入', '支払', '注文', '公開', '投稿', '承認',
-      '振込', '予約', 'excluir', 'remover', 'comprar', 'pagar',
-      'finalizar pedido', 'publicar', 'autorizar',
-      'aprovar', 'transferir', 'reservar',
-    ];
-    const href = String(element.getAttribute('href') || '');
-    const navigation = tag === 'a' && role !== 'button' && /^(?:https?:|[/.#])/i.test(href)
-      && !element.getAttribute('onclick')
-      && !['post', 'put', 'patch', 'delete'].includes(String(element.getAttribute('data-method') || '').toLowerCase());
-    return terms.some((term) => {
-      // Latin word fragments such as Facebook, Bookmarks and payroll are not
-      // action verbs. Keep CJK matching, where spaces do not delimit words.
-      if (!/^[a-z ]+$/.test(term)) return label.includes(term);
-      if (term === 'post' && navigation && /^posts?\s+(?:history|archive|list|feed)\b/.test(label)) return false;
-      let offset = label.indexOf(term);
-      while (offset >= 0) {
-        const before = label.slice(offset - 1, offset);
-        const after = label.slice(offset + term.length, offset + term.length + 1);
-        if ((!before || !/[\p{L}\p{N}_]/u.test(before)) && (!after || !/[\p{L}\p{N}_]/u.test(after))) return true;
-        offset = label.indexOf(term, offset + 1);
-      }
-      return false;
-    });
-  };
-`;
+import { displayBrowserUrl } from './web_assist_url';
 
 export type WebAssistPageAction =
   | 'click'
@@ -52,7 +15,12 @@ export type WebAssistPageAction =
   | 'check'
   | 'uncheck'
   | 'scroll'
-  | 'drag';
+  | 'drag'
+  | 'upload'
+  | 'press'
+  | 'hover'
+  | 'double_click'
+  | 'right_click';
 
 export interface WebAssistElementSignature {
   tag: string;
@@ -74,8 +42,10 @@ export interface WebAssistRawElement {
   checked: boolean | null;
   sensitive: boolean;
   fillable: boolean;
-  requires_user_action: boolean;
   options: string[];
+  option_count?: number;
+  identity?: number;
+  documentToken?: string;
 }
 
 export interface WebAssistRawObservation {
@@ -96,6 +66,8 @@ export interface WebAssistRawObservation {
 }
 
 export interface WebAssistStoredElementRef {
+  identity?: number;
+  documentToken?: string;
   path: number[];
   signature: WebAssistElementSignature;
 }
@@ -107,6 +79,10 @@ export type WebAssistPageScope = 'browser' | 'connector_setup';
 export interface WebAssistObserveWindow {
   textOffset?: number;
   elementOffset?: number;
+  frameId?: string;
+  /** Estimated tokens the whole result may fill (host-side only; the page
+   *  script never sees it). Omitted means the ordinary per-result ceiling. */
+  tokenBudget?: number;
 }
 
 function safeOffset(value: unknown): number {
@@ -121,7 +97,7 @@ export function webAssistObserveScript(
 ): string {
   return String.raw`
 (() => {
-  const protectHighImpactActions = ${scope !== 'connector_setup'};
+
   const MAX_ELEMENTS = 80;
   const MAX_TEXT = 6000;
   const TEXT_FROM = ${safeOffset(window.textOffset)};
@@ -171,34 +147,26 @@ export function webAssistObserveScript(
     return path;
   };
   const sensitiveControl = (element) => {
-    const tag = element.tagName.toLowerCase();
-    if (tag !== 'input') return false;
     const type = String(element.type || '').toLowerCase();
-    const autocomplete = String(element.autocomplete || '').toLowerCase().split(/\s+/).filter(Boolean);
+    const autocomplete = String(element.autocomplete || element.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/).filter(Boolean);
     return type === 'password'
       || autocomplete.includes('current-password')
       || autocomplete.includes('new-password')
       || autocomplete.includes('one-time-code')
       || autocomplete.some((token) => token.startsWith('cc-'));
   };
-  const submitControl = (element) => {
-    const tag = element.tagName.toLowerCase();
-    const type = String(element.type || '').toLowerCase();
-    return (tag === 'button' && type === 'submit')
-      || (tag === 'input' && (type === 'submit' || type === 'image'));
-  };
-${HIGH_IMPACT_CONTROL_SCRIPT}
-  const sensitiveFormSubmission = (element) => {
-    if (!submitControl(element) || !element.form || !element.form.elements) return false;
-    return Array.from(element.form.elements).some((control) => (
-      control instanceof Element && sensitiveControl(control)
-    ));
+  const identities = globalThis.__orkasBrowserNodes ||= { nodes: new WeakMap(), refs: new Map(), next: 1, token: crypto.randomUUID() };
+  for (const [id, ref] of identities.refs) if (!ref.deref()) identities.refs.delete(id);
+  const identityFor = element => {
+    let id = identities.nodes.get(element);
+    if (!id) { id = identities.next++; identities.nodes.set(element, id); identities.refs.set(id, new WeakRef(element)); }
+    return id;
   };
   const selectors = [
-    'a[href]', 'button', 'input', 'select', 'textarea', '[contenteditable="true"]',
+    'a[href]', 'button', 'input', 'select', 'textarea', '[contenteditable]:not([contenteditable="false"])', '[onclick]', '[tabindex]', 'canvas',
     '[role="button"]', '[role="link"]', '[role="checkbox"]', '[role="radio"]',
     '[role="tab"]', '[role="menuitem"]', '[role="combobox"]',
-    '[role="slider"]', '[draggable="true"]', '[role="treeitem"]', '[role="option"]', '[role="switch"]', '[role="menuitemcheckbox"]',
+    '[role="slider"]', '[role="listbox"]', '[role="grid"]', '[draggable="true"]', '[role="treeitem"]', '[role="option"]', '[role="switch"]', '[role="menuitemcheckbox"]',
   ].join(',');
   const candidates = [];
   const seen = new Set();
@@ -211,12 +179,22 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
     }
     for (const host of root.querySelectorAll('*')) {
       if (host.shadowRoot) collect(host.shadowRoot);
+      if (!seen.has(host)) {
+        const style = getComputedStyle(host);
+        if (['auto', 'scroll'].includes(style.overflowY) || ['auto', 'scroll'].includes(style.overflowX)) {
+          seen.add(host); candidates.push(host);
+        }
+      }
     }
   };
   collect(document);
   const rows = [];
   for (const element of candidates) {
-    if (!isVisible(element)) continue;
+    // Sites commonly hide their file input behind an Attach button. Upload
+    // needs a ref to that input; it does not send pointer input to it.
+    const uploadInput = element.tagName === 'INPUT'
+      && String(element.type).toLowerCase() === 'file';
+    if (!isVisible(element) && !uploadInput) continue;
     const path = structuralPath(element);
     if (!path.length) continue;
     const tag = element.tagName.toLowerCase();
@@ -225,7 +203,7 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
     const label = labelFor(element);
     const sensitive = sensitiveControl(element);
     const isFile = tag === 'input' && inputType === 'file';
-    const fillable = !sensitive && !isFile && !element.readOnly && (
+    const fillable = !isFile && !element.readOnly && (
       tag === 'textarea'
       || element.isContentEditable
       || (tag === 'input' && !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden', 'image'].includes(inputType))
@@ -235,7 +213,8 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
       try {
         const parsed = new URL(element.href, location.href);
         if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
-          href = normalize(parsed.origin + parsed.pathname, 320);
+          parsed.username = ''; parsed.password = '';
+          href = (${displayBrowserUrl.toString()})(parsed.toString());
         }
       } catch { /* omit malformed link */ }
     }
@@ -243,6 +222,9 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
       ? Array.from(element.options || []).slice(0, 30).map((option) => normalize(option.label || option.text, 160))
       : [];
     rows.push({
+      identity: identityFor(element),
+      documentToken: identities.token,
+      option_count: tag === 'select' ? element.options.length : 0,
       path,
       signature: { tag, type: inputType, role, label },
       tag,
@@ -257,8 +239,6 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
         : null,
       sensitive,
       fillable,
-      requires_user_action: sensitive || isFile || sensitiveFormSubmission(element)
-        || (protectHighImpactActions && highImpactControl(element)),
       options,
     });
   }
@@ -266,8 +246,7 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
   // down is aimed at a code block someone embedded in a page; applying it to a
   // whole JSON or text document made that entire class read as a blank page,
   // which a caller could not tell from a page that genuinely had nothing.
-  // Form values — the other half of that mitigation and the load-bearing half —
-  // do not exist in such a document, so nothing is weakened by reading it.
+  // Form values are read separately through snapshot-scoped field references.
   //
   // Chromium renders JSON and text/plain into a single <pre>. XML gets a tree
   // viewer with no such element, so that reports the kind and no payload rather
@@ -303,9 +282,10 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
   // Read each visible text node once, including table cells, ordinary divs and
   // open shadow roots. Ancestor textContent duplicated nested rows and included
   // hidden descendants; a tag whitelist silently dropped most console data.
-  // Keep form/code subtrees excluded, and retain block/row and cell boundaries.
+  // Keep form subtrees separate, and retain block/row and cell boundaries.
   const parts = [];
-  const skippedTags = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'CODE', 'PRE', 'KBD', 'SAMP', 'INPUT', 'TEXTAREA', 'SELECT']);
+  const skippedTags = new Set(['SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'INPUT', 'TEXTAREA', 'SELECT',
+    ]);
   const stack = document.body ? [{ node: document.body, hidden: false }] : [];
   const visited = new Set();
   while (stack.length) {
@@ -373,12 +353,13 @@ function scriptJson(value: unknown): string {
 
 export function buildWebAssistActionScript(input: {
   ref?: WebAssistStoredElementRef;
-  action: WebAssistPageAction;
+  action: WebAssistPageAction | 'read_value' | 'options';
+  values?: string[];
+  optionOffset?: number;
   text?: string;
-  direction?: 'up' | 'down' | 'top' | 'bottom';
+  textOffset?: number;
+  direction?: 'up' | 'down' | 'top' | 'bottom' | 'left' | 'right';
 }, scope: WebAssistPageScope = 'browser', options: {
-  /** The user approved this exact control for this page in a host dialog. */
-  grantedProtectedAction?: boolean;
   /** Prepare a checked pointer target for the host's native input path. */
   preparePointer?: boolean;
 } = {}): string {
@@ -386,8 +367,7 @@ export function buildWebAssistActionScript(input: {
   return String.raw`
 (() => {
   const request = ${payload};
-  const protectHighImpactActions = ${scope !== 'connector_setup'};
-  const grantedProtectedAction = ${options.grantedProtectedAction === true};
+
   const preparePointer = ${options.preparePointer === true};
   const normalize = (value, cap = 240) => String(value == null ? '' : value)
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
@@ -421,37 +401,26 @@ export function buildWebAssistActionScript(input: {
     );
   };
   const sensitiveControl = (element) => {
-    if (element.tagName.toLowerCase() !== 'input') return false;
     const type = String(element.type || '').toLowerCase();
-    const autocomplete = String(element.autocomplete || '').toLowerCase().split(/\s+/).filter(Boolean);
+    const autocomplete = String(element.autocomplete || element.getAttribute('autocomplete') || '').toLowerCase().split(/\s+/).filter(Boolean);
     return type === 'password'
       || autocomplete.includes('current-password')
       || autocomplete.includes('new-password')
       || autocomplete.includes('one-time-code')
       || autocomplete.some((token) => token.startsWith('cc-'));
   };
-  const submitControl = (element) => {
-    const tag = element.tagName.toLowerCase();
-    const type = String(element.type || '').toLowerCase();
-    return (tag === 'button' && type === 'submit')
-      || (tag === 'input' && (type === 'submit' || type === 'image'));
-  };
-${HIGH_IMPACT_CONTROL_SCRIPT}
-  const sensitiveFormSubmission = (element) => {
-    if (!submitControl(element) || !element.form || !element.form.elements) return false;
-    return Array.from(element.form.elements).some((control) => (
-      control instanceof Element && sensitiveControl(control)
-    ));
-  };
-  if (request.action === 'scroll') {
+  if (request.action === 'scroll' && !request.ref) {
     const distance = Math.max(240, Math.floor(window.innerHeight * 0.72));
     if (request.direction === 'top') window.scrollTo({ top: 0, behavior: 'instant' });
     else if (request.direction === 'bottom') window.scrollTo({ top: document.documentElement.scrollHeight, behavior: 'instant' });
-    else window.scrollBy({ top: request.direction === 'up' ? -distance : distance, behavior: 'instant' });
+    else window.scrollBy({ top: ['left', 'right'].includes(request.direction) ? 0 : request.direction === 'up' ? -distance : distance, left: request.direction === 'left' ? -distance : request.direction === 'right' ? distance : 0, behavior: 'instant' });
     return { ok: true, outcome: 'acted', action: request.action };
   }
-  const element = resolvePath(request.ref.path);
-  if (!element) return { ok: false, code: 'stale_element', error: 'The page changed; observe it again.' };
+  if (request.ref?.documentToken && request.ref.documentToken !== globalThis.__orkasBrowserNodes?.token) return { ok: false, code: 'stale_element', error: 'The page changed; observe it again.' };
+  const element = request.ref.identity
+    ? globalThis.__orkasBrowserNodes?.refs.get(request.ref.identity)?.deref()
+    : resolvePath(request.ref.path);
+  if (!element || element.isConnected === false) return { ok: false, code: 'stale_element', error: 'The page changed; observe it again.' };
   const current = {
     tag: element.tagName.toLowerCase(),
     type: normalize(element.getAttribute('type') || element.type, 40).toLowerCase(),
@@ -460,8 +429,40 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
   };
   const expected = request.ref.signature;
   if (current.tag !== expected.tag || current.type !== expected.type || current.role !== expected.role
-      || (expected.label && current.label !== expected.label)) {
+      || (!request.ref.identity && expected.label && current.label !== expected.label)) {
     return { ok: false, code: 'stale_element', error: 'The page changed; observe it again.' };
+  }
+  const optionDisabled = option => option.disabled
+    || (option.parentElement?.tagName === 'OPTGROUP' && option.parentElement.disabled);
+  if (request.action === 'options') {
+    if (current.tag !== 'select' || sensitiveControl(element)) return { ok: false, code: 'unsupported_element', error: 'This control does not expose selectable options.' };
+    const start = Math.min(Number(request.optionOffset || 0), element.options.length);
+    const options = Array.from(element.options).slice(start, start + 80).map((option, index) => ({ index: start + index, label: normalize(option.label || option.text, 160), value: option.value, selected: option.selected, disabled: optionDisabled(option) }));
+    return { ok: true, options, multiple: element.multiple, option_count: element.options.length, option_next_offset: start + options.length < element.options.length ? start + options.length : null, untrusted_content: true };
+  }
+  if (request.action === 'read_value') {
+    if (sensitiveControl(element) || (current.tag === 'input' && ['hidden', 'file'].includes(current.type))) {
+      return { ok: false, code: 'value_not_readable', error: 'This field does not expose its value.' };
+    }
+    if (!['input', 'textarea', 'select'].includes(current.tag) && !element.isContentEditable) {
+      return { ok: false, code: 'unsupported_element', error: 'This control has no form value.' };
+    }
+    const value = String(element.isContentEditable ? element.innerText : element.value);
+    const offset = Number(request.textOffset || 0);
+    if (offset > value.length) return { ok: false, code: 'invalid_offset', value_total: value.length, error: 'The offset is past the field value.' };
+    const text = value.slice(offset, offset + 6000);
+    const end = offset + text.length;
+    return { ok: true, value: text, value_offset: offset, value_total: value.length,
+      value_next_offset: end < value.length ? end : null, value_truncated: end < value.length,
+      ...(current.tag === 'select' ? { selected_options: Array.from(element.selectedOptions || []).slice(0, 30).map(option => normalize(option.label || option.text, 160)) } : {}),
+      untrusted_content: true };
+  }
+  if (request.action === 'scroll') {
+    const distance = Math.max(240, Math.floor(element.clientHeight * 0.72));
+    if (request.direction === 'top') element.scrollTo({ top: 0, behavior: 'instant' });
+    else if (request.direction === 'bottom') element.scrollTo({ top: element.scrollHeight, behavior: 'instant' });
+    else element.scrollBy({ top: ['left', 'right'].includes(request.direction) ? 0 : request.direction === 'up' ? -distance : distance, left: request.direction === 'left' ? -distance : request.direction === 'right' ? distance : 0, behavior: 'instant' });
+    return { ok: true, outcome: 'acted', action: 'scroll' };
   }
   if (element.disabled || element.getAttribute('aria-disabled') === 'true') {
     return { ok: false, code: 'element_disabled', error: 'This element is disabled.' };
@@ -482,42 +483,19 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
     if (!hit || (hit !== element && !element.contains(hit))) return { ok: false, code: 'element_obscured', error: 'Another element covers this control.' };
     return { ok: true, pointer: { x, y, width: window.innerWidth, height: window.innerHeight } };
   };
-  if (request.action === 'click' || request.action === 'drag') {
-    const isFile = current.tag === 'input' && current.type === 'file';
-    if (request.action === 'drag' && sensitiveControl(element)) {
-      return { ok: false, code: 'user_action_required', reason: 'sensitive_input', error: 'The user must complete this action directly in Web Assist.' };
-    }
-    // Ordinary submissions run on their own; what is left for the user is a
-    // high-impact control, and a host approval releases exactly that. It never
-    // releases a submission carrying a password, OTP or card number.
-    const isSubmission = sensitiveFormSubmission(element);
-    const isHighImpact = protectHighImpactActions && !grantedProtectedAction && highImpactControl(element);
-    if (isFile || isSubmission || isHighImpact) {
-      return {
-        ok: false,
-        code: 'user_action_required',
-        reason: isFile
-          ? 'file_upload'
-          : (isHighImpact ? 'high_impact_action'
-            : 'sensitive_form_submission'),
-        error: 'The user must complete this action directly in Web Assist.',
-      };
-    }
+  if (['click', 'drag', 'hover', 'double_click', 'right_click'].includes(request.action)) {
     if (preparePointer) return pointerTarget();
     if (request.action === 'drag') return { ok: false, code: 'invalid_action', error: 'Drag requires native page input.' };
     element.focus();
     element.click();
     return { ok: true, outcome: 'acted', action: request.action };
   }
+  if (request.action === 'press') { element.focus(); return { ok: true, outcome: 'focused' }; }
+  if (request.action === 'upload') {
+    if (current.tag !== 'input' || current.type !== 'file') return { ok: false, code: 'unsupported_element', error: 'This control is not a file input.' };
+    return element;
+  }
   if (request.action === 'fill') {
-    if (sensitiveControl(element)) {
-      return {
-        ok: false,
-        code: 'user_action_required',
-        reason: 'sensitive_input',
-        error: 'The user must enter this value directly in Web Assist.',
-      };
-    }
     const text = String(request.text == null ? '' : request.text);
     const inputFillable = current.tag === 'input'
       && !['button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'hidden', 'image'].includes(current.type);
@@ -529,12 +507,12 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
     // Focus first, then recheck the target before changing any text.
     element.focus();
     const active = element.getRootNode().activeElement;
-    if (active !== element || !element.isConnected || sensitiveControl(element)
+    if (active !== element || !element.isConnected
         || element.disabled || element.readOnly || String(element.type || '').toLowerCase() !== current.type) {
       return { ok: false, code: 'stale_element', error: 'The field changed while focusing; observe it again.' };
     }
     const textEntry = current.tag === 'textarea' || element.isContentEditable
-      || (current.tag === 'input' && ['text', 'search', 'tel', 'url', 'email', 'number'].includes(current.type));
+      || (current.tag === 'input' && ['text', 'password', 'search', 'tel', 'url', 'email', 'number'].includes(current.type));
     if (current.tag === 'textarea' && text.length > 2000) {
       // Large multiline insertText commands repeatedly relayout textareas.
       // Use the native value setter and the input event consumed by controlled fields.
@@ -580,14 +558,25 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
   }
   if (request.action === 'select') {
     if (current.tag !== 'select') return { ok: false, code: 'unsupported_element', error: 'This is not a select field.' };
-    const expectedOption = String(request.text == null ? '' : request.text);
+    const requested = Array.isArray(request.values) ? request.values : [String(request.text == null ? '' : request.text)];
+    if (!requested.length || (!element.multiple && requested.length !== 1)) return { ok: false, code: 'invalid_selection', error: 'Choose one option unless this field allows multiple selections.' };
     const options = Array.from(element.options || []);
-    const matches = options.filter((option) => normalize(option.label || option.text, 160) === expectedOption || option.value === expectedOption);
-    if (matches.length !== 1) return { ok: false, code: 'option_not_unique', error: 'Choose one exact option from a fresh observation.' };
-    element.value = matches[0].value;
+    const selected = [];
+    for (const value of requested) {
+      const exact = options.filter(option => option.value === value);
+      const matches = exact.length ? exact : options.filter(option => normalize(option.label || option.text, 160) === value);
+      if (matches.length !== 1) return { ok: false, code: 'option_not_unique', error: 'Use one exact option value from options.' };
+      if (optionDisabled(matches[0])) return { ok: false, code: 'element_disabled', error: 'This option is disabled.' };
+      selected.push(matches[0]);
+    }
+    for (const option of options) option.selected = selected.includes(option);
     element.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
     element.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-    return { ok: true, outcome: 'acted', action: request.action };
+    return Promise.resolve().then(() => {
+      const actual = Array.from(element.options || []).filter(option => option.selected);
+      if (!element.isConnected || actual.length !== selected.length || selected.some(option => !actual.includes(option))) return { ok: false, code: 'selection_rejected', error: 'The page did not retain the requested selection.' };
+      return { ok: true, outcome: 'acted', action: request.action };
+    });
   }
   if (request.action === 'check' || request.action === 'uncheck') {
     if (current.tag !== 'input' || !['checkbox', 'radio'].includes(current.type)) {
@@ -598,14 +587,6 @@ ${HIGH_IMPACT_CONTROL_SCRIPT}
       return { ok: false, code: 'unsupported_element', error: 'A radio control cannot be unchecked directly.' };
     }
     if (Boolean(element.checked) !== desired) {
-      if (protectHighImpactActions && !grantedProtectedAction && highImpactControl(element)) {
-        return {
-          ok: false,
-          code: 'user_action_required',
-          reason: 'high_impact_action',
-          error: 'The user must complete this action directly in Web Assist.',
-        };
-      }
       if (preparePointer) return pointerTarget();
       element.click();
     }
@@ -647,12 +628,13 @@ export function sanitizeWebAssistObservation(
   const hrefs = new Set<string>();
   for (const row of rows) {
     const href = row && typeof row.href === 'string' ? row.href.trim() : '';
-    if (href) hrefs.add(href.slice(0, 320));
+    if (href) hrefs.add(href);
   }
   const elements = rows.flatMap((row, index) => {
     if (!row || !Array.isArray(row.path) || !row.signature) return [];
     const ref = `e${elementOffset + index + 1}`;
     refs.set(ref, {
+      ...(Number.isInteger(row.identity) ? { identity: row.identity, documentToken: row.documentToken } : {}),
       path: row.path.filter((part) => Number.isInteger(part)).slice(0, 80),
       signature: {
         tag: String(row.signature.tag || '').slice(0, 40),
@@ -661,23 +643,32 @@ export function sanitizeWebAssistObservation(
         label: String(row.signature.label || '').slice(0, 240),
       },
     });
-    return [{
-      ref,
-      tag: String(row.tag || '').slice(0, 40),
-      role: String(row.role || '').slice(0, 40),
-      label: String(row.label || '').slice(0, 240),
-      input_type: String(row.input_type || '').slice(0, 40),
-      placeholder: String(row.placeholder || '').slice(0, 160),
-      href: String(row.href || '').slice(0, 320),
-      disabled: row.disabled === true,
-      checked: typeof row.checked === 'boolean' ? row.checked : null,
-      sensitive: row.sensitive === true,
-      fillable: row.fillable === true,
-      requires_user_action: row.requires_user_action === true,
-      options: Array.isArray(row.options)
-        ? row.options.slice(0, 30).map((option) => String(option).slice(0, 160))
-        : [],
-    }];
+    // Only values that differ from the default are sent: an absent text field
+    // is empty, an absent flag is false and an absent `checked` means the
+    // element is not a checkbox or radio. Defaults were about half of an
+    // observation's tokens and carried no information.
+    const tag = String(row.tag || '').slice(0, 40);
+    const element: Record<string, unknown> = { ref, tag };
+    const setText = (key: string, value: unknown, cap?: number) => {
+      const text = cap === undefined ? String(value || '') : String(value || '').slice(0, cap);
+      if (text) element[key] = text;
+    };
+    setText('role', row.role, 40);
+    setText('label', row.label, 240);
+    setText('input_type', row.input_type, 40);
+    setText('placeholder', row.placeholder, 160);
+    setText('href', row.href);
+    if (row.disabled === true) element.disabled = true;
+    if (typeof row.checked === 'boolean') element.checked = row.checked;
+    if (row.sensitive === true) element.sensitive = true;
+    if (row.fillable === true) element.fillable = true;
+    // A select reports its option count even when it is empty.
+    if (tag === 'select' && Number.isInteger(row.option_count)) element.option_count = row.option_count;
+    const options = Array.isArray(row.options)
+      ? row.options.slice(0, 30).map((option) => String(option).slice(0, 160))
+      : [];
+    if (options.length) element.options = options;
+    return [element];
   });
   return {
     publicSnapshot: {

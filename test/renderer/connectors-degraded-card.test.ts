@@ -1,4 +1,5 @@
 import { composerAccessorSource } from './composer-test-source';
+import { conversationCacheSource } from './conversation-cache-test-source';
 /**
  * A connector that cannot reach its backend must never render as "已连接".
  *
@@ -56,6 +57,27 @@ function makeElement(tag: string): any {
   return el;
 }
 
+// Exercise the visible menu and its click handlers without launching real OAuth.
+function openCardMenu(ctx: any, entry: any, instance: any) {
+  const pop = makeElement('div');
+  const items = new Map<string, any>();
+  pop.remove = vi.fn();
+  pop.getBoundingClientRect = () => ({ width: 160, height: 120 });
+  pop.querySelectorAll = () => [...pop.innerHTML.matchAll(/data-act="([^"]+)"/g)].map((match: any) => {
+    const item: any = { dataset: { act: match[1] }, addEventListener: (_: string, click: () => void) => { item.click = click; } };
+    items.set(match[1], item);
+    return item;
+  });
+  ctx.document.querySelector = () => null;
+  ctx.document.createElement = () => pop;
+  ctx._runConnect = vi.fn();
+  ctx._quickDisconnect = vi.fn();
+  ctx._toggleConnectorEnabled = vi.fn();
+  ctx._openCardMenu({ closest: () => null, setAttribute: vi.fn(),
+    getBoundingClientRect: () => ({ right: 300, bottom: 100, top: 70 }) }, entry, instance);
+  return { pop, items };
+}
+
 describe('connector setup assistance', () => {
   it('keeps private IPC errors out of catalog, verification and install logs while retaining recovery', async () => {
     const privateError = new Error('private-shop-token https://private-shop.example/orders');
@@ -111,18 +133,43 @@ describe('connector setup assistance', () => {
     expect(ctx._assistConnectorSetup).toHaveBeenCalledTimes(outcome === 'assist' ? 1 : 0);
   });
 
-  it.each(['feishu', 'dingtalk', 'wecom'])('shows %s missing permissions alongside both Use and Reauthorize', id => {
+  it.each(['feishu', 'lark', 'dingtalk', 'wecom', 'xero'])('keeps %s usable without card permission warnings', id => {
     const ctx = loadConnectorsRenderer();
-    ctx.t = (key: string, args: any = {}) => `${key} ${args.permissions || ''}`.trim();
-    const entry = { id, display_name: 'Lark', auth_mode: 'local_cli' };
-    const card = ctx._renderCatalogCard(entry, { id, status: { kind: 'connected' },
-      reauthorization_required: true, missing_permissions: id === 'wecom' ? [] : [id === 'feishu' ? 'im:message.send_as_user' : 'chat.message:send'] });
-    expect(card.innerHTML).toContain('data-act="use-connector"');
-    expect(card.innerHTML).toContain('connectors.action.authorize_permissions');
-    expect(card.querySelector('[data-role="permission-notice"]').textContent)
-      .toBe(id === 'wecom' ? 'connectors.permissions.limited' : 'connectors.permissions.missing connectors.permissions.send_as_user');
-    const ordinary = ctx._renderCatalogCard(entry, { id, status: { kind: 'connected' } });
-    expect(ordinary.innerHTML).not.toContain('permission-notice');
+    const entry = { id, display_name: id, auth_mode: 'local_cli' };
+    for (const scopes of [[], ['vc:meeting.realtime:read'], Array.from({ length: 208 }, (_, i) => `fixture:scope${i}`)]) {
+      const card = ctx._renderCatalogCard(entry, { id, status: { kind: 'connected' },
+        reauthorization_required: true, missing_permissions: scopes });
+      expect(card.innerHTML).toContain('data-act="use-connector"');
+      expect(card.innerHTML).toContain('data-act="menu"');
+      expect(card.innerHTML).not.toMatch(/permission-notice|connectors.permissions|authorize_permissions|data-act="connect"/);
+    }
+  });
+
+  it.each([false, true])('offers explicit menu reauthorization with permission deficiency=%s', required => {
+    const ctx = loadConnectorsRenderer();
+    const entry = { id: 'feishu', display_name: 'Feishu', auth_mode: 'local_cli' };
+    const instance = { id: entry.id, enabled: false, status: { kind: 'connected' }, reauthorization_required: required };
+    const { pop, items } = openCardMenu(ctx, entry, instance);
+    expect(pop.innerHTML).toContain('connectors.action.authorize_permissions');
+    expect(pop.innerHTML).toContain('component.enable');
+    expect(pop.innerHTML).toContain('data-act="disconnect"');
+    expect(ctx._runConnect).not.toHaveBeenCalled();
+    items.get('reauthorize').click();
+    expect(pop.remove).toHaveBeenCalledOnce();
+    expect(ctx._runConnect).toHaveBeenCalledExactlyOnceWith(entry);
+    expect(ctx._toggleConnectorEnabled).not.toHaveBeenCalled();
+    expect(ctx._quickDisconnect).not.toHaveBeenCalled();
+  });
+
+  it('keeps non-CLI menu actions intact', () => {
+    const ctx = loadConnectorsRenderer();
+    const entry = { id: 'gcal', auth_mode: 'server_bridge' };
+    const instance = { id: entry.id, enabled: true, status: { kind: 'connected' } };
+    const { pop, items } = openCardMenu(ctx, entry, instance);
+    expect(pop.innerHTML).not.toContain('reauthorize');
+    items.get('toggle-enabled').click();
+    expect(ctx._toggleConnectorEnabled).toHaveBeenCalledExactlyOnceWith(entry, instance, false);
+    expect(ctx._runConnect).not.toHaveBeenCalled();
   });
 
   it.each(['check_bot_availability', 'check_app_permissions', 'check_resource_access'])(
@@ -136,23 +183,11 @@ describe('connector setup assistance', () => {
       expect(card.querySelector('[data-role="access-notice"]').textContent).toBe('connectors.permissions.' + recovery);
       const mixed = ctx._renderCatalogCard(entry, { ...instance, reauthorization_required: true,
         missing_permissions: ['im:message.send_as_user'] });
-      expect(mixed.innerHTML).toContain('connectors.action.authorize_permissions');
-      expect(mixed.innerHTML).toContain('data-role="permission-notice"');
+      expect(mixed.innerHTML).not.toContain('connectors.action.authorize_permissions');
+      expect(mixed.innerHTML).not.toContain('data-role="permission-notice"');
       expect(mixed.querySelector('[data-role="access-notice"]').textContent).toBe('connectors.permissions.' + recovery);
     },
   );
-
-  it('names DingTalk message permission and preserves unknown identifiers as text', () => {
-    const ctx = loadConnectorsRenderer();
-    ctx.t = (key: string, args: any = {}) => `${key} ${args.permissions || ''}`.trim();
-    const card = ctx._renderCatalogCard({ id: 'dingtalk', display_name: 'DingTalk', auth_mode: 'local_cli' },
-      { id: 'dingtalk', status: { kind: 'connected' }, reauthorization_required: true,
-        missing_permissions: ['chat.message:send', 'mail:send', 'calendar.event:get'] });
-    expect(card.querySelector('[data-role="permission-notice"]').textContent)
-      .toBe('connectors.permissions.missing connectors.permissions.send_as_user, connectors.permissions.send_mail, calendar.event:get');
-    expect(card.innerHTML).toContain('data-act="use-connector"');
-    expect(card.innerHTML).toContain('connectors.action.authorize_permissions');
-  });
 
   const complex = {
     id: 'seller-app', display_name: 'Seller', auth_mode: 'local_api',
@@ -171,20 +206,20 @@ describe('connector setup assistance', () => {
     ctx.window.focusConnectorById = vi.fn(async () => true);
     const html = ctx._renderCatalogCard(entry, instance).innerHTML;
     expect(html).toContain('data-act="use-connector"');
-    expect(html.includes('connectors.action.authorize_permissions')).toBe(required);
+    expect(html).not.toContain('connectors.action.authorize_permissions');
     expect(await ctx.window.openConnectorSetupById(entry.id)).toBe(true);
     expect(ctx._runConnect).toHaveBeenCalledTimes(required ? 1 : 0);
     expect(ctx.window.focusConnectorById).toHaveBeenCalledExactlyOnceWith(entry.id);
   });
 
-  it.each(['error', 'degraded'])('offers reauthorization from a %s CLI connection', kind => {
+  it.each(['error', 'degraded'])('keeps %s CLI recovery separate from missing permissions', kind => {
     const ctx = loadConnectorsRenderer();
     const entry = { id: 'dingtalk', display_name: 'DingTalk', auth_mode: 'local_cli' };
     const html = ctx._renderCatalogCard(entry, {
       id: entry.id, status: { kind }, reauthorization_required: true,
     }).innerHTML;
-    expect(html).toContain('data-act="connect"');
-    expect(html).toContain('connectors.action.authorize_permissions');
+    expect(html).not.toContain('connectors.action.authorize_permissions');
+    expect(html).toContain(kind === 'degraded' ? 'data-act="retry-degraded"' : 'data-act="connect"');
   });
 
   it('offers assistance inside extra-setup panels while catalog cards and unavailable entries keep their normal actions', () => {
@@ -242,8 +277,12 @@ describe('connector setup assistance', () => {
       assistance: { kind: 'connector_setup', connector_id: 'seller-app' },
     });
     expect(ready).not.toHaveBeenCalled();
+    // A concurrent list read can see the persisted setup conversation before
+    // its creation receipt. The assist entry must reuse that one cached row.
+    ctx._appendConversationSlice([{ conversation_id: 'fresh-task', title: 'Loaded setup task', processing: true }]);
     completeCreate({ json: async () => ({ ok: true, conversation: { conversation_id: 'fresh-task' } }) });
     await pending;
+    expect(ctx.conversations).toEqual([{ conversation_id: 'fresh-task', title: 'Loaded setup task', processing: true }]);
     expect(ctx.setView).toHaveBeenCalledWith('conversation', 'fresh-task', { skipLoad: true });
     expect(ctx.setChatRecipient).toHaveBeenCalledWith('conversation', { kind: 'commander' });
     expect(ready).toHaveBeenCalledOnce();
@@ -419,6 +458,7 @@ function loadConnectorsRenderer(
   context.window.globalThis = context.globalThis;
   vm.createContext(context);
   vm.runInContext(composerAccessorSource, context);
+  vm.runInContext(conversationCacheSource, context);
   vm.runInContext(code, context, { filename: 'connectors.js' });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/connector-action-dialog.js'), 'utf8'), context);
   // `_connectorsState` is a top-level `let`, so it is NOT a property of the context object (only
@@ -1362,6 +1402,30 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx.isConnectorLive(entry.id)).toBe(false);
   });
 
+  // connectors.list sends a tool count, not the schemas. A local CLI row that
+  // once listed tools but has no cache timestamp (an older stored row) is a
+  // previously usable connector, so its failure stays a real service error.
+  it('treats a failed local CLI connector with listed tools as a service error', async () => {
+    const entry = {
+      id: 'dingtalk', display_name: 'DingTalk', auth_mode: 'local_cli',
+      local_cli: { executable: 'dws' },
+    };
+    const instance = {
+      id: entry.id, tools_count: 3, tools_cached_at: 0,
+      status: { kind: 'error', message: 'connection failed' },
+    };
+    const invoke = vi.fn(async (channel: string) => {
+      if (channel === 'connectors.catalog') return { ok: true, catalog: [entry] };
+      if (channel === 'connectors.list') return { ok: true, instances: [instance] };
+      return { ok: true };
+    });
+    const ctx = loadConnectorsRenderer(invoke);
+    await ctx.loadConnectors();
+    const card = ctx._renderCatalogCard(entry, ctx._instanceById(entry.id)).innerHTML;
+    expect(card).toContain('connector-card-error');
+    expect(card).not.toContain('>connectors.action.connect</button>');
+  });
+
   it('leaves an unfinished DingTalk setup available after restart and reports a new failure once', async () => {
     const entry = {
       id: 'dingtalk', display_name: 'DingTalk', auth_mode: 'local_cli',
@@ -1458,10 +1522,9 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
     expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('disabled');
 
-    // Opening the system browser moves focus away from Orkas. Only the short launch spinner is
-    // cleared; the accepted attempt remains correlated for callback/result telemetry.
+    // Opening the system browser must not interrupt feedback for the accepted attempt.
     ctx.__emitWindow('blur');
-    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
 
     ctx.__emitPush('connectors:oauth-callback', {
       attempt_id: 'attempt-loading',
@@ -1471,6 +1534,8 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('connectors.action.connecting');
     ctx.__advanceTimers(2000);
     expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
+    await ctx._runConnect(entry);
+    expect(invoke.mock.calls.filter(([channel]) => channel === 'connectors.start_oauth')).toHaveLength(1);
 
     // A stale terminal event must not clear the active callback's feedback.
     ctx.__emitPush('connectors:oauth-result', {
@@ -1492,7 +1557,7 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx.__events).toEqual([]);
   });
 
-  it('throttles clicks for two seconds while keeping launch loading visible until window blur', async () => {
+  it('throttles clicks for two seconds and keeps loading through blur and replacement attempts', async () => {
     const resolveStarts: Array<(value: unknown) => void> = [];
     const invoke = vi.fn((channel: string) => {
       if (channel === 'connectors.start_oauth') {
@@ -1528,7 +1593,91 @@ describe('connectors panel — degraded cards never claim 已连接', () => {
     expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
     expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('disabled');
     ctx.__emitWindow('blur');
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
+    ctx.__emitPush('connectors:oauth-callback', { attempt_id: 'attempt-old', catalog_id: entry.id });
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('disabled');
+    ctx.__emitPush('connectors:oauth-result', {
+      attempt_id: 'attempt-old', catalog_id: entry.id, result: 'cancelled', code: 'flow_timeout',
+    });
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
+    ctx.__emitPush('connectors:oauth-result', {
+      attempt_id: 'attempt-retry', catalog_id: entry.id, result: 'cancelled', code: 'flow_timeout',
+    });
     expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
+    expect(ctx.__alerts).toEqual([]);
+    expect(ctx.__events).toEqual([]);
+  });
+
+  it.each([false, true])('silently clears expired authorization (callback received=%s) and lets the user retry', async callback => {
+    let attempt = 0;
+    const invoke = vi.fn(async channel => channel === 'connectors.start_oauth'
+      ? { ok: true, started: true, attempt_id: `attempt-${++attempt}` } : { ok: true });
+    const ctx = loadConnectorsRenderer(invoke);
+    const entry = { id: 'github', display_name: 'GitHub' };
+    await ctx._runConnect(entry);
+    if (callback) ctx.__emitPush('connectors:oauth-callback', { attempt_id: 'attempt-1', catalog_id: entry.id });
+    ctx.__emitPush('connectors:oauth-result', {
+      attempt_id: 'attempt-1', catalog_id: entry.id, result: 'cancelled', code: 'flow_timeout',
+    });
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
+    expect(ctx.__alerts).toEqual([]);
+    expect(ctx.__events).toEqual([]);
+    expect(ctx.__errors).toEqual([]);
+    await ctx._runConnect(entry);
+    expect(attempt).toBe(2);
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).toContain('is-loading');
+    ctx.__emitPush('connectors:oauth-callback', { attempt_id: 'attempt-1', catalog_id: entry.id });
+    expect(ctx.__events).toEqual([]);
+  });
+
+  it('keeps custom authorization loading through retry, ignores the older expiry and finishes silently', async () => {
+    let attempt = 0;
+    const invoke = vi.fn(async channel => channel === 'connectors.authorize_custom'
+      ? { ok: true, started: true, attempt_id: `custom-${++attempt}` } : { ok: true });
+    const ctx = loadConnectorsRenderer(invoke);
+    const entry = { id: 'custom-fixture', display_name: 'Fixture', _custom: true };
+    const instance = { id: entry.id, origin: 'custom', custom_auth_mode: 'oauth', status: { kind: 'error' } };
+    await ctx._authorizeCustom(entry, instance);
+    await ctx._authorizeCustom(entry, instance);
+    expect(attempt).toBe(1);
+    ctx.__emitWindow('blur');
+    expect(ctx._renderCatalogCard(entry, instance).innerHTML).toContain('is-loading');
+    ctx.__advanceTimers(2000);
+    await ctx._authorizeCustom(entry, instance);
+    expect(attempt).toBe(2);
+    ctx.__emitPush('connectors:oauth-result', {
+      attempt_id: 'custom-1', catalog_id: entry.id, result: 'cancelled', code: 'flow_timeout',
+    });
+    expect(ctx._renderCatalogCard(entry, instance).innerHTML).toContain('is-loading');
+    ctx.__emitPush('connectors:oauth-callback', { attempt_id: 'custom-2', catalog_id: entry.id });
+    ctx.__advanceTimers(2000);
+    await ctx._authorizeCustom(entry, instance);
+    expect(attempt).toBe(2);
+    ctx.__emitPush('connectors:oauth-result', {
+      attempt_id: 'custom-2', catalog_id: entry.id, result: 'cancelled', code: 'flow_timeout',
+    });
+    expect(ctx._renderCatalogCard(entry, instance).innerHTML).not.toContain('is-loading');
+    expect(ctx.__alerts).toEqual([]);
+    expect(ctx.__events).toEqual([]);
+  });
+
+  it.each(['launch', 'exchange', 'structured'])('clears loading without an alert after a %s request timeout', async phase => {
+    const invoke = vi.fn(async () => phase === 'launch'
+      ? { ok: false, code: 'E_NETWORK_TIMEOUT', error: 'request timed out' }
+      : phase === 'structured' ? { ok: false, code: 'E_NETWORK_TIMEOUT', error: '请求超时' }
+      : { ok: true, started: true, attempt_id: 'timed-out' });
+    const ctx = loadConnectorsRenderer(invoke);
+    const entry = { id: 'github', display_name: 'GitHub' };
+    await ctx._runConnect(entry);
+    if (phase === 'exchange') {
+      ctx.__emitPush('connectors:oauth-callback', { attempt_id: 'timed-out', catalog_id: entry.id });
+      ctx.__emitPush('connectors:oauth-result', {
+        attempt_id: 'timed-out', catalog_id: entry.id, result: 'failure',
+        code: 'exchange_failed', error: 'exchange request timed out',
+      });
+    }
+    expect(ctx._renderCatalogCard(entry, null).innerHTML).not.toContain('is-loading');
+    expect(ctx.__alerts).toEqual([]);
   });
 
   it('reports an asynchronous user cancellation without an error or alert', async () => {

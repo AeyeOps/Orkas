@@ -101,4 +101,6 @@ fi
 # This is ANGLE fallback noise when probing driver attributes and has no
 # functional impact. Filter only that stderr line; pass through everything else.
 # If `unbuffer` is unavailable, default line buffering is fine (macOS bash built-in).
-exec npm run start:electron 2> >(grep -v --line-buffered "EGL Driver message" >&2)
+# Dependencies are already prepared above; npm's prestart:electron would run
+# the entire preparation a second time before starting the same Electron CLI.
+exec node "$APP_DIR/node_modules/electron/cli.js" . 2> >(grep -v --line-buffered "EGL Driver message" >&2)

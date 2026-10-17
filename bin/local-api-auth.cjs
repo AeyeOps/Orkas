@@ -123,7 +123,8 @@ async function taobaoApi(appKey, appSecret, session, method, parameters = {}) {
     sign_method: 'hmac-sha256', format: 'json', simplify: 'true', ...parameters,
   };
   form.sign = signTaobao(form, appSecret);
-  return readJson(await postForm(TAOBAO_API_URL, form), 'Taobao seller verification');
+  return readJson(await postForm(TAOBAO_API_URL, form), 'Taobao seller verification',
+    method === 'taobao.user.seller.get' ? text => parseMerchantIdentityJson(text, ['user_id']) : JSON.parse);
 }
 
 function encode1688Parameter(value) {
@@ -142,7 +143,7 @@ async function alibaba1688Api(appKey, appSecret, accessToken, namespace, name, p
   form._aop_signature = sign1688(pathName, form, appSecret);
   const result = await readJson(await postForm(`https://gw.open.1688.com/openapi/${pathName}`, Object.fromEntries(
     Object.entries(form).map(([key, value]) => [key, encode1688Parameter(value)]),
-  )), '1688 seller verification');
+  )), '1688 seller verification', text => parseMerchantIdentityJson(text, ['memberId', 'aliId']));
   if (result.success === false) throw new Error(`1688 seller verification failed: ${String(result.errorMessage || result.errorCode || 'unknown error').slice(0, 160)}`);
   return result;
 }
@@ -163,7 +164,8 @@ async function jdApi(appKey, appSecret, accessToken, method, parameters = {}) {
     '360buy_param_json': JSON.stringify(parameters), v: '2.0',
   };
   form.sign = signJd(form, appSecret);
-  const result = await readJson(await postForm(JD_API_URL, form), 'JD.com seller verification');
+  const result = await readJson(await postForm(JD_API_URL, form), 'JD.com seller verification',
+    text => parseMerchantIdentityJson(text, ['vender_id', 'venderId', 'shop_id', 'shopId']));
   if (result.error_response) {
     throw new Error(`JD.com seller verification failed: ${String(result.error_response.code || 'provider error').slice(0, 80)}`);
   }
@@ -196,7 +198,7 @@ async function pinduoduoApi(clientId, clientSecret, accessToken, type, parameter
   form.sign = signPinduoduo(form, clientSecret);
   const result = await readJson(await postForm(PINDUODUO_API_URL, Object.fromEntries(
     Object.entries(form).map(([key, value]) => [key, encodePinduoduoParameter(value)]),
-  )), 'Pinduoduo seller verification');
+  )), 'Pinduoduo seller verification', parsePinduoduoIdentityJson);
   if (result.error_response) {
     throw new Error(`Pinduoduo seller verification failed: ${String(result.error_response.error_code || 'provider error').slice(0, 80)}`);
   }
@@ -234,7 +236,8 @@ async function douyinApi(appKey, appSecret, accessToken, pathName, method, param
     body: paramJson,
     redirect: 'error', signal: AbortSignal.timeout(60_000),
   });
-  const result = await readJson(response, label);
+  const result = await readJson(response, label, ['token.create', 'token.refresh', 'open.getAuthInfo'].includes(method)
+    ? text => parseMerchantIdentityJson(text, ['shop_id', 'auth_id', 'authority_id']) : JSON.parse);
   if (result.code !== undefined && Number(result.code) !== 10000) {
     throw new Error(`${label} failed: ${String(result.message || result.msg || result.code || 'provider error').slice(0, 160)}`);
   }
@@ -242,6 +245,23 @@ async function douyinApi(appKey, appSecret, accessToken, pathName, method, param
 }
 
 // Official merchant identity and grant fields are shared by initial and rotated grants.
+function parseMerchantIdentityJson(text, keys, label = 'platform', strictNumeric = false) {
+  const fields = new Set(keys);
+  return JSON.parse(text, (key, value, context) => {
+    if (fields.has(key) && typeof value === 'number' && !Number.isSafeInteger(value)
+        && (strictNumeric || Number.isInteger(value) || !Number.isFinite(value))) {
+      // Compare the independently issued identities before Number rounding can
+      // make neighboring merchants equal. Other response fields keep their types.
+      if (!context?.source || !/^-?[0-9]+$/.test(context.source)) throw new Error(`Invalid ${label} merchant identifier`);
+      return context.source;
+    }
+    return value;
+  });
+}
+function parsePinduoduoIdentityJson(text) {
+  return parseMerchantIdentityJson(text, ['owner_id', 'mall_id'], 'Pinduoduo', true);
+}
+
 function parseKuaishouIdentityJson(text) {
   return JSON.parse(text, (key, value, context) => {
     if (key === 'sellerId' && typeof value === 'number' && !Number.isSafeInteger(value)) {
@@ -330,7 +350,7 @@ async function youzanAuthToken(clientId, clientSecret, kdtId, refresh = false) {
       grant_id: kdtId, refresh: Boolean(refresh),
     }),
     redirect: 'error', signal: AbortSignal.timeout(60_000),
-  }), 'Youzan token');
+  }), 'Youzan token', text => parseMerchantIdentityJson(text, ['authority_id']));
   const token = result.data || result;
   if (!token.access_token || String(token.authority_id || '') !== String(kdtId)) {
     throw new Error('Youzan token returned incomplete credentials or a different shop');
@@ -344,7 +364,8 @@ async function youzanAuthApi(accessToken, method, version, parameters = {}) {
   const result = await readJson(await fetch(url, {
     method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json' },
     body: JSON.stringify(parameters), redirect: 'error', signal: AbortSignal.timeout(60_000),
-  }), 'Youzan seller verification');
+  }), 'Youzan seller verification', method === 'youzan.shop.get'
+    ? text => parseMerchantIdentityJson(text, ['id', 'kdt_id', 'shop_id']) : JSON.parse);
   if (result.success === false || (result.code !== undefined && Number(result.code) !== 200)) {
     throw new Error(`Youzan seller verification failed: ${String(result.message || result.code || 'provider error').slice(0, 160)}`);
   }
@@ -359,7 +380,7 @@ async function weimobAuthToken(clientId, clientSecret, shopId) {
   }).toString();
   const result = await readJson(await fetch(url, {
     method: 'POST', headers: { accept: 'application/json' }, redirect: 'error', signal: AbortSignal.timeout(60_000),
-  }), 'Weimob WOS token');
+  }), 'Weimob WOS token', text => parseMerchantIdentityJson(text, ['business_operation_system_id', 'public_account_id', 'business_id']));
   const token = result.data || result;
   if (!token.access_token || String(token.business_operation_system_id || '') !== String(shopId)) {
     throw new Error('Weimob WOS token returned incomplete credentials or a different shop');
@@ -605,7 +626,7 @@ async function authorizeEtsy(env) {
   const identity = await readJson(await fetch(`https://openapi.etsy.com/v3/application/shops/${encodeURIComponent(shopId)}`, {
     headers: { authorization: `Bearer ${token.access_token}`, 'x-api-key': `${keystring}:${sharedSecret}`, accept: 'application/json' },
     redirect: 'error', signal: AbortSignal.timeout(60_000),
-  }), 'Etsy shop verification');
+  }), 'Etsy shop verification', text => parseMerchantIdentityJson(text, ['shop_id', 'user_id']));
   if (String(identity.shop_id || '') !== shopId) throw new Error('Etsy authorization returned a different shop');
   const userId = String(token.access_token).split('.', 1)[0];
   if (!/^[1-9][0-9]*$/.test(userId) || (identity.user_id && String(identity.user_id) !== userId)) {
@@ -630,7 +651,7 @@ async function authorizeMercadoLibre(env) {
   const token = await readJson(await postForm('https://api.mercadolibre.com/oauth/token', {
     grant_type: 'authorization_code', client_id: clientId, client_secret: clientSecret,
     code, redirect_uri: redirectUri, code_verifier: verifier,
-  }), 'Mercado Libre token exchange');
+  }), 'Mercado Libre token exchange', text => parseMerchantIdentityJson(text, ['user_id']));
   if (!token.access_token || !token.refresh_token || !token.user_id) {
     throw new Error('Mercado Libre token exchange returned incomplete credentials');
   }
@@ -645,7 +666,7 @@ async function authorizeMercadoLibre(env) {
   const identity = await readJson(await fetch('https://api.mercadolibre.com/users/me', {
     headers: { authorization: `Bearer ${token.access_token}`, accept: 'application/json' },
     redirect: 'error', signal: AbortSignal.timeout(60_000),
-  }), 'Mercado Libre seller verification');
+  }), 'Mercado Libre seller verification', text => parseMerchantIdentityJson(text, ['id']));
   if (String(identity.id || '') !== userId
       || (typeof identity.id !== 'string' && !Number.isSafeInteger(identity.id))) {
     throw new Error('Mercado Libre authorization returned a different seller');
@@ -666,7 +687,7 @@ async function authorizeTaobao(env) {
   const token = await readJson(await postForm(TAOBAO_TOKEN_URL, {
     grant_type: 'authorization_code', code, client_id: appKey,
     client_secret: appSecret, redirect_uri: redirectUri,
-  }), 'Taobao token exchange');
+  }), 'Taobao token exchange', text => parseMerchantIdentityJson(text, ['taobao_user_id', 'taobao_open_uid']));
   if (!token.access_token || !token.taobao_user_id) {
     throw new Error('Taobao token exchange returned incomplete credentials');
   }
@@ -698,7 +719,7 @@ async function authorizeAlibaba1688(env) {
   const token = await readJson(await postForm(tokenUrl, {
     grant_type: 'authorization_code', need_refresh_token: 'true', client_id: appKey,
     client_secret: appSecret, redirect_uri: redirectUri, code,
-  }), '1688 token exchange');
+  }), '1688 token exchange', text => parseMerchantIdentityJson(text, ['memberId', 'aliId']));
   if (!token.access_token || !token.refresh_token || !token.memberId) {
     throw new Error('1688 token exchange returned incomplete credentials');
   }
@@ -729,7 +750,7 @@ async function authorizeJd(env) {
   const token = await readJson(await postForm(JD_TOKEN_URL, {
     grant_type: 'authorization_code', code, app_key: appKey,
     app_secret: appSecret, redirect_uri: redirectUri,
-  }), 'JD.com token exchange');
+  }), 'JD.com token exchange', text => parseMerchantIdentityJson(text, ['uid', 'xid']));
   if (!token.access_token || !token.refresh_token) {
     throw new Error('JD.com token exchange returned incomplete credentials');
   }
@@ -960,7 +981,7 @@ module.exports = {
   authorizeXiaohongshuArk,
   chinaTimestamp, signTaobao, sign1688, signJd, signPinduoduo, signDouyin, signKuaishou,
   stableJson, douyinApi, kuaishouApi, expiryMs, absoluteOrRelativeExpiryMs,
-  parseKuaishouIdentityJson, kuaishouGrantedScope, kuaishouMerchantIdentity,
+  parseMerchantIdentityJson, parsePinduoduoIdentityJson, parseKuaishouIdentityJson, kuaishouGrantedScope, kuaishouMerchantIdentity,
   youzanAuthToken, youzanAuthApi, weimobAuthToken, weimobAuthApi,
   signXiaohongshu, xiaohongshuAuthApi,
   DEVICE_AUTHORIZE_URL: CONSTANT_CONTACT_DEVICE_URL,

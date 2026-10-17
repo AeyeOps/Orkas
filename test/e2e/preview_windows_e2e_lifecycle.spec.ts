@@ -265,15 +265,22 @@ test('presentation fills the native window and retains its slide content on resi
   const file = path.join(orkas.userWorkspaceRoot, 'preview-deck.pptx');
   await orkas.electronApp!.evaluate(async (_electron, args) => {
     const engine = (process as any).mainModule.require(args.module);
+    const req = (process as any).mainModule.require.bind((process as any).mainModule);
+    const verify = (stage: string, result: { code: number; stdout: string; stderr: string }) => {
+      const diagnostic = JSON.stringify({ stage, code: result.code,
+        stdoutChars: result.stdout.length, stderrChars: result.stderr.length });
+      req('node:assert/strict').equal(result.code, 0, diagnostic);
+    };
     const options = { cwd: args.cwd };
     try {
-      await engine.runOfficeCli(['create', args.file, '--force', '--json'], options);
-      await engine.runOfficeCli(['batch', args.file, '--stop-on-error', '--json'], {
+      verify('create', await engine.runOfficeCli(['create', args.file, '--force', '--json'], options));
+      verify('batch', await engine.runOfficeCli(['batch', args.file, '--stop-on-error', '--json'], {
         ...options, stdin: JSON.stringify([
           { command: 'add', parent: '/', type: 'slide', props: { title: 'Quarterly review', text: 'Progress and next steps' } },
           { command: 'add', parent: '/', type: 'slide', props: { title: 'Next steps', text: 'Review the proposed changes' } },
         ]),
-      });
+      }));
+      req('node:assert/strict').equal(req('node:fs').existsSync(args.file), true, 'Office fixture must exist before native preview');
     } finally { await engine.closeOfficeFile(args.file, args.cwd); }
   }, { module: path.resolve(__dirname, '../../src/main/features/office/office_engine.ts'), file, cwd: orkas.userWorkspaceRoot });
   const preview = await orkas.openPreview(() => orkas.page!.evaluate(file =>

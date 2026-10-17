@@ -12,9 +12,11 @@
 /resources/runtime/ffmpeg
 /resources/runtime/whisper
 /resources/runtime/vc
+/resources/runtime/phone-passkey/
 /src/main/native/build/
 /playwright-report/
 /test-results/
 *.pyc
 __pycache__/
 /userWorkSpace
+/.cache/

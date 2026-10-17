@@ -21,6 +21,7 @@ import nativeFs from 'node:fs';
 import { syncBuiltinESMExports } from 'node:module';
 import * as path from 'node:path';
 import { setTimeout as realDelay } from 'node:timers/promises';
+import * as storage from '../../../src/main/storage';
 
 const electronRuntime = vi.hoisted(() => ({
   idleState: 'active' as 'active' | 'idle' | 'locked' | 'unknown',
@@ -64,7 +65,10 @@ import {
   userRoot,
 } from '../../../src/main/paths';
 import {
+  AUTO_TASK_CATCH_UP_DELAY_MS,
+  AUTO_TASK_CATCH_UP_WINDOW_MS,
   armedDueAtForTest,
+  catchUpBoundaryForTest,
   createTask,
   deleteTask,
   deleteAttachment,
@@ -81,6 +85,8 @@ import {
   rescheduleAllForTest,
   resumeSchedulerForTest,
   runTaskNow,
+  startScheduler,
+  setTaskEnabled,
   stopScheduler,
   subscribeFires,
   subscribeFiresForUser,
@@ -90,6 +96,7 @@ import {
   _buildSeedTextForTest,
   _onTimerFireForTest,
   _setMarkRanFailureForTest,
+  type AutoFireEvent,
   type AutoTask,
   type Schedule,
 } from '../../../src/main/features/auto_tasks';
@@ -159,8 +166,18 @@ async function waitForSchedulerOutcome(
   throw new Error(`Timed out waiting for ${description}`);
 }
 
-beforeEach(() => {
+async function settleSchedulerWork(): Promise<void> {
   stopScheduler();
+  // Stopping timers does not cancel already-admitted filesystem work. Drain
+  // those turns before removing the account, as the switch fixture does.
+  for (let index = 0; index < 12; index += 1) {
+    await Promise.resolve();
+    await realDelay(0);
+  }
+}
+
+beforeEach(async () => {
+  await settleSchedulerWork();
   automationLogs.records.length = 0;
   _setDeviceFingerprintForTests(null);
   electronRuntime.idleState = 'active';
@@ -176,8 +193,8 @@ beforeEach(() => {
   autoRuntime.getAgent.mockResolvedValue(null);
 });
 
-afterEach(() => {
-  stopScheduler();
+afterEach(async () => {
+  await settleSchedulerWork();
   _setDeviceFingerprintForTests(null);
   _setMarkRanFailureForTest(null);
   vi.useRealTimers();
@@ -918,39 +935,299 @@ describe('scheduler dispatch', () => {
     expect(autoRuntime.send).toHaveBeenCalledTimes(3);
   });
 
-  it('skips a boundary crossed while suspended, then runs the next occurrence after resume', async () => {
+  it('runs a boundary crossed during sleep once after wake, labeled as a catch-up, then keeps the next occurrence', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
     activateUser(TEST_UID);
+    setCurrentLang('en');
+    const events: AutoFireEvent[] = [];
+    const unsubscribe = subscribeFires((ev) => events.push(ev));
     const taskId = 'at_59595959';
     const created = await createTask(TEST_UID, {
       id: taskId,
-      content: 'skip the sleeping boundary',
+      title: 'Reply check',
+      content: 'check replies every morning',
       schedule: { type: 'daily', hour: 9, minute: 0 },
     });
     expect(created.ok).toBe(true);
 
+    // The lid is closed across 09:00 and opened at 10:00.
     suspendSchedulerForTest();
-    vi.setSystemTime(new Date(2026, 4, 22, 10, 0, 0));
+    const wokeAt = new Date(2026, 4, 22, 10, 0, 0);
+    vi.setSystemTime(wokeAt);
     await resumeSchedulerForTest(TEST_UID);
     await vi.advanceTimersByTimeAsync(0);
+    // The late run waits for the settle delay instead of racing the network.
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBeUndefined();
+
+    const nextBoundary = new Date(2026, 4, 23, 9, 0, 0);
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+    await waitForSchedulerOutcome(
+      () => armedDueAtForTest(taskId) === nextBoundary.getTime(),
+      'the missed occurrence to run after wake and re-arm',
+    );
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.createConversation.mock.calls[0][1]).toMatchObject({ title: 'Reply check (catch-up)' });
+    expect((await getTask(TEST_UID, taskId))?.last_run_at)
+      .toBe(new Date(wokeAt.getTime() + AUTO_TASK_CATCH_UP_DELAY_MS).toISOString());
+
+    await vi.advanceTimersByTimeAsync(nextBoundary.getTime() - Date.now());
+    await waitForSchedulerOutcome(
+      () => events.length === 2,
+      'the next occurrence to run on time',
+    );
+    unsubscribe();
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(2);
+    expect(autoRuntime.createConversation.mock.calls[1][1]).toMatchObject({ title: 'Reply check' });
+    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(nextBoundary.toISOString());
+    expect(events.map((ev) => [ev.type, ev.catch_up === true])).toEqual([
+      ['conv_created', true],
+      ['conv_created', false],
+    ]);
+  });
+
+  it('skips an occurrence missed more than 12 hours before wake without running or persisting it', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    activateUser(TEST_UID);
+    const taskId = 'at_59595960';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      content: 'missed too long ago',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+    const configBefore = fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8');
+
+    suspendSchedulerForTest();
+    const missedAt = new Date(2026, 4, 22, 9, 0, 0).getTime();
+    vi.setSystemTime(new Date(missedAt + AUTO_TASK_CATCH_UP_WINDOW_MS + 1000));
+    await resumeSchedulerForTest(TEST_UID);
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
 
     expect(autoRuntime.createConversation).not.toHaveBeenCalled();
     expect(autoRuntime.send).not.toHaveBeenCalled();
-    expect(await getTask(TEST_UID, taskId)).toMatchObject({ enabled: true });
-    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBeUndefined();
-    const nextBoundary = new Date(2026, 4, 23, 9, 0, 0);
-    expect(armedDueAtForTest(taskId)).toBe(nextBoundary.getTime());
+    expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId), 'utf8')).toBe(configBefore);
+    expect(armedDueAtForTest(taskId)).toBe(new Date(2026, 4, 23, 9, 0, 0).getTime());
+  });
 
-    await vi.advanceTimersByTimeAsync(23 * 60 * 60 * 1000);
+  it('runs an evening occurrence missed overnight the next morning, titled in the app language', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 22, 30, 0));
+    activateUser(TEST_UID);
+    setCurrentLang('zh');
+    const taskId = 'at_59595961';
+    const created = await createTask(TEST_UID, {
+      id: taskId,
+      title: '晚间汇总',
+      content: 'summarize the day',
+      schedule: { type: 'daily', hour: 23, minute: 0 },
+    });
+    expect(created.ok).toBe(true);
+
+    suspendSchedulerForTest();
+    const wokeAt = new Date(2026, 4, 23, 7, 0, 0);
+    vi.setSystemTime(wokeAt);
+    await resumeSchedulerForTest(TEST_UID);
+    const tonight = new Date(2026, 4, 23, 23, 0, 0);
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
     await waitForSchedulerOutcome(
-      () => autoRuntime.createConversation.mock.calls.length === 1,
-      'the first post-resume occurrence to dispatch',
+      () => armedDueAtForTest(taskId) === tonight.getTime(),
+      'the overnight miss to run and tonight to stay armed',
     );
 
     expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.createConversation.mock.calls[0][1]).toMatchObject({ title: '晚间汇总（补跑）' });
+    expect((await getTask(TEST_UID, taskId))?.last_run_at)
+      .toBe(new Date(wokeAt.getTime() + AUTO_TASK_CATCH_UP_DELAY_MS).toISOString());
+  });
+
+  it('on startup runs only the occurrence missed within 12 hours while Orkas was closed', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    setCurrentLang('en');
+    const recentId = 'at_59595962';
+    const staleId = 'at_59595963';
+    expect((await createTask(TEST_UID, {
+      id: recentId,
+      title: 'Morning brief',
+      content: 'morning',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    })).ok).toBe(true);
+    expect((await createTask(TEST_UID, {
+      id: staleId,
+      title: 'Evening digest',
+      content: 'evening',
+      schedule: { type: 'daily', hour: 20, minute: 30 },
+    })).ok).toBe(true);
+    const staleConfig = fs.readFileSync(autoTaskConfigFile(TEST_UID, staleId), 'utf8');
+
+    // Orkas stays closed until 09:30 the next day: the 09:00 brief was missed
+    // 30 minutes ago, the 20:30 digest 13 hours ago.
+    stopScheduler();
+    vi.setSystemTime(new Date(2026, 4, 23, 9, 30, 0));
+    activateUser(TEST_UID);
+    startScheduler();
+    await waitForSchedulerOutcome(
+      () => armedDueAtForTest(recentId) !== null && armedDueAtForTest(staleId) !== null,
+      'startup to arm both tasks',
+    );
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+    await waitForSchedulerOutcome(
+      () => armedDueAtForTest(recentId) === new Date(2026, 4, 24, 9, 0, 0).getTime(),
+      'the recent miss to run and re-arm',
+    );
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.createConversation.mock.calls[0][1]).toMatchObject({ title: 'Morning brief (catch-up)' });
+    expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, staleId), 'utf8')).toBe(staleConfig);
+    expect(armedDueAtForTest(staleId)).toBe(new Date(2026, 4, 23, 20, 30, 0).getTime());
+  });
+
+  it('runs a missed occurrence once even when the computer sleeps during the delay and wakes again', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    activateUser(TEST_UID);
+    const taskId = 'at_59595964';
+    expect((await createTask(TEST_UID, {
+      id: taskId,
+      content: 'run the miss once',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    })).ok).toBe(true);
+    const tomorrow = new Date(2026, 4, 23, 9, 0, 0).getTime();
+
+    suspendSchedulerForTest();
+    vi.setSystemTime(new Date(2026, 4, 22, 10, 0, 0));
+    await resumeSchedulerForTest(TEST_UID);
+    // The lid closes again before the settle delay ends.
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS / 2);
+    suspendSchedulerForTest();
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+
+    vi.setSystemTime(new Date(2026, 4, 22, 10, 5, 0));
+    await resumeSchedulerForTest(TEST_UID);
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+    await waitForSchedulerOutcome(
+      () => armedDueAtForTest(taskId) === tomorrow,
+      'the missed occurrence to run once',
+    );
+
+    // A later sleep and wake inside the window has nothing left to catch up.
+    suspendSchedulerForTest();
+    vi.setSystemTime(new Date(2026, 4, 22, 10, 10, 0));
+    await resumeSchedulerForTest(TEST_UID);
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
     expect(autoRuntime.send).toHaveBeenCalledTimes(1);
-    expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(nextBoundary.toISOString());
+    expect(armedDueAtForTest(taskId)).toBe(tomorrow);
+  });
+
+  it('runs a one-time task missed during sleep once after wake and then disables it', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    activateUser(TEST_UID);
+    const taskId = 'at_59595965';
+    expect((await createTask(TEST_UID, {
+      id: taskId,
+      content: 'one reminder',
+      schedule: { type: 'one_time', at: new Date(2026, 4, 22, 9, 0, 0).toISOString() },
+    })).ok).toBe(true);
+
+    suspendSchedulerForTest();
+    vi.setSystemTime(new Date(2026, 4, 22, 10, 0, 0));
+    await resumeSchedulerForTest(TEST_UID);
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+    await waitForSchedulerOutcome(
+      () => autoRuntime.send.mock.calls.length === 1,
+      'the missed reminder to run',
+    );
+
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(await getTask(TEST_UID, taskId)).toMatchObject({
+      enabled: false,
+      last_run_at: new Date(2026, 4, 22, 10, 1, 0).toISOString(),
+    });
+    expect(armedDueAtForTest(taskId)).toBeNull();
+  });
+
+  it('keeps a pending catch-up when sync rebuilds timers during the settle delay', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    activateUser(TEST_UID);
+    setCurrentLang('en');
+    const taskId = 'at_59595966';
+    expect((await createTask(TEST_UID, {
+      id: taskId,
+      title: 'Sync safe',
+      content: 'still late after sync',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    })).ok).toBe(true);
+
+    suspendSchedulerForTest();
+    const wokeAt = new Date(2026, 4, 22, 10, 0, 0);
+    vi.setSystemTime(wokeAt);
+    await resumeSchedulerForTest(TEST_UID);
+    const lateRunAt = wokeAt.getTime() + AUTO_TASK_CATCH_UP_DELAY_MS;
+    expect(armedDueAtForTest(taskId)).toBe(lateRunAt);
+
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS / 2);
+    await rescheduleAllAfterSyncForTest(TEST_UID);
+    expect(armedDueAtForTest(taskId)).toBe(lateRunAt);
+
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+    await waitForSchedulerOutcome(
+      () => autoRuntime.send.mock.calls.length === 1,
+      'the preserved catch-up to run',
+    );
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.createConversation.mock.calls[0][1]).toMatchObject({ title: 'Sync safe (catch-up)' });
+  });
+
+  it('retries a late run after the settle delay when recording it fails', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
+    activateUser(TEST_UID);
+    setCurrentLang('en');
+    const events: AutoFireEvent[] = [];
+    const unsubscribe = subscribeFiresForUser(TEST_UID, (ev) => events.push(ev));
+    const taskId = 'at_59595967';
+    expect((await createTask(TEST_UID, {
+      id: taskId,
+      title: 'Retry late',
+      content: 'retry the late run',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+    })).ok).toBe(true);
+
+    suspendSchedulerForTest();
+    const wokeAt = new Date(2026, 4, 22, 10, 0, 0);
+    vi.setSystemTime(wokeAt);
+    await resumeSchedulerForTest(TEST_UID);
+    _setMarkRanFailureForTest(new Error('injected persistence failure'));
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+    await waitForSchedulerOutcome(
+      () => armedDueAtForTest(taskId) === wokeAt.getTime() + 2 * AUTO_TASK_CATCH_UP_DELAY_MS,
+      'the failed late run to be re-armed',
+    );
+    _setMarkRanFailureForTest(null);
+    expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+    expect(events).toEqual([expect.objectContaining({
+      type: 'fire_failed',
+      source: 'scheduled',
+      catch_up: true,
+      error_code: 'mark_ran_failed',
+    })]);
+
+    await vi.advanceTimersByTimeAsync(AUTO_TASK_CATCH_UP_DELAY_MS);
+    await waitForSchedulerOutcome(() => events.length === 2, 'the retried late run');
+    unsubscribe();
+    expect(events[1]).toMatchObject({ type: 'conv_created', catch_up: true });
+    expect(autoRuntime.createConversation).toHaveBeenCalledTimes(1);
+    expect(autoRuntime.createConversation.mock.calls[0][1]).toMatchObject({ title: 'Retry late (catch-up)' });
   });
 
   it('preserves an already-armed due boundary when live sync rebuilds timers before its callback', async () => {
@@ -990,8 +1267,8 @@ describe('scheduler dispatch', () => {
     });
     expect(created.ok).toBe(true);
 
-    // The 14:00 boundary was missed while Orkas was unavailable, so restore
-    // intentionally starts a fresh six-hour interval at 20:00.
+    // The 14:00 boundary was missed while this account was inactive. Restore
+    // without catch-up (an account switch) starts a fresh six-hour interval.
     vi.setSystemTime(new Date(2026, 4, 22, 20, 0, 0));
     await rescheduleAllForTest(TEST_UID);
     const recoveredDueAt = new Date(2026, 4, 23, 2, 0, 0).getTime();
@@ -1206,7 +1483,7 @@ describe('scheduler dispatch', () => {
       .toBe(new Date(2026, 4, 22, 9, 0, 0).toISOString());
   });
 
-  it('does not persist state or create a conversation for an overdue restored task', async () => {
+  it('does not persist state or create a conversation for an overdue task restored without catch-up (account switch)', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date(2026, 4, 22, 8, 30, 0));
     const taskId = 'at_61616161';
@@ -1259,7 +1536,7 @@ describe('scheduler dispatch', () => {
     expect(armedDueAtForTest(taskId)).toBe(actualDueAt.getTime());
   });
 
-  it('does not disable or mutate an expired one-time task during restore', async () => {
+  it('does not disable or mutate an expired one-time task during a restore without catch-up (account switch)', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-05-22T08:30:00.000Z'));
     const taskId = 'at_63636363';
@@ -1360,6 +1637,60 @@ describe('scheduler dispatch', () => {
       }),
     ]);
   });
+
+  it.each(['delete', 'disable', 'reschedule', 'edit'] as const)(
+    'uses the committed task after a concurrent %s before scheduled admission', async mutation => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-05-22T09:00:00.000Z'));
+      const taskId = 'at_61616161';
+      expect((await createTask(TEST_UID, {
+        id: taskId, content: 'old report',
+        schedule: { type: 'one_time', at: '2026-05-22T08:59:00.000Z' },
+      })).ok).toBe(true);
+      const configFile = autoTaskConfigFile(TEST_UID, taskId);
+      const readJson = storage.readJson;
+      let release!: () => void;
+      let captured = false;
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      const spy = vi.spyOn(storage, 'readJson').mockImplementation(async (...args) => {
+        const result = await readJson(...args);
+        if (!captured && args[0] === configFile) {
+          captured = true;
+          await barrier;
+        }
+        return result;
+      });
+      const firing = _onTimerFireForTest(TEST_UID, taskId);
+      try {
+        await waitForSchedulerOutcome(() => captured, 'the scheduler task read');
+        if (mutation === 'delete') expect(await deleteTask(TEST_UID, taskId)).toEqual({ ok: true });
+        if (mutation === 'disable') expect((await setTaskEnabled(TEST_UID, taskId, false)).ok).toBe(true);
+        if (mutation === 'reschedule') expect((await updateTask(TEST_UID, taskId, {
+          schedule: { type: 'one_time', at: '2026-05-23T09:00:00.000Z' },
+        })).ok).toBe(true);
+        if (mutation === 'edit') expect((await updateTask(TEST_UID, taskId, { content: 'new report' })).ok).toBe(true);
+        expect(autoRuntime.send).not.toHaveBeenCalled();
+        release();
+        await firing;
+        const saved = await getTask(TEST_UID, taskId);
+        if (mutation === 'edit') {
+          expect(autoRuntime.send).toHaveBeenCalledExactlyOnceWith({
+            userId: TEST_UID, cid: 'cid_auto', text: 'new report',
+          });
+          expect(saved?.last_run_at).toBe('2026-05-22T09:00:00.000Z');
+        } else {
+          expect(autoRuntime.createConversation).not.toHaveBeenCalled();
+          expect(autoRuntime.send).not.toHaveBeenCalled();
+          expect(saved?.last_run_at).toBeUndefined();
+          if (mutation === 'delete') expect(saved).toBeNull();
+        }
+      } finally {
+        release();
+        await firing;
+        spy.mockRestore();
+      }
+    },
+  );
 
   it('fires a due one-time task, copies attachments, emits an event, and disables the task', async () => {
     vi.useFakeTimers();
@@ -1769,7 +2100,9 @@ describe('scheduler next due: recurring creation baseline', () => {
   });
 });
 
-describe('scheduler restore skips missed boundaries', () => {
+// The no-backfill baseline still applies whenever no catch-up is owed: account
+// switches, sync, edits, and misses outside the catch-up window.
+describe('scheduler restore without catch-up starts at the next boundary', () => {
   it('starts a fresh hourly interval instead of back-filling missed intervals', () => {
     const now = new Date(2026, 4, 27, 20, 0, 0);
     const next = nextDueAfterRestoreForTest(
@@ -1819,6 +2152,101 @@ describe('scheduler restore skips missed boundaries', () => {
       makeTask({ type: 'one_time', at: new Date(2026, 4, 27, 9, 0, 0).toISOString() }),
       now,
     )).toBeNull();
+  });
+});
+
+describe('catch-up eligibility after wake or startup', () => {
+  const daily9 = (overrides: Partial<AutoTask> = {}) => makeTask(
+    { type: 'daily', hour: 9, minute: 0 },
+    { last_run_at: new Date(2026, 4, 21, 9, 0, 0).toISOString(), ...overrides },
+  );
+
+  it('finds the latest missed occurrence across midnight, week, and month ends', () => {
+    expect(catchUpBoundaryForTest(
+      makeTask({ type: 'daily', hour: 23, minute: 0 }, {
+        last_run_at: new Date(2026, 4, 21, 23, 0, 0).toISOString(),
+      }),
+      new Date(2026, 4, 23, 7, 0, 0),
+    )?.getTime()).toBe(new Date(2026, 4, 22, 23, 0, 0).getTime());
+
+    // Friday 18:15 missed, checked early Saturday.
+    expect(catchUpBoundaryForTest(
+      makeTask({ type: 'weekly', weekday: 5, hour: 18, minute: 15 }, {
+        last_run_at: new Date(2026, 4, 15, 18, 15, 0).toISOString(),
+      }),
+      new Date(2026, 4, 23, 5, 0, 0),
+    )?.getTime()).toBe(new Date(2026, 4, 22, 18, 15, 0).getTime());
+
+    // day=31 falls on April 30; the miss is found from May 1.
+    expect(catchUpBoundaryForTest(
+      makeTask({ type: 'monthly', day: 31, hour: 23, minute: 0 }, {
+        last_run_at: new Date(2026, 2, 31, 23, 0, 0).toISOString(),
+      }),
+      new Date(2026, 4, 1, 6, 0, 0),
+    )?.getTime()).toBe(new Date(2026, 3, 30, 23, 0, 0).getTime());
+
+    // Only the latest of several missed hourly intervals runs.
+    expect(catchUpBoundaryForTest(
+      makeTask({ type: 'hourly', interval_hours: 2 }, {
+        created_at: new Date(2026, 4, 22, 8, 0, 0).toISOString(),
+        updated_at: new Date(2026, 4, 22, 8, 0, 0).toISOString(),
+      }),
+      new Date(2026, 4, 22, 13, 30, 0),
+    )?.getTime()).toBe(new Date(2026, 4, 22, 12, 0, 0).getTime());
+  });
+
+  it('includes an occurrence exactly 12 hours old and skips anything older', () => {
+    const missed = new Date(2026, 4, 22, 9, 0, 0).getTime();
+    expect(catchUpBoundaryForTest(daily9(), new Date(missed + AUTO_TASK_CATCH_UP_WINDOW_MS))?.getTime())
+      .toBe(missed);
+    expect(catchUpBoundaryForTest(daily9(), new Date(missed + AUTO_TASK_CATCH_UP_WINDOW_MS + 1))).toBeNull();
+  });
+
+  it('does not resurrect an occurrence already covered by a run, creation, or later edit', () => {
+    const wokeAt = new Date(2026, 4, 22, 10, 0, 0);
+    const afterBoundary = new Date(2026, 4, 22, 9, 30, 0).toISOString();
+    expect(catchUpBoundaryForTest(daily9(), wokeAt)).not.toBeNull();
+    expect(catchUpBoundaryForTest(daily9({ last_run_at: new Date(2026, 4, 22, 9, 0, 5).toISOString() }), wokeAt))
+      .toBeNull();
+    expect(catchUpBoundaryForTest(daily9({ last_run_at: undefined, created_at: afterBoundary }), wokeAt))
+      .toBeNull();
+    // A schedule edit or re-enable after 09:00 never scheduled that occurrence.
+    expect(catchUpBoundaryForTest(daily9({ updated_at: afterBoundary }), wokeAt)).toBeNull();
+  });
+
+  it('respects end conditions, the enabled switch, and device ownership', () => {
+    const wokeAt = new Date(2026, 4, 22, 10, 0, 0);
+    expect(catchUpBoundaryForTest(
+      daily9({ end_condition: { type: 'count', max_runs: 3 }, scheduled_run_count: 3 }),
+      wokeAt,
+    )).toBeNull();
+    expect(catchUpBoundaryForTest(daily9({ enabled: false }), wokeAt)).toBeNull();
+    expect(catchUpBoundaryForTest(daily9({ device_id: 'another-installation' }), wokeAt)).toBeNull();
+    // The last allowed day's occurrence still runs late the next morning.
+    expect(catchUpBoundaryForTest(
+      makeTask({ type: 'daily', hour: 23, minute: 0 }, {
+        last_run_at: new Date(2026, 4, 21, 23, 0, 0).toISOString(),
+        end_condition: { type: 'date', date: '2026-05-22' },
+      }),
+      new Date(2026, 4, 23, 7, 0, 0),
+    )?.getTime()).toBe(new Date(2026, 4, 22, 23, 0, 0).getTime());
+  });
+
+  it('runs a missed one-time task once and only if it was scheduled ahead of time', () => {
+    const at = new Date(2026, 4, 22, 9, 0, 0);
+    const oneTime = (overrides: Partial<AutoTask> = {}) => makeTask(
+      { type: 'one_time', at: at.toISOString() },
+      { created_at: new Date(2026, 4, 22, 8, 0, 0).toISOString(), ...overrides },
+    );
+    const wokeAt = new Date(2026, 4, 22, 10, 0, 0);
+    expect(catchUpBoundaryForTest(oneTime(), wokeAt)?.getTime()).toBe(at.getTime());
+    expect(catchUpBoundaryForTest(oneTime({ last_run_at: at.toISOString() }), wokeAt)).toBeNull();
+    expect(catchUpBoundaryForTest(
+      oneTime({ created_at: new Date(2026, 4, 22, 9, 30, 0).toISOString() }),
+      wokeAt,
+    )).toBeNull();
+    expect(catchUpBoundaryForTest(oneTime(), new Date(at.getTime() + AUTO_TASK_CATCH_UP_WINDOW_MS + 1)))
+      .toBeNull();
   });
 });
 

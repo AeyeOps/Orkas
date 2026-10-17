@@ -54,6 +54,7 @@ export {
   upsertContext, dropContext,
   indexChatMessage,
   dropChatConversation,
+  reindexChatConversation,
   reconcileContextsIndex,
   invalidateContextsIndex,
   flushAll,
@@ -540,9 +541,21 @@ export async function searchChats(
   return (await searchChatsWithStatus(userId, query, options)).results;
 }
 
-/** Cheap coverage-only IPC path: no source bodies, embeddings or rebuild. */
-export async function searchIndexStatus(userId: string): Promise<{ chat_index_complete: boolean }> {
-  return { chat_index_complete: indexer.isChatsIndexTrusted(userId) || await indexer.isChatsIndexCurrent(userId) };
+/** Cheap coverage-only IPC path: no source bodies, embeddings or rebuild.
+ * An unverified index schedules its idle repair here, so opening search starts
+ * the catch-up instead of waiting for a typed query. `chat_index_building` is
+ * true only until the account's first full build completes: after that an
+ * unverified index can lack at most the catch-up work, which the search UI
+ * does not announce. `chat_index_complete` keeps its verified meaning for the
+ * history tools that report coverage. */
+export async function searchIndexStatus(
+  userId: string,
+): Promise<{ chat_index_complete: boolean; chat_index_building: boolean }> {
+  if (indexer.isChatsIndexTrusted(userId) || await indexer.isChatsIndexCurrent(userId)) {
+    return { chat_index_complete: true, chat_index_building: false };
+  }
+  indexer.scheduleChatIndexRepair(userId);
+  return { chat_index_complete: false, chat_index_building: !chatStore.hasCompletedRebuild(userId) };
 }
 
 /** Query-local index status: a scheduled repair must not turn a partial miss
@@ -551,17 +564,18 @@ export async function searchChatsWithStatus(
   userId: string,
   query: string,
   options: SearchChatsOptions = {},
-): Promise<{ results: SearchResult[]; indexComplete: boolean }> {
+): Promise<{ results: SearchResult[]; indexComplete: boolean; indexBuilding: boolean }> {
   const q = (query || '').trim();
-  if (!q) return { results: [], indexComplete: true };
+  if (!q) return { results: [], indexComplete: true, indexBuilding: false };
   // Appends hand their upsert to a deferred chain so a send is not held up by
   // the index; a reader pays that cost instead, and only when it searches.
   await indexer.drainDeferredChatWrites(userId);
 
-  // Cold and partial indexes use the same background path. Searching must
-  // never inherit a history-wide rebuild, including during first migration.
-  let indexComplete = (await searchIndexStatus(userId)).chat_index_complete;
-  if (!indexComplete) indexer.scheduleChatIndexRepair(userId);
+  // Cold and partial indexes use the same background path (the status check
+  // schedules it). Searching must never inherit a history-wide rebuild,
+  // including during first migration.
+  const status = await searchIndexStatus(userId);
+  let indexComplete = status.chat_index_complete;
   const tokens = tokenize(q);
   // Normalize BM25 against the currently available corpus, including a
   // partially rebuilt index.
@@ -650,7 +664,7 @@ export async function searchChatsWithStatus(
     const { visible: _visible, ...snippet } = projected || { visible: false, snippet: '' };
     return [{ ...result, ...snippet }];
   });
-  return { results, indexComplete };
+  return { results, indexComplete, indexBuilding: status.chat_index_building };
 }
 
 // ── Agent / skill body search (in-memory, no persistent index) ──────────
@@ -947,6 +961,7 @@ export async function searchAll(
   total?: number;
   degradation_code?: SearchDegradationCode | 'multiple';
   chat_index_complete?: boolean;
+  chat_index_building?: boolean;
 }> {
   const q = (query || '').trim();
   if (!q) return { results: [] };
@@ -954,6 +969,7 @@ export async function searchAll(
   const buckets: SearchResult[] = [];
   const degradations = new Set<SearchDegradationCode>();
   let chatIndexComplete: boolean | undefined;
+  let chatIndexBuilding: boolean | undefined;
   const tasks: Array<Promise<void>> = [];
   if (scope === 'all' || scope === 'context') {
     tasks.push(searchContexts(q, userId, requestedLimit).then((r) => { buckets.push(...r); }));
@@ -972,6 +988,7 @@ export async function searchAll(
     tasks.push(searchChatsWithStatus(userId, q, { limit: requestedLimit }).then((page) => {
       buckets.push(...page.results);
       chatIndexComplete = page.indexComplete;
+      chatIndexBuilding = page.indexBuilding;
     }));
   }
   if (scope === 'all' || scope === 'agent') {
@@ -989,6 +1006,7 @@ export async function searchAll(
     results: _limitSearchResults(merged, requestedLimit, scope),
     total: merged.length,
     ...(chatIndexComplete !== undefined ? { chat_index_complete: chatIndexComplete } : {}),
+    ...(chatIndexBuilding !== undefined ? { chat_index_building: chatIndexBuilding } : {}),
     ...(degradationCode ? { degradation_code: degradationCode } : {}),
   };
 }

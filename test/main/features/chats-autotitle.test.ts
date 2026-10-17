@@ -82,40 +82,40 @@ describe('autoTitle — set A (produces clean title)', () => {
   // did not: 25 Chinese characters render twice as wide as 25 Latin ones, so
   // rows ended raggedly and Latin titles were cut at half the useful length.
   it('ends a Chinese and a Latin title at the same rendered width', () => {
-    const zh = autoTitle('一'.repeat(40));
-    const en = autoTitle('A'.repeat(80));
+    const zh = autoTitle('一'.repeat(80));
+    const en = autoTitle('A'.repeat(160));
     expect(zh.endsWith('…')).toBe(true);
     expect(en.endsWith('…')).toBe(true);
     expect(renderedWidth(zh)).toBe(renderedWidth(en));
   });
 
-  it('keeps a Chinese title exactly as long as the character cap did', () => {
-    // 25 full-width characters was the previous cap's output. Nothing may get
-    // shorter for users who already have titles at that length.
-    expect(autoTitle('一'.repeat(40))).toBe(`${'一'.repeat(25)}…`);
+  it('shows about fifty Chinese characters before cutting a long request', () => {
+    // The project task tab is wide; a 25-character stub left most of each row
+    // empty. Wider titles must also never be shorter than the old 25 cap.
+    expect(autoTitle('一'.repeat(80))).toBe(`${'一'.repeat(50)}…`);
   });
 
   it('gives a Latin title the full width instead of half of it', () => {
-    expect(autoTitle('A'.repeat(80))).toBe(`${'A'.repeat(50)}…`);
+    expect(autoTitle('A'.repeat(160))).toBe(`${'A'.repeat(100)}…`);
   });
 
   it('leaves a title that fits the budget untouched, and marks the one past it', () => {
-    expect(autoTitle('A'.repeat(50))).toBe('A'.repeat(50));
-    expect(autoTitle('A'.repeat(51))).toBe(`${'A'.repeat(50)}…`);
-    expect(autoTitle('一'.repeat(25))).toBe('一'.repeat(25));
-    expect(autoTitle('一'.repeat(26))).toBe(`${'一'.repeat(25)}…`);
+    expect(autoTitle('A'.repeat(100))).toBe('A'.repeat(100));
+    expect(autoTitle('A'.repeat(101))).toBe(`${'A'.repeat(100)}…`);
+    expect(autoTitle('一'.repeat(50))).toBe('一'.repeat(50));
+    expect(autoTitle('一'.repeat(51))).toBe(`${'一'.repeat(50)}…`);
   });
 
   it('never cuts a grapheme cluster in half', () => {
-    const out = autoTitle('🙂'.repeat(40));
-    expect(out).toBe(`${'🙂'.repeat(25)}…`);
+    const out = autoTitle('🙂'.repeat(80));
+    expect(out).toBe(`${'🙂'.repeat(50)}…`);
     // A lone surrogate would survive a character slice but not a cluster walk.
     expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(out)).toBe(false);
   });
 
   it('measures a mixed-script title by what it renders, not by character count', () => {
-    // 20 full-width (40 units) + 10 half-width (10 units) exactly fills 50.
-    const mixed = `${'一'.repeat(20)}${'A'.repeat(10)}`;
+    // 40 full-width (80 units) + 20 half-width (20 units) exactly fills 100.
+    const mixed = `${'一'.repeat(40)}${'A'.repeat(20)}`;
     expect(autoTitle(mixed)).toBe(mixed);
     expect(autoTitle(`${mixed}B`)).toBe(`${mixed}…`);
   });

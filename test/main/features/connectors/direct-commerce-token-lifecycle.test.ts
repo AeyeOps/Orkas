@@ -58,6 +58,113 @@ afterEach(() => {
 });
 
 describe('direct commerce authorization continuity', () => {
+  const integerRefreshes = [
+    { provider: 'taobao_top', field: 'taobao_user_id', binding: 'user_id' },
+    { provider: 'alibaba_1688', field: 'memberId', binding: 'member_id' },
+    { provider: 'jd_jos', field: 'xid', binding: 'xid' },
+    { provider: 'douyin_shop', field: 'shop_id', binding: 'shop_id' },
+    { provider: 'youzan', field: 'authority_id', binding: 'kdt_id' },
+    { provider: 'weimob_wos', field: 'business_operation_system_id', binding: 'business_operation_system_id' },
+    { provider: 'mercado_libre', field: 'user_id', binding: 'user_id' },
+  ];
+  it.each(integerRefreshes.flatMap(row => [true, false].map(accepts => ({ ...row, accepts })) ))(
+    'matches exact $provider refreshed identities before further IO (accepts=$accepts)', async row => {
+      const exact = '9007199254740993', expected = row.accepts ? exact : '9007199254740992';
+      const metadata = row.provider === 'weimob_wos' ? { shop_id: expected, shop_type: 'business_operation_system_id' }
+        : row.provider === 'douyin_shop' ? { shop_id: expected }
+        : row.provider === 'youzan' ? { kdt_id: expected } : row.provider === 'mercado_libre' ? { user_id: expected } : {};
+      const env = environment(row.provider, { app_key: 'fixture-app', app_secret: 'fixture-secret',
+        client_id: 'fixture-client', client_secret: 'fixture-secret', access_token: 'old-access', refresh_token: 'old-refresh',
+        expires_at: 0, refresh_expires_at: Date.now() + 86400_000, scope: 'offline_access read write',
+        identity: { [row.binding]: expected, nick: 'Fixture', vender_id: '123', shop_id: row.provider === 'jd_jos' ? '456' : expected } }, metadata);
+      const previous = stored(env);
+      let tokenRequests = 0, identityRequests = 0, businessRequests = 0;
+      vi.stubGlobal('fetch', vi.fn(async (raw: string, init: RequestInit = {}) => {
+        const url = new URL(raw), form = new URLSearchParams(String(init.body || ''));
+        const tokenRequest = url.hostname.startsWith('oauth.') || url.hostname.startsWith('open-oauth.')
+          || url.pathname.includes('/getToken/') || url.pathname.includes('/auth/token')
+          || url.pathname.endsWith('/oauth/token') || url.pathname === '/fuwu/b/oauth2/token' || url.pathname === '/token/refresh';
+        let body: any;
+        if (tokenRequest) {
+          tokenRequests++;
+          const grant = { access_token: 'rotated-access', refresh_token: 'rotated-refresh', expires_in: 7200, expires: 7200,
+            scope: 'offline_access read write', [row.field]: exact };
+          body = row.provider === 'douyin_shop' ? { code: 10000, data: grant }
+            : ['youzan', 'weimob_wos'].includes(row.provider) ? { data: grant } : grant;
+        } else {
+          const method = form.get('method') || url.searchParams.get('method');
+          if (method === 'taobao.user.seller.get' || url.pathname.includes('/alibaba.account.basic/')
+            || method === 'jingdong.seller.vender.info.get' || url.pathname === '/open/getAuthInfo') {
+            identityRequests++;
+            body = row.provider === 'taobao_top' ? { user_seller_get_response: { user: { user_id: exact, nick: 'Fixture' } } }
+              : row.provider === 'alibaba_1688' ? { result: { memberId: exact } }
+                : row.provider === 'jd_jos' ? { seller_vender_info_get_response: { vender_info_result: { data: { vender_id: '123', shop_id: '456' } } } }
+                  : { code: 10000, data: { auth_id: exact, status: 1 } };
+          } else {
+            businessRequests++;
+            body = row.provider === 'douyin_shop' ? { code: 10000, data: { list: [] } }
+              : row.provider === 'mercado_libre' ? { id: exact } : { data: { list: [] } };
+          }
+        }
+        return new Response(JSON.stringify(body).replaceAll('"9007199254740993"', exact));
+      }));
+      // JD/1688/Taobao's account read uses the verification endpoint again.
+      const readAction = row.provider === 'douyin_shop' ? 'products.list'
+        : row.provider === 'weimob_wos' ? 'products.list' : row.provider === 'youzan' ? 'products.list_on_sale' : 'account.get';
+      const outcome = adapter.callTool('execute_read', { action: readAction,
+        ...(row.provider === 'weimob_wos' ? { parameters: { payload: {} } } : {}) }, env);
+      if (row.accepts) {
+        await expect(outcome).resolves.toMatchObject({ provider: row.provider });
+        expect(stored(env)).toMatchObject({ access_token: 'rotated-access', identity: { [row.binding]: expected } });
+      } else {
+        await expect(outcome).rejects.toThrow(/different|mismatch/);
+        expect(stored(env)).toEqual(previous);
+        expect(identityRequests).toBe(0); expect(businessRequests).toBe(0);
+      }
+      expect(tokenRequests).toBe(1);
+    });
+
+  it.each(['token owner', 'identity endpoint'])('rejects a Pinduoduo merchant mismatch hidden by numeric rounding at %s', async stage => {
+    const env = environment('pinduoduo', { client_id: 'fixture-client', client_secret: 'fixture-secret',
+      access_token: 'old-access', refresh_token: 'old-refresh', expires_at: 0, identity: { mall_id: '9007199254740992' } });
+    const previous = stored(env);
+    let tokenRequests = 0, identityRequests = 0, businessRequests = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      const type = new URLSearchParams(String(init.body)).get('type');
+      if (type === 'pdd.pop.auth.token.refresh') {
+        tokenRequests++;
+        return new Response('{"pop_auth_token_refresh_response":{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":7200'
+          + (stage === 'token owner' ? ',"owner_id":9007199254740993' : '') + '}}');
+      }
+      if (type === 'pdd.mall.info.get') {
+        identityRequests++;
+        return new Response('{"mall_info_get_response":{"mall_id":9007199254740993}}');
+      }
+      businessRequests++; return reply({ goods_list_get_response: { goods_list: [] } });
+    }));
+    await expect(adapter.callTool('execute_read', { action: 'products.list' }, env))
+      .rejects.toMatchObject({ code: 'E_TOOL_CALL_AUTH' });
+    expect(stored(env)).toEqual(previous);
+    expect(tokenRequests).toBe(1);
+    expect(identityRequests).toBe(stage === 'token owner' ? 0 : 1);
+    expect(businessRequests).toBe(0);
+  });
+
+  it('refreshes a matching Pinduoduo integer identity without changing its exact binding', async () => {
+    const env = environment('pinduoduo', { client_id: 'fixture-client', client_secret: 'fixture-secret',
+      access_token: 'old-access', refresh_token: 'old-refresh', expires_at: 0, identity: { mall_id: '9007199254740993' } });
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      const type = new URLSearchParams(String(init.body)).get('type');
+      return new Response(type === 'pdd.pop.auth.token.refresh'
+        ? '{"pop_auth_token_refresh_response":{"access_token":"rotated-access","refresh_token":"rotated-refresh","expires_in":7200,"owner_id":9007199254740993}}'
+        : type === 'pdd.mall.info.get' ? '{"mall_info_get_response":{"mall_id":9007199254740993}}'
+          : '{"goods_list_get_response":{"goods_list":[]}}');
+    }));
+    await expect(adapter.callTool('execute_read', { action: 'products.list' }, env)).resolves.toMatchObject({ provider: 'pinduoduo' });
+    expect(stored(env)).toMatchObject({ access_token: 'rotated-access', refresh_token: 'rotated-refresh',
+      identity: { mall_id: '9007199254740993' } });
+  });
+
   it.each(['ebay', 'etsy', 'constant_contact'])('shares one %s refresh across simultaneous reads and the next request', async provider => {
     const env = provider === 'ebay' ? ebay() : environment(provider, {
       client_id: 'fixture-client', keystring: 'fixturekey', shared_secret: 'fixture-secret',

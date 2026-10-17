@@ -17,6 +17,7 @@ import { createLogger } from '../../../logger.js';
 import { AGENT_EXECUTION_MAX_MS } from '../../../util/agent-execution-budget.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
 import { CliInputCancellation, CliInputNotSentError } from '../cli_input_cancel.js';
+import { ClaudeStreamDiagnostics } from './claude-stream-diagnostics.js';
 import {
   type LocalBackend,
   type LocalActiveRunIngress,
@@ -60,6 +61,9 @@ export const claudeBackend: LocalBackend = {
     const child = spawnCli(opts.binPath, args, opts.cwd);
     const tail = new StderrTail();
     const startedAt = Date.now();
+    const streamDiagnostics = process.env.ORKAS_DEVTOOLS === '1'
+      || process.env.ORKAS_CLAUDE_STREAM_DIAGNOSTICS === '1'
+      ? new ClaudeStreamDiagnostics() : undefined;
     const deadlineAt = Math.min(opts.deadlineAt ?? Infinity, startedAt + opts.timeoutMs);
 
     let sessionId: string | undefined;
@@ -277,6 +281,9 @@ export const claudeBackend: LocalBackend = {
     ): void => {
       if (doneEmitted) return;
       doneEmitted = true;
+      if (streamDiagnostics) {
+        log.info('claude stdout delivery summary', { pid: child.pid ?? -1, ...streamDiagnostics.summary() });
+      }
       opts.onEvent({
         type: 'done',
         status,
@@ -354,7 +361,9 @@ export const claudeBackend: LocalBackend = {
      *  resumes foreground presentation without resetting either run budget. */
     const emit = (event: LocalEvent): void => {
       trackTask(event);
+      const forwardStartedAt = streamDiagnostics && event.type === 'text-delta' ? performance.now() : undefined;
       opts.onEvent(event);
+      if (forwardStartedAt !== undefined) streamDiagnostics.recordForward(performance.now() - forwardStartedAt);
       if (phase === 'background' && isForegroundActivity(event)) enterForeground();
     };
 
@@ -498,6 +507,7 @@ export const claudeBackend: LocalBackend = {
     const splitter = new LineSplitter();
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', (chunk: string) => {
+      streamDiagnostics?.beginRead(chunk.length);
       splitter.push(chunk, line => {
         if (exited) return;
         const trimmed = line.trim();
@@ -522,6 +532,7 @@ export const claudeBackend: LocalBackend = {
           else emit({ type: 'raw-line', line: trimmed });
           return;
         }
+        streamDiagnostics?.record(obj);
         // Side-channel: control_request needs a stdin write back AND a
         // rail event. Handled outside mapClaudeEvent so the mapper
         // stays a pure translator (no I/O, easier to unit-test).
@@ -575,6 +586,10 @@ export const claudeBackend: LocalBackend = {
           }
         }
         const ev = mapClaudeEvent(obj, sessionId, partialState);
+        if (streamDiagnostics && obj?.type === 'assistant' && !obj.parent_tool_use_id
+            && (ev?.events || (ev?.event ? [ev.event] : [])).some(event => event.type === 'text-delta')) {
+          streamDiagnostics.recordFallback();
+        }
         const hadSession = !!sessionId;
         if (ev?.captureSession && obj.session_id) sessionId = String(obj.session_id);
         if (obj?.session_id && !sessionId) sessionId = String(obj.session_id);
@@ -605,6 +620,7 @@ export const claudeBackend: LocalBackend = {
           // assistant blocks even when the previous turn streamed deltas.
           partialState.sawTextStreamEvent = false;
           partialState.messageId = undefined;
+          partialState.subagentMessages?.clear();
           // Tool calls never span turns; drop any callId whose result
           // never arrived so the map stays turn-scoped.
           partialState.toolNamesByCallId?.clear();
@@ -739,7 +755,7 @@ export const claudeBackend: LocalBackend = {
  *  model/effort/permission overrides deliberately leave selection to Claude
  *  Code when the Agent has no explicit value. */
 export function buildClaudeArgs(opts: Pick<BackendRunOptions,
-  'resumeSessionId' | 'customArgs' | 'bridge' | 'systemPrompt' | 'modelOverride' | 'thinkingLevel' | 'permissionPolicy'
+  'resumeSessionId' | 'customArgs' | 'bridge' | 'systemPrompt' | 'modelOverride' | 'thinkingLevel' | 'permissionPolicy' | 'cliFlags'
 >): string[] {
   // `--include-partial-messages` is the flag that turns claude code's
   // stream-json output from "one assistant message per completed turn"
@@ -752,16 +768,18 @@ export function buildClaudeArgs(opts: Pick<BackendRunOptions,
     '--output-format', 'stream-json',
     '--input-format', 'stream-json',
     '--include-partial-messages',
-    '--include-hook-events',
     '--verbose',
     // The response transport is also required for AskUserQuestion under
     // inherited/full-access policies; the CLI still owns permission mode.
     '--permission-prompt-tool', 'stdio',
     ...buildClaudePermissionArgs(opts.permissionPolicy || 'inherit'),
   ];
+  if (opts.cliFlags?.includes('--include-hook-events')) args.push('--include-hook-events');
   if (opts.resumeSessionId) args.push('--resume', opts.resumeSessionId);
   if (opts.modelOverride) args.push('--model', opts.modelOverride);
-  if (opts.thinkingLevel) args.push('--effort', opts.thinkingLevel);
+  if (opts.thinkingLevel && opts.cliFlags?.includes('--effort')) {
+    args.push('--effort', opts.thinkingLevel);
+  }
   // orkas-bridge: ADD the per-run MCP server alongside the user's own MCP
   // config (no --strict-mcp-config — their servers must keep working), and
   // tell the agent the bridge exists via an appended system prompt.
@@ -811,6 +829,9 @@ export function buildClaudePermissionArgs(
  */
 export type ClaudeParseState = {
   sawTextStreamEvent: boolean;
+  /** Full-record de-duplication per spawning Agent call, never shared with
+   * the main reply. Cleared at the native turn boundary. */
+  subagentMessages?: Map<string, ClaudeParseState>;
   /** Native assistant message identity, shared by partial and full records. */
   messageId?: string;
   messageHasNativeId?: boolean;
@@ -855,6 +876,8 @@ export function mapClaudeEvent(
     } {
   if (!obj || typeof obj !== 'object') return undefined;
   const type = obj.type;
+  const parentToolUseId = typeof obj.parent_tool_use_id === 'string'
+    ? obj.parent_tool_use_id : '';
   if (type === 'system' && obj.subtype === 'init') {
     // Surface a running-status pulse alongside capturing the session
     // id. Matches multica's parity: an explicit '▶ running' row tells
@@ -1038,6 +1061,10 @@ export function mapClaudeEvent(
     };
   }
   if (type === 'stream_event') {
+    // Child partials share stdout with the main conversation. Their full
+    // assistant records supply process detail below; streaming them here
+    // would both publish child prose as a reply and replace the main id.
+    if (parentToolUseId) return undefined;
     const inner = obj.event;
     if (!inner || typeof inner !== 'object') return undefined;
     const innerType = inner.type;
@@ -1077,6 +1104,20 @@ export function mapClaudeEvent(
     return undefined;
   }
   if (type === 'assistant') {
+    if (parentToolUseId) {
+      const children = partialState.subagentMessages ??= new Map();
+      let childState = children.get(parentToolUseId);
+      if (!childState) {
+        childState = {
+          sawTextStreamEvent: false,
+          // Tool ids belong to the CLI run, so child Read results still use
+          // the same ownership lookup and cannot become generated images.
+          toolNamesByCallId: partialState.toolNamesByCallId,
+        };
+        children.set(parentToolUseId, childState);
+      }
+      partialState = childState;
+    }
     const content = Array.isArray(obj?.message?.content) ? obj.message.content : [];
     const events: LocalEvent[] = [];
     const messageId = typeof obj.message?.id === 'string' ? obj.message.id : undefined;
@@ -1101,7 +1142,12 @@ export function mapClaudeEvent(
         // we fall back to emitting it here so the user still sees the
         // reply.
         if (!alreadyStreamed) {
-          events.push({ type: 'text-delta', text: part.text, itemId });
+          events.push(parentToolUseId
+            ? {
+                type: 'status', status: 'tool-progress',
+                tool: 'Agent', callId: parentToolUseId, message: part.text,
+              }
+            : { type: 'text-delta', text: part.text, itemId });
         }
         continue;
       }

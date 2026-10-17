@@ -1,8 +1,95 @@
 import { createServer } from 'node:http';
-import { readFileSync } from 'node:fs';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import { expect, OrkasTestApp, test } from './fixtures/orkas';
+
+test('resource cache survives restart while website data stays in its original profile', async ({}, testInfo) => {
+  test.setTimeout(120_000);
+  // macOS permits some temporary roots independently; use a home-directory
+  // fixture to detect the real external-profile sandbox regression. Windows
+  // runs the same cache/restart oracle against its unchanged native directories.
+  const orkas = new OrkasTestApp(testInfo, { rootParent: homedir() });
+  let hits = 0;
+  const server = createServer((req, res) => {
+    if (req.url === '/asset') {
+      hits++;
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      res.end('resource'.repeat(20_000));
+      return;
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    if (req.url === '/sw.js') {
+      res.setHeader('Content-Type', 'text/javascript');
+      res.end('self.addEventListener("install", () => self.skipWaiting());');
+      return;
+    }
+    res.setHeader('Content-Type', 'text/html');
+    res.end('<title>Cache continuity</title><h1>Ready</h1>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await orkas.launch();
+    const origin = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+    const created = await orkas.invoke<any>('conversations.create', { title: 'Cache continuity' });
+    const open = async () => {
+      expect(await orkas.invoke<any>('webAssist.open', { conversationId: created.conversation.conversation_id, url: origin })).toMatchObject({ ok: true });
+      await expect.poll(async () => (await orkas.invoke<any>('webAssist.state')).state.loading).toBe(false);
+    };
+    const run = (script: string) => orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }, code) => {
+      const views = BrowserWindow.getAllWindows()[0].contentView.children.filter(v => v instanceof WebContentsView);
+      return (views.at(-1) as InstanceType<typeof WebContentsView>).webContents.executeJavaScript(code);
+    }, script);
+    const native = (clear = false) => orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }, clearCache) => {
+      const views = BrowserWindow.getAllWindows()[0].contentView.children.filter(v => v instanceof WebContentsView);
+      const ses = (views.at(-1) as InstanceType<typeof WebContentsView>).webContents.session;
+      if (clearCache) await ses.clearCache();
+      return { bytes: await ses.getCacheSize(), storagePath: ses.storagePath };
+    }, clear);
+    const fetchAsset = () => run("fetch('/asset').then(r => r.text()).then(s => s.length)");
+    const readStores = ` (async () => {
+      const db = await new Promise((resolve, reject) => { const q = indexedDB.open('retained', 1); q.onsuccess = () => resolve(q.result); q.onerror = () => reject(q.error); });
+      const indexed = await new Promise((resolve, reject) => { const q = db.transaction('values').objectStore('values').get('key'); q.onsuccess = () => resolve(q.result); q.onerror = () => reject(q.error); });
+      db.close();
+      return { local: localStorage.getItem('key'), cookie: document.cookie, indexed,
+        cache: await (await caches.match('/saved')).text(), worker: !!(await navigator.serviceWorker.getRegistration()) };
+    })()`;
+    await open();
+    expect(await fetchAsset()).toBe(160_000);
+    expect(await fetchAsset()).toBe(160_000);
+    expect(hits).toBe(1);
+    await expect.poll(async () => (await native()).bytes).toBeGreaterThan(160_000);
+    const profile = path.join(orkas.workspaceRoot, 'account-e2e/local/web-assist/profile');
+    expect(realpathSync((await native()).storagePath!)).toBe(realpathSync(profile));
+    expect(lstatSync(path.join(profile, 'Cache')).isSymbolicLink()).toBe(process.platform === 'darwin');
+    await run(`(async () => {
+      localStorage.setItem('key', 'local'); sessionStorage.setItem('key', 'session'); document.cookie = 'retained=cookie; Max-Age=3600; Path=/';
+      const db = await new Promise((resolve, reject) => { const q = indexedDB.open('retained', 1); q.onupgradeneeded = () => q.result.createObjectStore('values'); q.onsuccess = () => resolve(q.result); q.onerror = () => reject(q.error); });
+      await new Promise((resolve, reject) => { const t = db.transaction('values', 'readwrite'); t.objectStore('values').put('indexed', 'key'); t.oncomplete = resolve; t.onerror = () => reject(t.error); }); db.close();
+      await (await caches.open('retained')).put('/saved', new Response('website-cache'));
+      await navigator.serviceWorker.register('/sw.js'); await navigator.serviceWorker.ready;
+    })()`);
+    const expected = { local: 'local', cookie: 'retained=cookie', indexed: 'indexed', cache: 'website-cache', worker: true };
+    expect(await run(readStores)).toEqual(expected);
+    for (const dir of ['Local Storage', 'Session Storage', 'IndexedDB', 'Service Worker']) expect(lstatSync(path.join(profile, dir)).isSymbolicLink()).toBe(false);
+    await orkas.relaunch();
+    await open();
+    expect(await fetchAsset()).toBe(160_000);
+    expect(hits).toBe(1);
+    expect(await run(readStores)).toEqual(expected);
+    // HTTP eviction must never include the website's CacheStorage or logins.
+    await run("sessionStorage.setItem('key', 'new-session')");
+    await native(true);
+    expect(await run(readStores)).toEqual(expected);
+    expect(await run("sessionStorage.getItem('key')")).toBe('new-session');
+    expect(await fetchAsset()).toBe(160_000);
+    expect(hits).toBe(2);
+  } finally {
+    await orkas.dispose();
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
 
 test('website login survives app restart and website logout stays logged out', async ({ orkas }) => {
   test.setTimeout(120_000);
@@ -279,6 +366,9 @@ test('task browser blocks requests when proxy setup fails instead of using a rea
       const require = (process as any).mainModule.require.bind((process as any).mainModule);
       const paths = require(args.pathsModule);
       const dir = paths.userWebAssistProfileDir('account-e2e');
+      // Fault injection must preserve the production prepare-before-session
+      // boundary, otherwise this fixture races native cache initialization.
+      await require(args.cacheModule).prepareWebAssistCache('account-e2e');
       require('node:fs').mkdirSync(dir, { recursive: true });
       const ses = session.fromPath(dir, { cache: true });
       // Fault injection: Chromium cannot apply the requested proxy. No request may escape on its old route.
@@ -289,6 +379,7 @@ test('task browser blocks requests when proxy setup fails instead of using a rea
     }, {
       cid: created.conversation.conversation_id, url,
       pathsModule: path.resolve(__dirname, '../../src/main/paths.ts'),
+      cacheModule: path.resolve(__dirname, '../../src/main/features/web_assist_cache.ts'),
       webModule: path.resolve(__dirname, '../../src/main/features/web_assist.ts'),
     });
     expect(opened.ok).toBe(true);
@@ -537,10 +628,10 @@ test('task browser opens ordinary pages as tabs while preserving web navigation 
   }
 });
 
-test('task completion only closes explicitly temporary native tabs and resumes an unmarked login', async ({ orkas }) => {
+test('task completion only closes explicitly temporary native tabs and resumes an unmarked login', async ({ modelOrkas: orkas }) => {
   const server = createServer((_req, res) => {
     res.setHeader('Content-Type', 'text/html');
-    res.end('<title>Lifecycle page</title><h1>Browser lifecycle</h1>');
+    res.end('<title>Lifecycle page</title><h1>Browser lifecycle</h1><input aria-label="Draft">');
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
@@ -566,28 +657,53 @@ test('task completion only closes explicitly temporary native tabs and resumes a
       web.bindWebAssistConversation('account-e2e', args.cid, sender);
       lifecycle.beginBrowserTaskRun('account-e2e', args.cid, 'e2e-first');
       await web.openWebAssist('account-e2e', sender, { conversationId: args.cid, url: args.url + 'user' });
-      const temporary = await web.openModelWebAssist('account-e2e', args.cid, { url: args.url + 'temporary' });
-      const mark = web.retainModelWebAssistTab('account-e2e', args.cid, temporary.active_tab_id, 'temporary');
+      const temporary = await web.openModelWebAssist('account-e2e', args.cid, { url: args.url + 'temporary', retention: 'temporary' });
+      const deliverable = await web.openModelWebAssist('account-e2e', args.cid, { url: args.url + 'deliverable', retention: 'deliverable' });
+      const handoff = await web.openModelWebAssist('account-e2e', args.cid, { url: args.url + 'explicit-handoff', retention: 'handoff' });
+      const takeover = await web.openModelWebAssist('account-e2e', args.cid, { url: args.url + 'takeover', retention: 'temporary' });
       const login = await web.openControlledWebAssist('account-e2e', args.cid, {
         scope: 'connector_setup', scopeId: 'fixture-shop', url: args.url + 'handoff',
       });
-      return { mark, login, state: web.webAssistState(sender) };
+      return { temporary, deliverable, handoff, takeover, login, state: web.webAssistState(sender) };
     }, input);
-    expect(initial.mark.ok).toBe(true);
+    expect(initial.temporary).toMatchObject({ ok: true, tab: { retention: 'temporary' } });
+    expect(initial.deliverable).toMatchObject({ ok: true, tab: { retention: 'deliverable' } });
+    expect(initial.handoff).toMatchObject({ ok: true, tab: { retention: 'handoff' } });
     expect(initial.login.ok).toBe(true);
-    await expect(page.locator('.web-assist-tab')).toHaveCount(3);
+    await expect(page.locator('.web-assist-tab')).toHaveCount(6);
     const nativePaths = () => orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }) => (
       BrowserWindow.getAllWindows()[0].contentView.children
         .filter(view => view instanceof WebContentsView)
         .map(view => view.webContents.getURL())
         .map(url => url ? new URL(url).pathname : '').sort()
     ));
-    await expect.poll(nativePaths).toEqual(['/handoff', '/temporary', '/user']);
+    await expect.poll(nativePaths).toEqual(['/deliverable', '/explicit-handoff', '/handoff', '/takeover', '/temporary', '/user']);
+    await orkas.invoke('webAssist.activateTab', { tabId: initial.takeover.active_tab_id });
+    const draft = () => orkas.electronApp!.evaluate(async ({ webContents }, url) => (
+      webContents.getAllWebContents().find(contents => contents.getURL() === url)!
+        .executeJavaScript('document.querySelector("input").value')
+    ), input.url + 'takeover');
+    // Native user input uses the production takeover lease, without an
+    // assistant-input marker or a synthetic retention mutation.
+    await orkas.electronApp!.evaluate(async ({ BrowserWindow, webContents }, url) => {
+      const owner = BrowserWindow.getAllWindows()[0];
+      owner.setFocusable(true); owner.show(); owner.focus();
+      const contents = webContents.getAllWebContents().find(contents => contents.getURL() === url)!;
+      contents.focus();
+      await contents.executeJavaScript('document.querySelector("input").focus()');
+      contents.sendInputEvent({ type: 'keyDown', keyCode: 'A' });
+      contents.sendInputEvent({ type: 'char', keyCode: 'A' });
+      contents.sendInputEvent({ type: 'keyUp', keyCode: 'A' });
+    }, input.url + 'takeover');
+    await expect.poll(draft).toBe('A');
+    await expect.poll(async () => (await orkas.invoke<any>('webAssist.state')).state.tabs
+      .find((tab: any) => tab.tab_id === initial.takeover.active_tab_id)?.retention).toBe('handoff');
     await orkas.electronApp!.evaluate((_electron, args) => {
       (process as any).mainModule.require(args.lifecyclePath).finishBrowserTaskRun('account-e2e', args.cid, 'e2e-first');
     }, input);
-    await expect(page.locator('.web-assist-tab')).toHaveCount(2);
-    await expect.poll(nativePaths).toEqual(['/handoff', '/user']);
+    await expect(page.locator('.web-assist-tab')).toHaveCount(5);
+    await expect.poll(nativePaths).toEqual(['/deliverable', '/explicit-handoff', '/handoff', '/takeover', '/user']);
+    expect(await draft()).toBe('A');
     const resumed = await orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }, args) => {
       const lifecycle = (process as any).mainModule.require(args.lifecyclePath);
       const web = (process as any).mainModule.require(args.webPath);
@@ -603,17 +719,117 @@ test('task completion only closes explicitly temporary native tabs and resumes a
       return observed;
     }, input);
     expect(resumed, JSON.stringify(resumed)).toMatchObject({ ok: true, tab_id: initial.login.state.active_tab_id, display_url: input.url + 'applications' });
-    await expect(page.locator('.web-assist-tab')).toHaveCount(2);
-    await expect.poll(nativePaths).toEqual(['/applications', '/user']);
+    await expect(page.locator('.web-assist-tab')).toHaveCount(5);
+    await expect.poll(nativePaths).toEqual(['/applications', '/deliverable', '/explicit-handoff', '/takeover', '/user']);
     const closed = await orkas.electronApp!.evaluate((_electron, args) => {
       return (process as any).mainModule.require(args.webPath)
         .closeModelWebAssistTab('account-e2e', args.cid, args.tabId);
     }, { ...input, tabId: resumed.tab_id });
     expect(closed.ok).toBe(true);
-    await expect(page.locator('.web-assist-tab')).toHaveCount(1);
-    await expect.poll(nativePaths).toEqual(['/user']);
+    await expect(page.locator('.web-assist-tab')).toHaveCount(4);
+    await expect.poll(nativePaths).toEqual(['/deliverable', '/explicit-handoff', '/takeover', '/user']);
     await orkas.invoke('webAssist.close', {});
   } finally {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  }
+});
+
+test('model last-page closure hides only its task browser while user closure keeps the browser available', async ({}, testInfo) => {
+  const orkas = new OrkasTestApp(testInfo, { softwareRendering: true });
+  const server = createServer((_req, res) => {
+    res.setHeader('Content-Type', 'text/html');
+    res.end('<title>Close lifecycle</title><h1>Ready</h1>');
+  });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    await orkas.launch();
+    const page = orkas.page!;
+    const a = (await orkas.invoke<any>('conversations.create', { title: 'Browser close owner' })).conversation.conversation_id;
+    const b = (await orkas.invoke<any>('conversations.create', { title: 'Other browser task' })).conversation.conversation_id;
+    await page.evaluate(async () => (window as any).loadConversations());
+    const select = async (cid: string) => {
+      await page.evaluate(id => (window as any).setView('conversation', id), cid);
+      await orkas.invoke('webAssist.setContext', { conversationId: cid });
+    };
+    const input = {
+      webPath: path.resolve(__dirname, '../../src/main/features/web_assist.ts'),
+      lifecyclePath: path.resolve(__dirname, '../../src/main/features/web_assist_lifecycle.ts'),
+      url: `http://127.0.0.1:${(server.address() as { port: number }).port}/`,
+    };
+    const open = async (cid: string) => {
+      const result = await orkas.electronApp!.evaluate(async ({ BrowserWindow }, args) => {
+        const web = (process as any).mainModule.require(args.webPath);
+        web.bindWebAssistConversation('account-e2e', args.cid, BrowserWindow.getAllWindows()[0].webContents);
+        return web.openModelWebAssist('account-e2e', args.cid, { url: args.url });
+      }, { ...input, cid });
+      expect(result.ok).toBe(true);
+      return String(result.active_tab_id);
+    };
+    const close = async (cid: string, tabId: string) => {
+      const result = await orkas.electronApp!.evaluate((_electron, args) => (
+        (process as any).mainModule.require(args.webPath).closeModelWebAssistTab('account-e2e', args.cid, args.tabId)
+      ), { ...input, cid, tabId });
+      expect(result.ok).toBe(true);
+    };
+    const details = page.locator('#conversation-info-panel');
+    await select(a);
+    const first = await open(a);
+    const last = await open(a);
+    await expect(details).toBeVisible();
+    await expect(page.locator('.web-assist-tab')).toHaveCount(2);
+    await close(a, first);
+    await expect(page.locator('.web-assist-tab')).toHaveCount(1);
+    await expect(details).toBeVisible();
+    await page.locator('[data-act="expand"]').click();
+    await expect(details).toHaveClass(/is-web-assist-expanded/);
+    await close(a, last);
+    await expect(details).toBeHidden();
+    await expect(details).not.toHaveClass(/is-web-assist-expanded/);
+    expect((await orkas.invoke<any>('webAssist.state')).state.tabs).toHaveLength(0);
+
+    // Automatic dismissal permits later model work to reveal again in this turn.
+    await open(a);
+    await expect(details).toBeVisible();
+    await page.locator('.web-assist-tab-close').click();
+    await expect(details).toBeVisible();
+    await expect(page.locator('.web-assist-tab')).toHaveCount(1);
+    await expect(page.locator('.web-assist-empty')).toBeVisible();
+    expect((await orkas.invoke<any>('webAssist.state')).state.tabs[0].created_by).toBe('user');
+    await orkas.invoke('webAssist.close', {});
+    await expect(page.locator('.web-assist-tab')).toHaveCount(0);
+    await expect(details).toBeVisible();
+
+    const temporary = await open(a);
+    await orkas.electronApp!.evaluate((_electron, args) => {
+      const lifecycle = (process as any).mainModule.require(args.lifecyclePath);
+      const web = (process as any).mainModule.require(args.webPath);
+      lifecycle.beginBrowserTaskRun('account-e2e', args.cid, 'e2e-auto-dismiss');
+      const marked = web.retainModelWebAssistTab('account-e2e', args.cid, args.tabId, 'temporary');
+      if (!marked.ok) throw new Error('temporary page setup failed');
+      lifecycle.finishBrowserTaskRun('account-e2e', args.cid, 'e2e-auto-dismiss');
+    }, { ...input, cid: a, tabId: temporary });
+    await expect(details).toBeHidden();
+
+    const background = await open(a);
+    await expect(details).toBeVisible();
+    await select(b);
+    await open(b);
+    await expect(details).toBeVisible();
+    await close(a, background);
+    await expect(details).toBeVisible();
+    await expect(page.locator('.web-assist-tab')).toHaveCount(1);
+    await select(a);
+    await expect(details).toBeHidden();
+    // A model close must not dismiss the Files tab the user chose instead.
+    const checking = await open(a);
+    await expect(details).toBeVisible();
+    await page.evaluate(() => (window as any).ConversationInfo.openAndSetTab('files'));
+    await close(a, checking);
+    await expect(details).toBeVisible();
+    await expect(details.locator('[data-info-tab="files"]')).toHaveClass(/is-active/);
+  } finally {
+    await orkas.dispose();
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
@@ -668,10 +884,12 @@ test('task browser caps its visible strip at thirty while keeping user and conne
   }
 });
 
-test('task browser keeps an authorization popup separate and reconnects it to its opener', async ({ orkas }) => {
+test('task browser owns an authorization popup as a tab and preserves its opener', async ({ modelOrkas: orkas }) => {
+  const authorizationCookies: string[] = [];
   const server = createServer((req, res) => {
     res.setHeader('Content-Type', 'text/html');
     if (req.url === '/authorize') {
+      authorizationCookies.push(req.headers.cookie || '');
       res.end(`<!doctype html><title>Provider authorization</title>
         <h1>Provider authorization</h1>
         <button id="authorize">Authorize</button>
@@ -683,6 +901,7 @@ test('task browser keeps an authorization popup separate and reconnects it to it
         </script>`);
       return;
     }
+    res.setHeader('Set-Cookie', 'provider-session=fixture; HttpOnly; SameSite=Lax; Path=/');
     res.end(`<!doctype html><title>Provider settings</title>
       <h1>Provider settings</h1>
       <button id="open-auth">Connect account</button>
@@ -724,86 +943,68 @@ test('task browser keeps an authorization popup separate and reconnects it to it
       });
     }, input);
     expect(opened).toMatchObject({ ok: true });
+    await orkas.page!.evaluate(() => (window as any).ConversationInfo.openAndSetTab('browser'));
+    await expect(orkas.page!.locator('.web-assist-shell')).toBeVisible();
     await expect.poll(async () => orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }) => {
       const owner = BrowserWindow.getAllWindows().find(win => !win.getParentWindow())!;
       const parent = owner.contentView.children.find(child => child instanceof WebContentsView);
       return parent?.webContents.getTitle();
     })).toBe('Provider settings');
 
-    const requestedPopupSize = await orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }) => {
+    const inventory = () => orkas.electronApp!.evaluate(({ BrowserWindow }, args) => {
+      const web = (process as any).mainModule.require(args.modulePath);
+      return { ...web.listModelWebAssistTabs('account-e2e', args.cid), windows: BrowserWindow.getAllWindows().length };
+    }, input);
+    const openAuthorization = () => orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }, url) => {
       const owner = BrowserWindow.getAllWindows().find(win => !win.getParentWindow())!;
-      const parent = owner.contentView.children.find(child => child instanceof WebContentsView) as InstanceType<typeof WebContentsView>;
-      const created = new Promise(resolve => parent.webContents.once('did-create-window', (_popup, details) => {
-        resolve([details.options.width, details.options.height]);
-      }));
+      const parent = owner.contentView.children.find(child => child instanceof WebContentsView
+        && child.webContents.getURL() === url) as InstanceType<typeof WebContentsView>;
       await parent.webContents.executeJavaScript('document.querySelector("#open-auth").click()', true);
-      return created;
-    });
-    expect(requestedPopupSize).toEqual([480, 620]);
-    if (process.env.PWDEBUG !== '1' && process.env.ORKAS_E2E_SHOW_WINDOW !== '1') {
-      expect(await orkas.electronApp!.evaluate(({ BrowserWindow }) => {
-        const popup = BrowserWindow.getAllWindows().find(win => !!win.getParentWindow())!;
-        return { visible: popup.isVisible(), focused: popup.isFocused(), focusable: popup.isFocusable() };
-      })).toEqual({ visible: false, focused: false, focusable: false });
-    }
-    await expect.poll(async () => orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView, screen }) => {
+    }, parentUrl);
+    await openAuthorization();
+    await expect(orkas.page!.locator('.web-assist-tab')).toHaveCount(2);
+    await expect(orkas.page!.locator('.web-assist-tab.is-active')).toContainText('Provider authorization');
+    const popupState = await inventory();
+    expect(popupState.windows).toBe(1);
+    expect(popupState.tabs).toHaveLength(2);
+    expect(popupState.tabs.find((tab: any) => tab.tab_id === popupState.active_tab_id)?.page_title).toBe('Provider authorization');
+    expect(authorizationCookies).toEqual(['provider-session=fixture']);
+    const nativePopup = await orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }, url) => {
       const owner = BrowserWindow.getAllWindows().find(win => !win.getParentWindow())!;
-      const popup = BrowserWindow.getAllWindows().find(win => win.getParentWindow()?.id === owner.id);
-      const parent = owner.contentView.children.find(child => child instanceof WebContentsView) as InstanceType<typeof WebContentsView>;
-      if (!popup) return null;
-      const scale = screen.getDisplayMatching(popup.getBounds()).scaleFactor;
-      // Windows native frame conversion yields 480x622 at 125% DPI, but 480x620 at 100%.
-      // Keep the requested dimensions exact above; allow only a small native rounding delta.
-      const tolerance = process.platform === 'win32' && !Number.isInteger(scale) ? 2 : 0;
+      const views = owner.contentView.children.filter(child => child instanceof WebContentsView) as InstanceType<typeof WebContentsView>[];
+      const parent = views.find(view => view.webContents.getURL() === url)!;
+      const popup = views.find(view => view.webContents.getURL() === url + 'authorize')!;
       return {
-        title: popup.webContents.getTitle(),
-        parent: popup.getParentWindow()?.id === owner.id,
-        sharedSession: popup.webContents.session === parent?.webContents.session,
-        sizeWithinTolerance: popup.getSize().every((value, index) => Math.abs(value - [480, 620][index]) <= tolerance),
+        id: popup.webContents.id,
+        sharedSession: popup.webContents.session === parent.webContents.session,
+        opener: await popup.webContents.executeJavaScript('window.opener !== null && window.opener.location.href === ' + JSON.stringify(url)),
+        visible: popup.getVisible(),
       };
-    })).toEqual({
-      title: 'Provider authorization',
-      parent: true,
-      sharedSession: true,
-      sizeWithinTolerance: true,
-    });
-    await expect.poll(async () => orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }, expectedUrl) => {
-      const owner = BrowserWindow.getAllWindows().find(win => !win.getParentWindow())!;
-      const parent = owner.contentView.children.find(child => child instanceof WebContentsView) as InstanceType<typeof WebContentsView>;
-      return parent.webContents.getURL() === expectedUrl;
-    }, parentUrl)).toBe(true);
+    }, parentUrl);
+    expect(nativePopup).toMatchObject({ sharedSession: true, opener: true, visible: true });
 
-    await orkas.electronApp!.evaluate(async ({ BrowserWindow }) => {
-      const popup = BrowserWindow.getAllWindows().find(win => !!win.getParentWindow())!;
-      await popup.webContents.executeJavaScript('document.querySelector("#authorize").click()', true);
-    });
-    await expect.poll(async () => orkas.electronApp!.evaluate(({ BrowserWindow }) => (
-      BrowserWindow.getAllWindows().filter(win => !!win.getParentWindow()).length
-    ))).toBe(0);
-    await expect.poll(async () => orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }) => {
+    await orkas.electronApp!.evaluate(async ({ webContents }, id) => {
+      await webContents.fromId(id)!.executeJavaScript('document.querySelector("#authorize").click()', true);
+    }, nativePopup.id);
+    await expect(orkas.page!.locator('.web-assist-tab')).toHaveCount(1);
+    await expect.poll(() => orkas.electronApp!.evaluate(({ webContents }, id) => !!webContents.fromId(id), nativePopup.id)).toBe(false);
+    await expect.poll(async () => orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }, url) => {
       const owner = BrowserWindow.getAllWindows().find(win => !win.getParentWindow())!;
-      const parent = owner.contentView.children.find(child => child instanceof WebContentsView) as InstanceType<typeof WebContentsView>;
+      const parent = owner.contentView.children.find(child => child instanceof WebContentsView
+        && child.webContents.getURL() === url) as InstanceType<typeof WebContentsView>;
       return parent.webContents.executeJavaScript('document.querySelector("#auth-result").textContent');
-    })).toBe('Connected');
+    }, parentUrl)).toBe('Connected');
 
-    await orkas.electronApp!.evaluate(async ({ BrowserWindow, WebContentsView }) => {
-      const owner = BrowserWindow.getAllWindows().find(win => !win.getParentWindow())!;
-      const parent = owner.contentView.children.find(child => child instanceof WebContentsView) as InstanceType<typeof WebContentsView>;
-      await parent.webContents.executeJavaScript('document.querySelector("#open-auth").click()', true);
-    });
-    await expect.poll(async () => orkas.electronApp!.evaluate(({ BrowserWindow }) => (
-      BrowserWindow.getAllWindows().filter(win => !!win.getParentWindow()).length
-    ))).toBe(1);
+    await openAuthorization();
+    await expect(orkas.page!.locator('.web-assist-tab')).toHaveCount(2);
+    await expect(orkas.page!.locator('.web-assist-tab.is-active')).toContainText('Provider authorization');
+    expect(authorizationCookies).toEqual(['provider-session=fixture', 'provider-session=fixture']);
     await orkas.invoke('webAssist.close', {});
-    await expect.poll(async () => orkas.electronApp!.evaluate(({ BrowserWindow }) => (
-      BrowserWindow.getAllWindows().filter(win => !!win.getParentWindow()).length
+    await expect.poll(() => orkas.electronApp!.evaluate(({ BrowserWindow, WebContentsView }) => (
+      BrowserWindow.getAllWindows()[0].contentView.children.filter(child => child instanceof WebContentsView).length
     ))).toBe(0);
+    expect((await inventory()).tabs).toHaveLength(0);
   } finally {
-    await orkas.electronApp?.evaluate(({ BrowserWindow }) => {
-      for (const win of BrowserWindow.getAllWindows()) {
-        if (win.getParentWindow()) win.close();
-      }
-    });
     server.closeAllConnections();
     await new Promise<void>(resolve => server.close(() => resolve()));
   }
@@ -909,55 +1110,25 @@ test('background browser work is revealed on return and activity overlays preser
     ), nativeId);
     const before = await documentState();
     const backdrop = page.locator('.web-assist-page-preview');
-    const expectPageBackdrop = async () => {
-      await expect(backdrop).toBeVisible();
-      // Read actual captured page pixels, not just the presence of an image URL.
-      await expect.poll(() => backdrop.evaluate((image: HTMLImageElement) => {
-        const canvas = document.createElement('canvas');
-        canvas.width = canvas.height = 1;
-        const ctx = canvas.getContext('2d')!;
-        ctx.drawImage(image, image.naturalWidth - 2, image.naturalHeight - 2, 1, 1, 0, 0, 1, 1);
-        return Array.from(ctx.getImageData(0, 0, 1, 1).data).slice(0, 3)
-          .every((value, index) => Math.abs(value - [219, 234, 254][index]) <= 3);
-      })).toBe(true);
+    const expectPageHidden = async () => {
+      // Floating application controls conceal pixels only; no screenshot copy
+      // or page replacement is mounted in the browser host.
+      await expect(backdrop).toHaveCount(0);
+      await expect(page.locator('.web-assist-native-host img')).toHaveCount(0);
     };
-    // A real download refusal and a real visit are merged into one chronology.
-    await orkas.electronApp!.evaluate(async ({ webContents }, id) => {
-      await webContents.fromId(id)!.executeJavaScript('document.querySelector("a").click(); void 0', true);
-    }, nativeId);
-    await expect.poll(async () => (await orkas.invoke<any>('webAssist.downloads', { conversation_id: cid })).downloads.length).toBe(1);
     const prompt = page.locator('.web-assist-download-prompt');
-    await expect(prompt).toBeVisible();
-    await expect(prompt.locator('.web-assist-download-origin')).toHaveText(origin);
-    await expect(prompt.locator('.web-assist-download-filename')).toHaveText('report.csv');
-    await expect(prompt.locator('.web-assist-download-description')).toContainText('retry the download');
-    await expect(page.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
-    const promptBox = (await prompt.boundingBox())!;
-    const browserBox = (await page.locator('.web-assist-page').boundingBox())!;
-    expect(promptBox.x).toBeGreaterThanOrEqual(browserBox.x);
-    expect(promptBox.x + promptBox.width).toBeLessThanOrEqual(browserBox.x + browserBox.width);
-    await expectPageBackdrop();
-    await page.screenshot({ path: testInfo.outputPath('browser-download-permission.png') });
-    await page.evaluate(id => (window as any).setView('conversation', id), front.conversation.conversation_id);
     await expect(prompt).toBeHidden();
-    await page.evaluate(id => (window as any).setView('conversation', id), cid);
-    await expect(prompt).toBeVisible();
-    await expectPageBackdrop();
-    await prompt.locator('[data-act="deny-download"]').click();
-    await expect(prompt).toBeHidden();
-    expect((await orkas.invoke<any>('webAssist.downloads', { conversation_id: cid })).allowed_origins).toEqual([]);
     const activity = page.locator('.web-assist-activity-popover');
     const button = page.locator('[data-act="activity"]');
     const hostBox = await page.locator('.web-assist-native-host').boundingBox();
     await button.click();
     await expect(activity).toBeVisible();
-    await expect(activity.locator('.web-assist-trail-row')).toHaveCount(2);
-    await expect(activity.locator('.web-assist-trail-url').first()).toHaveText('report.csv');
+    await expect(activity.locator('.web-assist-trail-row')).toHaveCount(1);
     await expect(activity.locator('.web-assist-trail-url').last()).toHaveText(origin + '/work');
-    await expect(activity.locator('.web-assist-download-allow')).toBeVisible();
+    await expect(activity.locator('.web-assist-download-allow')).toHaveCount(0);
     await expect.poll(async () => (await native()).visible).toBe(false);
     expect(await page.locator('.web-assist-native-host').boundingBox()).toEqual(hostBox);
-    await expectPageBackdrop();
+    await expectPageHidden();
     await page.screenshot({ path: testInfo.outputPath('browser-activity.png') });
     await page.keyboard.press('Escape');
     await expect(activity).toBeHidden();
@@ -966,18 +1137,6 @@ test('background browser work is revealed on return and activity overlays preser
     await expect(backdrop).toHaveCount(0);
     expect((await native()).id).toBe(nativeId);
     expect(await documentState()).toEqual(before);
-    await button.click();
-    expect(await activity.locator('[data-download-action]').count()).toBe(0);
-    await page.keyboard.press('Escape');
-    await orkas.electronApp!.evaluate(async ({ webContents }, id) => {
-      await webContents.fromId(id)!.executeJavaScript('document.querySelector("a").click(); void 0', true);
-    }, nativeId);
-    await expect(prompt).toBeVisible();
-    await prompt.locator('[data-act="allow-download"]').click();
-    await expect(prompt).toBeHidden();
-    const afterGrant = await orkas.invoke<any>('webAssist.downloads', { conversation_id: cid });
-    expect(afterGrant.allowed_origins).toEqual([origin]);
-    expect(afterGrant.downloads.map((entry: any) => entry.state)).toEqual(['refused', 'refused']);
     await button.click();
     await expect(activity).toBeVisible();
     const downloaded = await orkas.electronApp!.evaluate(async ({ webContents }, id) => {
@@ -996,7 +1155,7 @@ test('background browser work is revealed on return and activity overlays preser
     await expect(saved).toHaveCount(1);
     await expect(saved.locator('.web-assist-trail-url')).toHaveText('report.csv');
     await expect(saved.locator('.web-assist-activity-marker .is-download')).toHaveCount(1);
-    await expect(activity.locator('.web-assist-trail-row')).toHaveCount(4);
+    await expect(activity.locator('.web-assist-trail-row')).toHaveCount(2);
     await page.screenshot({ path: testInfo.outputPath('browser-download-actions.png') });
     const navigated = await orkas.electronApp!.evaluate(async (_electron, input) => {
       const web = (process as any).mainModule.require(input.modulePath);
@@ -1008,7 +1167,7 @@ test('background browser work is revealed on return and activity overlays preser
     expect(navigated.ok).toBe(true);
     await expect(activity).toBeVisible();
     await expect(activity.locator('.web-assist-trail-url').first()).toHaveText(origin + '/updated');
-    await expect(activity.locator('.web-assist-trail-row')).toHaveCount(5);
+    await expect(activity.locator('.web-assist-trail-row')).toHaveCount(3);
     const preview = await orkas.openPreview(() => saved.locator('[data-download-action="view"]').click());
     await expect(preview.locator('.delimited-preview td').filter({ hasText: /^fixture$/ })).toHaveCount(1);
     await expect(preview.locator('.delimited-preview td').filter({ hasText: /^1$/ })).toHaveCount(1);
@@ -1157,7 +1316,7 @@ test('a background task clicks its hidden page natively and is refused before in
   }
 });
 
-test('full-screen task browser keeps keyboard focus out of covered controls and permits dialogs', async ({ orkas }) => {
+test('full-screen task browser keeps keyboard focus out of covered controls and permits dialogs', async ({ modelOrkas: orkas }, testInfo) => {
   const created = await orkas.invoke<{ conversation: { conversation_id: string } }>(
     'conversations.create', { title: 'Browser focus boundary' },
   );
@@ -1205,7 +1364,7 @@ test('full-screen task browser keeps keyboard focus out of covered controls and 
 test('task-details browser supports tabs, address navigation, resizing, and view recovery', async ({ orkas }, testInfo) => {
   const server = createServer((_req, res) => {
     res.setHeader('Content-Type', 'text/html');
-    res.end('<title>Setup console</title><h1>Application setup</h1><label>Application name<input></label><button type="button">Purchase now</button>');
+    res.end('<title>Setup console</title><h1>Application setup</h1><label>Application name<input></label><button type="button" onclick="window.purchaseClicks = (window.purchaseClicks || 0) + 1">Purchase now</button>');
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
@@ -1282,6 +1441,48 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     }
     await page.setViewportSize({ width: 1280, height: 800 });
     await expect.poll(async () => (await native())?.visible).toBe(true);
+    const pageBeforeSearch = (await native())!.id;
+    await orkas.electronApp!.evaluate(async ({ webContents }, id) => {
+      await webContents.fromId(id)!.executeJavaScript('document.querySelector("input").value = "Unsaved browser draft"');
+    }, pageBeforeSearch);
+    for (const fullScreen of [false, true]) {
+      if (fullScreen) await browser.locator('.web-assist-expand-btn').click();
+      // Use the sidebar entry and the real keyboard toggle, rather than a
+      // synthetic modal: search has its own overlay shell and display state.
+      if (fullScreen) {
+        await browser.locator('.web-assist-address-input').focus();
+        await page.keyboard.press('ControlOrMeta+k');
+      } else await page.locator('#sidebar-search-btn').click();
+      await expect(page.locator('#search-input')).toBeFocused();
+      await expect.poll(async () => (await native())?.visible).toBe(false);
+      await page.locator('#search-input').fill('Browser E2E');
+      await page.screenshot({ path: testInfo.outputPath(fullScreen ? 'browser-search-fullscreen.png' : 'browser-search.png') });
+      await page.locator('#search-close-btn').click();
+      await expect(page.locator('#search-overlay')).toBeHidden();
+      await expect.poll(async () => (await native())?.visible).toBe(true);
+      expect((await native())?.id).toBe(pageBeforeSearch);
+
+      await browser.locator('.web-assist-address-input').focus();
+      await page.keyboard.press('ControlOrMeta+k');
+      await expect.poll(async () => (await native())?.visible).toBe(false);
+      await page.keyboard.press('ControlOrMeta+k');
+      await expect(page.locator('#search-overlay')).toBeHidden();
+      await expect.poll(async () => (await native())?.visible).toBe(true);
+      await browser.locator('.web-assist-address-input').focus();
+      await page.keyboard.press('ControlOrMeta+k');
+      await expect(page.locator('#search-input')).toBeFocused();
+      await expect.poll(async () => (await native())?.visible).toBe(false);
+      await page.keyboard.press('Escape');
+      await expect(page.locator('#search-overlay')).toBeHidden();
+      await expect.poll(async () => (await native())?.visible).toBe(true);
+      if (fullScreen) {
+        await expect(details).toHaveClass(/is-web-assist-expanded/);
+        await browser.locator('.web-assist-expand-btn').click();
+      }
+    }
+    expect(await orkas.electronApp!.evaluate(async ({ webContents }, id) => {
+      return webContents.fromId(id)!.executeJavaScript('document.querySelector("input").value');
+    }, pageBeforeSearch)).toBe('Unsaved browser draft');
     // Use the actual close/tab controls: ongoing model operations must not
     // undo the user's view choice, and the native page remains usable hidden.
     await page.locator('#conversation-info-close').click();
@@ -1324,6 +1525,19 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     await expect.poll(async () => (await native())?.visible).toBe(false);
     // The conversation controller invokes this at the next request boundary.
     await page.evaluate(taskId => (window as any).WebAssist.beginTaskTurn(taskId), cid);
+    // The retained page alone must not expand details in a non-browser turn.
+    await page.locator('#conversation-info-close').click();
+    await page.evaluate(taskId => {
+      (window as any).setView('settings');
+      (window as any).setView('conversation', taskId);
+    }, cid);
+    await orkas.invoke('webAssist.state', {});
+    await expect(details).toBeHidden();
+    await expect.poll(async () => (await native())?.visible).toBe(false);
+    expect((await native())?.id).toBe(pageBeforeSearch);
+    expect(await orkas.electronApp!.evaluate(async ({ webContents }, id) => (
+      webContents.fromId(id)!.executeJavaScript('document.querySelector("input").value')
+    ), pageBeforeSearch)).toBe('Hidden-page draft');
     await orkas.electronApp!.evaluate(async (_electron, input) => {
       const web = (process as any).mainModule.require(input.modulePath);
       return web.observeModelWebAssist('account-e2e', input.cid, input.tabId);
@@ -1395,7 +1609,8 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     await expect.poll(async () => (await details.boundingBox())!.width).toBe(400);
     const resizedWidth = (await browser.boundingBox())!.width;
     await expect.poll(async () => (await native())?.visible).toBe(true);
-    // An unrelated overlay outside the browser must not blank its viewport.
+    // Every application overlay suppresses the browser, including a surface
+    // outside its rectangle. No geometry-specific browser exception remains.
     await page.evaluate(() => {
       const overlay = document.createElement('div');
       overlay.id = 'browser-occlusion-fixture';
@@ -1404,7 +1619,7 @@ test('task-details browser supports tabs, address navigation, resizing, and view
       document.body.appendChild(overlay);
       return new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
     });
-    expect((await native())?.visible).toBe(true);
+    await expect.poll(async () => (await native())?.visible).toBe(false);
     await page.evaluate(() => {
       const overlay = document.getElementById('browser-occlusion-fixture')!;
       const rect = document.querySelector('.web-assist-native-host')!.getBoundingClientRect();
@@ -1480,40 +1695,16 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     const purchase = (modelObservation.elements as Array<{
       ref: string;
       label: string;
-      requires_user_action: boolean;
     }>).find(element => element.label === 'Purchase now');
-    expect(purchase).toMatchObject({ requires_user_action: true });
+    // Task actions are never flagged for the user (2026-10-03); observations
+    // no longer carry the flag at all.
+    expect(purchase).toBeTruthy();
+    expect(purchase).not.toHaveProperty('requires_user_action');
     const permissionMode = await orkas.invoke<{ ok: boolean; mode: string }>(
       'permissions.setLocalExecMode',
       { mode: 'all_files_approval' },
     );
     expect(permissionMode).toMatchObject({ ok: true, mode: 'all_files_approval' });
-    const clickPurchase = () => orkas.electronApp!.evaluate(async (_electron, input) => {
-      const web = (process as any).mainModule.require(input.modulePath);
-      return web.actOnModelWebAssist('account-e2e', input.cid, {
-        tabId: input.tabId,
-        pageId: input.pageId,
-        elementRef: input.elementRef,
-        action: 'click',
-      });
-    }, {
-      cid,
-      tabId: activeState.state.active_tab_id,
-      pageId: modelObservation.page_id,
-      elementRef: purchase!.ref,
-      modulePath: path.resolve(__dirname, '../../src/main/features/web_assist.ts'),
-    });
-
-    // The controller still refuses on its own; what the user now gets is a way
-    // to answer. Declining leaves the model with the same handback as before.
-    const declined = clickPurchase();
-    const permissionDialog = page.locator('.bash-permission-dialog');
-    await expect(permissionDialog).toContainText('Purchase now', { timeout: 20_000 });
-    await permissionDialog.locator('[data-act="cancel"]').click();
-    expect(await declined).toMatchObject({
-      ok: false, code: 'user_action_required', reason: 'high_impact_action',
-    });
-
     const modelAction = await orkas.electronApp!.evaluate(async (_electron, input) => {
       const web = (process as any).mainModule.require(input.modulePath);
       return web.actOnModelWebAssist('account-e2e', input.cid, {
@@ -1532,8 +1723,8 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     });
     expect(modelAction).toMatchObject({ ok: true, outcome: 'acted' });
 
-    // Approving runs the same control the controller refused. A successful
-    // action invalidates the snapshot, so this needs its own observation.
+    // A successful fill invalidates its snapshot. A fresh reference clicks
+    // once without a second approval, and replay is rejected.
     const approvedObservation = await orkas.electronApp!.evaluate(async (_electron, input) => {
       const web = (process as any).mainModule.require(input.modulePath);
       return web.observeModelWebAssist('account-e2e', input.cid, input.tabId);
@@ -1545,7 +1736,7 @@ test('task-details browser supports tabs, address navigation, resizing, and view
     const repeatPurchase = (approvedObservation.elements as Array<{ ref: string; label: string }>)
       .find(element => element.label === 'Purchase now');
     expect(repeatPurchase).toBeTruthy();
-    const approved = orkas.electronApp!.evaluate(async (_electron, input) => {
+    const clickPurchase = () => orkas.electronApp!.evaluate(async (_electron, input) => {
       const web = (process as any).mainModule.require(input.modulePath);
       return web.actOnModelWebAssist('account-e2e', input.cid, {
         tabId: input.tabId,
@@ -1560,10 +1751,12 @@ test('task-details browser supports tabs, address navigation, resizing, and view
       elementRef: repeatPurchase!.ref,
       modulePath: path.resolve(__dirname, '../../src/main/features/web_assist.ts'),
     });
-    await expect(permissionDialog).toContainText('Purchase now', { timeout: 20_000 });
-    await permissionDialog.locator('[data-id="allow_once"]').click();
-    expect(await approved).toMatchObject({ ok: true, outcome: 'acted', action: 'click' });
-    await expect(permissionDialog).toHaveCount(0);
+    expect(await clickPurchase()).toMatchObject({ ok: true, outcome: 'acted', action: 'click' });
+    expect(await clickPurchase()).toMatchObject({ ok: false, code: 'stale_page' });
+    await expect(page.locator('.bash-permission-dialog')).toHaveCount(0);
+    expect(await orkas.electronApp!.evaluate(async ({ webContents }, url) => {
+      return webContents.getAllWebContents().find(wc => wc.getURL() === url)!.executeJavaScript('window.purchaseClicks');
+    }, `http://127.0.0.1:${address.port}/second`)).toBe(1);
 
     await page.locator('.web-assist-tab-close').last().click();
     await expect(page.locator('.web-assist-tab')).toHaveCount(1);

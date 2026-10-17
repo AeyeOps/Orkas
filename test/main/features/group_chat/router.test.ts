@@ -5,6 +5,7 @@ import {
   extractFormFromFinal, computeFormId, decodeSubmission, encodeSubmission,
   validateFormAnswers,
   extractPlanInteractionFromFinal, extractHandbackFromFinal,
+  classifyUserMentionRoute,
 } from '../../../../src/main/features/group_chat/router';
 
 describe('group_chat router › chat form answers', () => {
@@ -124,16 +125,19 @@ describe('group_chat router › parseMentions', () => {
     expect(parseMentions('@Software Foo Bar', { names })).toEqual(['Software']);
   });
 
-  // LLM 派活走 dispatch_to / plan_set 工具,散文里 @agent 是 markdown 装饰。
-  // 这条不变量保护"commander/agent 在介绍/列举/计划里写 @ 不会误触发"
-  // 的 bug 修复(详见 docs/plans/dispatch-via-tool-call.md)。Agent 仍可
-  // 显式 @commander / @指挥官 升级给指挥官。
-  it('skips non-reserved scanning when fromKind is not user', () => {
+  // LLM 派活走 dispatch_to / hand_off_to 工具,散文里的 @ 只是展示或指代。
+  // 这条不变量保护"commander/agent 在介绍/列举/计划里写 @ 不会误触发"。
+  // 2026-10-04 起 agent 正文里的 @commander / @指挥官 也不再路由:交还指挥官
+  // 只走 <handback> / orkas_handoff_to_commander(带单跳与防循环保护)。
+  it('parses no routing mentions from commander or agent prose', () => {
     const text = '我让 @需求挖掘师 先聊,然后 **@全面评估师** 评估';
     expect(parseMentions(text, { fromKind: 'commander' })).toEqual([]);
     expect(parseMentions(text, { fromKind: 'agent' })).toEqual([]);
     expect(parseMentions('辛苦 @需求挖掘师 继续, @commander 接力, @指挥官 看一下', { fromKind: 'agent' }))
-      .toEqual(['commander', '指挥官']);
+      .toEqual([]);
+    // 2026-10-04 真实误触:表格单元格里举例写到 @指挥官。
+    expect(parseMentions('| C | 其他带 @ 的消息,或混了 @指挥官 | 整条交给指挥官 |', { fromKind: 'agent' }))
+      .toEqual([]);
     // user 仍然走完整扫描
     expect(parseMentions(text, { fromKind: 'user' })).toEqual(['需求挖掘师', '全面评估师']);
     // 缺省 fromKind 等价老行为(向后兼容)
@@ -209,7 +213,10 @@ describe('group_chat router › resolveRecipients', () => {
   it.each([
     ['check this', ['writer']],
     ['  @commander check this', ['commander']],
-    ['check first @commander review', ['writer', 'commander']],
+    // D29: prose before a mention no longer leaves the leading text to the
+    // floor. Agent mentions go to the dispatch planner; a Commander-only
+    // mention has one possible owner and goes straight to Commander.
+    ['check first @commander review', ['commander']],
     ['> @writer quoted\n @commander review', ['commander']],
     ['@writer first @writer second', ['writer']],
   ])('routes first-instruction ownership for %s', (text, expected) => {
@@ -280,8 +287,8 @@ describe('group_chat router › resolveRecipients', () => {
   it('agent with no @ → defaults to [user]', () => {
     // Agents surface their output to the human user by default — most
     // turns produce intermediate / final results meant for user-facing
-    // display. Reaching commander (to ask it to re-orchestrate) requires
-    // explicit `@<commander>` (e.g. `@指挥官` or `@commander`).
+    // display. Returning control to commander uses `<handback>` (or a CLI
+    // agent's `orkas_handoff_to_commander`), never a prose mention.
     const r = resolveRecipients({ fromKind: 'agent', fromId: 'writer', text: 'done', members });
     expect(r.to).toEqual(['user']);
   });
@@ -334,18 +341,18 @@ describe('group_chat router › resolveRecipients', () => {
     expect(r.to).toEqual(['user']);
   });
 
-  it('agent explicit @commander / @指挥官 routes to commander', () => {
-    const a = resolveRecipients({
-      fromKind: 'agent', fromId: 'writer',
-      text: '辛苦 @commander 接力', members,
-    });
-    expect(a.to).toEqual(['commander']);
-
-    const b = resolveRecipients({
-      fromKind: 'agent', fromId: 'writer',
-      text: '@指挥官 我这边卡住了，需要你协调。', members,
-    });
-    expect(b.to).toEqual(['commander']);
+  it('agent @commander / @指挥官 / @user in prose stays with the user (display-only)', () => {
+    for (const text of [
+      '辛苦 @commander 接力',
+      '@指挥官 我这边卡住了，需要你协调。',
+      '这一格写的是不带代码格式的 @指挥官，系统就把整条回复当成了发给指挥官的消息',
+      '@user 结果在这里',
+    ]) {
+      const r = resolveRecipients({ fromKind: 'agent', fromId: 'writer', text, members });
+      expect(r.to).toEqual(['user']);
+      expect(r.unknown).toEqual([]);
+      expect(r.hadExplicitMention).toBe(false);
+    }
   });
 });
 
@@ -528,153 +535,91 @@ describe('group_chat router › form encoding', () => {
   });
 });
 
-describe('group_chat router › segmentUserMentions (D9 §4.2.1)', () => {
+describe('group_chat router › classifyUserMentionRoute (D29)', () => {
   // Fixture contract (repo rule: parser code needs accepted real shapes +
-  // rejected look-alikes). The segmenter is the deterministic core that
-  // retired same-text broadcast: a wrong split sends an agent another
-  // agent's instructions.
+  // rejected look-alikes). The classifier only decides direct vs planned;
+  // it never cuts text, so no agent can receive half a sentence again.
   const IDS = { a: 'agent-aaa1', b: 'agent-bbb2', helper: 'agent-ccc3' };
-  const NAMES: Record<string, string> = { A: IDS.a, B: IDS.b, 'Writing Helper': IDS.helper, 写作助手: IDS.helper };
-  const opts = (recipientIds: string[] = Object.values(IDS)) => ({
+  const CMD = 'commander';
+  const NAMES: Record<string, string> = {
+    A: IDS.a, B: IDS.b, 'Writing Helper': IDS.helper, 写作助手: IDS.helper, 指挥官: CMD, commander: CMD,
+  };
+  const route = (text: string, recipientIds: string[] = [...Object.values(IDS), CMD]) => classifyUserMentionRoute(text, {
     tokenToId: (token: string) => NAMES[token] || null,
     recipientIds: new Set(recipientIds),
     names: Object.keys(NAMES),
   });
-  const { segmentUserMentions } = require('../../../../src/main/features/group_chat/router');
 
-  it('assigns the first instruction to Commander and strips later routing tokens', () => {
-    const out = segmentUserMentions('明天上线前：@A 做a，输出到 docs/。@B 做b。', opts());
-    expect(out?.preamble).toBe('明天上线前：');
-    expect(out?.segments).toEqual([
-      { actorId: 'commander', instruction: '明天上线前：', group: 0 },
-      { actorId: IDS.a, instruction: '做a，输出到 docs/。', group: 1 },
-      { actorId: IDS.b, instruction: '做b。', group: 2 },
-    ]);
+  it('keeps a message that starts with its only mentioned actor on the direct path', () => {
+    expect(route('@A do the whole thing')).toEqual({ kind: 'direct' });
+    expect(route('@A first step @A second step')).toEqual({ kind: 'direct' });
+    expect(route('> quoted context\n@A handle it')).toEqual({ kind: 'direct' });
+    expect(route('@指挥官 总结现状')).toEqual({ kind: 'direct' });
+    expect(route('just some text')).toEqual({ kind: 'direct' });
+    expect(route('mail a@b and c@d then decide')).toEqual({ kind: 'direct' });
   });
 
-  it('adjacent mentions share the following span (共同段) and the same group', () => {
-    const out = segmentUserMentions('@A @B 检查这份报告', opts());
-    expect(out?.segments).toEqual([
-      { actorId: IDS.a, instruction: '检查这份报告', group: 0 },
-      { actorId: IDS.b, instruction: '检查这份报告', group: 0 },
-    ]);
+  it('routes a Commander-only mention directly wherever it appears', () => {
+    // Commander is always a planner candidate, so there is nothing to split.
+    expect(route('先看一下现状 @指挥官 再定计划')).toEqual({ kind: 'direct' });
+    expect(route('check first @commander review @指挥官 again')).toEqual({ kind: 'direct' });
+    expect(route('先看一下现状 @指挥官 再让 @A 跑测试')).toEqual({ kind: 'plan', candidates: [CMD, IDS.a] });
   });
 
-  it('deduplicates an adjacent recipient group and skips Agents without descriptions', () => {
-    expect(segmentUserMentions('@A @A @B inspect', opts())?.segments).toEqual([
-      { actorId: IDS.a, instruction: 'inspect', group: 0 },
-      { actorId: IDS.b, instruction: 'inspect', group: 0 },
-    ]);
-    expect(segmentUserMentions('@A inspect @B', opts())?.segments).toEqual([
-      { actorId: IDS.a, instruction: 'inspect', group: 0 },
-    ]);
-    expect(segmentUserMentions('@A', opts())?.segments).toEqual([]);
-    expect(segmentUserMentions('@A @B ', opts())?.segments).toEqual([]);
-    expect(segmentUserMentions('> context\n@A', opts())?.segments).toEqual([]);
+  it('sends every orchestrated shape to the planner with candidates in first-mention order', () => {
+    // The shapes positional segmentation cut apart (2026-10-04 probe).
+    expect(route('帮我把这段翻译成英文 @A')).toEqual({ kind: 'plan', candidates: [IDS.a] });
+    expect(route('这个方案 @A 你看下有没有问题')).toEqual({ kind: 'plan', candidates: [IDS.a] });
+    expect(route('@A 和 @B 一起评审这份方案')).toEqual({ kind: 'plan', candidates: [IDS.a, IDS.b] });
+    expect(route('让 @A 和 @B 分别写初稿，最后汇总成一份')).toEqual({ kind: 'plan', candidates: [IDS.a, IDS.b] });
+    expect(route('把 @A 的报告发给 @B 改一下')).toEqual({ kind: 'plan', candidates: [IDS.a, IDS.b] });
+    expect(route('@A 写一篇介绍，然后@B 做成一份ppt文件')).toEqual({ kind: 'plan', candidates: [IDS.a, IDS.b] });
+    expect(route('@指挥官 总结现状 @A 跑一遍测试')).toEqual({ kind: 'plan', candidates: [CMD, IDS.a] });
+    expect(route('@Writing Helper polish the intro @B then the ending'))
+      .toEqual({ kind: 'plan', candidates: [IDS.helper, IDS.b] });
   });
 
-  it('keeps literal code in the assigned instruction without dispatching its mentions', () => {
-    const text = '@A inspect `@B` and this example:\n```xml\n@B\n```\n@B verify';
-    expect(segmentUserMentions(text, opts())?.segments).toEqual([
-      { actorId: IDS.a, instruction: 'inspect `@B` and this example:\n```xml\n@B\n```', group: 0 },
-      { actorId: IDS.b, instruction: 'verify', group: 1 },
-    ]);
+  it('treats mention-only text as nothing to dispatch', () => {
+    expect(route('@A')).toEqual({ kind: 'mention_only' });
+    expect(route('@A @B ')).toEqual({ kind: 'mention_only' });
+    expect(route('> context\n@A')).toEqual({ kind: 'mention_only' });
   });
 
-  it('the same agent mentioned twice yields two ordered segments (no dedup)', () => {
-    const out = segmentUserMentions('@A first step @A second step', opts());
-    expect(out?.segments.map((s: any) => s.actorId)).toEqual([IDS.a, IDS.a]);
-    expect(out?.segments.map((s: any) => s.instruction)).toEqual(['first step', 'second step']);
+  it('never counts mentions in code, quotes, or outside the recipient set', () => {
+    expect(route('@A inspect `@B` and\n```xml\n@B\n```')).toEqual({ kind: 'direct' });
+    expect(route('> quoted from @B earlier\n@A do a')).toEqual({ kind: 'direct' });
+    expect(route('@A do a @B do b', [IDS.a])).toEqual({ kind: 'direct' });
+    expect(route('@A do it with @nobody')).toEqual({ kind: 'direct' });
   });
 
-  it('matches multi-word and Chinese display names exactly', () => {
-    const out = segmentUserMentions('@Writing Helper polish the intro @写作助手 then the ending', opts());
-    expect(out?.segments.map((s: any) => s.actorId)).toEqual([IDS.helper, IDS.helper]);
-    expect(out?.segments[0].instruction).toBe('polish the intro');
+  it('uses host-validated resources as content without routing mentions inside the quoted source', () => {
+    expect(classifyUserMentionRoute('@Writing Helper', {
+      tokenToId: (token) => NAMES[token] || null, recipientIds: new Set(Object.values(IDS)),
+      names: Object.keys(NAMES), hasMessageContent: true,
+    })).toEqual({ kind: 'direct' });
+    const members = [{ kind: 'agent' as const, id: IDS.helper, name: 'Writing Helper', joined_at: '' }];
+    expect(resolveRecipients({ fromKind: 'user', fromId: 'user', members, text: '@Writing Helper',
+      hasMessageContent: true }).to).toEqual([IDS.helper]);
+    expect(resolveRecipients({ fromKind: 'user', fromId: 'user', members, text: '@Writing Helper',
+      hasMessageContent: false })).toMatchObject({ to: [], mentionOnly: true });
+    expect(classifyUserMentionRoute('@A @B', {
+      tokenToId: (token) => NAMES[token] || null, recipientIds: new Set(Object.values(IDS)),
+      names: Object.keys(NAMES), hasMessageContent: true,
+    })).toEqual({ kind: 'plan', candidates: [IDS.a, IDS.b] });
   });
 
-  it('does not copy the first instruction into an empty trailing segment', () => {
-    const out = segmentUserMentions('review the doc: @A rewrite it @B', opts());
-    expect(out?.segments).toEqual([
-      { actorId: 'commander', instruction: 'review the doc:', group: 0 },
-      { actorId: IDS.a, instruction: 'rewrite it', group: 1 },
-    ]);
-  });
-
-  // CJK prose puts no whitespace before `@` — the mention (and thus the
-  // second segment) must still open. This exact shape routed to ONE agent
-  // on-device 2026-08-23 ("…，然后@PptMaker 做成…" reached only the first
-  // mention's agent, with the second @ left as literal text).
-  it('a mention directly after a CJK character still opens a segment', () => {
-    const out = segmentUserMentions('@A 写一篇介绍，然后@B 做成一份ppt文件', opts());
-    expect(out?.segments).toEqual([
-      { actorId: IDS.a, instruction: '写一篇介绍，然后', group: 0 },
-      { actorId: IDS.b, instruction: '做成一份ppt文件', group: 1 },
-    ]);
-  });
-
-  // ── rejected look-alikes ────────────────────────────────────────────────
-
-  it('returns null for zero or one resolved mention (single-recipient path owns those)', () => {
-    expect(segmentUserMentions('just some text', opts())).toBeNull();
-    expect(segmentUserMentions('@A do the whole thing', opts())).toBeNull();
-    // Unresolvable tokens are not segment boundaries.
-    expect(segmentUserMentions('@A do it with @nobody', opts())).toBeNull();
-  });
-
-  it('mentions on blockquote lines never open segments', () => {
-    const out = segmentUserMentions('> quoted from @A earlier\n@A do a\n@B do b', opts());
-    expect(out?.segments.map((s: any) => s.actorId)).toEqual([IDS.a, IDS.b]);
-    // The quote line stays in the preamble text, not as its own segment.
-    expect(out?.preamble).toContain('quoted from @A earlier');
-  });
-
-  it('does not treat email-like tokens as mention boundaries', () => {
-    expect(segmentUserMentions('mail a@b and c@d then decide', opts())).toBeNull();
-  });
-
-  it('a mention resolving outside recipientIds is not a boundary', () => {
-    const out = segmentUserMentions('@A do a @B do b', opts([IDS.a]));
-    expect(out).toBeNull(); // only one span remains → single-recipient path
-  });
-
-  // ── D22 (user adjudication 2026-08-27): commander segments ────────────
-  // Commander participates only through an explicit mention; ordinary text
-  // before a mention stays shared context for the selected recipients.
-  const CMD = 'commander';
-  const d22opts = (recipientIds: string[] = Object.values(IDS)) => ({
-    ...opts(recipientIds),
-    tokenToId: (token: string) => NAMES[token]
-      || (token === '指挥官' || token.toLowerCase() === 'commander' ? CMD : null),
-    commanderId: CMD,
-  });
-
-  it('D22: an explicit commander mention opens its own segment instead of broadcasting', () => {
-    const out = segmentUserMentions('@指挥官 总结现状 @A 跑一遍测试', d22opts());
-    expect(out?.segments).toEqual([
-      { actorId: CMD, instruction: '总结现状', group: 0 },
-      { actorId: IDS.a, instruction: '跑一遍测试', group: 1 },
-    ]);
-  });
-
-  it.each(['commander', IDS.b])('assigns the unaddressed first instruction to the current %s', (defaultRecipient) => {
-    const out = segmentUserMentions('写一个登录页 @A 出这个页面的视觉稿', { ...d22opts(), defaultRecipient });
-    expect(out?.segments).toEqual([
-      { actorId: defaultRecipient, instruction: '写一个登录页', group: 0 },
-      { actorId: IDS.a, instruction: '出这个页面的视觉稿', group: 1 },
-    ]);
-  });
-
-  it('D22: a quote-only preamble stays shared context — no commander segment', () => {
-    const out = segmentUserMentions('> 引用的上下文\n@A 处理 @B 复核', d22opts());
-    expect(out?.segments).toEqual([
-      { actorId: IDS.a, instruction: '> 引用的上下文\n处理', group: 0 },
-      { actorId: IDS.b, instruction: '> 引用的上下文\n复核', group: 1 },
-    ]);
-  });
-
-  it('D22: a single mention with no substantive preamble keeps the single-recipient path', () => {
-    expect(segmentUserMentions('@A 单独做这件事', d22opts())).toBeNull();
-    expect(segmentUserMentions('> 只有引用\n@A 单独做', d22opts())).toBeNull();
+  it('resolveRecipients hands planned sends to the bus with their candidates', () => {
+    const members = [
+      { kind: 'commander' as const, id: CMD, joined_at: '' },
+      { kind: 'agent' as const, id: IDS.a, name: 'A', joined_at: '' },
+      { kind: 'agent' as const, id: IDS.b, name: 'B', joined_at: '' },
+    ];
+    const planned = resolveRecipients({ fromKind: 'user', fromId: 'user', members, text: '让 @A 和 @B 分别写初稿，最后汇总' });
+    expect(planned).toMatchObject({ to: [IDS.a, IDS.b], plannerCandidates: [IDS.a, IDS.b], hadExplicitMention: true });
+    const direct = resolveRecipients({ fromKind: 'user', fromId: 'user', members, text: '@A 写初稿' });
+    expect(direct.to).toEqual([IDS.a]);
+    expect(direct.plannerCandidates).toBeUndefined();
+    const mentionOnly = resolveRecipients({ fromKind: 'user', fromId: 'user', members, text: '@A @B' });
+    expect(mentionOnly).toMatchObject({ to: [], mentionOnly: true });
   });
 });

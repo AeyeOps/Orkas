@@ -1,10 +1,11 @@
-import { expect, test } from './fixtures/orkas';
+import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
 
 
 for (const scope of ['global', 'project'] as const) {
   test(`previews ${scope} todo attachments from the card and editor without editing or removing them`, async ({ orkas }, info) => {
     const page = orkas.page!;
+    await page.evaluate(() => (window as any).setLang('en'));
     const project = scope === 'project' ? await orkas.invoke<any>('projects.create', { name: 'Preview project' }) : null;
     const projectId = project?.project.project_id || '';
     const created = await orkas.invoke<any>('projects.tasks.create', { projectId, content: 'Read the attached document' });
@@ -18,7 +19,7 @@ for (const scope of ['global', 'project'] as const) {
         await (window as any).setView('project', pid);
       }, projectId);
       await page.locator('[data-project-tab="todo"]').click();
-    } else await page.locator('#todos-btn').click();
+    } else await openSidebarEntry(page, '#todos-btn');
     const card = page.locator(`.project-todo-item[data-tid="${taskId}"]:visible`);
     const preview = await orkas.openPreview(() => card.locator('[data-action="todo-attachments"]').click());
     await expect(preview.locator('.chat-file-viewer-body')).toContainText('Original attachment body');
@@ -37,7 +38,9 @@ for (const scope of ['global', 'project'] as const) {
     await expect(chosen.locator('.chat-file-viewer-body')).toContainText('Second attachment body');
     await chosen.close();
 
-    await card.locator('[data-action="todo-edit"]').click();
+    await card.hover();
+    await card.locator('[data-action="todo-menu"]').click();
+    await page.locator('.context-menu-item', { hasText: 'Edit' }).click();
     const chip = page.locator('#project-todo-attachments .chat-attach-chip[data-name="brief.txt"]');
     const editorPreview = await orkas.openPreview(() => scope === 'project' ? chip.press('Enter') : chip.click());
     await expect(editorPreview.locator('.chat-file-viewer-body')).toContainText('Original attachment body');

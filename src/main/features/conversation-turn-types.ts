@@ -1,6 +1,6 @@
 export const CONVERSATION_TURN_PAGE_SIZE = 15;
-export const CONVERSATION_TURN_USER_PREVIEW_CHARS = 40;
-export const CONVERSATION_TURN_ASSISTANT_PREVIEW_CHARS = 80;
+export const CONVERSATION_TURN_USER_PREVIEW_CHARS = 100;
+export const CONVERSATION_TURN_ASSISTANT_PREVIEW_CHARS = 240;
 
 export interface ConversationTurnIndexEntry {
   messageId: string;

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import * as path from 'node:path';
 
-const runtime = vi.hoisted(() => ({ windows: [] as any[], hook: null as any, nextId: 0, unsubscribe: vi.fn() }));
+const runtime = vi.hoisted(() => ({ windows: [] as any[], hook: null as any, nextId: 0, appType: 'local', unsubscribe: vi.fn() }));
 vi.mock('electron', async () => {
   const { EventEmitter } = await import('node:events');
   class Contents extends EventEmitter {
@@ -26,6 +26,12 @@ vi.mock('electron', async () => {
   }
   return { BrowserWindow: Window, shell: { openExternal: vi.fn() }, screen: { getDisplayMatching: () => ({ workArea: { x: 0, y: 0, width: 1440, height: 900 } }) } };
 });
+vi.mock('../../../src/main/features/saved_apps', () => ({
+  resolveSavedAppType: async () => runtime.appType,
+  resolveArtifactAppType: async () => runtime.appType,
+  boundAppType: async () => undefined,
+  managedPathAppType: async () => undefined,
+}));
 vi.mock('../../../src/main/features/user-switch-hooks', () => ({ registerUserSwitchHook: (_name: string, fn: any) => { runtime.hook = fn; } }));
 vi.mock('../../../src/main/features/group_chat', () => ({ subscribeBus: () => runtime.unsubscribe }));
 vi.mock('../../../src/main/logger', () => ({ createLogger: () => ({ warn: vi.fn() }) }));
@@ -36,10 +42,24 @@ import { openPreview, initializePreview, closePreview, setPreviewDirty, requestP
 beforeEach(() => {
   for (const win of runtime.windows) win.destroy();
   runtime.windows.length = 0;
+  runtime.appType = 'local';
   runtime.unsubscribe.mockClear();
 });
 
 describe('independent preview ownership and lifecycle', () => {
+  it.each(['web', 'cloud'])('refuses a %s preview before allocating, focusing or reusing a window', async appType => {
+    const main = new BrowserWindow({});
+    const local = { kind: 'app', appId: 'a', title: 'App' };
+    await openPreview('user-a', main.webContents, local);
+    const previous = runtime.windows[1]; previous.focus.mockClear(); previous.show.mockClear();
+    runtime.appType = appType;
+    for (const source of [local, { kind: 'artifact', cid: 'task', artifactId: 'result', title: 'Result' }]) {
+      expect(await openPreview('user-a', main.webContents, source)).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
+      expect(runtime.windows).toHaveLength(2);
+      expect(previous.focus).not.toHaveBeenCalled(); expect(previous.show).not.toHaveBeenCalled();
+    }
+  });
+
   it.each([false, true])('inherits owner focusability across every preview kind, including reopening minimized windows: %s', async (focusable) => {
     const sources = [
       { kind: 'app', appId: 'a', title: 'App' },

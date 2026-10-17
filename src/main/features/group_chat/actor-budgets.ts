@@ -4,16 +4,12 @@ import type { ActorKind } from './state';
  * Per-turn tool-round budgets for dispatched actors, kept out of bus.ts so they
  * are unit-testable and cannot silently drift.
  *
- * core-agent's schema default is currently 100 (config/schema.ts). Named agent
- * workers (VideoStudio, DeepResearcher) pin that same production budget here so
- * a future schema-default change cannot silently shorten their gate-bounded,
- * tool-heavy turns. The commander gets a larger orchestration budget because it
- * may coordinate several such workflows. Graceful wrap-up at the cap,
- * loop_detection, and the 30-min idle watchdog still bound true runaways.
- * Ephemeral workers ('worker') continue to follow the schema default.
+ * Commander and named agents share the core-agent default of 500 rounds.
+ * Periodic checkpoints, the hard cap, repeat protection and idle watchdogs
+ * bound long-running work. Ephemeral workers inherit the schema default.
  */
-export const COMMANDER_MAX_TOOL_LOOPS = 120;
-export const AGENT_MAX_TOOL_LOOPS = 100;
+export const COMMANDER_MAX_TOOL_LOOPS = 500;
+export const AGENT_MAX_TOOL_LOOPS = 500;
 
 /**
  * Per-turn tool-round budget for a dispatched actor, or `undefined` to let

@@ -51,8 +51,10 @@ type AgentRunEvent =
   | { type: 'retry'; attempt: number; reason: string }
   | {
       type: 'provider_fallback';
-      reason: 'auth' | 'server_model_fallback';
+      reason: 'auth' | 'balance' | 'permission' | 'rate_limit' | 'unavailable' | 'server_model_fallback';
       providerId: string;
+      toProviderId?: string;
+      skipped?: boolean;
       candidateIndex?: number;
       candidateCount?: number;
       fromModel?: string;
@@ -1998,6 +2000,45 @@ describe('event-mapper › tool_start / tool_end emit a single structured event'
   });
 
   it.each([
+    ['400 with a status', 400, true],
+    ['400 from the SDK message only', 400, false],
+    ['413', 413, true],
+    ['422', 422, true],
+  ] as const)('never calls the endpoint dead or moved after repeated HTTP %s rejections', async (_label, status, structured) => {
+    // 2026-09-20: two `400 (no body)` runs from a qwen service told the user
+    // her endpoint was "dead or moved"; it answered again seven minutes
+    // later. A rejected request says nothing about the configured URL.
+    const failureTrackingScope = {};
+    const failedRun = () => collect([{
+      type: 'done',
+      result: { text: '', meta: { provider: 'custom', error: {
+        kind: 'provider_error', message: `${status} status code (no body)`,
+        code: 'PROVIDER_ERROR', ...(structured ? { statusCode: status } : {}),
+      } } },
+    }], { failureTrackingScope });
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      expect(String((await failedRun())[0].text || '')).not.toContain('endpoint');
+    }
+  });
+
+  it.each([404, 405])('still names the configured endpoint after repeated HTTP %s', async (status) => {
+    const failureTrackingScope = {};
+    const failedRun = () => collect([{
+      type: 'done',
+      result: { text: '', meta: { provider: 'custom', error: {
+        kind: 'provider_error', message: `${status} status code (no body)`,
+        code: 'PROVIDER_ERROR', statusCode: status,
+      } } },
+    }], { failureTrackingScope });
+
+    expect(String((await failedRun())[0].text || '')).not.toContain('endpoint');
+    const second = String((await failedRun())[0].text || '');
+    expect(second).toContain('endpoint');
+    expect(second).toContain(String(status));
+  });
+
+  it.each([
     [401, 'provider_auth'],
     [402, 'provider_balance'],
     [403, 'provider_permission'],
@@ -2270,5 +2311,124 @@ describe('event-mapper › friendlyRetryReason', () => {
     expect(friendlyRetryReason('')).toBe('');
     expect(friendlyRetryReason('some brand-new SDK error we have not seen')).toBe('some brand-new SDK error we have not seen');
     expect(friendlyRetryReason('There is no rate limit')).toBe('There is no rate limit');
+  });
+});
+
+describe('stopped summary display', () => {
+  it.each([
+    ['zh', 'tool_loop_limit', '', '本轮已达到 500 轮工具执行上限，任务已停止。收尾总结未能完整生成。'],
+    ['en', 'tool_loop_limit', 'Saved the draft.', 'This run stopped at the limit of 500 tool rounds. The final summary could not be completed.'],
+    ['zh', 'repetitive_tool_calls', '文件已保存。', '本轮因重复操作未产生新进展而停止。收尾总结未能完整生成。'],
+    ['ja', 'repetitive_tool_calls', '', '操作を繰り返しても新たな進展がなかったため、今回の実行は停止しました。最終要約を完成できませんでした。'],
+  ] as const)('renders factual status in %s for %s and preserves summary text', async (lang, reason, text, notice) => {
+    setCurrentLang(lang);
+    try {
+      const out = await collect([
+        { type: 'tool_end', name: 'private_internal_tool', id: 'call', result: 'INTERNAL_RESULT_PREVIEW' },
+        { type: 'done', result: { text, meta: { error: null, termination: {
+          status: 'stopped', reason, summaryIncomplete: true,
+          ...(reason === 'tool_loop_limit' ? { toolRoundLimit: 500 } : {}),
+        } } } },
+      ]);
+      const finals = out.filter(e => e.type === 'final');
+      expect(finals).toEqual([{ type: 'final', text: [text, notice].filter(Boolean).join('\n\n') }]);
+      expect(out.filter(e => e.type === 'error')).toEqual([]);
+      expect(finals[0].text).not.toContain('501/500');
+      expect(finals[0].text).not.toContain('private_internal_tool');
+      expect(finals[0].text).not.toContain('INTERNAL_RESULT_PREVIEW');
+      // Diagnostics remain available in the execution record, not the reply.
+      expect(JSON.stringify(out.filter(e => e.type === 'event'))).toContain('INTERNAL_RESULT_PREVIEW');
+    } finally { setCurrentLang('en'); }
+  });
+
+  it.each([undefined, 0, -1, 1.5, NaN])('does not invent a round count when a structured stop lacks a valid limit (%s)', async limit => {
+    setCurrentLang('en');
+    const out = await collect([{ type: 'done', result: { text: '', meta: { error: null, termination: {
+      status: 'stopped', reason: 'tool_loop_limit', summaryIncomplete: true, toolRoundLimit: limit,
+    } } } }]);
+    expect(out).toContainEqual({ type: 'final', text: 'This run stopped. The final summary could not be completed.' });
+    expect(out.some(e => e.type === 'error')).toBe(false);
+  });
+
+  it('keeps complete, legacy and ordinary model answers unchanged, including diagnostic-looking prose', async () => {
+    for (const termination of [undefined, { status: 'stopped', reason: 'tool_loop_limit' },
+      { status: 'stopped', reason: 'repetitive_tool_calls', summaryIncomplete: false }] as const) {
+      const text = 'Recent errors: a heading the user asked to quote. Next step: a model-authored sentence.';
+      const out = await collect([{ type: 'done', result: { text, meta: { error: null, termination } } }]);
+      expect(out).toContainEqual({ type: 'final', text });
+    }
+  });
+});
+
+describe('live reasoning preview sanitizing cost', () => {
+  // The previous algorithm sanitized the whole text before taking the tail.
+  const MAX = 2_048;
+  async function reference(value: string): Promise<string> {
+    const { sanitizePublicReasoningSummary } = await import('../../../src/main/model/core-agent/event-mapper');
+    const sanitized = sanitizePublicReasoningSummary(value);
+    return sanitized.length <= MAX ? sanitized : `…${sanitized.slice(-(MAX - 1))}`;
+  }
+
+  it('shows exactly the same preview as sanitizing the whole text', async () => {
+    const { boundedLiveReasoningSummary } = await import('../../../src/main/model/core-agent/event-mapper');
+    const secretPath = '/Users/test/Projects/secret-plan/notes.md';
+    const token = 'sk-' + 'A1b2C3d4'.repeat(6);
+    const filler = (n: number) => 'Reasoning about the task step by step. '.repeat(Math.ceil(n / 40)).slice(0, n);
+    const cases: string[] = [
+      '',
+      'short thought',
+      filler(2_000),
+      filler(2_048) + ' tail',
+      filler(30_000),
+      filler(300_000),
+      // Whitespace collapses under sanitizing; the tail must still fill the preview.
+      'word' + ' '.repeat(50_000) + filler(1_000) + '\n\n\n'.repeat(20_000) + 'end',
+    ];
+    // Sensitive values straddling every point around the sanitize window edge.
+    for (const shift of [6_200, 6_160, 6_144, 6_140, 6_100, 2_100, 2_048, 2_000, 40]) {
+      for (const secret of [secretPath, token]) {
+        const tail = filler(shift);
+        cases.push(filler(20_000) + secret + tail);
+        cases.push(filler(20_000) + secret.slice(0, 8) + tail);
+      }
+    }
+    for (const value of cases) expect(boundedLiveReasoningSummary(value)).toBe(await reference(value));
+  });
+
+  it('preserves redaction when one sensitive value exceeds the preview window', async () => {
+    const { boundedLiveReasoningSummary } = await import('../../../src/main/model/core-agent/event-mapper');
+    const value = 'privateCanary'.repeat(1_000);
+    for (const prefix of ['token=', 'Bearer ', 'sk-', '/Users/test/', '"token":"']) {
+      const raw = 'Earlier public reasoning.\n' + prefix + value + (prefix.startsWith('"') ? '"' : '');
+      expect(boundedLiveReasoningSummary(raw)).toBe(await reference(raw));
+      expect(boundedLiveReasoningSummary(raw)).not.toContain('privateCanary');
+    }
+    // A redaction prefix may be separated from its value by line breaks.
+    for (const prefix of ['Bearer \n', 'token\n=\n', '"token"\n:\n"']) {
+      const raw = 'Earlier reasoning.\n' + prefix + value + '"\n' + 'safe tail '.repeat(220);
+      expect(boundedLiveReasoningSummary(raw)).toBe(await reference(raw));
+    }
+  });
+
+  it('keeps per-flush cost bounded for very long reasoning with complete lines', async () => {
+    const { boundedLiveReasoningSummary, sanitizePublicReasoningSummary } = await import('../../../src/main/model/core-agent/event-mapper');
+    const chunk = 'Comparing the two options and checking the constraints again before deciding. '.repeat(25);
+    const long = Array.from({ length: 600 }, (_, i) => chunk + (i % 50 === 0 ? ' see /Users/test/Projects/plan.md ' : '')).join('\n'); // ~1.2M chars
+    expect(boundedLiveReasoningSummary(long)).toBe(await reference(long));
+    let started = performance.now();
+    for (let i = 0; i < 40; i++) boundedLiveReasoningSummary(long);
+    const bounded = (performance.now() - started) / 40;
+    started = performance.now();
+    for (let i = 0; i < 5; i++) sanitizePublicReasoningSummary(long);
+    const whole = (performance.now() - started) / 5;
+    expect(bounded).toBeLessThan(1);
+    expect(bounded).toBeLessThan(whole / 5);
+  });
+
+  it('never costs more than sanitizing the whole text when sanitizing shrinks the tail', async () => {
+    const { boundedLiveReasoningSummary } = await import('../../../src/main/model/core-agent/event-mapper');
+    // Adjacent paths redact into a few characters, so the window widens to the whole text.
+    const pathHeavy = 'Reasoning about /Users/test/Projects/plan step by step. '.repeat(5_000);
+    expect(boundedLiveReasoningSummary(pathHeavy)).toBe(await reference(pathHeavy));
   });
 });

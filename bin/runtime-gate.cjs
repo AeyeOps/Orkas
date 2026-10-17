@@ -10,7 +10,7 @@ const path = require('node:path');
 // different, but pruning, post-pack verification, release validation, and cache
 // isolation must all consume these exported lists instead of copying them.
 const MANIFEST_RUNTIME_KINDS = ['python', 'uv', 'node'];
-const PACKAGED_RUNTIME_KINDS = [...MANIFEST_RUNTIME_KINDS, 'ffmpeg', 'whisper', 'vc'];
+const PACKAGED_RUNTIME_KINDS = [...MANIFEST_RUNTIME_KINDS, 'ffmpeg', 'whisper', 'vc', 'phone-passkey'];
 const FFMPEG_CAPABILITIES = ['libass', 'ass', 'subtitles'];
 const WINDOWS_VC_RUNTIME_CONTRACT = Object.freeze({
   schema: 1,
@@ -389,11 +389,20 @@ function verifyRuntimeDir(kind, dir, key, spec, asset, targetPlatform, targetArc
   requiredFile(`${kind} runtime executable`, executable);
   for (const companion of runtimeCompanionFiles(kind, executable, targetPlatform, spec)) {
     requiredFile(`${kind} runtime companion`, companion);
+    verifyExecutableMode(companion, targetPlatform, options);
   }
+  verifyExecutableMode(executable, targetPlatform, options);
   if (options.checkArch !== false && targetPlatform === 'darwin') {
     assertDarwinExecutableArch(executable, targetArch);
   }
   return executable;
+}
+
+function verifyExecutableMode(file, targetPlatform, options) {
+  // Opted in by packaging only; Windows commands have no POSIX execute bit.
+  if (options.requireExecutable && targetPlatform !== 'win32' && (fs.statSync(file).mode & 0o111) === 0) {
+    throw new Error(`[native-deps-gate] runtime file is not executable: ${file}`);
+  }
 }
 
 function verifyFfmpegRuntimeDir(runtimeRoot, targetPlatform, targetArch, options = {}) {
@@ -422,6 +431,7 @@ function verifyFfmpegRuntimeDir(runtimeRoot, targetPlatform, targetArch, options
   }
   for (const [name, file] of Object.entries(binaries)) {
     requiredFile(`${name} runtime executable`, file);
+    verifyExecutableMode(file, targetPlatform, options);
     const expected = marker.binaries && marker.binaries[name];
     const stat = fs.statSync(file);
     const rawHashMatches = expected
@@ -480,6 +490,7 @@ function verifyWhisperRuntimeDir(runtimeRoot, targetPlatform, targetArch, option
       throw new Error(`[native-deps-gate] whisper runtime hash/size mismatch: ${file}`);
     }
     if (expected.executable) {
+      verifyExecutableMode(file, targetPlatform, options);
       assertExecutableArch(file, targetPlatform, targetArch, options);
     }
   }
@@ -783,11 +794,40 @@ function verifyWindowsVcExtraFilesConfig(winConfig) {
   return true;
 }
 
+function verifyPhonePasskeyRuntimeDir(runtimeRoot, targetPlatform, targetArch, options = {}) {
+  if (targetPlatform !== 'darwin') throw new Error('[native-deps-gate] phone passkey helper is Mac-only');
+  const key = runtimeKey(targetPlatform, targetArch);
+  requireOnlyRuntimeDirs(runtimeRoot, 'phone-passkey', options.allowedKeys || [key]);
+  const dir = path.join(runtimeRoot, 'phone-passkey', key);
+  const marker = readJsonFile('phone passkey marker', path.join(dir, '.orkas-phone-passkey.json'));
+  if (marker.schema !== 1 || marker.protocol !== 1 || marker.platformKey !== key
+    || !/^[a-f0-9]{64}$/.test(marker.source || '')) throw new Error('[native-deps-gate] phone passkey marker mismatch');
+  const files = marker.files || {};
+  for (const name of ['orkas-phone-passkey', 'NOTICE.txt', 'webauthn-source.tar.gz', 'licenses/OpenSSL-LICENSE.txt']) {
+    if (!files[name]) throw new Error('[native-deps-gate] incomplete phone passkey runtime');
+  }
+  if (!Object.keys(files).some(name => name.startsWith('licenses/'))) throw new Error('[native-deps-gate] phone passkey licenses missing');
+  for (const [name, expected] of Object.entries(files)) {
+    if (path.isAbsolute(name) || name.split(/[\\/]/).some(part => !part || part === '..' || part === '.')) {
+      throw new Error('[native-deps-gate] invalid phone passkey runtime file');
+    }
+    const file = path.join(dir, name);
+    requiredFile('phone passkey runtime file', file);
+    const matches = expected.bytes === fs.statSync(file).size && expected.sha256 === sha256File(file);
+    if (!matches && (name !== 'orkas-phone-passkey' || !acceptSignedDarwinRuntimeMutation(file, targetPlatform, options))) {
+      throw new Error('[native-deps-gate] phone passkey runtime checksum mismatch');
+    }
+  }
+  const binary = path.join(dir, 'orkas-phone-passkey');
+  verifyExecutableMode(binary, targetPlatform, options);
+  assertExecutableArch(binary, targetPlatform, targetArch, options);
+  return binary;
+}
+
 function requiredRuntimeVerificationEntries(targetPlatform, targetArch) {
   const key = runtimeKey(targetPlatform, targetArch);
-  const kinds = targetPlatform === 'win32'
-    ? PACKAGED_RUNTIME_KINDS
-    : PACKAGED_RUNTIME_KINDS.filter(kind => kind !== 'vc');
+  const kinds = PACKAGED_RUNTIME_KINDS.filter(kind => (kind !== 'vc' || targetPlatform === 'win32')
+    && (kind !== 'phone-passkey' || targetPlatform === 'darwin'));
   return kinds.map(kind => `runtime:${kind}:${key}`);
 }
 
@@ -816,6 +856,10 @@ function verifyRuntimeRoot(runtimeRoot, targetPlatform, targetArch, options = {}
   verified.push(`runtime:ffmpeg:${key}`);
   verifyWhisperRuntimeDir(runtimeRoot, targetPlatform, targetArch, { ...options, allowedKeys });
   verified.push(`runtime:whisper:${key}`);
+  if (targetPlatform === 'darwin') {
+    verifyPhonePasskeyRuntimeDir(runtimeRoot, targetPlatform, targetArch, { ...options, allowedKeys });
+    verified.push(`runtime:phone-passkey:${key}`);
+  }
   if (targetPlatform === 'win32') {
     verifyWindowsVcRuntimeDir(runtimeRoot, targetPlatform, targetArch, { ...options, allowedKeys });
     verified.push(`runtime:vc:${key}`);
@@ -832,6 +876,7 @@ function verifyRuntimeRoot(runtimeRoot, targetPlatform, targetArch, options = {}
 }
 
 module.exports = {
+  verifyPhonePasskeyRuntimeDir,
   FFMPEG_CAPABILITIES,
   WHISPER_RUNTIME_CONTRACT,
   WINDOWS_VC_RUNTIME_CONTRACT,

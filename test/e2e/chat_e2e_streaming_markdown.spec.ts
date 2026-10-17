@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { expect, test, type Page } from '@playwright/test';
+import { classifyNativeCommentary } from '../../src/main/features/group_chat/message-display';
 
 // Real renderer, DOMPurify, local MathJax and fonts. No account or model calls.
 test.use({ launchOptions: { executablePath: process.env.ORKAS_E2E_BROWSER_PATH } });
@@ -10,7 +11,7 @@ const index = fs.readFileSync(path.join(renderer, 'index.html'), 'utf8');
 const mathConfig = index.slice(index.indexOf('window.MathJax = {'), index.indexOf('</script>', index.indexOf('window.MathJax = {')));
 const capturedLogs = new WeakMap<Page, Array<{ level: string; message: string }>>();
 
-test('renders process commentary formulas and retains completed formulas as the prose grows', async ({ page }, testInfo) => {
+test('renders process commentary formulas and retains completed formulas as the prose grows', async ({ page }) => {
   await setup(page);
   await page.evaluate(() => {
     const w = window as any;
@@ -32,8 +33,6 @@ test('renders process commentary formulas and retains completed formulas as the 
     return w.commentaryMath.isConnected && w.commentary.querySelector('mjx-container') === w.commentaryMath;
   })).toBe(true);
   await expect(commentary).toContainText('Second result:');
-  await page.locator('.stream-process').evaluate((element) => { (element as HTMLDetailsElement).open = true; });
-  await commentary.screenshot({ path: testInfo.outputPath('process-formulas.png') });
 });
 
 test.afterEach(async ({ page }, testInfo) => {
@@ -66,7 +65,7 @@ async function setup(page: Page) {
   capturedLogs.set(page, logs);
   page.on('pageerror', e => logs.push({ level: 'error', message: e.message }));
   page.on('console', m => logs.push({ level: m.type(), message: m.text() }));
-  const scripts = ['icons', 'strip-structural-blocks', 'utils', 'math', 'composer-input', 'conversation'];
+  const scripts = ['icons', 'avatar', 'strip-structural-blocks', 'utils', 'math', 'composer-input', 'conversation'];
   const fixture = test.info().outputPath('renderer.html');
   fs.mkdirSync(path.dirname(fixture), { recursive: true });
   fs.writeFileSync(fixture, `<!doctype html><html><head><meta charset="utf-8">
@@ -144,6 +143,46 @@ function isFontFallbackNotice(log: { level: string; message: string }) {
   return log.level === 'info' && log.message.startsWith('Slow network is detected.')
     && log.message.includes('Fallback font will be used while loading: file:')
     && /\/vendor\/mathjax\/output\/chtml\/fonts\/woff-v2\/MathJax_[\w-]+\.woff$/.test(log.message);
+}
+
+for (const formulas of [false, true]) {
+  test(`foreground snapshot keeps the readable reply while ${formulas ? 'formula' : 'prose'} repaint waits`, async ({ page }, testInfo) => {
+    await setup(page);
+    await page.evaluate(formulas => {
+      const w = window as any;
+      w.msg.dataset.fromActor = 'codex-agent';
+      w.msg.dataset.turnId = 'foreground';
+      w._stampRenderKey(w.msg, 'fixture', w._segmentRenderKey('foreground', 0));
+      w.prefix = formulas ? 'Readable \\(a+b\\). token-1.' : 'Readable reply token-1.';
+      w._streamingAppendFinalDelta(w.msg, w.prefix, 'final_answer');
+    }, formulas);
+    await settled(page);
+    await page.evaluate(formulas => {
+      const w = window as any;
+      w.observe(formulas ? 1 : 0);
+      const queue = w._queueStreamingPaint;
+      // Hold the scheduled body paint at the real recovery boundary. The DOM
+      // must remain readable even when frame scheduling is delayed on resume.
+      w._queueStreamingPaint = (msg: any, slot: string, paint: () => void) => {
+        if (slot === 'final') w.releaseRecoveredPaint = () => queue(msg, slot, paint);
+        else queue(msg, slot, paint);
+      };
+      w._restoreLiveDisplaySnapshot('fixture', { sequence: 2, turns: [{
+        actor: 'codex-agent', turn_id: 'foreground', records: [{
+          from: 'codex-agent', turn_id: 'foreground', seg: 0,
+          text: w.prefix + (formulas ? ' New \\(c+d\\). token-2.' : ' New text token-2.'), process: [],
+        }],
+      }] });
+    }, formulas);
+    await expect(page.locator('[data-role="final"]')).toBeVisible();
+    await expect(page.locator('[data-role="final"]')).toContainText('Readable');
+    await page.waitForTimeout(120);
+    await page.evaluate(() => (window as any).releaseRecoveredPaint());
+    await settled(page);
+    await expect(page.locator('[data-role="final"]')).toContainText('token-2');
+    await page.waitForTimeout(120);
+    await checkFrames(page, testInfo);
+  });
 }
 
 test('coalesces across frames while preserving long Markdown, typing and the latest trailing text', async ({ page }, testInfo) => {
@@ -565,3 +604,167 @@ test('prose appends preserve loaded images and audio state, while later embeds r
     const w = window as any; return w.audio === w.finalEl.querySelector('audio') && w.audio.currentTime === 0.25;
   })).toBe(true);
 });
+
+test('stored native classification survives live delivery, recovery and standalone history rendering', async ({ page }, testInfo) => {
+  await setup(page);
+  const record = classifyNativeCommentary({ id: 'native-0', ts: '2026-10-14T10:00:00',
+    from: 'claude', to: ['user'], turn_id: 'classified-turn', source_message_id: 'source', seg: 0,
+    text: 'Inspecting **the project**.', process: [{ type: 'progress', text: 'Read files' }] });
+  await page.evaluate(record => {
+    const w = window as any;
+    w.isGroupConversationBusy = () => true;
+    Object.assign(w.msg.dataset, { fromActor: 'claude', turnId: record.turn_id });
+    w._stampRenderKey(w.msg, 'fixture', w._segmentRenderKey(record.turn_id, 0));
+    w.msg.dataset.streamBuf = record.text;
+    w._appendProcessTextLines(w.msg.querySelector('[data-role="process"]'), 'Read files', 'tool', 'Read');
+    w._handleGroupBusEvent('fixture', w.msg, { type: 'process', actor: 'claude', turn_id: record.turn_id, seg: 0,
+      data: { type: 'native-message-finalized', phase: 'commentary', text: record.text } });
+    w._handleGroupBusEvent('fixture', w.msg, { type: 'process', actor: 'claude', turn_id: record.turn_id, seg: 1,
+      data: { type: 'delta', text: 'Final answer.' } });
+  }, record);
+  await expect(page.locator('.stream-process-commentary:not([hidden])')).toHaveCount(1);
+  await expect(page.locator('[data-role="final"]')).toHaveText('Final answer.');
+  await page.evaluate(record => {
+    const w = window as any;
+    w._restoreLiveDisplaySnapshot('fixture', { sequence: 4, turns: [{ actor: 'claude', turn_id: record.turn_id,
+      records: [record, { ...record, id: '', seg: 1, text: 'Final answer.', display_phase: 'pending', process: [] }] }] });
+  }, record);
+  await expect(page.locator('.stream-process-commentary')).toHaveCount(1);
+  await expect(page.locator('[data-role="final"]')).toHaveText('Final answer.');
+  await page.evaluate(record => {
+    const w = window as any;
+    w._streamingSetFinal(w.msg, 'Final answer.');
+    document.querySelector('#chat-history')!.replaceChildren();
+    // A history page may contain this record alone. Stored classification,
+    // rather than another message on the page, decides where its text belongs.
+    w.appendChatMessage(w._groupMsgToLegacy(record), false,
+      { archive: false, historyHydration: true, messageActions: 'errors-only' });
+  }, record);
+  await expect(page.locator('.stream-process')).not.toHaveAttribute('open');
+  await expect(page.locator('.chat-bubble > .markdown-body')).toHaveText('');
+  await page.locator('.stream-process-summary').click();
+  await expect(page.locator('.stream-process-commentary')).toHaveCount(1);
+  await expect(page.locator('.stream-process-commentary')).toHaveText('Inspecting the project.');
+  await page.screenshot({ path: testInfo.outputPath('stored-classification.png') });
+});
+
+for (const expanded of [false, true]) {
+test(`a forward history page preserves process open=${expanded}`, async ({ page }) => {
+  await setup(page);
+  await page.evaluate(expanded => {
+    const w = window as any;
+    const history = document.querySelector('#chat-history')!;
+    history.replaceChildren();
+    const makeRow = (seg: number, text: string) => {
+      const row = w._createStreamingAssistantMessage(history, { messageActions: 'errors-only' });
+      Object.assign(row.dataset, { fromActor: 'claude', turnId: 'paged-turn', msgId: `record-${seg}` });
+      w._stampRenderKey(row, 'fixture', w._segmentRenderKey('paged-turn', seg));
+      row._historyLegacyMessage = { content: text };
+      w._streamingSetFinal(row, text);
+      row.querySelector('.stream-process').remove();
+      w._renderPersistedProcess(row, [{ type: 'progress', text: `operation-${seg}` }]);
+      return row;
+    };
+    makeRow(0, 'Checking **the first page**.').querySelector('.stream-process').open = expanded;
+    const next = makeRow(1, 'The final answer.');
+    w._joinNewerHistoryTurn(history, next);
+  }, expanded);
+  await expect(page.locator('.chat-message')).toHaveCount(1);
+  await expect(page.locator('[data-role="final"]')).toHaveText('The final answer.');
+  await expect(page.locator('.stream-process')).toHaveCount(1);
+  expect(await page.locator('.stream-process').evaluate((el: HTMLDetailsElement) => el.open)).toBe(expanded);
+  if (!expanded) await page.locator('.stream-process-summary').click();
+  await expect(page.locator('.stream-process')).toContainText('Checking the first page.');
+  await expect(page.locator('.stream-process')).toContainText('operation-0');
+  await expect(page.locator('.stream-process')).toContainText('operation-1');
+  await expect(page.locator('.chat-turn-narration, .chat-turn-narration-toggle')).toHaveCount(0);
+});
+
+test(`an older history page preserves completed process open=${expanded}`, async ({ page }, testInfo) => {
+  await setup(page);
+  await page.evaluate(() => {
+    const w = window as any;
+    Object.assign(w.msg.dataset, { fromActor: 'claude', turnId: 'older-turn', msgId: 'record-2' });
+    w._stampRenderKey(w.msg, 'fixture', w._segmentRenderKey('older-turn', 2));
+    w._streamingSetFinal(w.msg, 'Completed answer.');
+    w.msg.querySelector('.stream-process').remove();
+    w._renderPersistedProcess(w.msg, [{ type: 'progress', text: 'Last operation' }]);
+  });
+  if (expanded) await page.locator('.stream-process-summary').click();
+  await page.evaluate(() => {
+    const w = window as any;
+    w._mergeNativeSegmentRecords([{ id: 'record-1', from: 'claude', turn_id: 'older-turn',
+      seg: 1, text: 'Earlier progress note.', process: [] }], 'fixture');
+  });
+  expect(await page.locator('.stream-process').evaluate((el: HTMLDetailsElement) => el.open)).toBe(expanded);
+  await expect(page.locator('[data-role="final"]')).toHaveText('Completed answer.');
+  await page.screenshot({ path: testInfo.outputPath('process-after-history-merge.png') });
+  if (!expanded) await page.locator('.stream-process-summary').click();
+  await expect(page.locator('.stream-process')).toContainText('Earlier progress note.');
+  await expect(page.locator('.stream-process')).toContainText('Last operation');
+});
+}
+
+for (const [locale, width, height] of [['zh', 1200, 780], ['en', 720, 500]] as const) {
+  test(`native message commentary shares one process disclosure (${locale}, ${width})`, async ({ page }, testInfo) => {
+    await page.setViewportSize({ width, height });
+    await setup(page);
+    const dictionary = JSON.parse(fs.readFileSync(path.join(renderer, 'locales', `${locale}.json`), 'utf8'));
+    await page.evaluate(({ dictionary, locale }) => {
+      const w = window as any;
+      w.t = (key: string, values: Record<string, unknown> = {}) => String(dictionary[key] || key)
+        .replace(/\{(\w+)\}/g, (_: string, name: string) => String(values[name] ?? `{${name}}`));
+      const history = document.querySelector('#chat-history') as HTMLElement;
+      history.style.width = '100%'; history.style.height = 'calc(100vh - 20px)';
+      document.querySelector('#composer')?.remove();
+      history.replaceChildren();
+      w.msg = w._createStreamingAssistantMessage(history, { messageActions: 'errors-only' });
+      w.msg.querySelector('[data-role="from-chip"]').textContent = 'Claude Code';
+      w.msg.dataset.turnId = 'native-fixture';
+      w.finalEl = w.msg.querySelector('[data-role="final"]');
+      w.records = [];
+      for (let seg = 0; seg < 19; seg++) {
+        const text = locale === 'zh' ? `正在核对第 ${seg + 1} 项：**检查执行结果**，保留完整过程记录。`
+          : `Checking step ${seg + 1}: **verify the execution result**, retaining the complete progress note.`;
+        w.records.push({ id: `segment-${seg}`, seg, text, process: [] });
+        w.msg.dataset.streamBuf = text;
+        w._appendProcessTextLines(w.msg.querySelector('[data-role="process"]'), `operation-${seg}`, 'tool', 'Read');
+        w._demoteBodyToNarration(w.msg, seg);
+      }
+      w.finalAnswer = locale === 'zh' ? '核对完成。最终结果保留在正文，过程可展开查看。'
+        : 'Review complete. The final result remains here; expand the execution details to inspect progress.';
+      w.records.push({ id: 'final', seg: 19, text: w.finalAnswer, process: [
+        { type: 'event', event: { stream: 'runtime', data: { duration_ms: 901000, phase: 'end' } } },
+      ] });
+    }, { dictionary, locale });
+    // Live grouping must not absorb the next segment's operation before its prose.
+    expect(await page.evaluate(() => Array.from((window as any).msg.querySelector('[data-role="process"]').children)
+      .filter((el: any) => !el.hidden).map((el: any) => el.classList.contains('stream-process-commentary') ? 'text' : 'operations')))
+      .toEqual(Array.from({ length: 19 }, () => ['text', 'operations']).flat());
+    await page.evaluate(() => {
+      const w = window as any;
+      w._streamingSetFinal(w.msg, w.finalAnswer);
+      const merged = w._mergeSegmentGroup(w.records).merged;
+      w.msg.querySelector('.stream-process').remove();
+      w._renderPersistedProcess(w.msg, merged.process, { parts: merged.process_parts });
+    });
+    await expect(page.locator('[data-role="final"]')).toHaveText(await page.evaluate(() => (window as any).finalAnswer));
+    await expect(page.locator('.stream-process')).not.toHaveAttribute('open');
+    await expect(page.locator('.chat-turn-narration, .chat-turn-narration-toggle')).toHaveCount(0);
+    await expect(page.locator('.stream-process-commentary')).toHaveCount(0); // lazy history
+    await page.screenshot({ path: testInfo.outputPath('native-process-collapsed.png') });
+    await page.locator('.stream-process-summary').focus();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.stream-process-commentary')).toHaveCount(19);
+    await expect(page.locator('.stream-process-commentary').first()).toBeVisible();
+    expect(await page.evaluate(() => {
+      const body = document.querySelector('.chat-bubble') as HTMLElement;
+      return body.scrollWidth <= body.clientWidth + 1;
+    })).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath('native-process-expanded.png') });
+    await page.locator('.stream-process-summary').focus();
+    await page.keyboard.press('Enter');
+    await expect(page.locator('.stream-process-commentary').last()).not.toBeVisible();
+    await expect(page.locator('[data-role="final"]')).toBeVisible();
+  });
+}

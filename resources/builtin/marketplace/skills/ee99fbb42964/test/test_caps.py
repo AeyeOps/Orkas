@@ -72,9 +72,39 @@ class Plan(unittest.TestCase):
         out = plan({
             "subquestions": ["desktop application comparison"],
             "caps": {"max_fetches": 8, "max_fetches_per_subquestion": 8},
+            "caps_reason": "The user asked for at most eight sources.",
         })
         self.assertEqual(out["total_fetch_budget"], 8)
         self.assertEqual(out["fetch_budget_per_subquestion"], 8)
+        self.assertEqual(out["caps_reason"], "The user asked for at most eight sources.")
+
+    def test_lowered_fetch_caps_without_reason_are_rejected_with_the_values(self):
+        # The 2026-10-02 "detailed research" run set 12/5 with no budget behind it.
+        for reason in (None, "", "   "):
+            payload = {
+                "subquestions": ["name and demo", "spatial optimization", "evaluation"],
+                "caps": {"max_fetches": 12, "max_fetches_per_subquestion": 5},
+            }
+            if reason is not None:
+                payload["caps_reason"] = reason
+            with self.assertRaises(ValueError) as raised:
+                plan(payload)
+            message = str(raised.exception)
+            self.assertIn("max_fetches 12, max_fetches_per_subquestion 5", message)
+            self.assertIn("max_fetches 40, max_fetches_per_subquestion 8", message)
+            self.assertIn("caps_reason", message)
+
+    def test_defaults_and_raised_fetch_caps_need_no_reason(self):
+        self.assertNotIn("caps_reason", plan({"subquestions": ["a topic here"]}))
+        out = plan({"subquestions": ["a topic here"],
+                    "caps": {"max_fetches": 60, "max_fetches_per_subquestion": 8}})
+        self.assertEqual(out["total_fetch_budget"], 60)
+
+    def test_lowering_non_fetch_caps_needs_no_reason(self):
+        out = plan({"subquestions": ["a topic here"], "depth": 1,
+                    "caps": {"max_subquestions": 3, "max_depth": 1, "max_model_calls": 10}})
+        self.assertTrue(out["allowed"])
+        self.assertEqual(out["caps"]["max_subquestions"], 3)
 
     def test_exact_duplicate_questions_collapse(self):
         out = plan({"subquestions": ["What is X?", "what is x", "How does Y work?"]})
@@ -212,6 +242,53 @@ class FileBackedAccount(unittest.TestCase):
         self.assertEqual(out["remaining"]["fetches"], 0)
         self.assertTrue(out["stop"])
         self.assertIn("max_fetches", out["limits_reached"])
+
+    def test_no_content_outcomes_within_the_allowance_do_not_consume_the_budget(self):
+        # max_fetches 8 -> allowance max(2, 8 // 4) = 2.
+        rows = [{"status": "ok", "url": f"https://example.com/{i}"} for i in range(6)]
+        rows.extend([
+            {"kind": "fetch", "url": "https://example.com/card.pdf", "status": "unusable_binary"},
+            {"kind": "fetch", "url": "https://example.com/report", "status": "navigation_only"},
+        ])
+        self.write_ledger(rows)
+        out = account_from_files(self.plan_path, self.ledger_path)
+        self.assertEqual(out["totals"]["fetches"], 6)
+        self.assertEqual(out["remaining"]["fetches"], 2)
+        self.assertFalse(out["stop"])
+        self.assertEqual(out["fetch_rows"]["no_content"], 2)
+        self.assertEqual(out["fetch_rows"]["exempt"]["no_content"], 2)
+
+    def test_no_content_outcomes_beyond_the_allowance_count(self):
+        rows = [{"status": "ok", "url": f"https://example.com/{i}"} for i in range(6)]
+        rows.extend({"status": "no_content", "reason": "empty", "url": f"https://example.com/empty-{i}"}
+                    for i in range(3))
+        self.write_ledger(rows)
+        out = account_from_files(self.plan_path, self.ledger_path)
+        self.assertEqual(out["totals"]["fetches"], 7)
+        self.assertEqual(out["remaining"]["fetches"], 1)
+
+    def test_continuation_windows_read_a_long_source_within_the_allowance(self):
+        rows = [{"status": "ok", "url": f"https://example.com/{i}"} for i in range(7)]
+        rows.extend({"kind": "fetch", "url": "https://example.com/paper", "offset": 12000 * i,
+                     "status": "ok"} for i in range(1, 5))
+        rows.append({"kind": "fetch", "url": "https://example.com/paper", "continuation": True,
+                     "status": "ok"})
+        # Offset 0 is an ordinary first read, not a continuation.
+        rows.append({"kind": "fetch", "url": "https://example.com/other", "offset": 0, "status": "ok"})
+        self.write_ledger(rows)
+        out = account_from_files(self.plan_path, self.ledger_path)
+        self.assertEqual(out["fetch_rows"]["continuation"], 5)
+        self.assertEqual(out["totals"]["fetches"], 8)
+        self.assertTrue(out["stop"])
+
+    def test_continuation_windows_beyond_the_allowance_count(self):
+        rows = [{"status": "ok", "url": "https://example.com/paper"}]
+        rows.extend({"url": "https://example.com/paper", "offset": 4000 * i, "status": "ok"}
+                    for i in range(1, 11))
+        self.write_ledger(rows)
+        out = account_from_files(self.plan_path, self.ledger_path)
+        self.assertEqual(out["fetch_rows"]["exempt"]["continuation"], 8)
+        self.assertEqual(out["totals"]["fetches"], 3)
 
     def test_search_rows_do_not_consume_a_fetch_budget(self):
         self.write_ledger([

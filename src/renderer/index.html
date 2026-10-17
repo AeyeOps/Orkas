@@ -27,6 +27,7 @@
       </button>
       <div class="sidebar-actions">
         <button class="sidebar-btn primary" id="new-chat-btn"><span data-ui-icon="message-square" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.new_chat">New Task</span><span class="sidebar-btn-running-chip" id="commander-running-chip" hidden></span></button>
+        <!-- One flat list, in the release_1.8.0 order. -->
         <button class="sidebar-btn" id="todos-btn"><span data-ui-icon="clipboard-list" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="project.todo.title">To-do</span></button>
         <button class="sidebar-btn" id="auto-btn"><span data-ui-icon="clock" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.auto">Auto</span></button>
         <button class="sidebar-btn" id="agents-btn"><span data-ui-icon="users" data-ui-icon-class="sidebar-btn-icon"></span><span data-i18n="sidebar.agents">Agents</span></button>
@@ -41,7 +42,7 @@
             <button class="sidebar-section-toggle" id="today-section-toggle" type="button"
                     aria-controls="today-list" aria-expanded="true">
               <span data-ui-icon="chevron-down" data-ui-icon-class="sidebar-section-chevron"></span>
-              <span class="sidebar-section-title" data-i18n="sidebar.today_tasks">Today's Tasks</span>
+              <span class="sidebar-section-title" data-i18n="sidebar.today_tasks">Recent Tasks</span>
               <span class="task-unread-dot" id="today-unread-dot" hidden aria-hidden="true"></span>
             </button>
           </div>
@@ -94,16 +95,11 @@
     </aside>
 
     <main class="main-content">
-      <!-- New Chat Landing — empty state per PC/docs/design/PATTERNS.md
-           (Surface B). 720px centered column: account-aware heading +
-           subtitle + composer (80px textarea) + quick-start task cards.
-           The heading is filled in by JS lifecycle hooks; see
-           _refreshEmptyStateHeading. -->
-      <section class="panel active" id="panel-new-chat">
+      <!-- Commander home: the composer stays above the scrollable work list. -->
+      <section class="panel active" id="panel-new-chat" data-home-state="pending">
         <div class="new-chat-center">
           <div class="new-chat-header">
             <h1 class="new-chat-greeting" id="new-chat-greeting" data-i18n="new_chat.title_fallback">Friend, what do you want to accomplish?</h1>
-            <p class="new-chat-subtitle" data-i18n="new_chat.subtitle"></p>
           </div>
           <div class="new-chat-input-wrapper">
             <div class="new-chat-input-area">
@@ -115,7 +111,7 @@
                 <div class="chat-attachments" id="new-chat-attachments" style="display:none"></div>
               </div>
               <div class="chat-quote-preview" id="new-chat-quote-preview" style="display:none"></div>
-              <div data-composer="1" id="new-chat-input" data-i18n-placeholder="new_chat.input_placeholder" placeholder="For example: Analyze this file, identify the key issues, and suggest improvements"></div>
+              <div data-composer="1" id="new-chat-input" data-i18n-placeholder="new_chat.home.input_placeholder" placeholder="Describe what you want to accomplish, or attach the files to work on"></div>
               <!-- Composer bottom bar order matches PC/docs/design/PATTERNS.md
                    P11: [+] | divider | [To] | [workspace - JS-injected] |
                    [skill] | spacer | [send]. The open-source build strips
@@ -127,13 +123,6 @@
                   <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                   <span class="chat-recipient-name" id="new-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                 </button>
-                <!-- Order toggle sits to the RIGHT of the workspace chip: the
-                     chip injects itself directly after the recipient chip, so
-                     placing the button here yields recipient → workspace →
-                     order in the left cluster (user directive 2026-08-27). -->
-                <button type="button" class="chat-queue-btn" id="new-chat-seq-toggle"
-                        data-i18n-title="chat.multi_dispatch_toggle_title"
-                        title="How the mentioned agents run for this message" hidden></button>
                 <!-- Workspace chip is injected by user-workspace.js::initUserWorkspace
                      immediately after the recipient chip; mounting position is
                      centralized there so the open-conversation composer stays in
@@ -150,21 +139,42 @@
               </div>
             </div>
           </div>
-          <!-- Server-orderable quick start list. Main-process client config
-               supplies the ordered ids; conversation.js renders localized
-               cards and binds their matching built-in/default agent. -->
-          <section class="new-chat-scenarios quick-panel" id="new-chat-scenarios" aria-labelledby="quick-panel-title">
-            <div class="quick-panel-head">
-              <span class="quick-panel-title" id="quick-panel-title" data-i18n="new_chat.quick.title">Try one of these tasks — one click to get started</span>
-              <span class="quick-panel-rule" aria-hidden="true"></span>
-              <!-- Opens the marketplace Open Source list (wired by modules/oss.js). -->
-              <button type="button" class="quick-panel-more" id="quick-panel-oss-more">
-                <span data-i18n="new_chat.quick.oss_more">Add more open-source tool capabilities</span>
-                <span data-ui-icon="chevron-right" data-ui-icon-class="quick-panel-more-arrow" aria-hidden="true"></span>
-              </button>
+          <!-- Everything below the composer. This is the only part of the
+               home that scrolls, so the composer is never inside a scroller. -->
+          <div class="home-below">
+            <!-- Empty: two equal ways to start. Copy only; the one control is the
+                 connect link that home.js renders inside the context line. -->
+            <div class="home-paths">
+              <section class="home-path" aria-labelledby="home-goal-title">
+                <h2 class="home-path-title" id="home-goal-title" data-i18n="new_chat.home.goal_title">Have a clear goal? Hand it to Commander.</h2>
+                <p class="home-path-body" data-i18n="new_chat.home.goal_body">Tell Commander what you want to accomplish, and it will coordinate your AI team to get it done.</p>
+                <p class="home-path-note" data-i18n="new_chat.home.goal_example">For example: research 3 similar products, compare their features and pricing, and turn the findings into a presentation.</p>
+              </section>
+              <section class="home-path" aria-labelledby="home-explore-title">
+                <h2 class="home-path-title" id="home-explore-title" data-i18n="new_chat.home.explore_title">Not sure yet? Let Orkas get to know you first.</h2>
+                <p class="home-path-body" data-i18n="new_chat.home.explore_body">Talk about your work, your business, or what's on your mind, and Orkas will help you find the right goals and keep them moving.</p>
+                <p class="home-path-note" id="home-explore-context"></p>
+              </section>
             </div>
-            <div class="quick-grid" id="new-chat-scenario-grid"></div>
-          </section>
+            <!-- Server-orderable quick start list. Main-process client config
+                 supplies the ordered ids; conversation.js renders localized
+                 cards and binds their matching built-in/default agent. -->
+            <section class="new-chat-scenarios quick-panel" id="new-chat-scenarios" aria-labelledby="quick-panel-title">
+              <div class="quick-panel-head">
+                <span class="quick-panel-title" id="quick-panel-title" data-i18n="new_chat.quick.title">Try one of these tasks — one click to get started</span>
+                <span class="quick-panel-rule" aria-hidden="true"></span>
+              </div>
+              <div class="quick-grid" id="new-chat-scenario-grid"></div>
+            </section>
+            <!-- Populated: the three groups are rendered by home.js. -->
+            <section class="home-work" id="home-work" aria-labelledby="home-continue-title">
+              <div class="home-continue-label" id="home-continue-title">
+                <span data-i18n="new_chat.home.continue_label">Keep things moving</span>
+                <span class="home-continue-rule" aria-hidden="true"></span>
+              </div>
+              <div class="home-groups" id="home-groups"></div>
+            </section>
+          </div>
         </div>
       </section>
 
@@ -177,6 +187,7 @@
                  avatars + counts + 详情 toggle. Filled in by JS lifecycle hook
                  `_refreshChatHeader()` in conversation.js. -->
             <div class="chat-header" id="chat-header">
+              <button type="button" class="btn btn-sm" id="chat-cleanup-back" data-i18n="common.back" hidden>Back</button>
               <div class="chat-header-main">
                 <div class="chat-header-title-row">
                   <h1 class="chat-header-title" id="chat-header-title"></h1>
@@ -247,12 +258,6 @@
                     <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                     <span class="chat-recipient-name" id="chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                   </button>
-                  <!-- D9 cross-group order toggle: visible only while the composer
-                       text splits into ≥2 mention groups. Label mirrors the current
-                       mode (serial default); click flips it for THIS send. -->
-                  <button type="button" class="chat-queue-btn" id="chat-seq-toggle"
-                          data-i18n-title="chat.multi_dispatch_toggle_title"
-                          title="How the mentioned agents run for this message; click to switch" hidden></button>
                   <!-- Workspace chip is injected by user-workspace.js right after
                        the recipient chip — see initUserWorkspace(). -->
                   <div class="chat-skill-chip" id="chat-skill-chip" data-target="conversation" style="display:none">
@@ -544,6 +549,10 @@
                     <div class="agents-detail-label" data-i18n="agents.label_cli_settings">Runtime settings</div>
                     <div class="agents-detail-cli-settings" id="agents-detail-cli-settings"></div>
                   </div>
+                  <div class="agents-detail-section" id="agents-detail-cli-usage-section" hidden>
+                    <div class="agents-detail-label" data-i18n="agents.cli_usage_title">Remaining allowance</div>
+                    <div id="agents-detail-cli-usage" aria-live="polite"></div>
+                  </div>
                   <div class="agents-detail-section" id="agents-detail-project-dir-section" style="display:none">
                     <div class="agents-detail-label" data-i18n="agents.label_project_dir">Project directory</div>
                     <div class="agents-detail-project-dir" id="agents-detail-project-dir"></div>
@@ -676,6 +685,7 @@
       <section class="panel" id="panel-project">
         <div class="project-detail-view">
           <div class="project-detail-content" id="project-detail-content">
+            <!-- Local rename and delete use the shared header menu. -->
             <header class="project-detail-header">
               <div class="project-detail-header-main">
                 <div class="project-detail-header-title-row">
@@ -685,9 +695,11 @@
                 </div>
               </div>
               <div class="project-detail-actions">
-                <button type="button" class="btn btn-sm" id="project-action-invite" data-i18n="project.menu.invite_members">Invite project members</button>
-                <button type="button" class="btn btn-sm" id="project-action-rename" data-i18n="project.action.rename">Rename</button>
-                <button type="button" class="btn btn-sm btn-danger" id="project-action-delete" data-i18n="project.action.delete">Delete</button>
+                <button type="button" class="btn btn-sm" id="project-action-rename" data-i18n="project.action.done" hidden>Done</button>
+                <button type="button" class="project-header-icon-btn" id="project-action-more" aria-haspopup="menu"
+                        data-i18n-title="project.menu.more_actions" data-i18n-aria-label="project.menu.more_actions" title="More actions" aria-label="More actions">
+                  <span data-ui-icon="more-horizontal" data-ui-icon-class="project-header-icon"></span>
+                </button>
               </div>
             </header>
 
@@ -710,11 +722,6 @@
                       <span class="chat-recipient-prefix" data-i18n="chat.recipient_label">To: </span>
                       <span class="chat-recipient-name" id="project-chat-recipient-name" data-i18n="chat.recipient_commander">Commander</span>
                     </button>
-                    <!-- Order toggle sits to the RIGHT of the injected workspace
-                         chip, same as the other composers. -->
-                    <button type="button" class="chat-queue-btn" id="project-chat-seq-toggle"
-                            data-i18n-title="chat.multi_dispatch_toggle_title"
-                            title="How the mentioned agents run for this message" hidden></button>
                     <!-- Workspace chip is injected by user-workspace.js right after
                          the recipient chip — see initUserWorkspace(). -->
                     <div class="chat-skill-chip" id="project-chat-skill-chip" data-target="project" style="display:none">
@@ -729,8 +736,9 @@
                   </div>
                 </div>
 
-                <!-- Tabbed workspace: project tasks and automation. Agents
-                     and Library live in the right rail. -->
+                <!-- Tabbed workspace: project tasks, automation and to-dos. The
+                     active tab's tools share the tab row. Agents and Library
+                     live in the right rail. -->
                 <section class="project-workbench">
                   <div class="project-detail-tabs">
                     <div class="project-detail-tab-group" role="tablist">
@@ -747,28 +755,33 @@
                         <span class="project-detail-tab-count" id="project-todo-count">0</span>
                       </button>
                     </div>
+                    <!-- _syncProjectDetailTabState shows the active tab's group. -->
+                    <div class="project-tab-tools" data-project-tools="auto" hidden>
+                      <button type="button" class="btn btn-sm" id="project-auto-add-btn" data-i18n="auto.add_btn">+ Create</button>
+                    </div>
+                    <div class="project-tab-tools" data-project-tools="todo" hidden>
+                      <!-- All / Mine, filled for shared projects by _renderProjectTodosList. -->
+                      <div class="project-todo-filter" id="project-todo-filter"></div>
+                      <button type="button" class="project-driver-toggle is-switch" id="project-driver-toggle"
+                              data-i18n-title="project.driver.toggle_hint"
+                              title="AI handles to-dos automatically for you to review when finished. Runs only on the device where you turn it on." aria-pressed="false"><span class="project-driver-switch" aria-hidden="true"></span><span data-i18n="project.driver.toggle">Auto</span><span id="project-driver-device"></span></button>
+                      <button type="button" class="project-driver-hint" id="project-driver-hint"
+                              data-i18n-aria-label="project.driver.toggle_hint" aria-label="AI handles to-dos automatically for you to review when finished. Runs only on the device where you turn it on."
+                              aria-describedby="project-driver-tooltip"><span data-ui-icon="info" data-ui-icon-class="project-driver-hint-icon"></span></button>
+                      <button type="button" class="btn btn-sm" id="project-todo-add-btn"
+                              data-i18n="todo.add_short" data-i18n-title="project.todo.add" title="Create task">+ Create</button>
+                    </div>
                   </div>
                   <div class="project-detail-tab-panel" data-project-panel="tasks">
                     <div class="project-tasks-list" id="project-tasks-list"></div>
                     <div class="project-tasks-empty empty muted" id="project-tasks-empty" data-i18n="project.tasks_empty">No tasks yet</div>
                   </div>
                   <div class="project-detail-tab-panel" data-project-panel="auto" hidden>
-                    <div class="project-auto-tab-head">
-                      <div class="auto-sync-note" id="project-auto-sync-note" hidden></div>
-                      <button type="button" class="btn btn-sm" id="project-auto-add-btn" data-i18n="auto.add_btn">+ Create</button>
-                    </div>
+                    <div class="auto-sync-note" id="project-auto-sync-note" hidden></div>
                     <div class="auto-list" id="project-auto-list"></div>
                     <div class="empty muted" id="project-auto-empty" data-i18n="auto.empty">No auto tasks yet</div>
                   </div>
                   <div class="project-detail-tab-panel" data-project-panel="todo" hidden>
-                    <div class="project-todo-tab-head">
-                      <button type="button" class="btn btn-sm project-driver-toggle" id="project-driver-toggle"
-                              data-i18n="project.driver.toggle" data-i18n-title="project.driver.toggle_hint"
-                              title="AI handles to-dos automatically for you to review when finished." aria-pressed="false">Auto</button>
-                      <span class="form-hint" data-i18n="project.driver.toggle_hint">AI handles to-dos automatically for you to review when finished.</span>
-                      <button type="button" class="btn btn-sm" id="project-todo-add-btn"
-                              data-i18n="todo.add_short" data-i18n-title="project.todo.add" title="Create task">+ Create</button>
-                    </div>
                     <div class="todo-load-error" id="project-todo-error" role="status" hidden><span data-i18n="todo.load_failed">Could not load tasks. Try again.</span><button class="btn btn-sm" id="project-todo-retry" data-i18n="chat.retry_btn">Retry</button></div>
                     <div class="project-tasks-list project-todo-list" id="project-todo-list"></div>
                   </div>
@@ -827,6 +840,8 @@
                               data-i18n-title="project.memory.add" title="Add memory"
                               data-i18n-aria-label="project.memory.add" aria-label="Add memory">Add</button>
                     </div>
+                    <p class="project-context-help project-memory-full" id="project-memory-full" role="status" hidden
+                       data-i18n="memory.full_notice">Memory is full. Before saving something new, the AI will merge existing entries.</p>
                     <div class="project-memory-editor" id="project-memory-editor" hidden>
                       <textarea class="project-memory-editor-input" id="project-memory-editor-input" rows="3" maxlength="2500"
                                 data-i18n-placeholder="project.memory.placeholder" placeholder="Record a durable fact, decision, or project update"></textarea>
@@ -1073,12 +1088,17 @@
                 <h1 class="apps-page-header-title" data-i18n="apps.title">Apps</h1>
                 <span class="apps-page-header-count" id="apps-page-header-count"></span>
               </div>
+              <div class="apps-header-types">
+                <div class="apps-type-tabs" id="apps-type-tabs" role="tablist" data-i18n-aria-label="apps.title" aria-label="Apps"></div>
+                <span class="apps-type-description" id="apps-type-description"></span>
+              </div>
             </div>
             <button type="button" class="btn btn-sm" id="apps-create-btn" aria-haspopup="dialog">
               <span data-ui-icon="plus" aria-hidden="true"></span><span data-i18n="apps.create">Create</span>
             </button>
           </div>
-          <div class="agents-grid-scroll">
+          <div class="agents-grid-scroll" id="apps-content" role="tabpanel" aria-labelledby="apps-tab-local">
+            <div class="app-publication-quota" id="apps-publication-quota" hidden></div>
             <div class="apps-grid" id="apps-grid"></div>
             <div class="agents-empty" id="apps-empty" data-i18n="apps.empty">No apps</div>
           </div>
@@ -1125,18 +1145,31 @@
 
                 <section class="settings-section" id="settings-section-local">
                   <div class="settings-section-title">
-                    <h2 data-i18n="settings.section.local">本地</h2>
+                    <h2 data-i18n="settings.data_root.title">数据目录</h2>
                     <span class="settings-section-hint" data-i18n="settings.data.local_hint">仅此设备</span>
                   </div>
                   <div class="settings-sheet">
                     <div class="settings-row settings-data-root-row">
                       <div class="settings-row-copy">
-                        <div class="settings-row-title" data-i18n="settings.data_root.title">Data root</div>
                         <div class="settings-row-desc" data-i18n="settings.data_root.sub">All conversations, agents, skills, and Library content live under this directory. Click the path to open it in the OS file manager.</div>
                         <span class="settings-mono" id="settings-data-root-path"></span>
                       </div>
                       <button class="btn btn-sm" id="settings-data-root-btn" type="button" title="" data-i18n-title="settings.data_root.open_tooltip" data-i18n="settings.data_root.open">打开目录</button>
                     </div>
+                  </div>
+                </section>
+
+                <section class="settings-section" id="settings-task-cleanup">
+                  <div class="settings-section-title"><h2 data-i18n="settings.cleanup.title">Clean up task history</h2></div>
+                  <div class="settings-sheet">
+                    <div class="settings-row">
+                      <div class="settings-row-copy">
+                        <div class="settings-row-title" data-i18n="settings.cleanup.age">Last active</div>
+                        <div class="settings-row-desc" data-i18n="settings.cleanup.scope">Filter all task history by age, then clean up by project or task.</div>
+                      </div>
+                      <div class="ai-select" id="settings-task-cleanup-age"></div>
+                    </div>
+                    <div id="settings-task-cleanup-body" aria-live="polite"></div>
                   </div>
                 </section>
 
@@ -1183,6 +1216,10 @@
                         <input type="checkbox" id="settings-task-notifications-toggle" checked aria-labelledby="settings-task-notifications-title" />
                       </label>
                     </div>
+                    <div class="settings-row settings-task-notification-permission" id="settings-task-notification-permission" role="status" aria-live="polite" hidden>
+                      <span class="settings-task-notification-permission-text" id="settings-task-notification-permission-text" data-i18n="settings.task_notifications.permission_disabled">系统已关闭 Orkas 的通知权限。请前往系统设置开启，否则无法收到任务进度提醒。</span>
+                      <button type="button" class="btn btn-sm" id="settings-task-notification-open-settings" data-i18n="settings.task_notifications.open_settings">打开系统设置</button>
+                    </div>
                     <div class="settings-row">
                       <div class="settings-row-copy">
                         <div class="settings-row-title" id="settings-operator-title" data-i18n="quality.operator.title">Custom validation</div>
@@ -1192,10 +1229,6 @@
                       <button class="btn btn-sm" id="settings-operator-file" data-i18n="quality.operator.file">Rule file</button>
                       <button class="btn btn-sm" id="settings-operator-reload" data-i18n="quality.operator.reload">Reload</button>
                       <label class="toggle-switch settings-switch"><input type="checkbox" id="settings-operator-toggle" aria-labelledby="settings-operator-title" /></label>
-                    </div>
-                    <div class="settings-row settings-task-notification-permission" id="settings-task-notification-permission" role="status" aria-live="polite" hidden>
-                      <span class="settings-task-notification-permission-text" id="settings-task-notification-permission-text" data-i18n="settings.task_notifications.permission_disabled">系统已关闭 Orkas 的通知权限。请前往系统设置开启，否则无法收到任务进度提醒。</span>
-                      <button type="button" class="btn btn-sm" id="settings-task-notification-open-settings" data-i18n="settings.task_notifications.open_settings">打开系统设置</button>
                     </div>
                   </div>
                 </section>
@@ -1260,8 +1293,11 @@
                 <div class="settings-group settings-orkas-api-group" id="settings-orkas-api-group">
                   <div class="settings-group-head settings-orkas-api-head">
                     <div class="settings-group-head-main">
-                      <div class="settings-group-title" data-i18n="settings.orkas_api.title">Orkas API Key</div>
-                      <div class="settings-group-sub" data-i18n="settings.orkas_api.sub">This shared credential is used by Orkas models, media, search, and credit-based connectors.</div>
+                      <div class="settings-orkas-api-title-row">
+                        <div class="settings-group-title" data-i18n="settings.orkas_api.title">Orkas API Key</div>
+                        <span class="settings-orkas-api-savings" data-i18n="price_comparison.maximum">Model costs up to ~60% less than provider APIs</span>
+                      </div>
+                      <div class="settings-group-sub" data-i18n="settings.orkas_api.sub">Shared by Orkas models, search, images, speech, video, and credit-based connectors. The key is encrypted on this device.</div>
                     </div>
                     <button type="button" class="btn btn-sm" id="settings-orkas-api-create-key" data-i18n="settings.orkas_api.create_key">Create API Key</button>
                   </div>
@@ -1464,6 +1500,9 @@
           </label>
           <div class="agent-cli-select-row">
             <div class="ai-select" id="agent-modal-ext-cli-select"></div>
+            <div id="agent-modal-ext-cli-upgrades"></div>
+          </div>
+          <div id="agent-modal-ext-cli-upgrade-warning" class="agent-cli-selection-warning" role="status" hidden></div>
             <span
               class="agent-cli-selection-warning"
               id="agent-modal-ext-cli-warning"
@@ -1471,7 +1510,6 @@
               aria-live="polite"
               hidden
             ></span>
-          </div>
         </div>
         <div class="form-row">
           <label data-i18n="agent_modal.ext_name">Name</label>
@@ -1931,6 +1969,7 @@
   <script src="./modules/i18n.js"></script>
   <script src="./modules/chat-use.js"></script>
   <script src="./modules/user-error.js"></script>
+  <script src="./modules/overlay-manager.js"></script>
   <script src="./modules/model-guard.js"></script>
   <script src="./modules/dropdown-placement.js"></script>
   <script src="./modules/composer-model-picker.js"></script>
@@ -1962,8 +2001,10 @@
   <script src="./modules/conversation-view-model.js"></script>
   <script src="./vendor/prosemirror/prosemirror.min.js"></script>
   <script src="./modules/composer-input.js"></script>
+  <script src="./modules/commercial-entry.js"></script>
   <script src="./modules/conversation.js"></script>
   <script src="./modules/conversation-to-project.js"></script>
+  <script src="./modules/home.js"></script>
   <script src="./modules/conversation-turn-nav.js"></script>
   <script src="./modules/web-app-host.js"></script>
   <script src="./modules/artifact-security.js"></script>
@@ -1983,6 +2024,7 @@
   <!-- DOMPurify must load before utils.js so inline connector SVGs are sanitized, not disabled. -->
   <script src="./vendor/dompurify/purify.min.js"></script>
   <script src="./modules/pinyin-firstletter.js"></script>
+  <script src="./modules/cli-account-usage.js"></script>
   <script src="./modules/agents.js"></script>
   <script src="./modules/auto-title.js"></script>
   <script src="./modules/auto-events.js"></script>

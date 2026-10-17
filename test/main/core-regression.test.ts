@@ -241,7 +241,7 @@ describe('PC core regression unit coverage', () => {
       expect(source).toContain('========== FILE: assets/app.js ==========');
     }
 
-    expect(savedApps.deleteSavedApp(TEST_UID, saved.id).ok).toBe(true);
+    expect((await savedApps.deleteSavedApp(TEST_UID, saved.id)).ok).toBe(true);
     expect(savedApps.listSavedApps(TEST_UID)).toEqual([]);
   });
 

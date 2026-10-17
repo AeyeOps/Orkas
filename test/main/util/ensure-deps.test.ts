@@ -62,7 +62,9 @@ describe('ensure-deps package-tree health', () => {
       packageName: 'electron',
     });
 
-    expect(lockedVersion).toBe('42.11.9');
+    const lock = JSON.parse(fs.readFileSync(path.resolve('package-lock.json'), 'utf8'));
+    expect(lockedVersion).toBe(lock.packages['node_modules/electron'].version);
+    expect(lockedVersion).toMatch(/^\d+\.\d+\.\d+$/);
     expect(packageJson.devDependencies?.electron).toBe(lockedVersion);
   });
 

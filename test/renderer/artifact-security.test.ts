@@ -18,6 +18,15 @@ function loadSecurity() {
 }
 
 describe('artifact iframe security boundary', () => {
+  it('round trips result JSON without allowing payload text to close its structural tag', () => {
+    const context:any={window:{OrkasArtifactSecurity:loadSecurity()}};
+    vm.runInNewContext(chatSource,context);
+    const payload={text:'</artifact-result> unexpected <artifact-result> & "quoted"',nested:['<div>']};
+    const result=context.window.encodeArtifactResult('artifact','commander','Fixture',payload);
+    expect(result.match(/<\/artifact-result>/g)).toHaveLength(1);
+    const body=result.match(/<artifact-result[^>]*>\n([\s\S]*)\n<\/artifact-result>/)[1];
+    expect(JSON.parse(body)).toEqual(payload);
+  });
   it('loads the shared boundary before eager and lazy artifact renderers use it', () => {
     expect(indexSource.indexOf('./modules/artifact-security.js')).toBeGreaterThanOrEqual(0);
     expect(indexSource.indexOf('./modules/artifact-security.js')).toBeLessThan(
@@ -53,14 +62,18 @@ describe('artifact iframe security boundary', () => {
     }
   });
 
-  it('requires both the marker and the live iframe contentWindow identity', () => {
+  it('requires the marker, live iframe identity and its exact registered origin', () => {
     const security = loadSecurity();
     const liveWindow = {};
-    const frame = { contentWindow: liveWindow };
+    const frame = { contentWindow: liveWindow, src:'chat-app://local/chat/app/index.html' };
+    const origin = 'chat-app://local';
     const data = { __orkasArtifact: true, type: 'submit' };
-    expect(security.trustedArtifactMessage({ source: liveWindow, data }, frame)).toBe(true);
+    expect(security.trustedArtifactMessage({ source: liveWindow, origin, data }, frame)).toBe(true);
     expect(security.trustedArtifactMessage({ source: {}, data }, frame)).toBe(false);
     expect(security.trustedArtifactMessage({ source: liveWindow, data: { type: 'submit' } }, frame)).toBe(false);
     expect(security.trustedArtifactMessage({ source: liveWindow, data: null }, frame)).toBe(false);
+    for(const foreign of ['https://example.com','chat-app://saved','chat-app://local.evil','null','',undefined])
+      expect(security.trustedArtifactMessage({source:liveWindow,origin:foreign,data},frame)).toBe(false);
+    expect(security.trustedArtifactMessage({source:liveWindow,origin:'https://example.com',data},{...frame,src:'https://example.com'})).toBe(false);
   });
 });

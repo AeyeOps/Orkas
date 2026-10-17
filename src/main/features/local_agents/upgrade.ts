@@ -1,0 +1,165 @@
+/** Host-only CLI maintenance. Fixed commands target the detected installation;
+ * renderer input never supplies executable paths, packages, flags or scripts.
+ * Automatic maintenance requires verified installation ownership. Unsupported
+ * installations fail without modifying another executable or configuration.
+ */
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import os from 'node:os';
+import { spawn } from 'node:child_process';
+import { buildCliSpawnEnv, resolveCliCommand } from './spawn-command.js';
+import { killProcessTree } from './backends/base.js';
+import { resolveCli, invalidateCache, type LocalCliType, type LocalCliEntry } from './registry.js';
+import { detectVersionResult, checkMinVersion, cliVersionAtLeast } from './version.js';
+import { whichBin } from './which.js';
+
+const PACKAGES: Record<LocalCliType, readonly string[]> = {
+  codex: ['@openai/codex'], claude: ['@anthropic-ai/claude-code'],
+  opencode: ['opencode-ai', '@opencode/cli'], openclaw: ['openclaw'], hermes: [],
+};
+export type CliUpgradePlan = { method: 'native' | 'npm' | 'brew' | 'unavailable'; command?: string; args?: string[] };
+export type CliUpgradeInfo = { type: LocalCliType; version: string | null; can_upgrade: boolean; method: CliUpgradePlan['method'] };
+type CliUpgradeOutcome = CliUpgradeInfo & { ok: boolean; error_code?: 'failed' | 'timeout' | 'output_limit' | 'verification_failed' | 'changed_installation' | 'unavailable'; entry?: LocalCliEntry };
+export type CliUpgradeResult = CliUpgradeOutcome & { operation_id: number; duration_ms: number };
+let operationCounter = 0;
+const inFlight = new Map<LocalCliType, Promise<CliUpgradeResult>>();
+
+/** No output enters UI/logs. Help capture and total output are independently bounded. */
+export function runUpgradeCommand(command: string, args: string[], timeoutMs: number, capture = false): Promise<{ ok: boolean; text: string; error?: 'failed' | 'timeout' | 'output_limit' }> {
+  return new Promise(resolve => {
+    const launch = resolveCliCommand(command, args);
+    let settled = false; let bytes = 0; let text = '';
+    let timer: NodeJS.Timeout | undefined;
+    const child = spawn(launch.command, launch.args, {
+      cwd: os.homedir(), env: buildCliSpawnEnv(command), stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true, windowsVerbatimArguments: launch.windowsVerbatimArguments,
+      detached: process.platform !== 'win32',
+    });
+    const finish = (ok: boolean, error?: 'failed' | 'timeout' | 'output_limit', kill = false) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      const done = () => resolve({ ok, text, ...(error ? { error } : {}) });
+      if (kill) killProcessTree(child, 'SIGKILL', { onComplete: done }); else done();
+    };
+    const read = (chunk: Buffer) => {
+      if (settled) return;
+      bytes += chunk.length;
+      if (bytes > 1024 * 1024) return finish(false, 'output_limit', true);
+      if (capture && text.length < 64 * 1024) text += chunk.toString('utf8').slice(0, 64 * 1024 - text.length);
+    };
+    child.stdout?.on('data', read); child.stderr?.on('data', read);
+    child.on('error', () => finish(false, 'failed'));
+    child.on('close', code => finish(code === 0, code === 0 ? undefined : 'failed'));
+    timer = setTimeout(() => finish(false, 'timeout', true), timeoutMs); timer.unref?.();
+  });
+}
+
+export async function planCliUpgrade(type: LocalCliType, binPath: string): Promise<CliUpgradePlan> {
+  const unavailable: CliUpgradePlan = { method: 'unavailable' };
+  let real: string;
+  try { real = await fs.realpath(binPath); } catch { return unavailable; }
+  if (process.platform === 'win32') {
+    const launch = resolveCliCommand(binPath, []);
+    const nodeEntry = launch.args[0];
+    if (nodeEntry && path.isAbsolute(nodeEntry) && /\.(?:c?js|mjs)$/i.test(nodeEntry)) {
+      try { real = await fs.realpath(nodeEntry); } catch { return unavailable; }
+    }
+  }
+  const segments = real.split(path.sep);
+  if (segments.some(s => s.endsWith('.app')) && segments.includes('Contents')) return unavailable;
+  // Package ownership is established by both package identity and its global layout.
+  let dir = path.dirname(real);
+  for (let depth = 0; depth < 8; depth++) {
+    try {
+      const manifest = path.join(dir, 'package.json');
+      if ((await fs.stat(manifest)).size > 64 * 1024) return unavailable;
+      const pkg = JSON.parse(await fs.readFile(manifest, 'utf8'));
+      if (PACKAGES[type].includes(pkg.name)) {
+        const parts = dir.split(path.sep); const nm = parts.lastIndexOf('node_modules');
+        if (nm >= 0) {
+          const parent = parts.slice(0, nm).join(path.sep) || path.parse(dir).root;
+          const prefix = path.basename(parent) === 'lib' ? path.dirname(parent) : parent;
+          // POSIX global bin is <prefix>/bin; Windows npm shims live at <prefix>.
+          const expected = process.platform === 'win32' ? prefix : path.join(prefix, 'bin');
+          if (await fs.realpath(path.dirname(binPath)) !== await fs.realpath(expected)) return unavailable;
+          const npm = await whichBin('npm', { extraDirs: [expected] });
+          if (npm) return { method: 'npm', command: npm, args: ['install', '--global', `${pkg.name}@latest`, '--prefix', prefix, '--no-audit', '--no-fund'] };
+        }
+        return unavailable;
+      }
+    } catch { /* bounded ancestor walk; no user content is returned */ }
+    const parent = path.dirname(dir); if (parent === dir) break; dir = parent;
+  }
+  const cellar = segments.indexOf('Cellar'); const cask = segments.indexOf('Caskroom');
+  const owner = cellar >= 0 ? cellar : cask;
+  const brewNames: Record<LocalCliType, readonly string[]> = {
+    codex: ['codex'], claude: ['claude-code'], opencode: ['opencode'], openclaw: ['openclaw'], hermes: [],
+  };
+  if (owner >= 0 && brewNames[type].includes(segments[owner + 1])) {
+    const brew = path.join(segments.slice(0, owner).join(path.sep), 'bin', 'brew');
+    try { await fs.access(brew); return { method: 'brew', command: brew, args: ['upgrade', ...(cask >= 0 ? ['--cask'] : []), segments[owner + 1]] }; }
+    catch { return unavailable; }
+  }
+  const native = (type === 'codex' && segments.includes('standalone') && segments.includes('packages'))
+    || (type === 'claude' && segments.includes('claude') && segments.includes('versions'))
+    || (type === 'opencode' && segments.includes('.opencode'));
+  if (native) {
+    const command = type === 'opencode' ? 'upgrade' : 'update';
+    const help = await runUpgradeCommand(binPath, ['--help'], 15_000, true);
+    // Commander-style help can list aliases in one command token, e.g.
+    // Claude Code 2.1.112 advertises "update|upgrade".
+    const commandRow = new RegExp(`^[ \\t]*(?:[a-z][a-z0-9-]*\\|)*${command}(?:\\|[a-z][a-z0-9-]*)*(?:[ \\t]|$)`, 'm');
+    if (help.ok && commandRow.test(help.text)) {
+      return { method: 'native', command: binPath, args: [command] };
+    }
+    // Some native builds truncate long root help when piped. Probe
+    // the short command help and require its exact usage, not a generic exit 0.
+    const detail = await runUpgradeCommand(binPath, [command, '--help'], 15_000, true);
+    const usage = new RegExp(`^Usage:[ \\t]+${type}[ \\t]+(?:[a-z][a-z0-9-]*\\|)*${command}(?:\\|[a-z][a-z0-9-]*)*(?:[ \\t]|$)`, 'mi');
+    if (detail.ok && usage.test(detail.text)) {
+      return { method: 'native', command: binPath, args: [command] };
+    }
+  }
+  return unavailable;
+}
+function info(entry: LocalCliEntry, plan: CliUpgradePlan): CliUpgradeInfo {
+  return { type: entry.type, version: entry.fullVersion || entry.version, can_upgrade: !!plan.command,
+    method: plan.method };
+}
+export async function getCliUpgradeInfo(type: LocalCliType): Promise<CliUpgradeInfo> {
+  const entry = await resolveCli(type, { force: true });
+  return info(entry, entry.path ? await planCliUpgrade(type, entry.path) : { method: 'unavailable' });
+}
+export function upgradeLocalCli(type: LocalCliType): Promise<CliUpgradeResult> {
+  const pending = inFlight.get(type); if (pending) return pending;
+  const operationId = ++operationCounter;
+  const startedAt = Date.now();
+  const job = (async (): Promise<CliUpgradeOutcome> => {
+    const entry = await resolveCli(type, { force: true });
+    const plan = entry.path ? await planCliUpgrade(type, entry.path) : { method: 'unavailable' as const };
+    const metadata = info(entry, plan);
+    if (!entry.path || !plan.command || !plan.args) return { ...metadata, ok: false, error_code: 'unavailable' };
+    // An external installer may have changed the binding while help was probed.
+    const fresh = await resolveCli(type, { force: true });
+    if (fresh.path !== entry.path || fresh.fullVersion !== entry.fullVersion || fresh.version !== entry.version) {
+      return { ...metadata, ok: false, error_code: 'changed_installation' };
+    }
+    const result = await runUpgradeCommand(plan.command, plan.args, 10 * 60_000);
+    invalidateCache(type);
+    if (!result.ok) return { ...metadata, ok: false, error_code: result.error || 'failed' };
+    // Verify the original entry point, not a newly discovered higher-priority install.
+    const probe = await detectVersionResult(entry.path);
+    if (probe.status !== 'success' || checkMinVersion(type, probe.version)
+      || (entry.version && !cliVersionAtLeast(probe.version, entry.version))) {
+      return { ...metadata, ok: false, error_code: 'verification_failed' };
+    }
+    const after = await resolveCli(type, { force: true });
+    if (after.path !== entry.path || after.version !== probe.version || !after.available) {
+      return { ...metadata, ok: false, error_code: 'changed_installation' };
+    }
+    return { ...info(after, plan), ok: true, entry: after };
+  })().then(result => ({ ...result, operation_id: operationId, duration_ms: Date.now() - startedAt }));
+  inFlight.set(type, job);
+  void job.finally(() => { if (inFlight.get(type) === job) inFlight.delete(type); }).catch(() => {});
+  return job;
+}

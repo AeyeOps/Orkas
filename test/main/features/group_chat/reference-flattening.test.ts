@@ -4,9 +4,11 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 
+const modelInputs = vi.hoisted(() => [] as string[]);
 vi.mock('../../../../src/main/model/client', () => ({
-  async *streamChatWithModel() {
-    yield { type: 'final', text: '' };
+  async *streamChatWithModel(options: any) {
+    modelInputs.push(String(options.message || ''));
+    yield { type: 'final', text: 'Reference received.' };
     yield { type: 'done' };
   },
   async chatWithModel() { return { ok: true, text: '', error: '', aborted: false }; },
@@ -22,6 +24,7 @@ beforeEach(async () => {
   previousWorkspace = process.env.ORKAS_WORKSPACE_ROOT;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
   vi.resetModules();
+  modelInputs.length = 0;
   const users = await import('../../../../src/main/features/users');
   users.activateUser(UID);
 });
@@ -40,6 +43,44 @@ afterEach(async () => {
 });
 
 describe('cross-task reference flattening', () => {
+  it('rejects missing or deleted quote locators as empty without renaming the target, then accepts a real quote', async () => {
+    const chats = await import('../../../../src/main/features/chats');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const layout = await import('../../../../src/main/util/project-layout');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const source = await chats.createConversation(UID, { title: 'Source' });
+    const target = await chats.createConversation(UID, { conversationId: 'target-cid', title: 'New Chat' });
+    const targetHistory = layout.conversationMessageFile(UID, target.conversation_id);
+    const originalHistory = fs.readFileSync(targetHistory, 'utf8');
+    fs.writeFileSync(layout.conversationMessageFile(UID, source.conversation_id), [
+      { id: 'deleted-msg', from: 'user', to: ['commander'], ts: '2026-10-10T07:00:00Z',
+        text: 'Deleted request', deleted_at: '2026-10-10T07:01:00Z' },
+      { id: 'real-msg', from: 'user', to: ['commander'], ts: '2026-10-10T07:00:00Z',
+        text: 'Explain the root cause and proposed solution.' },
+    ].map((row) => JSON.stringify(row)).join('\n') + '\n');
+    for (const sourceMsgId of ['missing-msg', 'deleted-msg']) {
+      expect(await groupChat.send({ userId: UID, cid: target.conversation_id, text: '@commander',
+        references: [{ source_cid: source.conversation_id, source_msg_id: sourceMsgId }],
+      })).toEqual({ ok: false, error: 'empty message' });
+      expect((await chats.getConversation(UID, target.conversation_id))?.title).toBe('New Chat');
+      expect(fs.readFileSync(targetHistory, 'utf8')).toBe(originalHistory);
+      expect(modelInputs).toEqual([]);
+    }
+    const accepted = await groupChat.send({ userId: UID, cid: target.conversation_id, text: '@commander',
+      title_text: '', references: [{ source_cid: source.conversation_id, source_msg_id: 'real-msg' }],
+    });
+    expect(accepted.ok).toBe(true);
+    expect(accepted.msg?.to).toEqual(['commander']);
+    const deadline = Date.now() + 3000;
+    while (!bus.isQuiescent(UID, target.conversation_id) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    expect(bus.isQuiescent(UID, target.conversation_id)).toBe(true);
+    expect(modelInputs).toHaveLength(1);
+    expect(modelInputs[0]).toContain('Explain the root cause and proposed solution.');
+    expect((await chats.getConversation(UID, target.conversation_id))?.title).toBe('New Chat');
+  });
+
   it('carries source attachments, expands existing references, and deduplicates locators', async () => {
     const chats = await import('../../../../src/main/features/chats');
     const groupChat = await import('../../../../src/main/features/group_chat');

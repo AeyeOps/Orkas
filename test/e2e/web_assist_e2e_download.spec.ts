@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { expect, test } from './fixtures/orkas';
 
 for (const kind of ['blob', 'data']) {
-  test(`page-generated ${kind} CSV shows a usable site grant and saves on retry`, async ({ orkas }, testInfo) => {
+  test(`page-generated ${kind} CSV saves once without a separate site grant`, async ({ orkas }, testInfo) => {
     const csv = 'url,status\nhttps://example.com/report,indexed\n';
     const server = createServer((_req, res) => {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
@@ -36,21 +36,13 @@ for (const kind of ['blob', 'data']) {
       }, nativeId);
       await trigger();
       const prompt = page.locator('.web-assist-download-prompt');
-      await expect(prompt).toBeVisible();
-      await expect(prompt.locator('.web-assist-download-origin')).toHaveText(origin);
-      await expect(prompt.locator('.web-assist-download-filename')).toHaveText('site-export.csv');
-      await prompt.locator('[data-act="allow-download"]').click();
       await expect(prompt).toBeHidden();
-      const granted = await orkas.invoke<any>('webAssist.downloads', { conversation_id: cid });
-      expect(granted.allowed_origins).toEqual([origin]);
-      expect(granted.downloads.map((entry: any) => entry.state)).toEqual(['refused']);
-      await trigger();
       await expect.poll(async () => (await orkas.invoke<any>('webAssist.downloads', { conversation_id: cid })).downloads.at(-1).state).toBe('saved');
       const file = await orkas.invoke<any>('attachments.absPath', { cid, name: 'site-export.csv' });
       expect(file.ok).toBe(true);
       expect(readFileSync(file.path, 'utf8')).toBe(csv);
       await expect(prompt).toBeHidden();
-      await page.screenshot({ path: testInfo.outputPath('download-granted.png') });
+      await page.screenshot({ path: testInfo.outputPath('download-saved.png') });
     } finally {
       server.closeAllConnections();
       await new Promise<void>(resolve => server.close(() => resolve()));

@@ -28,7 +28,7 @@
  *
  * Distinct from `features/project_tasks.ts` (Q6 adjudication): that board
  * holds PROJECT-level work items (todo/progress/review/done,
- * human review gate, result_ref); this one holds CONVERSATION-level
+ * human review gate); this one holds CONVERSATION-level
  * execution units. Conversation `blocked` means a failed `after` predecessor;
  * it is not a backlog status. The two have separate state contracts, and the
  * UI names them apart ("Tasks" vs "Runs" / 「任务」 vs 「执行」).
@@ -71,6 +71,17 @@ const TERMINAL_STATUSES: ReadonlySet<ConversationTaskStatus> = new Set([
   'done', 'stopped', 'failed', 'cancelled',
 ]);
 
+/** Normalize a dependency list: a legacy single id becomes a one-element
+ * list; empty / non-string ids and duplicates are dropped (first-seen order). */
+export function normalizeTaskAfter(raw: unknown): string[] {
+  const list = typeof raw === 'string' ? [raw] : Array.isArray(raw) ? raw : [];
+  const out: string[] = [];
+  for (const id of list) {
+    if (typeof id === 'string' && id && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
 /** Resume metadata for a form-parked task (plan §4.1 `resume`): which form
  * blocks it, and — for commander sub-tasks — the orchestration facts the
  * commander wake needs. Written when a turn ends waiting_input and enriched
@@ -104,8 +115,15 @@ export interface ConversationTask {
   parent_task_id?: string;
   /** Structured backlog associations, independent of business status. */
   backlog_tasks?: Array<{ project_id: string; task_id: string }>;
-  /** P2: chain dependency — "start after task X reaches done". */
-  after?: string;
+  /** Dependencies (D29): start only after EVERY listed task reaches done;
+   * their results are handed to this task. Pointers only reach tasks that
+   * already existed when this one was created, so the graph stays acyclic.
+   * Legacy snapshots stored a single string; the loader normalizes it. */
+  after?: string[];
+  /** Split note of a planned task (D29), worded for its later turns. The
+   * first turn's note is consume-time only and never enters the canonical
+   * log, so a user reply that continues this row gets this copy instead. */
+  assignment_context?: string;
   source_msg_id?: string;
   result_msg_id?: string;
   turn_id?: string;
@@ -245,7 +263,11 @@ function normalizeTask(raw: any, cid: string): ConversationTask | null {
       && /^t_[a-f0-9]{12}$/.test(link.task_id));
     t.backlog_tasks = links.map((link: any) => ({ project_id: link.project_id, task_id: link.task_id }));
   }
-  if (typeof raw.after === 'string' && raw.after) t.after = raw.after;
+  const after = normalizeTaskAfter(raw.after);
+  if (after.length) t.after = after;
+  if (typeof raw.assignment_context === 'string' && raw.assignment_context) {
+    t.assignment_context = raw.assignment_context;
+  }
   if (typeof raw.source_msg_id === 'string' && raw.source_msg_id) t.source_msg_id = raw.source_msg_id;
   if (typeof raw.result_msg_id === 'string' && raw.result_msg_id) t.result_msg_id = raw.result_msg_id;
   if (typeof raw.turn_id === 'string' && raw.turn_id) t.turn_id = raw.turn_id;
@@ -329,7 +351,8 @@ function pruneLocked(b: BoardState): void {
   if (b.tasks.length <= MAX_TASKS) return;
   const referenced = new Set<string>();
   for (const t of b.tasks) {
-    if (!TERMINAL_STATUSES.has(t.status) && t.after) referenced.add(t.after);
+    if (TERMINAL_STATUSES.has(t.status)) continue;
+    for (const id of t.after || []) referenced.add(id);
   }
   const excess = b.tasks.length - MAX_TASKS;
   let removed = 0;
@@ -452,12 +475,12 @@ export interface CreateTaskInput {
   /** P3: commander sub-tasks point at their orchestration turn's task. */
   parentTaskId?: string;
   backlogTask?: { project_id: string; task_id: string };
-  /** §4.8 chain dependency set at creation time (serial multi-mention
-   * dispatch): "start after task X reaches done". Creation-time pointers are
-   * built strictly over tasks created earlier in the same send, so the
-   * single-`after` chain stays acyclic by construction — same guarantee the
-   * user-facing selector gets from "only point at the past". */
-  after?: string;
+  /** Dependencies set at creation time (D29): "start after every listed task
+   * reaches done". Pointers are built strictly over tasks created earlier in
+   * the same send, so the graph stays acyclic by construction. */
+  after?: readonly string[];
+  /** Split note a later turn of this planned task receives (D29). */
+  assignmentContext?: string;
   /** Create directly in running state (lazy claim of a pre-board item). */
   running?: boolean;
   /** The scheduler will distinguish initial admission from actual waiting. */
@@ -489,7 +512,8 @@ export function createTask(
       ...(input.turnId ? { turn_id: input.turnId } : {}),
       ...(input.parentTaskId ? { parent_task_id: input.parentTaskId } : {}),
       ...(input.backlogTask ? { backlog_tasks: [{ ...input.backlogTask }] } : {}),
-      ...(input.after ? { after: input.after } : {}),
+      ...(normalizeTaskAfter(input.after).length ? { after: normalizeTaskAfter(input.after) } : {}),
+      ...(input.assignmentContext ? { assignment_context: input.assignmentContext } : {}),
       ...(input.running ? { started_at: now } : {}),
     };
     b.tasks.push(t);
@@ -619,10 +643,10 @@ export function cancelPending(
   });
 }
 
-/** Set or clear a queued task's `after` chain pointer (§4.8). Deterministic
- * validation only: the predecessor must exist, differ from the task, and the
- * resulting single-`after` chain must stay acyclic (each task has at most one
- * pointer, so one linear walk suffices). */
+/** Set a queued task's dependencies to one predecessor, or clear them
+ * (legacy single-id IPC and send-now). Deterministic validation only: the
+ * predecessor must exist, differ from the task, and must not depend on it
+ * (directly or transitively), so the graph stays acyclic. */
 export function setTaskAfter(
   uid: string,
   cid: string,
@@ -640,23 +664,26 @@ export function setTaskAfter(
     if (afterTaskId === taskId) return { task: null, error: 'self_reference' };
     const target = b.tasks.find((x) => x.task_id === afterTaskId);
     if (!target) return { task: null, error: 'predecessor_missing' };
-    // Walk the single-pointer chain from the target; reaching this task
-    // again would close a cycle.
-    const seen = new Set<string>([taskId]);
-    let cursor: ConversationTask | undefined = target;
-    while (cursor) {
-      if (seen.has(cursor.task_id)) return { task: null, error: 'cycle' };
-      seen.add(cursor.task_id);
-      cursor = cursor.after ? b.tasks.find((x) => x.task_id === cursor!.after) : undefined;
+    // Walk every dependency reachable from the target; reaching this task
+    // would close a cycle.
+    const seen = new Set<string>();
+    const stack = [target.task_id];
+    while (stack.length) {
+      const id = stack.pop()!;
+      if (id === taskId) return { task: null, error: 'cycle' };
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const row = b.tasks.find((x) => x.task_id === id);
+      for (const dep of row?.after || []) stack.push(dep);
     }
-    t.after = afterTaskId;
+    t.after = [afterTaskId];
     return { task: { ...t } };
   });
 }
 
-/** queued → blocked: the `after` predecessor failed or was cancelled (§4.8
- * failure rule — never silently release, never silently cascade-cancel; the
- * downgrade decision belongs to the user). */
+/** queued → blocked: an `after` predecessor failed, stopped, or was cancelled
+ * (§4.8 failure rule — never silently release, never silently cascade-cancel;
+ * the downgrade decision belongs to the user). */
 export function markBlocked(
   uid: string,
   cid: string,
@@ -671,8 +698,9 @@ export function markBlocked(
   });
 }
 
-/** blocked → queued: the user chose "run anyway" — the dependency pointer is
- * cleared and the task rejoins ordinary admission. */
+/** blocked → queued: the user chose "run anyway". Only predecessors that
+ * ended without `done` (or whose record is gone) are dropped; unfinished
+ * ones keep gating, so the task still waits for the inputs that can arrive. */
 export function requeueBlocked(
   uid: string,
   cid: string,
@@ -682,7 +710,12 @@ export function requeueBlocked(
     const t = b.tasks.find((x) => x.task_id === taskId);
     if (!t || t.status !== 'blocked') return null;
     t.status = 'queued';
-    delete t.after;
+    const keep = (t.after || []).filter((id) => {
+      const dep = b.tasks.find((x) => x.task_id === id);
+      return !!dep && (dep.status === 'done' || !TERMINAL_STATUSES.has(dep.status));
+    });
+    if (keep.length) t.after = keep;
+    else delete t.after;
     return { ...t };
   });
 }
@@ -884,7 +917,7 @@ export async function formatConversationBoardForTurn(uid: string, cid: string): 
     lines.push(
       `- ${t.task_id} — @${who} [${t.status}]`
       + (t.created_by === 'commander' ? ' (dispatched)' : '')
-      + (t.after ? ` | after=${t.after}` : '')
+      + (t.after?.length ? ` | after=${t.after.join(',')}` : '')
       + `: ${preview}`,
     );
   }

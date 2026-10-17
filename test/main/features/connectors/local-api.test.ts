@@ -70,6 +70,8 @@ const localApiAuth = require('../../../../bin/local-api-auth.cjs') as {
   sign1688: (pathName: string, parameters: Record<string, string>, secret: string) => string;
   signJd: (parameters: Record<string, string>, secret: string) => string;
   signPinduoduo: (parameters: Record<string, string>, secret: string) => string;
+  parsePinduoduoIdentityJson: (text: string) => any;
+  parseMerchantIdentityJson: (text: string, keys: string[]) => any;
   signDouyin: (appKey: string, method: string, paramJson: string, timestamp: string, secret: string) => string;
   signKuaishou: (parameters: Record<string, string>, secret: string) => string;
   stableJson: (value: unknown) => string;
@@ -101,6 +103,39 @@ afterEach(() => {
 });
 
 describe('device-local commerce API credentials', () => {
+  it.each([
+    { id: 'shopee', parameters: { region: 'global', shop_id: '456', partner_id: '12345', partner_key: 'partner-test-secret' } },
+    { id: 'ebay-seller', parameters: { marketplace_id: 'EBAY_US', content_language: 'en-US', client_id: 'ebay-client', client_secret: 'ebay-secret', ru_name: 'Merchant-RuName' } },
+    { id: 'woocommerce', parameters: { store_url: 'https://shop.example.com' } },
+  ])('preserves $id authorization expiry without saving credentials or rewriting it as a failure', async ({ id, parameters }) => {
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const expired = Object.assign(new Error('Authorization timed out'), { code: 'flow_timeout' });
+    vi.spyOn(oauth, 'startLocalApiBrowserOAuth').mockRejectedValue(expired);
+    await expect(authorizeLocalApi(TEST_UID, entry(id), parameters)).rejects.toBe(expired);
+    expect(hasLocalApiAuthorization(TEST_UID, entry(id))).toBe(false);
+  });
+
+  it('limits shared exact decoding to declared identity fields and preserves fractional compatibility', () => {
+    expect(localApiAuth.parseMerchantIdentityJson('{"user_id":9007199254740993,"price":1.5,"quantity":7,"label":"user_id:9007199254740993"}', ['user_id']))
+      .toEqual({ user_id: '9007199254740993', price: 1.5, quantity: 7, label: 'user_id:9007199254740993' });
+    expect(localApiAuth.parseMerchantIdentityJson('{"id":1.5,"user_id":"opaque-seller"}', ['id', 'user_id']))
+      .toEqual({ id: 1.5, user_id: 'opaque-seller' });
+  });
+  it('preserves exact Pinduoduo identities while leaving ordinary fields and escaped labels unchanged', () => {
+    const parsed = localApiAuth.parsePinduoduoIdentityJson('{"owner_id":9223372036854775807,"mall_info_get_response":{"mall_id":9007199254740993,"mall_name":"literal \\"mall_id\\":9007199254740993","goods_count":7,"price":1.5},"expires_in":3600}');
+    expect(parsed).toEqual({ owner_id: '9223372036854775807', mall_info_get_response: {
+      mall_id: '9007199254740993', mall_name: 'literal "mall_id":9007199254740993', goods_count: 7, price: 1.5,
+    }, expires_in: 3600 });
+    expect(localApiAuth.parsePinduoduoIdentityJson('{"mall_id":700001,"owner_id":"700001"}'))
+      .toEqual({ mall_id: 700001, owner_id: '700001' });
+  });
+
+  it('rejects merchant numeric forms that cannot be recovered as exact integer identifiers', () => {
+    for (const text of ['{"owner_id":1.5}', '{"mall_id":1e30}']) {
+      expect(() => localApiAuth.parsePinduoduoIdentityJson(text)).toThrow('Invalid Pinduoduo merchant identifier');
+    }
+  });
+
   it('retains eBay signing credentials through OAuth without sending them to token or privilege endpoints', async () => {
     const signing_private_key = generateKeyPairSync('ed25519').privateKey
       .export({ format: 'der', type: 'pkcs8' }).toString('base64');

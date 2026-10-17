@@ -1,1 +1,3 @@
-"NSMicrophoneUsageDescription" = "Orkas usa il microfono per l’inserimento vocale.";
+"NSMicrophoneUsageDescription" = "Orkas usa il microfono per l’inserimento vocale e i siti che autorizzi.";
+"NSCameraUsageDescription" = "Orkas consente ai siti di usare la fotocamera con la tua autorizzazione.";
+"NSBluetoothAlwaysUsageDescription" = "Orkas usa Bluetooth per verificare che il telefono con la tua passkey sia nelle vicinanze.";

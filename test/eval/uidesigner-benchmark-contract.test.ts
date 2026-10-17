@@ -101,4 +101,66 @@ it('keeps only UIDesigner routing boundaries resident and delegates source mecha
     expect(guidance).toMatch(/claims cite only executed evidence/i);
 
   });
+
+  /**
+   * 2026-10-07: a home-page redesign took 17 revisions. The ordinary route
+   * never loaded a skill that judged layout or polish, re-drew the product
+   * instead of reusing it, patched copy into slots of the wrong level, and
+   * added states and buttons nobody asked for. The rules that answer each of
+   * those live in the always-loaded skills; html_preview's measured design
+   * warnings are covered in html_preview.test.ts.
+   */
+  it('keeps visual craft and live-product authority in the always-loaded route', () => {
+    const ordinary = [shippedAgent.workflow, skillBody('ui-design-executor'), skillBody('ui-artifact-workspace'), ...shippedAgent.standards].join('\n\n');
+    expect(ordinary).toContain('## Visual Craft Baseline');
+    expect(ordinary).not.toContain('## skill: ui-taste');
+    expect(ordinary).not.toContain('## skill: ui-craft-checks');
+    expect(ordinary).toMatch(/parallel[\s\S]{0,120}same component, heading level, size, weight, width, and alignment/i);
+    expect(ordinary).toMatch(/9 → 3×3, not 5\+4/);
+    expect(ordinary).toMatch(/each baseline item is either `ok` with what was compared, or names the element, the problem, and the fix/i);
+    expect(ordinary).toMatch(/Fix every design warning or state why it stays/i);
+    expect(ordinary).toMatch(/written visual review against the executor's Visual Craft Baseline/i);
+    expect(shippedAgent.standards.join('\n')).toMatch(/standalone artifact has[^.]*written visual review/i);
+
+    // A layout redesign of an existing screen keeps the product's visual layer.
+    expect(ordinary).toMatch(/does not license a new visual language/i);
+    expect(skillBody('ui-design-source')).toMatch(/Redesign scope is per layer/);
+    expect(ordinary).toMatch(/re-read the repo component, copy, and styles when the user refers to the live product/i);
+    expect(ordinary).toMatch(/record the product source it points to/i);
+
+    // Structural revisions replace the region instead of stacking overrides.
+    expect(ordinary).toMatch(/never stack override blocks at the end of a stylesheet/i);
+    expect(ordinary).toMatch(/rewrite its markup and style block together/i);
+
+    // States and controls need a caller; checklists alone do not add them.
+    expect(ordinary).toMatch(/populated and empty by default/i);
+    expect(ordinary).toMatch(/do not add a demo state switcher/i);
+    expect(ordinary).toMatch(/Do not invent buttons, chips, links, or prefill shortcuts/i);
+    expect(ordinary).not.toMatch(/populated, loading, empty, error, and partial\/stale when the surface actually fetches/i);
+    expect(skillBody('ui-craft-checks')).toMatch(/An unrequested demo state switcher is not required/);
+  });
+
+  /**
+   * 2026-10-09: a project-detail layout redesign passed every baseline item
+   * yet only removed borders. Its own review never compared against the
+   * user's screenshot, never asked why rows left most of a wide pane empty,
+   * and accepted native selects and letter avatars in place of product
+   * controls. The review lists weak points without forcing a fix, and a single
+   * repair round keeps it from looping.
+   */
+  it('diagnoses a redesign, fits space to content, and reviews against the source in one round', () => {
+    const ordinary = [shippedAgent.workflow, skillBody('ui-design-executor'), skillBody('ui-artifact-workspace'), ...shippedAgent.standards].join('\n\n');
+    expect(ordinary).toMatch(/a diagnosis: at most three concrete causes read from their screenshot/i);
+    expect(ordinary).toMatch(/Every change answers one cause; the final review checks each/i);
+    expect(ordinary).toMatch(/real text lengths and where they are truncated/i);
+    expect(ordinary).toMatch(/the layout layer is in scope/i);
+    expect(ordinary).toMatch(/Removing borders alone is not a layout redesign/i);
+    expect(ordinary).toMatch(/\*\*Space fits content\.\*\*/);
+    expect(ordinary).toMatch(/Prototype convenience does not swap product controls/i);
+    expect(ordinary).toMatch(/side by side with the user's screenshot or the source rendering/i);
+    expect(ordinary).toMatch(/up to three weakest remaining points, each marked `fix now` or `keep`/i);
+    expect(ordinary).toMatch(/never invent a problem to fill it/i);
+    expect(ordinary).toMatch(/That is the only repair round/i);
+    expect(skillBody('ui-design-source')).toMatch(/A requested layout redesign puts widths, grouping, density/i);
+  });
 });

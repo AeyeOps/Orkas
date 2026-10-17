@@ -56,6 +56,7 @@ describe('renderer lazy feature loader', () => {
     expect(appended.map((script) => script.src)).toEqual([
       './modules/settings.js',
       './modules/memory.js',
+      './modules/task-cleanup.js',
     ]);
     expect(appended.every((script) => script.async === false)).toBe(true);
     expect(telemetry.events).toEqual([]);
@@ -310,4 +311,11 @@ describe('renderer lazy feature loader', () => {
     expect(settings).toContain('updates: { runtime: nextRuntime }');
   });
 
+});
+
+
+it('loads public apps without requesting an unavailable publication module', async () => {
+  const { context, appended } = loadFeatureLoader();
+  await context.loadRendererFeature('apps');
+  expect(appended.map(script => script.src)).toEqual(['./modules/saved-apps.js']);
 });

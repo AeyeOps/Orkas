@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { BrowserWindow } from 'electron';
 import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
 
 /**
@@ -14,28 +15,35 @@ import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
  * review lifecycle (progress → review → done) and progress rollup, and the
  * change/advance notifications the renderer listens to.
  *
- * Only the genuinely model-driven side is mocked — spawning the advance
+ * The model-driven side is mocked — spawning the advance
  * conversation (chats.createConversation) and enqueuing its seed
  * (groupChat.send). Unlike fabric_pipeline_e2e (which INJECTS the fire), this
  * runs the real advance so the status flip, lease bookkeeping, and events are
  * all covered end to end.
+ * The headless Electron window registry is empty; real browser binding must
+ * return unavailable without throwing or preventing a task from running.
  */
+vi.mock('electron', () => ({
+  BrowserWindow: { getAllWindows: vi.fn(() => []) },
+}));
 vi.mock('../../../src/main/model/client', () => ({
   async *streamChatWithModel() { yield { type: 'final', text: '' }; yield { type: 'done' }; },
   async chatWithModel() { return { ok: true, text: '', error: '', aborted: false }; },
 }));
 // This deterministic trunk has no desktop window; browser input has its own suites.
 vi.mock('../../../src/main/features/web_assist', () => ({
-  bindHostStartedWebAssistConversation: () => false,
+  bindHostStartedWebAssistConversation: vi.fn(() => false),
 }));
 vi.mock('../../../src/main/features/chats', () => ({
   createConversation: vi.fn(),
   deleteConversation: vi.fn(),
+  getConversation: vi.fn(async () => null),
+  getProjectConversationCounts: vi.fn(async () => new Map()),
 }));
 vi.mock('../../../src/main/features/group_chat', () => ({
   send: vi.fn(),
   setFloor: vi.fn(async () => ({ ok: true })),
-  busIsQuiescent: () => true,
+  busIsQuiescent: vi.fn(() => true),
 }));
 
 let tmpDir: string;
@@ -72,6 +80,7 @@ async function load() {
   vi.mocked(chats.createConversation).mockImplementation(async () => ({ conversation_id: `c_${++convSeq}` } as never));
   vi.mocked(chats.deleteConversation).mockResolvedValue(undefined as never);
   vi.mocked(groupChat.send).mockResolvedValue({ ok: true } as never);
+  vi.mocked(groupChat.busIsQuiescent).mockReturnValue(true);
   return {
     chats,
     groupChat,
@@ -80,6 +89,13 @@ async function load() {
     drv: await import('../../../src/main/features/project_driver'),
     runner: await import('../../../src/main/features/project_driver_runner'),
   };
+}
+
+// Automatic dispatch fixtures opt in explicitly, just like the toolbar action.
+async function startAutomaticTask(runner: Awaited<ReturnType<typeof load>>['runner'], pid: string, task: any) {
+  const driver = await import('../../../src/main/features/project_driver');
+  await driver.writeConfig(UID, pid, { enabled: true });
+  return runner.advance(UID, pid, task);
 }
 
 async function seedProject(projects: any, name = 'Iterate'): Promise<string> {
@@ -94,7 +110,85 @@ async function seedProject(projects: any, name = 'Iterate'): Promise<string> {
 }
 
 describe('project to-do › end-to-end', () => {
-  it.each(['project', 'global'])('links a %s todo only on execution, never on creation, edits, completion or duplicate creation', async (scope) => {
+  it.each(['project', 'global'])('executes a synced %s backlog only on its bound installation, then hands it over after disable/re-enable', async scope => {
+    const a = await load();
+    const pid = scope === 'project' ? await seedProject(a.projects) : '';
+    const created = await a.pt.createTask(UID, pid, { content: 'One automatic execution' });
+    if (!created.ok) throw new Error('task fixture failed');
+    const configA = await a.drv.writeConfig(UID, pid, { enabled: true });
+    const pathsA = await import('../../../src/main/paths');
+    const driverFileA = pid ? pathsA.projectDriverFile(UID, pid) : pathsA.userTodoDriverFile(UID);
+    const rootB = path.join(tmpDir, 'installation-b');
+    // Each device has its own stale todo snapshot and local lease/count. Only
+    // cloud data is copied, exactly as sync does; machine identity is not copied.
+    fs.cpSync(path.join(tmpDir, UID, 'cloud'), path.join(rootB, UID, 'cloud'), { recursive: true });
+    expect(await a.runner.advanceProjectIfDue(UID, pid)).toBe('advanced');
+    expect(a.groupChat.send).toHaveBeenCalledTimes(1);
+
+    process.env.ORKAS_WORKSPACE_ROOT = rootB;
+    vi.resetModules();
+    const usersB = await import('../../../src/main/features/users');
+    usersB.activateUser(UID);
+    const b = await load();
+    expect(b.drv.getCurrentDevice().id).not.toBe(configA.device_id);
+    vi.mocked(b.groupChat.send).mockClear();
+    expect((await b.pt.getTask(UID, pid, created.task.id))?.status).toBe('todo');
+    expect(await b.runner.advanceProjectIfDue(UID, pid)).toBe('other_device');
+    expect(b.groupChat.send).not.toHaveBeenCalled();
+    expect(await b.drv.readState(UID, pid)).toEqual({});
+
+    await b.drv.writeConfig(UID, pid, { enabled: false });
+    const pathsB = await import('../../../src/main/paths');
+    const driverFileB = pid ? pathsB.projectDriverFile(UID, pid) : pathsB.userTodoDriverFile(UID);
+    fs.copyFileSync(driverFileB, driverFileA);
+    expect(await a.runner.advanceProjectIfDue(UID, pid)).toBe('disabled');
+    const configB = await b.drv.writeConfig(UID, pid, { enabled: true });
+    expect(configB.device_id).toBe(b.drv.getCurrentDevice().id);
+    fs.copyFileSync(driverFileB, driverFileA);
+    expect(await a.runner.advanceProjectIfDue(UID, pid)).toBe('other_device');
+    expect(await b.runner.advanceProjectIfDue(UID, pid)).toBe('advanced');
+    expect(b.groupChat.send).toHaveBeenCalledTimes(1);
+    expect(await b.pt.getTask(UID, pid, created.task.id)).toMatchObject({ status: 'progress', origin_cid: expect.any(String) });
+  });
+
+  it.each([
+    ['global', 'manual'], ['global', 'automatic'],
+    ['project', 'manual'], ['project', 'automatic'], ['project', 'legacy'],
+  ])('persists and executes Commander in %s scope through %s dispatch without agent bindings', async (scope, mode) => {
+    const { pt, runner, projects, groupChat } = await load();
+    let pid = '';
+    if (scope === 'project') {
+      const project = await projects.createProject(UID, 'Commander work');
+      if (!project.ok) throw new Error('project fixture failed');
+      pid = project.project.project_id;
+    }
+    vi.useFakeTimers();
+    try {
+      const created = await pt.createTask(UID, pid, { content: 'Commander work',
+        owner_agent_id: 'commander', owner_agent: 'Commander' });
+      expect(created).toMatchObject({ ok: true, task: { owner_agent_id: 'commander' } });
+      if (!created.ok) return;
+      if (mode === 'legacy') {
+        const { projectTaskFile } = await import('../../../src/main/paths');
+        const file = projectTaskFile(UID, pid, created.task.id);
+        const stored = JSON.parse(fs.readFileSync(file, 'utf8'));
+        delete stored.owner_agent_id;
+        stored.owner_agent = 'commander';
+        fs.writeFileSync(file, JSON.stringify(stored));
+      }
+      const fresh = await pt.getTask(UID, pid, created.task.id);
+      if (mode !== 'legacy') expect(fresh).toMatchObject({ owner_agent_id: 'commander' });
+      const result = mode !== 'automatic' ? await runner.runTaskNow(UID, pid, created.task.id)
+        : await startAutomaticTask(runner, pid, fresh!);
+      expect(result.ok).toBe(true);
+      expect(groupChat.setFloor).toHaveBeenCalledWith(UID, result.cid, 'commander');
+      expect(groupChat.send).toHaveBeenCalledWith(expect.objectContaining({ text: 'Commander work' }));
+      expect(await pt.getTask(UID, pid, created.task.id)).toMatchObject({ status: 'progress',
+        ...(mode !== 'legacy' ? { owner_agent_id: 'commander' } : { owner_agent: 'commander' }), origin_cid: result.cid });
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it.each(['project', 'global'])('links a %s todo on its saved-from conversation (global only) or first execution; edits, completion and duplicate creation keep the link', async (scope) => {
     const { pt, runner, projects } = await load();
     const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
     const pid = scope === 'project' ? await seedProject(projects) : '';
@@ -102,29 +196,36 @@ describe('project to-do › end-to-end', () => {
     const created = await creator.create({ content: 'Execute only when requested' });
     expect(created.ok).toBe(true);
     const tid = created.task.id;
-    expect(created.task).not.toHaveProperty('origin_cid');
+    // A global to-do saved from a conversation points back there; a project
+    // backlog item links on its first run instead.
+    if (scope === 'global') expect(created.task).toMatchObject({ origin_cid: 'c_creator' });
+    else expect(created.task).not.toHaveProperty('origin_cid');
     expect((await creator.update(tid, { status: 'progress' })).ok).toBe(true);
-    expect((await creator.complete(tid, 'early-result')).ok).toBe(true);
-    expect(await pt.getTask(UID, pid, tid)).not.toHaveProperty('origin_cid');
+    expect((await creator.complete(tid)).ok).toBe(true);
+    if (scope === 'global') expect(await pt.getTask(UID, pid, tid)).toMatchObject({ origin_cid: 'c_creator' });
+    else expect(await pt.getTask(UID, pid, tid)).not.toHaveProperty('origin_cid');
     await creator.update(tid, { status: 'todo' });
 
+    // The saved-from conversation does not exist in this fixture, so the run
+    // falls back to a new conversation and the link follows it.
     const first = await runner.runTaskNow(UID, pid, tid);
     expect(first.ok).toBe(true);
+    expect((await import('../../../src/main/features/web_assist')).bindHostStartedWebAssistConversation).toHaveBeenCalledWith(UID, first.cid);
     expect(await pt.getTask(UID, pid, tid)).toMatchObject({ origin_cid: first.cid, status: 'progress' });
     const reused = await creator.create({ content: 'Execute only when requested' });
     expect(reused).toMatchObject({ ok: true, alreadyExists: true, task: { id: tid, origin_cid: first.cid } });
     await creator.update(tid, { content: 'Revised requirements', owner: '', status: 'todo' });
-    const second = await runner.advance(UID, pid, (await pt.getTask(UID, pid, tid))!);
+    const second = await startAutomaticTask(runner, pid, (await pt.getTask(UID, pid, tid))!);
     expect(second.ok).toBe(true);
     expect(second.cid).not.toBe(first.cid);
     const oldExecutor = createProjectTasksHandler(UID, pid, first.cid!, new Map());
-    expect((await oldExecutor.update(tid, { status: 'review', result_ref: 'delivery' })).ok).toBe(true);
-    expect((await oldExecutor.complete(tid, 'verified')).ok).toBe(true);
+    expect((await oldExecutor.update(tid, { status: 'review' })).ok).toBe(true);
+    expect((await oldExecutor.complete(tid)).ok).toBe(true);
     expect((await creator.update(tid, { content: 'Final requirements' })).ok).toBe(true);
     vi.resetModules();
     const reloaded = await import('../../../src/main/features/project_tasks');
     expect(await reloaded.listTasks(UID, pid)).toEqual([expect.objectContaining({
-      id: tid, content: 'Final requirements', status: 'done', result_ref: 'verified', origin_cid: second.cid,
+      id: tid, content: 'Final requirements', status: 'done', origin_cid: second.cid,
     })]);
   });
 
@@ -140,7 +241,7 @@ describe('project to-do › end-to-end', () => {
     if (pid) await projects.addAgentBinding(UID, pid, owner.agent_id);
     const created = await pt.createTask(UID, pid, { content: 'Assigned work', owner_agent_id: owner.agent_id });
     if (!created.ok) throw new Error('task fixture failed');
-    const run = () => mode === 'manual' ? runner.runTaskNow(UID, pid, created.task.id) : runner.advance(UID, pid, created.task);
+    const run = () => mode === 'manual' ? runner.runTaskNow(UID, pid, created.task.id) : startAutomaticTask(runner, pid, created.task);
     const result = await run();
     expect(result.ok).toBe(true);
     expect(groupChat.setFloor).toHaveBeenCalledWith(UID, result.cid, owner.agent_id);
@@ -172,12 +273,12 @@ describe('project to-do › end-to-end', () => {
     expect((await pt.getTask(UID, pid, created.task.id))?.status).toBe('progress');
     // These writes represent explicit executor tool updates after verification;
     // dispatching the conversation itself must not imply either outcome.
-    expect((await pt.updateTask(UID, pid, created.task.id, { status: 'review', result_ref: 'delivery-v1' })).ok).toBe(true);
+    expect((await pt.updateTask(UID, pid, created.task.id, { status: 'review' })).ok).toBe(true);
     const second = await runner.runTaskNow(UID, pid, created.task.id);
     expect(second.ok).toBe(true);
     expect(second.cid).not.toBe(first.cid);
     expect(await pt.getTask(UID, pid, created.task.id)).toMatchObject({
-      status: 'review', result_ref: 'delivery-v1', origin_cid: second.cid,
+      status: 'review', origin_cid: second.cid,
     });
     expect(vi.mocked(groupChat.send).mock.calls.at(-1)?.[0]).toMatchObject({
       cid: second.cid, attachments: ['brief.txt'], model_text: expect.stringContaining('to done with todo_tasks'),
@@ -185,12 +286,17 @@ describe('project to-do › end-to-end', () => {
     const { chatAttachmentDirForConversation } = await import('../../../src/main/util/project-layout');
     expect(fs.readFileSync(path.join(chatAttachmentDirForConversation(UID, second.cid!, pid), 'brief.txt'), 'utf8'))
       .toBe('Required delivery');
-    expect((await pt.completeTask(UID, pid, created.task.id, 'verified-delivery')).ok).toBe(true);
+    expect((await pt.completeTask(UID, pid, created.task.id)).ok).toBe(true);
     const persisted = await pt.listTasks(UID, pid);
     expect(persisted).toEqual([expect.objectContaining({
-      id: created.task.id, status: 'done', result_ref: 'verified-delivery', origin_cid: second.cid,
+      id: created.task.id, status: 'done', origin_cid: second.cid,
     })]);
     expect(pt.computeProgress(persisted)).toMatchObject({ done: 1, open: 0 });
+    // Completed work cannot be dispatched or reopened by another run-now click.
+    const sent = vi.mocked(groupChat.send).mock.calls.length;
+    expect(await runner.runTaskNow(UID, pid, created.task.id)).toMatchObject({ ok: false, error: 'not_runnable' });
+    expect(groupChat.send).toHaveBeenCalledTimes(sent);
+    expect(await pt.listTasks(UID, pid)).toEqual(persisted);
   });
 
   it.each([
@@ -222,7 +328,7 @@ describe('project to-do › end-to-end', () => {
       runner.runTaskNow(UID, pid, created.task.id),
       competing === 'manual'
         ? runner.runTaskNow(UID, pid, created.task.id)
-        : runner.advance(UID, pid, created.task),
+        : startAutomaticTask(runner, pid, created.task),
     ]);
 
     expect(results.filter((result) => result.ok)).toHaveLength(1);
@@ -263,11 +369,11 @@ describe('project to-do › end-to-end', () => {
     if (!created.ok) throw new Error('task fixture failed');
     vi.mocked(groupChat.send).mockImplementationOnce(async () => {
       expect((await pt.getTask(UID, pid, created.task.id))?.status).toBe('progress');
-      expect((await pt.updateTask(UID, pid, created.task.id, { status, result_ref: 'reviewed-result' })).ok).toBe(true);
+      expect((await pt.updateTask(UID, pid, created.task.id, { status })).ok).toBe(true);
       return { ok: false, error: 'send_failed' } as never;
     });
     expect((await runner.runTaskNow(UID, pid, created.task.id)).ok).toBe(false);
-    expect(await pt.getTask(UID, pid, created.task.id)).toMatchObject({ status, result_ref: 'reviewed-result' });
+    expect(await pt.getTask(UID, pid, created.task.id)).toMatchObject({ status });
   });
 
   it('drives the whole backlog to progress and keeps advancing while conversations run', async () => {
@@ -322,12 +428,12 @@ describe('project to-do › end-to-end', () => {
     // Commander advances it, then a human review approves it.
     await pt.updateTask(UID, pid, t1.task.id, { status: 'progress' });
     await pt.updateTask(UID, pid, t1.task.id, { status: 'review' });
-    const done = await pt.updateTask(UID, pid, t1.task.id, { status: 'done', result_ref: 'chat-42' });
+    const done = await pt.updateTask(UID, pid, t1.task.id, { status: 'done' });
     expect(done.ok).toBe(true);
     if (done.ok) {
       expect(done.task.status).toBe('done');
       expect(done.task.done_at).toBeTruthy();
-      expect(done.task.result_ref).toBe('chat-42');
+      expect(done.task).not.toHaveProperty('result_ref');
     }
 
     const progress = pt.computeProgress(await pt.listTasks(UID, pid));
@@ -383,7 +489,7 @@ describe('project to-do › end-to-end', () => {
     if (!t2.ok) throw new Error('seed');
     await pt.uploadTaskAttachment(UID, pid, t2.task.id, 'spec.md', Buffer.from('# spec'));
     const fresh = await pt.getTask(UID, pid, t2.task.id);
-    const adv = await runner.advance(UID, pid, fresh!);
+    const adv = await startAutomaticTask(runner, pid, fresh!);
     expect(adv.ok).toBe(true);
     const advSend = vi.mocked(groupChat.send).mock.calls.at(-1)?.[0] as { attachments?: string[] };
     expect(advSend.attachments).toEqual(['spec.md']);

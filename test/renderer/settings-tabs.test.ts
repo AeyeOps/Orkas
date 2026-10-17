@@ -99,6 +99,13 @@ function loadSettingsTabsModule() {
 }
 
 describe('settings tabs module', () => {
+  it('initializes shared task cleanup on entering Data without requiring hosted data hooks', () => {
+    const { window, tabs } = loadSettingsTabsModule();
+    window.initTaskCleanup = vi.fn();
+    tabs[2].click(); expect(window.initTaskCleanup).not.toHaveBeenCalled();
+    tabs[0].click(); expect(window.initTaskCleanup).toHaveBeenCalledOnce();
+  });
+
   it('loads tabs eagerly and the settings page on demand', () => {
     const indexHtml = fs.readFileSync(path.join(root, 'src/renderer/index.html'), 'utf8');
     const lazyFeatures = fs.readFileSync(path.join(root, 'src/renderer/modules/lazy-features.js'), 'utf8');

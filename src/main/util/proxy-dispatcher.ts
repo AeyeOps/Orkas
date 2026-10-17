@@ -113,6 +113,7 @@ let _fetchDelegate: FetchLike | undefined;
 let _fetchRouter: FetchLike | undefined;
 let _baseBinaryFetch: BinaryFetchLike | undefined;
 let _binaryFetchDelegate: BinaryFetchLike | undefined;
+let _uploadRoute: ((url: URL) => Promise<ResolvedProxyRoute>) | undefined;
 let _childFetchBridge: Promise<ChildFetchBridge> | undefined;
 
 interface ChildFetchBridge {
@@ -342,6 +343,101 @@ async function electronSystemFetch(): Promise<FetchLike> {
       throw normalizeElectronNetFetchError(error);
     }
   }) as FetchLike;
+}
+
+export type UploadProgress = (sent: number, total: number) => void;
+
+/** Bounded JSON uploads use transport byte events, never body-producer reads.
+ * Keep environment/DIRECT on Node and system proxy routes on Chromium. */
+export async function fetchUploadWithProxyPolicy(
+  url: string, init: RequestInit, onProgress: UploadProgress,
+): Promise<Response> {
+  if (typeof init.body !== 'string') throw new TypeError('upload requires a serialized body');
+  const body = Buffer.from(init.body);
+  if (_uploadRoute && !_envActive && (await _uploadRoute(new URL(url))).kind !== 'direct') {
+    return electronUpload(url, init, body, onProgress);
+  }
+  const { fetch: nodeFetch, getGlobalDispatcher } = require('undici') as typeof import('undici');
+  const base = getGlobalDispatcher();
+  let active = true;
+  const dispatcher = {
+    dispatch(options: import('undici').Dispatcher.DispatchOptions, handler: import('undici').Dispatcher.DispatchHandler) {
+      let sent = 0;
+      return base.dispatch({...options, ...(options.body ? {body: Readable.from(chunks(), {objectMode: false})} : {})}, new Proxy(handler, {
+        get(target, key) {
+          if (key === 'onBodySent') return (chunk: Uint8Array) => {
+            // The installed undici runtime supplies the chunk (its .d.ts differs).
+            sent += chunk.byteLength;
+            if (active && !init.signal?.aborted) onProgress(Math.min(sent, body.length), body.length);
+          };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      }));
+    },
+  } as import('undici').Dispatcher;
+  // Subdivide within the same HTTP request. Socket backpressure controls pacing;
+  // no extra round trips or artificial progress timers are introduced.
+  async function* chunks() {
+    for (let offset = 0; offset < body.length; offset += 16 * 1024) yield body.subarray(offset, offset + 16 * 1024);
+  }
+  try {
+    // Retain fetch's replayable serialized body and redirect policy; split only
+    // at dispatch so 307/308 retries can obtain a fresh iterator.
+    return await nodeFetch(url, { ...init, headers: Object.fromEntries(new Headers(init.headers)), dispatcher,
+    } as Parameters<typeof nodeFetch>[1]) as unknown as Response;
+  } finally { active = false; }
+}
+
+async function electronUpload(url: string, init: RequestInit, body: Buffer, onProgress: UploadProgress): Promise<Response> {
+  const { net, session } = await import('electron');
+  return new Promise((resolve, reject) => {
+    const signal = init.signal;
+    if (signal?.aborted) { reject(signal.reason); return; }
+    const request = net.request({url, method: init.method || 'POST', session: session.defaultSession, redirect: init.redirect || 'follow'});
+    let settled = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const finish = (error?: unknown, response?: Response) => {
+      if (settled) return;
+      settled = true;
+      clearInterval(timer);
+      signal?.removeEventListener('abort', abort);
+      if (error) reject(error); else resolve(response!);
+    };
+    const abort = () => { finish(signal?.reason || new Error('upload aborted')); request.abort(); };
+    const report = () => {
+      if (settled || signal?.aborted) return;
+      const value = request.getUploadProgress();
+      if (value.active && value.started) onProgress(Math.min(value.current, body.length), body.length);
+    };
+    request.on('error', error => finish(normalizeElectronNetFetchError(error)));
+    request.on('abort', () => finish(new Error('upload aborted')));
+    request.on('close', () => finish(new Error('upload closed before response completed')));
+    request.on('response', response => {
+      report(); clearInterval(timer);
+      const chunks: Buffer[] = [];
+      response.on('data', (chunk: Buffer) => chunks.push(chunk));
+      response.on('error', error => finish(error));
+      response.on('aborted', () => finish(new Error('upload response aborted')));
+      response.on('end', () => {
+        if (settled) return;
+        try {
+          const headers = new Headers();
+          for (const [name, values] of Object.entries(response.headers)) {
+            for (const value of Array.isArray(values) ? values : [values]) headers.append(name, value);
+          }
+          finish(undefined, new Response([204,205,304].includes(response.statusCode) ? null : Buffer.concat(chunks),
+            {status: response.statusCode, headers}));
+        } catch (error) { finish(error); }
+      });
+    });
+    try {
+      new Headers(init.headers).forEach((value, name) => request.setHeader(name, value));
+      signal?.addEventListener('abort', abort, {once: true});
+      timer = setInterval(report, 100);
+      request.end(body);
+    } catch (error) { finish(error); request.abort(); }
+  });
 }
 
 /**
@@ -908,6 +1004,7 @@ export async function installSystemProxyDispatcher(
       electronSystemBinaryFetch,
       resolveProxy,
     );
+    _uploadRoute = createProxyRouteResolver(resolveProxy);
     _active = 'system:per-request';
     log.info('installed per-request Electron system-proxy routing for global fetch');
     return true;
@@ -937,6 +1034,7 @@ export function _resetProxyRoutingForTests(): void {
   _fetchRouter = undefined;
   _baseBinaryFetch = undefined;
   _binaryFetchDelegate = undefined;
+  _uploadRoute = undefined;
   if (_childFetchBridge) {
     void _childFetchBridge.then(({ close }) => close()).catch(() => undefined);
     _childFetchBridge = undefined;

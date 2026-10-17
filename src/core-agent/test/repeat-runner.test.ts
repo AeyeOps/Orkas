@@ -141,14 +141,17 @@ describe("completed-evidence repeat protection", () => {
     expect(f.requests.map(repeatControl)).toEqual([false, false, false, true, false]);
     expect(f.summaries).toHaveLength(1);
     expect(f.summaries[0].tools ?? []).toEqual([]);
-    expect(done.result.meta.termination).toEqual({ status: "stopped", reason: "repetitive_tool_calls" });
-    expect(done.result.text).toMatch(/stopped/i);
+    expect(done.result.meta.termination).toEqual({ status: "stopped", reason: "repetitive_tool_calls",
+      ...(summary === "success" ? {} : { summaryIncomplete: true }),
+    });
+    expect(done.result.text).toBe(summary === "success" ? "Saved work retained; stopped repeating." : "");
     expect(events.filter(e => e.type === "tool_start")).toHaveLength(5);
     expect(events.filter(e => e.type === "tool_end")).toHaveLength(5);
     expect(events.filter(e => e.type === "done")).toHaveLength(1);
     const history = JSON.stringify(f.runner.getSession().getMessages());
     expect(history).not.toContain("consecutive completed rounds");
     expect(history).not.toContain("This tool call was not executed");
+    expect(history).not.toContain("Recent successful results:");
   });
 
   it.each(["sequential", "parallel"] as const)("a single %s batch of five identical calls receives feedback before any stop", async mode => {

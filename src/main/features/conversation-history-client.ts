@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import { WS_ROOT } from '../paths';
 
 export type HistoryCommand = {
-  kind: 'page' | 'window' | 'project' | 'purge' | 'turns' | 'turn-purge';
+  kind: 'page' | 'window' | 'window-at-message' | 'project' | 'purge' | 'turns' | 'turn-purge' | 'process-page';
   userId: string;
   sourceFile: string;
   cid?: string;
@@ -12,6 +12,9 @@ export type HistoryCommand = {
   before?: number | null;
   after?: number;
   start?: number;
+  messageId?: string;
+  processRef?: string;
+  processCursor?: number;
   records?: import('./group_chat/visibility').GroupMessage[];
 };
 

@@ -3,18 +3,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
 
-/**
- * Narration folding (2026-09-18).
- *
- * An external-CLI turn narrates every tool loop, so one turn can carry dozens
- * of segments — a 16-minute task produced 62, and the 61 narration blocks
- * filled 95% of the bubble. All but the last couple fold behind one line.
- * Folding is presentation only: every block stays in the DOM and in
- * `row._narration`, so quoting, copying and search keep working.
- *
- * The keyed-rendering harness deliberately stubs `.chat-bubble`, so the fold
- * path is inert there. This file mounts a DOM complete enough to execute it.
- */
+/** Native message boundaries place earlier text in the shared process disclosure.
+ * These cases protect the single final body, live/canonical reconciliation,
+ * chronological recovery and bounded deferred history loading. */
 
 const SOURCE = fs.readFileSync(
   path.join(__dirname, '../../src/renderer/modules/conversation.js'),
@@ -27,6 +18,7 @@ const VIEW_MODEL_SOURCE = fs.readFileSync(
 
 class El {
   className = '';
+  hidden = false;
   dataset: Record<string, string> = {};
   children: El[] = [];
   parentElement: El | null = null;
@@ -69,6 +61,11 @@ class El {
   }
 
   get firstChild() { return this.children[0] || null; }
+  get lastElementChild() { return this.children.at(-1) || null; }
+  get nextElementSibling() {
+    const siblings = this.parentElement?.children || [];
+    return siblings[siblings.indexOf(this) + 1] || null;
+  }
 
   setAttribute(name: string, value: string) { this.attrs[name] = value; }
   getAttribute(name: string) { return this.attrs[name] ?? null; }
@@ -87,17 +84,18 @@ class El {
 
   querySelectorAll(selector: string): El[] {
     const cls = selector.replace(/^\./, '').replace(/\[.*$/, '');
-    const segMatch = selector.match(/data-narration-seg="([^"]+)"/);
+    const segMatch = selector.match(/data-native-seg="([^"]+)"/);
     return this.descendants().filter((el) => {
       if (cls && !el.classList.contains(cls)) return false;
-      if (segMatch && el.dataset.narrationSeg !== segMatch[1]) return false;
+      if (segMatch && el.dataset.nativeSeg !== segMatch[1]) return false;
       return true;
     });
   }
 
   querySelector(selector: string): El | null {
-    if (selector === '[data-role="final"]') {
-      return this.descendants().find((el) => el.getAttribute('data-role') === 'final') || null;
+    if (selector.startsWith('[data-role=')) {
+      const role = selector.match(/data-role="([^"]+)"/)?.[1];
+      return this.descendants().find((el) => el.getAttribute('data-role') === role) || null;
     }
     if (selector === '.chat-bubble') {
       return this.descendants().find((el) => el.classList.contains('chat-bubble')) || null;
@@ -115,6 +113,7 @@ function loadFoldContext() {
     requestAnimationFrame: (fn: Function) => { fn(); return 1; },
     createLogger: () => ({ warn() {}, info() {}, error() {}, debug() {} }),
     escapeHtml: (s: string) => String(s),
+    renderMarkdownFull: (s: string) => String(s),
     t: (key: string) => key,
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
     document: {
@@ -131,129 +130,107 @@ function loadFoldContext() {
   vm.createContext(context);
   vm.runInContext(VIEW_MODEL_SOURCE, context);
   vm.runInContext(SOURCE, context);
-  vm.runInContext('globalThis.__fold = _applyNarrationFold;', context);
+
   return context;
 }
 
-function rowWithBlocks(count: number, turnId = 'T-fold') {
+function rowWithProcess() {
   const row = new El();
-  row.dataset.turnId = turnId;
+  row.dataset.turnId = 'T-process';
   const bubble = new El();
   bubble.className = 'chat-bubble';
   row.appendChild(bubble);
-  for (let i = 0; i < count; i++) {
-    const block = new El();
-    block.className = 'chat-turn-narration';
-    block.dataset.narrationSeg = String(i);
-    bubble.appendChild(block);
-  }
-  const body = new El();
-  body.setAttribute('data-role', 'final');
-  bubble.appendChild(body);
-  return { row, bubble };
+  const details = new El();
+  details.className = 'stream-process';
+  const process = new El();
+  process.className = 'stream-process-body';
+  process.setAttribute('data-role', 'process');
+  details.appendChild(process);
+  bubble.appendChild(details);
+  const final = new El();
+  final.setAttribute('data-role', 'final');
+  final.textContent = 'Final answer';
+  bubble.appendChild(final);
+  return { row, bubble, process, final };
 }
 
-function foldedCount(bubble: El) {
-  return bubble.querySelectorAll('.chat-turn-narration')
-    .filter((b) => b.classList.contains('chat-turn-narration--folded')).length;
-}
+const commentary = (text: string) => ({
+  type: 'progress', text, event: { stream: 'assistant', data: { phase: 'commentary' } },
+});
 
-describe('narration folding', () => {
-  it('leaves a short turn alone', () => {
+describe('native narration in the shared process disclosure', () => {
+  it('uses stored commentary without classifying or duplicating raw source text', () => {
     const ctx = loadFoldContext();
-    const { row, bubble } = rowWithBlocks(3);
-    ctx.__fold(row);
-    expect(foldedCount(bubble), 'three blocks stay readable').toBe(0);
+    ctx._groupActorLabel = () => 'Claude';
+    const process = [commentary('Stored process text')];
+    const record = { id: 'classified', from: 'claude', seg: 0, text: 'Raw source text',
+      display_phase: 'commentary', process };
+    const merged = ctx._mergeSegmentGroup([record,
+      { id: 'answer', seg: 1, text: 'Answer', display_phase: 'final_answer', process: [] }]).merged;
+    expect(merged.process).toEqual(process);
+    expect(ctx._groupMsgToLegacy(record).content).toBe('');
+    expect(ctx._groupMsgToLegacy(record).display_phase).toBe('commentary');
+    const part = { ref: 'stored-process', message_id: record.id };
+    expect(ctx._processPartsForRecord({ ...record, process_parts: [part] }, true)).toEqual([part]);
+  });
+
+  it.each([1, 3, 19, 61])('keeps all %s earlier messages inside process information with no exposed tail', count => {
+    const ctx = loadFoldContext();
+    const { row, bubble, process, final } = rowWithProcess();
+    for (let i = 0; i < count; i++) ctx._appendNarrationBlock(row, i, `Progress ${i}`);
+    expect(process.children.map(child => child.dataset.processText))
+      .toEqual(Array.from({ length: count }, (_, i) => `Progress ${i}`));
+    expect(bubble.children.map(child => child.className)).toEqual(['stream-process', '']);
     expect(bubble.querySelectorAll('.chat-turn-narration-toggle')).toHaveLength(0);
+    expect(final.textContent).toBe('Final answer');
   });
 
-  it('folds all but the tail of a long turn and counts what it hid', () => {
+  it('replaces a provisional segment with its canonical text without duplicating the process entry', () => {
     const ctx = loadFoldContext();
-    const { row, bubble } = rowWithBlocks(61);
-    ctx.__fold(row);
-    expect(foldedCount(bubble)).toBe(59);
-    const toggle = bubble.querySelectorAll('.chat-turn-narration-toggle')[0];
-    expect(toggle, 'a fold needs a way back').toBeTruthy();
-    expect(toggle.dataset.hiddenCount).toBe('59');
-    expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    // The blocks are hidden, never dropped: quoting and search still see them.
-    expect(bubble.querySelectorAll('.chat-turn-narration')).toHaveLength(61);
+    const { row, process } = rowWithProcess();
+    ctx._appendNarrationBlock(row, 0, 'Partial');
+    ctx._appendNarrationBlock(row, 0, 'Complete', { canonical: true });
+    ctx._appendNarrationBlock(row, 0, 'Complete', { canonical: true });
+    expect(process.children.map(child => child.dataset.processText)).toEqual(['Complete']);
+    ctx._appendNarrationBlock(row, 0, '', { canonical: true });
+    expect(process.children).toHaveLength(0);
   });
 
-  it('keeps the newest segments visible, not the oldest', () => {
+  it('moves each previous body before its tool activity while the next body remains independent', () => {
     const ctx = loadFoldContext();
-    const { row, bubble } = rowWithBlocks(61);
-    ctx.__fold(row);
-    const visible = bubble.querySelectorAll('.chat-turn-narration')
-      .filter((b) => !b.classList.contains('chat-turn-narration--folded'))
-      .map((b) => Number(b.dataset.narrationSeg));
-    expect(visible).toEqual([59, 60]);
+    const { row, process } = rowWithProcess();
+    const tool = new El(); tool.textContent = 'Read files'; process.appendChild(tool);
+    row.dataset.streamBuf = 'Inspecting';
+    ctx._demoteBodyToNarration(row, 0);
+    const nextTool = new El(); nextTool.textContent = 'Run tests'; process.appendChild(nextTool);
+    row.dataset.streamBuf = 'Verifying';
+    ctx._demoteBodyToNarration(row, 1);
+    expect(process.children.filter(child => !child.hidden).map(child => child.dataset.processText || child.textContent))
+      .toEqual(['Inspecting', 'Read files', 'Verifying', 'Run tests']);
   });
 
-  it('opens and closes on click', () => {
+  it('projects recovered segments into chronological process items and keeps only the last body', () => {
     const ctx = loadFoldContext();
-    const { row, bubble } = rowWithBlocks(61);
-    ctx.__fold(row);
-    const toggle = bubble.querySelectorAll('.chat-turn-narration-toggle')[0];
-    toggle.click();
-    expect(foldedCount(bubble), 'expanded shows every segment').toBe(0);
-    expect(toggle.getAttribute('aria-expanded')).toBe('true');
-    toggle.click();
-    expect(foldedCount(bubble), 'collapsing again re-hides them').toBe(59);
+    const tool = { type: 'progress', text: 'Read files' };
+    const records = [
+      { id: 'one', seg: 0, text: 'Inspecting', process: [tool] },
+      { id: 'two', seg: 1, text: 'Verifying', process: [] },
+      { id: 'three', seg: 2, text: 'Final answer', process: [] },
+    ];
+    const merged = ctx._mergeSegmentGroup(records).merged;
+    expect(merged.text).toBe('Final answer');
+    expect(merged.process).toEqual([commentary('Inspecting'), tool, commentary('Verifying')]);
+    expect(records[0].process).toEqual([tool]);
   });
 
-  it('remembers a collapse across a transcript rebuild', () => {
-    // Switching conversations rebuilds the transcript, so the row carrying
-    // `narrationExpanded` is gone. A fold the reader chose must survive it
-    // (2026-09-18: it came back open).
+  it('keeps earlier commentary with its deferred process part without fetching that history', () => {
     const ctx = loadFoldContext();
-    const first = rowWithBlocks(61, 'T-keep');
-    ctx.__fold(first.row);
-    const toggle = first.bubble.querySelectorAll('.chat-turn-narration-toggle')[0];
-    toggle.click();                       // open
-    toggle.click();                       // and fold again — an explicit choice
-    expect(foldedCount(first.bubble)).toBe(59);
-
-    // Same turn, brand new DOM: what a conversation switch produces.
-    const rebuilt = rowWithBlocks(61, 'T-keep');
-    ctx.__fold(rebuilt.row);
-    expect(foldedCount(rebuilt.bubble), 'the choice outlives the row').toBe(59);
-    expect(rebuilt.row.dataset.narrationExpanded).toBe('0');
-  });
-
-  it('carries an explicit open across a rebuild too', () => {
-    const ctx = loadFoldContext();
-    const first = rowWithBlocks(61, 'T-open');
-    ctx.__fold(first.row);
-    first.bubble.querySelectorAll('.chat-turn-narration-toggle')[0].click();
-    const rebuilt = rowWithBlocks(61, 'T-open');
-    ctx.__fold(rebuilt.row);
-    expect(foldedCount(rebuilt.bubble)).toBe(0);
-  });
-
-  it('keeps turns independent', () => {
-    const ctx = loadFoldContext();
-    const a = rowWithBlocks(61, 'T-a');
-    ctx.__fold(a.row);
-    a.bubble.querySelectorAll('.chat-turn-narration-toggle')[0].click();
-    const b = rowWithBlocks(61, 'T-b');
-    ctx.__fold(b.row);
-    expect(foldedCount(a.bubble), 'opened turn stays open').toBe(0);
-    expect(foldedCount(b.bubble), 'untouched turn keeps the default').toBe(59);
-  });
-
-  it('re-folds newly absorbed older segments without losing the open state', () => {
-    const ctx = loadFoldContext();
-    const { row, bubble } = rowWithBlocks(61);
-    ctx.__fold(row);
-    bubble.querySelectorAll('.chat-turn-narration-toggle')[0].click();
-    // An older history page lands in this bubble (cross-page absorb).
-    const older = new El();
-    older.className = 'chat-turn-narration';
-    older.dataset.narrationSeg = '-1';
-    bubble.insertBefore(older, bubble.children[0]);
-    ctx.__fold(row);
-    expect(foldedCount(bubble), 'still expanded after absorbing').toBe(0);
-    expect(bubble.querySelectorAll('.chat-turn-narration-toggle')[0].dataset.hiddenCount).toBe('60');
+    const part = { ref: 'fixture-ref', message_id: 'one' };
+    const merged = ctx._mergeSegmentGroup([
+      { id: 'one', seg: 0, text: 'Inspecting', process_parts: [part] },
+      { id: 'two', seg: 1, text: 'Final answer', process: [] },
+    ]).merged;
+    expect(merged.process_parts[0]).toEqual({ ...part, leading_items: [commentary('Inspecting')] });
+    expect(part).not.toHaveProperty('leading_items');
   });
 });

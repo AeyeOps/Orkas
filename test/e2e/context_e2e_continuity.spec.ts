@@ -1,5 +1,5 @@
-import { expect, test } from './fixtures/orkas';
-import { contextBudget } from '../../src/core-agent/src/agent/context-budget';
+import { expect, test, E2E_MODEL_CONTEXT_WINDOW, E2E_MODEL_MAX_OUTPUT_TOKENS } from './fixtures/orkas';
+import { contextBudget, MAX_PER_RESULT_INLINE_TOKENS } from '../../src/core-agent/src/agent/context-budget';
 import { estimateTextTokens } from '../../src/core-agent/src/agent/session';
 
 /**
@@ -11,7 +11,7 @@ import { estimateTextTokens } from '../../src/core-agent/src/agent/session';
  * no pressure at all.
  *
  * Lower bound in aggregate: the active-process trigger derives from the model
- * window, and this fresh Orkas LLM (1M) task also borrows unused history room.
+ * window, and this fresh Orkas LLM task also borrows unused history room.
  * The files must exceed that effective trigger together or compaction
  * never fires — and a fixture that has quietly stopped applying pressure fails
  * as "0 compactions", which reads like a compaction bug rather than a sizing
@@ -19,23 +19,18 @@ import { estimateTextTokens } from '../../src/core-agent/src/agent/session';
  * failure, and the counts are recomputed here whenever either limit changes.
  */
 
-/** Mirrors `DEFAULT_INLINE_RESULT_TOKENS` in `src/main/util/tool-result-cap.ts`,
- *  which cannot be imported here: it pulls in the Electron logger. The pressure
- *  assertion below fails loudly if the real value ever drops below this. */
-const PER_RESULT_INLINE_TOKENS = 12_500;
+const PER_RESULT_INLINE_TOKENS = MAX_PER_RESULT_INLINE_TOKENS;
 /** Stay under the spill line with room for the estimator's own error. */
 const PER_FILE_TOKEN_TARGET = Math.floor(PER_RESULT_INLINE_TOKENS * 0.9);
 /** Exceed the trigger by enough that a small threshold change does not silently
  *  drop the run below it. */
 const AGGREGATE_PRESSURE_RATIO = 1.12;
-/** The deterministic provider reports deliberately tiny usage numbers, so the
- *  session's estimator calibration settles at the production floor. Size the
- *  fixture against the same calibrated trigger comparison. */
-const E2E_ESTIMATOR_CALIBRATION_FLOOR = 0.5;
+/** This scenario reports usage estimated from its actual request payload. */
+const E2E_ESTIMATOR_CALIBRATION = 1;
 
-/** The E2E model is Orkas LLM: a 1M window, and a fixed overhead large enough
+/** The E2E model uses the official planning limits, and a fixed overhead large enough
  *  to be realistic without needing the real prompt here. */
-const E2E_USABLE_INPUT_TOKENS = 1_048_576 - 8_192;
+const E2E_USABLE_INPUT_TOKENS = E2E_MODEL_CONTEXT_WINDOW - E2E_MODEL_MAX_OUTPUT_TOKENS;
 const E2E_ACTIVE_TRIGGER = contextBudget({
   usableInputTokens: E2E_USABLE_INPUT_TOKENS,
   // Match AgentRunner's request ceiling before dividing the remaining room.
@@ -50,7 +45,7 @@ const SOURCE_COUNT = Math.max(
   3,
   Math.ceil(
     (E2E_ACTIVE_TRIGGER * AGGREGATE_PRESSURE_RATIO)
-      / (PER_FILE_TOKEN_TARGET * E2E_ESTIMATOR_CALIBRATION_FLOOR),
+      / (PER_FILE_TOKEN_TARGET * E2E_ESTIMATOR_CALIBRATION),
   ),
 );
 
@@ -77,7 +72,7 @@ function pressureRow(label: string, index: number): string {
 function assertFixturePressure(compactionCount: number): void {
   const perFile = estimateTextTokens(contextPressureFixture('KEEP01', 'E2E_CTX_KEEP01=ALPHA-1'));
   const aggregate = perFile * SOURCE_COUNT;
-  const calibratedAggregate = aggregate * E2E_ESTIMATOR_CALIBRATION_FLOOR;
+  const calibratedAggregate = aggregate * E2E_ESTIMATOR_CALIBRATION;
   const sizing = `per-file ~${perFile} tokens x ${SOURCE_COUNT} files = ~${aggregate}; `
     + `calibrated aggregate ~${calibratedAggregate}; derived active trigger ${E2E_ACTIVE_TRIGGER}; `
     + `per-result spill line ${PER_RESULT_INLINE_TOKENS}`;
@@ -213,7 +208,7 @@ test.describe('long-task context continuity', () => {
   test('stops a stalled context compaction without a late response or replay', async ({
     modelOrkas,
   }) => {
-    // Building pressure now reads 137 files before cancellation can be tested.
+    // Build pressure from the official window before testing cancellation.
     // Allow setup to cross the real trigger; the cancellation gates stay at 10s.
     test.setTimeout(120_000);
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');

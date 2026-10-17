@@ -2544,6 +2544,7 @@ function _aiSelectMount(el, config) {
   const reposition = () => {
     if (!state.open) return;
     const rect = trigger.getBoundingClientRect();
+    popover.dataset.uiOverlay = '';
     popover.style.position = 'fixed';
     popover.style.left = rect.left + 'px';
     popover.style.width = rect.width + 'px';

@@ -186,6 +186,7 @@ function planFailure(
 export function createExecutionPlanTool(controller: ExecutionPlanController): AgentTool {
   return defineTool({
     name: "manage_execution_plan",
+    compatibilityInputFields: ["action", "finish", "replace_objective", "status", "step", "step_id", "updates"],
     description:
       "Store the optional current-task Plan as a complete ordered snapshot of a few durable outcome milestones. Use it for complex work that benefits from progress state across rounds; keep at most one in_progress. Use todo_tasks for backlogs. Plan state is working memory, not task completion or termination.",
     inputSchema: {

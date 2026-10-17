@@ -69,6 +69,12 @@ describe('ImageStudio project contract', () => {
     }
   });
 
+  it('rejects a clipped screenshot instead of stretching it into a valid-looking canvas', async () => {
+    const clipped = await sharp({ create: { width: 400, height: 180, channels: 4, background: '#2468ae' } }).png().toBuffer();
+    await expect(normalizeImageStudioSnapshot(clipped, { width: 400, height: 240 }))
+      .rejects.toThrow('E_IMAGE_STUDIO_CAPTURE_GEOMETRY');
+  });
+
   it('only exempts verified raster provenance, independent of route and legacy flags', () => {
     expect(imageStudioEvidenceIsGeneration(null)).toBe(false);
     expect(imageStudioEvidenceIsGeneration({ route: 'generate' } as any)).toBe(false);

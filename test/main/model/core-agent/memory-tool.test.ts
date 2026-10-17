@@ -1,5 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createCrossSessionMemoryTool, type MemoryToolHandler, type MemoryTier } from '../../../../src/core-agent/src/tools/memory-tool';
+import { TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS } from '../../../../src/core-agent/src/tools/base';
+import { estimateTextTokens } from '../../../../src/core-agent/src/shared/token-estimate';
 
 function stubHandler(): MemoryToolHandler & { calls: Array<{ op: string; tier: MemoryTier }> } {
   const calls: Array<{ op: string; tier: MemoryTier }> = [];
@@ -25,14 +27,16 @@ describe('cross_session_memory tool › project tier exposure', () => {
     const h = stubHandler();
     const tool = createCrossSessionMemoryTool(h, { ...options, globalTiersReadOnly: true });
     expect(tool.description).toContain('intended scope, not write access');
-    expect(tool.description).toContain('before replying, even without a save request');
-    expect(tool.description).toContain('stable facts, corrections or invalidations for future conversations');
+    expect(tool.description).toContain('Before replying, even unasked, save only compact facts');
+    expect(tool.description).toContain('leave specs, plans and progress in their files, tasks or library');
+    expect(tool.description).toContain('Update or remove stale entries');
     expect(tool.description).toContain('User/shared writes belong to Commander');
     expect(tool.description).toContain('hand back those changes without substituting or duplicating them in another store');
     expect((tool.inputSchema as any).properties.target.description).toContain('Agent-only reusable lessons');
-    expect(tool.description).toContain('exclude task progress and temporary state');
+    expect(tool.description).not.toContain('exclude task progress and temporary state');
     expect(tool.description).not.toContain('<handback');
-    expect(tool.description.length).toBeLessThanOrEqual(480);
+    expect(estimateTextTokens(tool.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
+    expect(tool.description.length).toBeLessThanOrEqual(540);
     expect((tool.inputSchema as any).properties.target.description.length).toBeLessThanOrEqual(220);
     for (const target of ['user', 'shared']) {
       expect((await tool.execute({ action: 'list', target }, {} as any)).isError).toBe(false);
@@ -71,10 +75,9 @@ describe('cross_session_memory tool › project tier exposure', () => {
     const action = (tool.inputSchema as any).properties.action;
     expect(enumOf(tool)).toEqual(['agent', 'shared', 'user']);
     expect(tool.description).toContain('Manage durable agent, shared, or user memory');
-    expect(tool.description).toContain('before replying');
-    expect(tool.description).toContain('even without an explicit save request');
-    expect(tool.description).toContain('Decide from meaning, never trigger words');
-    expect(tool.description).toContain('Do not store current-task progress');
+    expect(tool.description).toContain('Before replying, even unasked');
+    expect(tool.description).toContain('Decide by meaning, not trigger words');
+    expect(tool.description).not.toContain('Do not store current-task progress');
     expect(action.description).toContain('entries are already injected');
     expect(target.description).toContain('Defaults to agent');
     expect(target.description).toContain('user-wide profile/preferences');
@@ -85,7 +88,8 @@ describe('cross_session_memory tool › project tier exposure', () => {
     const tool = createCrossSessionMemoryTool(stubHandler(), { includeProjectTier: true });
     const target = (tool.inputSchema as any).properties.target;
     expect(enumOf(tool)).toEqual(['agent', 'project', 'shared', 'user']);
-    expect(tool.description).toContain('Use todo_tasks for task progress');
+    expect(tool.description).toContain('leave specs, plans and progress in their files, tasks or library');
+    expect(tool.description).not.toContain('Use todo_tasks for task progress');
     expect(target.description).toContain('project-specific facts and decisions');
     expect(target.description).toContain('this agent\'s reusable lessons');
     expect((tool.inputSchema as any).properties.old_text.description).toContain('must match exactly one entry');

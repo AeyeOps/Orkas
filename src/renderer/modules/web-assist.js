@@ -22,17 +22,14 @@
   let expandBtn = null;
   let expanded = false;
   const expandedInerted = new Set();
-  let downloadPromptEl = null;
-  let activeDownloadPrompt = null;
-  let downloadRevealKey = '';
-  const dismissedDownloadRequests = new Set();
+  let permissionPromptEl = null;
+  let activePermissionPrompt = null;
   let resizeObserver = null;
   let layoutFrame = 0;
   let nativeVisible = false;
   let nativeTabId = '';
-  let pagePreview = null;
-  let pagePreviewTabId = '';
-  let pagePreviewRequest = 0;
+  let layoutRevision = 0;
+  let overlaySubscription = null;
   let panelOpen = false;
   let panelTab = 'files';
   let activeView = typeof currentView === 'string' ? currentView : '';
@@ -40,6 +37,8 @@
   let contextEpoch = 0;
   let activityRequest = 0;
   let activityRefresh = null;
+  let activityMeasureFrame = 0;
+  let activityMeasuredWidth = 0;
   let currentState = null;
   let activationInFlight = '';
   let renderedTabId = '';
@@ -49,6 +48,9 @@
   // Reveal once per task turn. Subsequent operations must not undo the user's
   // decision to close Task Details or inspect Files/Attachments instead.
   const revealedTasks = new Set();
+  // Only actual browser work in this turn permits a reveal on task return.
+  // A retained control binding describes page authority, not current activity.
+  const browserActivityTasks = new Set();
 
   function label(key, fallback) {
     try {
@@ -128,6 +130,7 @@
       item.classList.toggle('is-active', tab.tab_id === selected?.tab_id);
       item.classList.toggle('is-loading', tab.loading === true);
       item.classList.toggle('is-suspended', tab.suspended === true);
+      item.classList.toggle('has-permission-request', !!tab.permission_request);
       item.setAttribute('aria-selected', tab.tab_id === selected?.tab_id ? 'true' : 'false');
       item.tabIndex = tab.tab_id === selected?.tab_id ? 0 : -1;
 
@@ -165,6 +168,7 @@
 
   function renderState(state) {
     if (state && typeof state === 'object') currentState = state;
+    window.OverlayManager.setBrowserOpen(currentState?.open === true, currentState?.overlay_epoch);
     if (!shell) return;
     renderTabs();
     refreshBrowserCount();
@@ -188,7 +192,9 @@
       || (tab?.suspended ? label('web_assist.suspended', 'Inactive — reloads when opened') : '')
       || (tab?.loading ? label('web_assist.loading', 'Loading…') : '')
       || assistantStatusText(tab);
-    renderDownloadPrompt();
+    const handback = shell.querySelector('[data-act="handback"]');
+    if (handback) { handback.hidden = !tab?.user_controlled; handback.textContent = label('web_assist.handback', 'Let AI continue'); }
+    renderPermissionPrompt();
     ensureMainActiveTab();
     syncVisibility();
   }
@@ -220,21 +226,21 @@
           <input class="web-assist-address-input" type="text" inputmode="search" autocomplete="off"
                  spellcheck="false">
         </form>
+        <button type="button" class="web-assist-icon-btn" data-act="permissions">${icon('settings')}</button>
         <button type="button" class="web-assist-icon-btn web-assist-external-btn" data-act="external">${icon('external')}</button>
       </div>
       <div class="web-assist-info">
+        <button type="button" class="btn btn-ghost btn-sm" data-act="handback" hidden></button>
         <div class="web-assist-status" role="status" aria-live="polite"></div>
       </div>
       <div class="web-assist-page">
-      <section class="web-assist-download-prompt" hidden role="dialog" aria-modal="false" aria-labelledby="web-assist-download-title">
-        <strong id="web-assist-download-title"></strong>
-        <div class="web-assist-download-origin"></div>
-        <div class="web-assist-download-filename"></div>
-        <p class="web-assist-download-description"></p>
-        <p class="web-assist-download-error" role="status" hidden></p>
+      <section class="web-assist-permission-prompt" hidden role="dialog" aria-modal="false" aria-labelledby="web-assist-permission-title">
+        <strong id="web-assist-permission-title"></strong>
+        <p class="web-assist-permission-message"></p>
+        <p class="web-assist-permission-error" role="status" hidden></p>
         <div class="web-assist-download-prompt-actions">
-          <button type="button" class="btn btn-ghost btn-sm" data-act="deny-download"></button>
-          <button type="button" class="btn btn-primary btn-sm" data-act="allow-download"></button>
+          <button type="button" class="btn btn-ghost btn-sm" data-act="deny-permission"></button>
+          <button type="button" class="btn btn-primary btn-sm" data-act="allow-permission"></button>
         </div>
       </section>
       <section id="web-assist-activity" class="web-assist-activity-popover" hidden aria-labelledby="web-assist-activity-title">
@@ -266,9 +272,9 @@
     activityListEl = shell.querySelector('.web-assist-trail-list');
     activityBtn = shell.querySelector('[data-act="activity"]');
     expandBtn = shell.querySelector('[data-act="expand"]');
-    downloadPromptEl = shell.querySelector('.web-assist-download-prompt');
-    downloadPromptEl.querySelector('[data-act="deny-download"]').addEventListener('click', dismissDownloadPrompt);
-    downloadPromptEl.querySelector('[data-act="allow-download"]').addEventListener('click', allowDownloadPrompt);
+    permissionPromptEl = shell.querySelector('.web-assist-permission-prompt');
+    permissionPromptEl.querySelector('[data-act="deny-permission"]').addEventListener('click', () => answerPermissionPrompt(false));
+    permissionPromptEl.querySelector('[data-act="allow-permission"]').addEventListener('click', () => answerPermissionPrompt(true));
     activityBtn.addEventListener('click', () => setActivityOpen(activityEl.hidden));
     expandBtn.addEventListener('click', () => setExpanded(!expanded));
     shell.querySelector('[data-act="close-activity"]').addEventListener('click', () => setActivityOpen(false, true));
@@ -277,6 +283,16 @@
     });
     document.addEventListener('keydown', (event) => {
       if (event.isComposing || event.keyCode === 229 || event.key !== 'Escape') return;
+      // An earlier floating-layer listener may already have removed its root.
+      // Its Escape must not also dismiss browser controls or leave full screen.
+      if (event.defaultPrevented) return;
+      const layer = window.OverlayManager.layerForEvent(event);
+      if (layer && layer !== permissionPromptEl && layer !== activityEl) return;
+      if (!permissionPromptEl.hidden && shell.contains(event.target) && !dialogIsOpen()) {
+        event.preventDefault();
+        void answerPermissionPrompt(false);
+        return;
+      }
       if (!activityEl.hidden) {
         event.preventDefault();
         setActivityOpen(false, true);
@@ -290,10 +306,20 @@
     });
 
     shell.querySelector('[data-act="add"]').addEventListener('click', addTab);
+    shell.querySelector('[data-act="handback"]').addEventListener('click', async () => {
+      const tab = selectedTab(); if (!tab) return;
+      try { await window.orkas.invoke('webAssist.handback', { tabId: tab.tab_id }); }
+      catch { log.warn('browser handback failed'); }
+    });
     backBtn.addEventListener('click', () => navigate('back'));
     forwardBtn.addEventListener('click', () => navigate('forward'));
     reloadBtn.addEventListener('click', () => navigate('reload'));
     externalBtn.addEventListener('click', openExternal);
+    shell.querySelector('[data-act="permissions"]').addEventListener('click', async () => {
+      const tab = selectedTab(); if (!tab) return;
+      try { await window.orkas.invoke('webAssist.resetPermissions', { tabId: tab.tab_id }); }
+      catch { log.warn('browser permission reset failed'); }
+    });
     shell.querySelector('.web-assist-address-form').addEventListener('submit', navigateToAddress);
     addressInput.addEventListener('input', () => { addressDirty = true; });
     const resetAddressDraft = () => {
@@ -331,101 +357,97 @@
     window.addEventListener('resize', scheduleLayout);
     window.addEventListener('i18n-change', refreshCopy);
     if (typeof ResizeObserver === 'function') {
-      resizeObserver = new ResizeObserver(scheduleLayout);
+      resizeObserver = new ResizeObserver(() => {
+        scheduleLayout();
+        if (activityListEl.clientWidth !== activityMeasuredWidth) scheduleActivityMeasurement();
+      });
       resizeObserver.observe(panel);
       resizeObserver.observe(host);
+      resizeObserver.observe(activityListEl);
     }
-    if (typeof MutationObserver === 'function') {
-      new MutationObserver(syncVisibility).observe(document.body, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['hidden', 'class', 'style'],
-      });
-    }
+    overlaySubscription?.();
+    overlaySubscription = window.OverlayManager.subscribe(() => {
+      syncVisibility();
+      revealCurrentTask();
+    });
     refreshCopy();
     renderState(currentState);
     return shell;
   }
 
-  function refreshCopy() {
+  function refreshCopy(event) {
     if (!shell) return;
     setButtonCopy(backBtn, 'web_assist.back', 'Back');
     setButtonCopy(forwardBtn, 'web_assist.forward', 'Forward');
     setButtonCopy(reloadBtn, 'web_assist.reload', 'Reload');
     setButtonCopy(externalBtn, 'web_assist.open_external', 'Open in default browser');
+    shell.querySelector('[data-act="handback"]').textContent = label('web_assist.handback', 'Let AI continue');
+    setButtonCopy(shell.querySelector('[data-act="permissions"]'), 'web_assist.permissions', 'Reset site permissions');
     setButtonCopy(shell.querySelector('[data-act="add"]'), 'web_assist.add_tab', 'New tab');
     addressInput.placeholder = label('web_assist.address_placeholder', 'Search Bing or enter a URL');
     addressInput.setAttribute('aria-label', addressInput.placeholder);
     shell.querySelector('.web-assist-empty-title').textContent = label('web_assist.empty_title', 'Browse in this task');
     shell.querySelector('.web-assist-empty-hint').textContent = label('web_assist.empty_hint', 'Search Bing or enter a URL above.');
-    downloadPromptEl.querySelector('#web-assist-download-title').textContent = label('web_assist.download_prompt_title', 'Allow downloads from this site?');
-    downloadPromptEl.querySelector('.web-assist-download-description').textContent = label('web_assist.download_prompt_description', 'Files will be saved to this task’s attachments. After allowing, return to the page and retry the download.');
-    downloadPromptEl.querySelector('[data-act="deny-download"]').textContent = label('web_assist.download_not_now', 'Not now');
-    downloadPromptEl.querySelector('[data-act="allow-download"]').textContent = label('web_assist.download_allow', 'Allow this site');
+    permissionPromptEl.querySelector('#web-assist-permission-title').textContent = label('web_assist.permission_title', 'Website permission');
+    permissionPromptEl.querySelector('[data-act="deny-permission"]').textContent = label('web_assist.permission_deny', 'Deny');
+    permissionPromptEl.querySelector('[data-act="allow-permission"]').textContent = label('web_assist.permission_allow', 'Allow');
     activityBtn.querySelector('span').textContent = label('web_assist.activity', 'Activity');
     shell.querySelector('#web-assist-activity-title').textContent = label('web_assist.activity', 'Activity');
     setButtonCopy(shell.querySelector('[data-act="close-activity"]'), 'web_assist.activity_close', 'Close activity');
     refreshExpandCopy();
     if (!activityEl.hidden) renderActivity();
     renderState(currentState);
+    if (event?.type === 'i18n-change' && activePermissionPrompt) {
+      const epoch = contextEpoch;
+      window.orkas.invoke('webAssist.state', {}).then(result => {
+        if (epoch === contextEpoch && result?.state) renderState(result.state);
+      }).catch(() => { log.warn('browser permission translation refresh failed'); });
+    }
   }
 
   // Requests are delivered with trusted renderer state, so background tasks
   // retain their own prompt without polling ledgers on every page update.
-  function renderDownloadPrompt() {
-    if (!downloadPromptEl) return;
-    const live = new Set((currentState?.tabs || []).map(tab => tab.download_request?.id).filter(Boolean));
-    for (const id of dismissedDownloadRequests) if (!live.has(id)) dismissedDownloadRequests.delete(id);
-    const pending = activeView === 'conversation'
-      ? tabsForConversation().find(item => item.download_request && !dismissedDownloadRequests.has(item.download_request.id))?.download_request : null;
-    if (pending) {
-      const revealKey = `${contextEpoch}:${pending.id}`;
-      if (downloadRevealKey !== revealKey) {
-        downloadRevealKey = revealKey;
-        if (!(panelOpen && panelTab === 'browser') && !window.ConversationInfo?.openAndSetTab('browser', activeCid)) downloadRevealKey = '';
-      }
-    }
-    const request = panelOpen && panelTab === 'browser' ? pending : null;
-    downloadPromptEl.hidden = !request;
+  function renderPermissionPrompt() {
+    if (!permissionPromptEl) return;
+    const tab = selectedTab();
+    const request = activeView === 'conversation' && panelOpen && panelTab === 'browser'
+      && currentState?.active_tab_id === tab?.tab_id ? tab?.permission_request : null;
+    permissionPromptEl.hidden = !request;
     if (activityBtn) activityBtn.disabled = !!request;
-    if (!request) { activeDownloadPrompt = null; return; }
-    if (activeDownloadPrompt?.id === request.id && activeDownloadPrompt.epoch === contextEpoch) return;
-    activeDownloadPrompt = { ...request, cid: activeCid, epoch: contextEpoch };
-    downloadPromptEl.querySelector('.web-assist-download-origin').textContent = request.origin;
-    downloadPromptEl.querySelector('.web-assist-download-filename').textContent = request.filename;
-    downloadPromptEl.querySelector('.web-assist-download-error').hidden = true;
-    downloadPromptEl.querySelectorAll('button').forEach(button => { button.disabled = false; });
+    if (!request) { activePermissionPrompt = null; return; }
+    permissionPromptEl.querySelector('.web-assist-permission-message').textContent = request.message;
+    if (activePermissionPrompt?.id === request.id && activePermissionPrompt.epoch === contextEpoch) return;
+    activePermissionPrompt = { ...request, tabId: tab.tab_id, epoch: contextEpoch };
+    permissionPromptEl.querySelector('.web-assist-permission-error').hidden = true;
+    permissionPromptEl.querySelectorAll('button').forEach(button => { button.disabled = false; });
     setActivityOpen(false);
+    // Denial owns the default keyboard focus, and no background tab opens UI.
+    permissionPromptEl.querySelector('[data-act="deny-permission"]').focus();
   }
 
-  function dismissDownloadPrompt() {
-    if (!activeDownloadPrompt) return;
-    dismissedDownloadRequests.add(activeDownloadPrompt.id);
-    renderDownloadPrompt();
-    syncVisibility();
-  }
-
-  async function allowDownloadPrompt() {
-    const request = activeDownloadPrompt;
-    const button = downloadPromptEl.querySelector('[data-act="allow-download"]');
-    if (!request || button.disabled || downloadPromptEl.hidden) return;
-    downloadPromptEl.querySelectorAll('button').forEach(item => { item.disabled = true; });
-    const isCurrent = () => activeDownloadPrompt?.id === request.id && contextEpoch === request.epoch && activeCid === request.cid;
+  async function answerPermissionPrompt(allowed) {
+    const request = activePermissionPrompt;
+    if (!request || permissionPromptEl.hidden
+      || permissionPromptEl.querySelector('[data-act="deny-permission"]').disabled) return;
+    const isCurrent = () => activePermissionPrompt?.id === request.id && contextEpoch === request.epoch
+      && selectedTab()?.tab_id === request.tabId && selectedTab()?.permission_request?.id === request.id;
+    if (!isCurrent()) return;
+    permissionPromptEl.querySelectorAll('button').forEach(button => { button.disabled = true; });
     try {
-      const result = await window.orkas.invoke('webAssist.allowDownloadOrigin', { conversation_id: request.cid, origin: request.origin });
+      const result = await window.orkas.invoke('webAssist.permissionResponse', {
+        tabId: request.tabId, requestId: request.id, allowed,
+      });
       if (!isCurrent()) return;
-      if (!result?.ok) throw new Error('download permission failed');
-      dismissedDownloadRequests.add(request.id);
-      renderDownloadPrompt();
-      syncVisibility();
+      if (!result?.handled) throw new Error('permission response failed');
+      delete selectedTab().permission_request;
+      renderState(currentState);
     } catch (_) {
       if (!isCurrent()) return;
-      const error = downloadPromptEl.querySelector('.web-assist-download-error');
-      error.textContent = label('web_assist.download_permission_failed', 'Could not allow this site. Try again.');
+      const error = permissionPromptEl.querySelector('.web-assist-permission-error');
+      error.textContent = label('web_assist.permission_failed', 'Could not save your choice. Try again.');
       error.hidden = false;
     } finally {
-      if (isCurrent()) downloadPromptEl.querySelectorAll('button').forEach(item => { item.disabled = false; });
+      if (isCurrent()) permissionPromptEl.querySelectorAll('button').forEach(button => { button.disabled = false; });
     }
   }
 
@@ -442,6 +464,30 @@
       if (restoreFocus) activityBtn.focus();
     }
     syncVisibility();
+  }
+
+  function scheduleActivityMeasurement() {
+    if (!activityEl || activityEl.hidden || activityMeasureFrame) return;
+    activityMeasureFrame = window.requestAnimationFrame(() => {
+      activityMeasureFrame = 0;
+      measureActivityGroups();
+    });
+  }
+
+  function measureActivityGroups() {
+    if (!activityListEl || activityEl.hidden) return;
+    const groups = Array.from(activityListEl.querySelectorAll('.web-assist-trail-group'));
+    // Measure natural heights once per render/width change, before allowing
+    // Chromium to skip offscreen contents. Guessed heights move the scrollbar
+    // when long URLs or download controls enter the viewport. Batch writes and
+    // reads so this does not force a separate layout for every group.
+    groups.forEach(group => group.classList.remove('is-contained'));
+    const heights = groups.map(group => group.getBoundingClientRect().height);
+    groups.forEach((group, index) => {
+      group.style.setProperty('--activity-group-height', `${heights[index]}px`);
+      group.classList.add('is-contained');
+    });
+    activityMeasuredWidth = activityListEl.clientWidth;
   }
 
   // Collapse bursts into one read and at most one trailing read per in-flight
@@ -488,7 +534,6 @@
     activityListEl.textContent = '';
     const navigation = results[0]?.status === 'fulfilled' ? results[0].value : null;
     const downloads = results[1]?.status === 'fulfilled' ? results[1].value : null;
-    const allowed = Array.isArray(downloads?.allowed_origins) ? downloads.allowed_origins : [];
     const entries = [
       ...(navigation?.navigations || []).map(entry => ({ ...entry, kind: 'navigation' })),
       ...(downloads?.downloads || []).map(entry => ({ ...entry, kind: 'download' })),
@@ -504,12 +549,17 @@
       empty.textContent = label('web_assist.activity_empty', 'No visits or downloads in this task yet.');
       activityListEl.appendChild(empty);
     }
-    const reasonCopy = {
-      needs_origin_grant: () => label('web_assist.download_needs_grant', 'needs permission'),
-      blocked_type: () => label('web_assist.download_blocked_type', 'file type not allowed'),
-      task_budget: () => label('web_assist.download_budget', 'task download limit reached'),
-    };
-    for (const entry of entries) {
+    let rowContainer = activityListEl;
+    for (const [index, entry] of entries.entries()) {
+      // Contain small batches rather than individual rows: scrolling then
+      // skips most paint work without relaying out hundreds of auto containers.
+      // Keep every record and its controls in the DOM for find and keyboard use.
+      if (entries.length > 40 && index % 20 === 0) {
+        rowContainer = document.createElement('div');
+        rowContainer.className = 'web-assist-trail-group';
+        rowContainer.setAttribute('role', 'presentation');
+        activityListEl.appendChild(rowContainer);
+      }
       const download = entry.kind === 'download';
       const row = document.createElement('li');
       row.className = 'web-assist-trail-row';
@@ -532,7 +582,7 @@
         state.className = 'web-assist-activity-badge';
         state.textContent = entry.state === 'downloading' ? label('web_assist.loading', 'Loading…') : entry.state === 'saved'
           ? label('web_assist.download_saved', 'saved to attachments')
-          : (reasonCopy[entry.reason] || (() => label('web_assist.download_failed', 'failed')))();
+          : label('web_assist.download_failed', 'failed');
         row.appendChild(state);
       }
       if (download && entry.state === 'saved') {
@@ -581,24 +631,9 @@
         }
         row.appendChild(actions);
       }
-      if (download && entry.state === 'refused' && entry.reason === 'needs_origin_grant' && !allowed.includes(entry.origin)) {
-        const allow = document.createElement('button');
-        allow.type = 'button';
-        allow.className = 'web-assist-download-allow';
-        allow.textContent = label('web_assist.download_allow', 'Allow this site');
-        allow.title = entry.origin;
-        allow.addEventListener('click', async () => {
-          if (epoch !== contextEpoch || cid !== activeCid || activeView !== 'conversation' || activityEl.hidden || request !== activityRequest) return;
-          allow.disabled = true;
-          try {
-            await window.orkas.invoke('webAssist.allowDownloadOrigin', { conversation_id: cid, origin: entry.origin });
-          } catch (_) { /* The unchanged row allows retry when the record is reopened. */ }
-          if (epoch === contextEpoch) renderActivity();
-        });
-        row.appendChild(allow);
-      }
-      activityListEl.appendChild(row);
+      rowContainer.appendChild(row);
     }
+    measureActivityGroups();
     activityListEl.scrollTop = scrollTop;
   }
 
@@ -620,59 +655,19 @@
   }
 
   function dialogIsOpen() {
-    return Array.from(document.querySelectorAll('.modal-overlay, [aria-modal="true"]'))
-      .some((overlay) => !overlay.hidden && overlay.getClientRects().length > 0);
+    return window.OverlayManager.hasModalLayers();
   }
 
   function modalIsOpen() {
-    const browserRect = host?.getBoundingClientRect();
-    if (!browserRect || browserRect.width <= 0 || browserRect.height <= 0) return false;
-    return Array.from(document.querySelectorAll('.panel.resource-detail-overlay, .modal-overlay, [aria-modal="true"], .chat-file-viewer.is-open, .web-assist-activity-popover, .web-assist-download-prompt'))
-      .some((overlay) => !overlay.hidden && Array.from(overlay.getClientRects()).some((rect) => (
-        rect.width > 0 && rect.height > 0
-        && rect.left < browserRect.right && rect.right > browserRect.left
-        && rect.top < browserRect.bottom && rect.bottom > browserRect.top
-      )));
+    return window.OverlayManager.hasOpenLayers();
   }
 
-  function clearPagePreview() {
-    pagePreviewRequest += 1;
-    pagePreview?.remove();
-    pagePreview = null;
-    pagePreviewTabId = '';
-  }
-
-  async function hideNativeView(previewTabId) {
-    // Native views paint above DOM overlays. Keep their last frame behind the
-    // controls while hidden, then discard it once the live view is restored.
-    clearPagePreview();
-    const request = pagePreviewRequest;
-    const epoch = contextEpoch;
-    pagePreviewTabId = previewTabId || '';
-    const current = () => request === pagePreviewRequest && epoch === contextEpoch && !nativeVisible;
+  async function hideNativeView() {
     try {
-      if (previewTabId) {
-        const result = await window.orkas.invoke('webAssist.capturePreview', { tabId: previewTabId });
-        if (!current()) return;
-        if (result?.preview) {
-          const image = new Image();
-          image.className = 'web-assist-page-preview';
-          image.alt = '';
-          image.setAttribute('aria-hidden', 'true');
-          image.src = result.preview;
-          await image.decode();
-          if (!current()) return;
-          pagePreview = image;
-          host.appendChild(image);
-        }
-      }
-    } catch {
-      log.warn('browser preview unavailable');
-    }
-    // Closing or switching tasks during capture must not hide the new page.
-    if (!current()) return;
-    try { await window.orkas.invoke('webAssist.layout', { visible: false }); }
-    catch { log.warn('native view hide failed'); }
+      await window.orkas.invoke('webAssist.layout', {
+        visible: false, overlayRevision: window.OverlayManager.version(), overlayEpoch: window.OverlayManager.epoch(),
+      });
+    } catch { log.warn('native view hide failed'); }
   }
 
   function syncVisibility() {
@@ -681,44 +676,37 @@
     const shown = panelOpen && panelTab === 'browser' && activeView === 'conversation' && !!activeCid;
     if (shown && tab?.suspended && !tab.error_code) ensureMainActiveTab();
     if (shell.hidden !== !shown) shell.hidden = !shown;
-    if (pagePreviewTabId && (!shown || pagePreviewTabId !== tab?.tab_id)) clearPagePreview();
-    const localOverlay = (activityEl && !activityEl.hidden) || (downloadPromptEl && !downloadPromptEl.hidden);
-    const ready = shown
-      && !tab?.suspended
-      && !!tab?.display_url
+    const ready = shown && !tab?.suspended && !!tab?.display_url
       && currentState?.active_tab_id === tab.tab_id;
     const next = ready && !modalIsOpen();
-    const nextTabId = ready && (next || localOverlay) ? tab.tab_id : '';
+    const nextTabId = ready ? tab.tab_id : '';
     if (nativeVisible === next && nativeTabId === nextTabId) return;
-    pagePreviewRequest += 1;
+    layoutRevision += 1;
     nativeVisible = next;
     nativeTabId = nextTabId;
     if (next) scheduleLayout();
-    else if (currentState?.open) {
-      void hideNativeView(ready && localOverlay ? tab.tab_id : '');
-    }
+    // Occlusion is presentation only. Main retains the page's logical
+    // selection, activity and viewport while its pixels are suppressed.
+    else if (!ready && currentState?.open) void hideNativeView();
   }
 
   function scheduleLayout() {
     if (!nativeVisible || !host || host.hidden || layoutFrame) return;
-    layoutFrame = window.requestAnimationFrame(() => {
+    layoutFrame = window.requestAnimationFrame(async () => {
       layoutFrame = 0;
-      if (!nativeVisible || !host || host.hidden) return;
+      const request = layoutRevision;
+      if (!await window.OverlayManager.settled() || request !== layoutRevision
+        || !nativeVisible || !host || host.hidden) return;
       const rect = host.getBoundingClientRect();
       if (rect.width < 80 || rect.height < 80) return;
-      const request = pagePreviewRequest;
       window.orkas.invoke('webAssist.layout', {
-        x: Math.round(rect.left),
-        y: Math.round(rect.top),
-        width: Math.round(rect.width),
-        height: Math.round(rect.height),
+        x: Math.round(rect.left), y: Math.round(rect.top),
+        width: Math.round(rect.width), height: Math.round(rect.height),
+        overlayRevision: window.OverlayManager.version(), overlayEpoch: window.OverlayManager.epoch(),
       }).then((result) => {
-        if (request !== pagePreviewRequest || !nativeVisible) return;
-        if (result?.ok) clearPagePreview();
+        if (request !== layoutRevision || !nativeVisible) return;
         if (result?.ok && result.state) renderState(result.state);
-      }).catch((error) => {
-        log.warn('native view layout failed', { error: (error && error.message) || String(error) });
-      });
+      }).catch(() => { log.warn('native view layout failed'); });
     });
   }
 
@@ -913,23 +901,33 @@
 
   function revealCurrentTask() {
     if (activeView !== 'conversation' || !activeCid || revealedTasks.has(activeCid)) return;
+    if (!browserActivityTasks.has(activeCid)) return;
     if (!tabsForConversation().some(tab => tab.assistant_controlled)) return;
+    if (panelOpen && panelTab === 'browser') { revealedTasks.add(activeCid); return; }
+    if (window.OverlayManager.hasOpenLayers()) return;
     if (window.ConversationInfo?.openAndSetTab('browser', activeCid)) revealedTasks.add(activeCid);
   }
 
-  function showFromMain(state) {
-    ensureShell();
-    currentState = state;
-    rememberMainActiveTab(state);
-    const ownerCid = String(state?.conversation_id || '');
-    renderState(state);
-    if (activeView === 'conversation' && activeCid === ownerCid && !revealedTasks.has(ownerCid)) {
-      if (window.ConversationInfo?.openAndSetTab('browser', ownerCid)) revealedTasks.add(ownerCid);
+  function showFromMain(state, activityCid) {
+    const ownerCid = String(activityCid || (state?.assistant_action ? state.conversation_id : '') || '');
+    if (ownerCid) browserActivityTasks.add(ownerCid);
+    // Background opens/reads carry only their task ID. They must not rebuild
+    // browser chrome or replace the foreground task's live selection.
+    if (Array.isArray(state?.tabs)) {
+      ensureShell();
+      currentState = state;
+      rememberMainActiveTab(state);
+      for (const tab of state.tabs) {
+        if (tab?.assistant_action && tab.conversation_id) browserActivityTasks.add(tab.conversation_id);
+      }
+      renderState(state);
     }
+    revealCurrentTask();
   }
 
   function beginTaskTurn(cid) {
     revealedTasks.delete(cid);
+    browserActivityTasks.delete(cid);
   }
 
   function updateContext(view, cid) {
@@ -939,7 +937,7 @@
     activeView = nextView;
     activeCid = nextCid;
     contextEpoch += 1;
-    clearPagePreview();
+    layoutRevision += 1;
     setActivityOpen(false);
     setExpanded(false);
     if (activityListEl) activityListEl.textContent = '';
@@ -988,14 +986,22 @@
 
   window.orkas.onPushEvent('web-assist:activity', refreshActivity);
   window.orkas.onPushEvent('web-assist:state', (state) => {
-    if (state?.assistant_action) {
+    if (state?.assistant_action || state?.tabs?.some(tab => tab?.assistant_action)) {
       showFromMain(state);
-      return;
+    } else {
+      rememberMainActiveTab(state);
+      renderState(state);
     }
-    rememberMainActiveTab(state);
-    renderState(state);
+    const closedCid = state?.model_closed_conversation_id;
+    if (closedCid && Array.isArray(state.tabs)
+        && !state.tabs.some(tab => tab?.conversation_id === closedCid)) {
+      // Automatic dismissal is not a manual opt-out from subsequent browsing.
+      browserActivityTasks.delete(closedCid);
+      if (window.ConversationInfo?.closeBrowserForTask(closedCid)) revealedTasks.delete(closedCid);
+    }
   });
-  window.orkas.onPushEvent('web-assist:show', (state) => showFromMain(state));
+  window.orkas.onPushEvent('web-assist:show', (state) => showFromMain(state,
+    String(state?.browser_activity_conversation_id || state?.conversation_id || '')));
   window.WebAssist = {
     openForModel,
     close,

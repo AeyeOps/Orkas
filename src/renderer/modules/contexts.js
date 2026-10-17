@@ -56,8 +56,9 @@ function _renderCtxScopeSelector(projects) {
   if (!host || typeof _aiSelectMount !== 'function') return;
   const options = [
     { value: '', label: t('contexts.global'), iconName: 'folder' },
-    ...(projects || []).slice().sort((a, b) => a.name.localeCompare(b.name)).map((project) => ({
-      value: project.project_id, label: project.name, iconName: 'folder',
+    ...(projects || []).slice().sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), undefined, { numeric: true, sensitivity: 'base' })).map((project) => ({
+      value: project.project_id, label: project.name,
+      iconName: typeof projectIconName === 'function' ? projectIconName(project) : 'folder',
     })),
   ];
   if (_ctxScopeSelector) {

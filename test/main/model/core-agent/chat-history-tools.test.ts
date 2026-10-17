@@ -467,6 +467,21 @@ describe('chat-history-tools › chat_history(search)', () => {
 });
 
 describe('chat-history-tools › chat_history(read)', () => {
+  it('uses mode defaults for out-of-range page counts without changing the requested anchor', async () => {
+    writeConversation('default-count', 'Count defaults', Array.from({ length: 40 }, (_, i) => ({
+      id: `m${i}`, ts: new Date(Date.UTC(2026, 0, 1, 0, i)).toISOString(), from: 'user', text: `entry-${i}`,
+    })));
+    const [, read] = await createChatHistoryActions({ userId: TEST_UID, currentCid: 'default-count', currentMessageId: 'm39', allowedScopes: ['current'] });
+    for (const page of [{ mode: 'latest' }, { mode: 'around', index: 20 }, { mode: 'before', index: 20 }, { mode: 'from', index: 20 }]) {
+      const expected = await read.execute({ scope: 'current', page }, ctxFor());
+      expect(expected.isError, `${JSON.stringify(page)}: ${expected.content}`).toBeFalsy();
+      for (const count of (page.mode === 'from' ? [-1] : [-1, 100])) {
+        const result = await read.execute({ scope: 'current', page: { ...page, count } }, ctxFor());
+        expect(result.isError).toBeFalsy();
+        expect(result.content).toBe(expected.content);
+      }
+    }
+  });
   it('advertises one tagged page object instead of conflicting flat paging fields', async () => {
     const [, chatRead] = await createChatHistoryActions({ userId: TEST_UID, projectId: 'project-a' });
     const schema = chatRead.inputSchema as any;

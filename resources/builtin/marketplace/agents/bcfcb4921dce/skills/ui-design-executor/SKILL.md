@@ -75,12 +75,13 @@ If a specialist is loaded, keep this executor as the coordinator instead of recu
 For a fast-path task, normally stay within six model/tool loops and eight tool calls after the needed skills are loaded. This is a coordination target, not permission to skip required evidence.
 
 - Skip a formal execution plan for one clear screen/component or a bounded local edit. Use an internal compact brief instead.
-- Inspect the source/target once. Batch independent reads when several small files are required.
+- Inspect the source/target once. Batch independent reads when several small files are required. In a later turn, re-read the repo component, copy, and styles when the user refers to the live product ("same as now", "跟现在一样", "the current title") or the change touches an element copied from it; the live product, not the artifact, decides that element.
 - Write the main entry once. Do not repeatedly re-read a newly written full HTML file unless a write was truncated, a validator points to a location, or a later edit requires a narrow range.
+- A follow-up that changes structure, grouping, or hierarchy rewrites the affected region's markup and its style block together: delete rules and classes that no longer match, and never stack override blocks at the end of a stylesheet. Keep artifact HTML and CSS readable, not minified, so later revisions can patch them.
 - Run one grouped deterministic validation command instead of many exploratory shell checks.
 - Create `DESIGN.md` only for multi-screen work, reusable systems, brand/identity work, formal handoff, or an explicit user request. A simple standalone screen normally needs only its entry and `artifact.json`.
 - Do not create optional state galleries, documentation, assets, or dependencies that the brief does not need.
-- If the budget must be exceeded, continue only for a concrete blocker, failed validation, source ambiguity, or requested complexity; consolidate the remaining work rather than repeating broad inspection.
+- If the budget must be exceeded, continue only for a concrete blocker, failed validation, a visual-review issue, source ambiguity, or requested complexity; consolidate the remaining work rather than repeating broad inspection.
 
 ## Compact Design Brief
 
@@ -93,9 +94,13 @@ Before editing, resolve these facts internally:
 - Whether the user authorized repo source changes. If not, the deliverable is artifact plus change proposal.
 - Output format and canonical target.
 - Keep/change boundaries and responsive constraint.
-- Visual thesis: hierarchy/layout, density, two precise tone words, role-based palette/type, one subject-specific signature, and one generic choice rejected.
+- When the user says an existing screen looks wrong, a diagnosis: at most three concrete causes read from their screenshot or the source rendering, each naming the element, the problem, and the evidence ("rows fill a third of a 1,400px card"), not restated CSS values. Every change answers one cause; the final review checks each.
+- The content that sizes the layout, verified in source rather than guessed from the screenshot: real text lengths and where they are truncated, and the fields each repeated row or card already carries.
+- Visual thesis: hierarchy/layout, density, two precise tone words, role-based palette/type, one subject-specific signature (for an existing product, its established signature rather than a new device), and one generic choice rejected.
 
 For a screenshot or existing screen, preserve its information architecture and visible content unless the user requests a structural redesign. Do not invent dashboards, tables, charts, metrics, sidebars, or operational data that the source and brief do not support.
+
+A redesign of an existing product screen changes only the layers the user asked to change. Reworking layout, grouping, or flow does not license a new visual language: unless the user asks to restyle, the shell, tokens, type, spacing, components, and icons stay existing-product authority and go through the Existing-Product Extension Gate below. Only the regions whose structure changes get new composition, built from the product's nearest existing components. When the user asks to redesign the layout, the layout layer is in scope: container widths and line length, grouping, density, and where existing controls sit (for example a tab's actions moving into its tab row) may change, while the controls, copy, data, and behavior stay. Removing borders alone is not a layout redesign when the diagnosis names a structural cause.
 
 ## Existing-Product Extension Gate
 
@@ -111,12 +116,12 @@ When current product UI is in scope, or multiple sources could control the same 
 
 Missing fields are a pre-authoring blocker: inspect or resolve them before building rather than styling from a token sample. This is targeted coverage, not permission to read the whole repository. A truncated read that never reaches the relevant component, or an artifact-only preview with no source comparison, cannot satisfy the missing evidence.
 
-For `existing-product-extension`, reconstruct the existing product before extending it:
+For `existing-product-extension`, and for every layer an `intentional-redesign` keeps, reconstruct the existing product before extending it:
 
 1. Locate the target route/page entry and follow its presentation imports through layout wrappers, components, styles, icons, and local assets. The source project does not need to build or run.
 2. For standalone HTML, directly reuse portable HTML/CSS and structurally translate JSX/TSX, Vue, Svelte, templates, or declarative native UI. Preserve component/DOM hierarchy, element order, visible copy, class/role identity, exact layout/style values, icons, and assets.
 3. Replace only framework wiring, stores, APIs, and business-runtime dependencies with representative static data or minimal local interactions. Reconstruct the unchanged baseline before inserting the requested capability at its source-supported location.
-4. Express the new region with the nearest mapped existing components and styles. Use another reference only for its assigned authority; do not import that reference's unrelated shell, brand, or visual system.
+4. Translate the nearest mapped existing components first into reusable HTML fragments, copying portable markup, CSS, icons, and assets directly from the inspected source. Compose the new region around those fragments; change only the authorized layout or behavior instead of recreating a component inside its new container. Use another reference only for its assigned authority; do not import that reference's unrelated shell, brand, or visual system.
 
 A verified code-to-HTML mapping supports a source-structural fidelity claim even when the current surface cannot be rendered. Reserve pixel-exact or visual-match claims for fresh source/result rendering; do not block code-first reconstruction merely because the original project cannot launch.
 
@@ -131,9 +136,9 @@ A verified code-to-HTML mapping supports a source-structural fidelity claim even
 - Keep controls semantic and keyboard reachable; provide visible focus and accessible names. Implement the expected keyboard model for composite controls such as tabs.
 - Define responsive behavior for navigation, primary action, dense data, long localized text, and narrow targets. If 320px or no horizontal scroll is explicit, recompose rather than relying on horizontal scrolling.
 
-Implement only states the workflow can reach, but implement those states in real DOM/component branches:
+Implement only states the workflow can reach and the user, the brief, or the existing product calls for, but implement those states in real DOM/component branches:
 
-- Data fetching/transformation: populated, loading, empty, error, and partial/stale when the surface actually fetches or transforms data.
+- Data surfaces: populated and empty by default. Add loading, error, or partial/stale only when the user asks for them, the existing product already shows them, or the brief is about latency or failure; do not add a demo state switcher just to display states nobody asked for.
 - Forms: pristine, dirty/touched invalid, submitted-pending, recoverable error, and success when the task includes a real form workflow.
 - Explicit success/failure requests: distinct named triggers, rendered feedback, and recovery; an unreachable conditional or prose list does not count.
 - Static navigation or presentation screens do not need artificial data-fetch states merely to satisfy a checklist.
@@ -141,6 +146,7 @@ Implement only states the workflow can reach, but implement those states in real
 For interactive standalone HTML:
 
 - Keep meaningful primary content in static HTML before scripts run.
+- Add a control only when the user or the existing product calls for it. Do not invent buttons, chips, links, or prefill shortcuts to illustrate guidance copy; when the right interaction is uncertain, say it in copy or a design note instead.
 - Treat every visible enabled button, standalone search field, and standalone filter as a behavior promise: bind it to the primary workflow or remove/disable it. When an error preview is reachable, include a bound retry, reload, refresh, or recovery control; explanatory copy alone is not recovery.
 - Use `addEventListener`, delegation, or data-action hooks; do not nest inline handlers inside generated HTML strings.
 - Keep cached element references immutable. Build complex state in a fragment/detached container and commit once.
@@ -163,6 +169,20 @@ if (document.readyState === "loading") {
 }
 ```
 
+## Visual Craft Baseline
+
+Build to these rules, then use them as the checklist for the final visual review:
+
+- **Scale from the product.** Take font sizes, weights, line heights, spacing, radius, and colors from the existing product's CSS and tokens; for greenfield work, declare one small scale first. Repeated values are custom properties, and a revision reuses them instead of adding one-off values.
+- **Few tiers.** Use only the scale's sizes; `html_preview` warns above eight sizes on one screen. Spacing comes from one 4/8-based scale. A new size or color needs a role no existing one covers.
+- **Structure follows function.** Content the user treats as parallel (alternative paths, peer groups, sibling cards) uses the same component, heading level, size, weight, width, and alignment. Make one item more prominent only when the brief ranks it higher.
+- **Space fits content.** A container is as wide as its content needs. Short rows in a wide pane get a narrower column, or fill the row with fields the source already carries (time, status), not invented ones; a repeated row whose content covers under half its width is a finding. Dividers and borders do not stretch across empty space.
+- **One primary per view.** One dominant heading and one primary action; secondary actions are visibly quieter.
+- **Balanced grids.** Repeated items fill rows evenly: pick a column count that fits the count (6 items → 3×2; 9 → 3×3, not 5+4), and peers in a row share width and height.
+- **Alignment and rhythm.** Items in a column share one left edge; related items sit closer than unrelated groups; equal groups get equal gaps.
+- **CJK text.** Chinese, Japanese, and Korean copy keeps body line height around 1.5–1.8, no letter-spacing on CJK glyphs, the product font stack, and a readable line length.
+- **Live-product consistency.** Unchanged elements match the product's markup and styles; a changed element starts from the nearest existing component, and a decision the user tied to the live product follows the live product. Prototype convenience does not swap product controls (a native `select` for a custom chip, letter avatars for product icons) or change real names, labels, values, or copy taken from the source.
+
 ## Fast Gate
 
 For a standalone HTML artifact, run the bundled validator when Node and shell execution are available:
@@ -184,7 +204,7 @@ An expectation failure is a focused same-turn repair signal, not a new approval 
 
 It checks strict `artifact.json`, entry/file inventory, safe relative paths, critical HTML structure, meaningful static content, inline JavaScript syntax, fragile generated inline handlers, guarded initialization when an initializer exists (`runtime-guarded-init`), custom field-error linkage (`form-error-accessibility`), and local references in one call. Field-error ownership is deterministic only when a control references the exact error ID with `aria-describedby`, or when an error in the same form uses the exact conventional ID `<control-id>-error` or `<control-id>-invalid`. A deterministically mapped error requires both the exact link and `aria-invalid`. A control may describe only its own errors and shared form-level containers; referencing another field's or another form's error is a hard failure, because a screen reader reads every referenced ID aloud. Missing or duplicate referenced error targets and semantic errors that cannot be mapped deterministically are review warnings, not guessed hard failures. It does not infer control wiring, recovery behavior, or business correctness from source patterns. Fix every reported error. Treat warnings as review prompts, not automatic failures.
 
-For a standalone build or in-place revision, validate before finalizing; for a revision, first read the baseline and patch the existing entry. Only after the validator passes, run `html_preview` with `interactions:false` and `screenshots:true` for the final visual review. This preserves runtime, resource, layout, keyboard-focus, and screenshot evidence without clicking controls or submitting forms. Use `target:"responsive"` only when the user explicitly requests responsive, multi-device, or narrow-screen behavior. Otherwise omit target for desktop, or use `target:"mobile"` for an explicitly mobile artifact. A failed preview returns deterministic diagnostics without model-visible screenshots: repair those findings and rerun instead of requesting image analysis. A passing final preview attaches lossless screenshot evidence; inspect it for hierarchy, typography, density, color, reference fidelity, the requested visual change or state, non-blank first render, requested viewport behavior, and local asset/reference resolution. For source-constrained work, candidate preview verifies the translated result: check code-backed structure against the code-to-HTML mapping and, when source rendering is available, additionally compare it at matching state/viewport/theme/locale before making visual-match claims. Keep a new artifact at its initial revision 1; for a follow-up, move baseline N exactly once to N+1 after this review. Then run the final package check and publish. Report these as UI rendering and visual-review evidence, not proof that authentication, persistence, network, or other business behavior works. A validator-only run is not rendered evidence.
+For a standalone build or in-place revision, validate before finalizing; for a revision, first read the baseline and patch the existing entry. Only after the validator passes, run `html_preview` with `interactions:false` and `screenshots:true` for the final visual review. This preserves runtime, resource, layout, keyboard-focus, and screenshot evidence without clicking controls or submitting forms. Use `target:"responsive"` only when the user explicitly requests responsive, multi-device, or narrow-screen behavior. Otherwise omit target for desktop, or use `target:"mobile"` for an explicitly mobile artifact. A failed preview returns deterministic diagnostics without model-visible screenshots: repair those findings and rerun instead of requesting image analysis. A passing final preview attaches lossless screenshot evidence plus a `design` audit (font sizes, hard-coded colors, text overlaps, low-contrast text) whose findings arrive as warnings. Review the screenshot side by side with the user's screenshot or the source rendering when one exists, not on its own, and write the result down: each baseline item is either `ok` with what was compared, or names the element, the problem, and the fix; each diagnosed cause is marked resolved or not. Then list up to three weakest remaining points, each marked `fix now` or `keep` with a reason. `keep` is a valid outcome and the list may be empty; never invent a problem to fill it. Also check reference fidelity, the requested visual change or state, non-blank first render, requested viewport behavior, and local asset/reference resolution. Fix every design warning or state why it stays, for example a value copied verbatim from the product. When the review finds a problem, repair it and preview once more before the revision increment. That is the only repair round: after the second preview, deliver and list anything still open instead of starting another. For source-constrained work, candidate preview verifies the translated result: check code-backed structure against the code-to-HTML mapping and, when source rendering is available, additionally compare it at matching state/viewport/theme/locale before making visual-match claims. Keep a new artifact at its initial revision 1; for a follow-up, move baseline N exactly once to N+1 after this review. Then run the final package check and publish. Report these as UI rendering and visual-review evidence, not proof that authentication, persistence, network, or other business behavior works. A validator-only run is not rendered evidence.
 
 Use embedded preview, DOM inspection, screenshots, or accessibility tooling only when already available and proportionate to the task. Do not open an external browser or install dependencies by default.
 
@@ -192,4 +212,4 @@ If a parser/browser/runtime check did not run, mark it `not run`; do not convert
 
 ## Delivery
 
-Lead with the canonical directory or repo screen, design relationship, entry/final format, revision for standalone artifacts, files changed — state `none` when the repo was left untouched — checks actually run, source/result comparison evidence, the supported fidelity claim, and remaining risks. Keep ordinary summaries compact. Surface a full design contract or craft matrix only when the user requested a review, system, handoff, or QA report.
+Lead with the canonical directory or repo screen, design relationship, entry/final format, revision for standalone artifacts, files changed — state `none` when the repo was left untouched — checks actually run, the visual review list, source/result comparison evidence, the supported fidelity claim, and remaining risks. Keep ordinary summaries compact. Surface a full design contract or craft matrix only when the user requested a review, system, handoff, or QA report.

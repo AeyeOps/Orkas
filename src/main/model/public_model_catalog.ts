@@ -7,6 +7,9 @@
 export interface ProviderModelEntry {
   id: string;
   name: string;
+  /** Hide a new-selection shortcut while retaining saved-entry validation and
+   * runtime compatibility. This does not migrate or retire the model. */
+  hiddenFromPicker?: boolean;
   /** Highlights the preferred bundled official model in product surfaces.
    * This is presentation metadata only and does not affect routing. */
   recommended?: boolean;
@@ -48,6 +51,7 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'claude-fable-5', name: 'Claude Fable 5', maxInputImages: 20 },
     { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', maxInputImages: 20 },
     { id: 'claude-sonnet-5', name: 'Claude Sonnet 5', maxInputImages: 20 },
+    { id: 'claude-haiku-5-5', name: 'Claude Haiku 5.5', maxInputImages: 20 },
   ],
   'openai-codex': [
     // Context windows come from pi-ai. Output reservations remain independent
@@ -89,7 +93,9 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
   ],
   'kimi-coding': [
     { id: 'k3', name: 'Kimi K3', template: 'kimi-for-coding', contextWindow: 1_000_000, maxTokens: 131072 },
-    { id: 'k2p7', name: 'Kimi K2.7 Code' },
+    { id: 'k3-256k', name: 'Kimi K3 (256K)' },
+    { id: 'kimi-for-coding', name: 'Kimi K2.8 Preview' },
+    { id: 'k2p7', name: 'Kimi K2.7 Code', hiddenFromPicker: true },
   ],
   'minimax-cn': [
     { id: 'MiniMax-M3', name: 'MiniMax 3' },
@@ -128,6 +134,7 @@ export const PUBLIC_PROVIDER_MODELS: Readonly<Record<string, readonly ProviderMo
     { id: 'anthropic/claude-fable-5', name: 'Claude Fable 5', maxInputImages: 20 },
     { id: 'anthropic/claude-sonnet-5.5', name: 'Claude Sonnet 5.5', maxInputImages: 20 },
     { id: 'anthropic/claude-sonnet-5', name: 'Claude Sonnet 5', maxInputImages: 20 },
+    { id: 'anthropic/claude-haiku-5.5', name: 'Claude Haiku 5.5', maxInputImages: 20 },
     { id: 'openai/gpt-6-astra', name: 'GPT-6 Astra', maxTokens: 128_000, maxInputImages: 20 },
     { id: 'openai/gpt-6.1-sol', name: 'GPT-6.1 Sol', maxInputImages: 20 },
     { id: 'openai/gpt-6-sol', name: 'GPT-6 Sol', maxInputImages: 20 },

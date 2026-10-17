@@ -1599,9 +1599,12 @@ describe('features/connectors/manager authorization recovery', () => {
     expect(registry.load(TEST_UID).connections['bing-webmaster']).toBeUndefined();
   });
 
-  it('keeps DCR refresh invalid_grant rows visible for reconnect', async () => {
+  it.each([
+    'DCR refresh HTTP 400: {"error":"invalid_grant","error_description":"Grant not found"}',
+    'DCR refresh HTTP 400',
+  ])('keeps DCR refresh authorization failures visible for reconnect (%s)', async message => {
     mocks.dcr.refreshDcrIfStale = vi.fn(async () => {
-      throw new Error('DCR refresh HTTP 400: {"error":"invalid_grant","error_description":"Grant not found"}');
+      throw new Error(message);
     });
 
     const registry = await import('../../../../src/main/features/connectors/registry');
@@ -1614,12 +1617,12 @@ describe('features/connectors/manager authorization recovery', () => {
     const row = manager.listInstances(TEST_UID).find((inst) => inst.id === 'notion');
     expect(row?.status).toMatchObject({
       kind: 'error',
-      message: expect.stringContaining('invalid_grant'),
+      message,
     });
     expect(registry.load(TEST_UID).connections.notion).toBeTruthy();
     expect(registry.load(TEST_UID).connections.notion.auth_error).toMatchObject({
       code: 'connector_reconnect_required',
-      message: expect.stringContaining('invalid_grant'),
+      message,
     });
 
     mocks.dcr.refreshDcrIfStale.mockClear();

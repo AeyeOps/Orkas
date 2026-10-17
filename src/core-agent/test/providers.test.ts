@@ -4,14 +4,65 @@ import { ProviderRegistry } from "../src/providers/registry.js";
 import { assistantTextPhaseFromSignatureForTest, buildPiContextForTest, createAnthropicProvider, createLeadingThinkTextFilterForTest, createOpenAIProvider, createPiProvider, effectiveMaxTokensFromPayloadForTest, listPiProviders, listPiModels, mapContentForTest, mapProviderContentForTest, normalizeReasoningForProvider, providerTerminationCategoryForTest, resolvedResponseModelForTest, restoreOfficialReasoningDefaultsForTest, retryAfterMsFromForTest, serverFallbackReasonFromResponseIdForTest, stripLeadingThinkTextForTest, useProviderDefaultOutputLimitForTest, wrapErrorForTest } from "../src/providers/pi-provider.js";
 import { AuthError, ContextOverflowError, ProviderError, RateLimitError, classifyRetryableError } from "../src/shared/errors.js";
 import { createConfig } from "../src/config/loader.js";
-import type { CompletionParams } from "../src/providers/base.js";
+import type { CompletionParams, ToolDefinition } from "../src/providers/base.js";
 import type { Message, MessageContent, StreamEvent } from "../src/shared/types.js";
 import type { Model } from "@earendil-works/pi-ai";
+import { getBuiltinModel } from "@earendil-works/pi-ai/providers/all";
 import { Session } from "../src/agent/session.js";
 import { MIRRORED_PI_AI_SERIALIZER_VERSION, restoreHostMessageRoles } from "../src/providers/pi-provider.js";
 import * as fs from "node:fs";
 
 describe("Providers (pi-ai backed)", () => {
+  it.each([
+    ['complete', 'openai-completions'], ['stream', 'openai-completions'],
+    ['complete', 'openai-responses'], ['stream', 'openai-responses'],
+  ] as const)('retains body-read machine codes after partial SDK output: %s / %s', async (method, api) => {
+    const provider = createPiProvider({ provider: 'custom', apiKey: 'fixture', customModel: {
+      id: 'fixture', name: 'fixture', provider: 'custom', api,
+      baseUrl: 'https://fixture.invalid/v1', reasoning: false, input: ['text'],
+      contextWindow: 128000, maxTokens: 4096,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    } });
+    const frames = api === 'openai-completions'
+      ? [{ id: 'fixture', choices: [{ index: 0, delta: { role: 'assistant', content: 'partial' }, finish_reason: null }] }]
+      : [{ type: 'response.output_item.added', output_index: 0, item: { type: 'message', id: 'msg_fixture', role: 'assistant', content: [] } },
+        { type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: 'partial' }];
+    const bytes = new TextEncoder().encode(frames.map(frame => 'data: ' + JSON.stringify(frame) + '\n\n').join(''));
+    try {
+      for (const code of ['UND_ERR_BODY_TIMEOUT', 'ECONNRESET', 'PRIVATE_CODE']) {
+        let reads = 0;
+        const fetchStub = vi.fn(async () => new Response(new ReadableStream({
+          pull(controller) {
+            if (++reads === 1) controller.enqueue(bytes);
+            else controller.error(new TypeError('PRIVATE body failure', { cause: { code } }));
+          },
+        }, { highWaterMark: 0 }), { status: 200, headers: { 'content-type': 'text/event-stream' } }));
+        vi.stubGlobal('fetch', fetchStub);
+        const failures: any[] = [];
+        const params: CompletionParams = { messages: [{ role: 'user', content: [{ type: 'text', text: 'probe' }] }],
+          onRequestFailure: failure => failures.push(failure) };
+        let delivered: unknown;
+        if (method === 'complete') delivered = await provider.complete(params).then(() => undefined, error => error);
+        else {
+          const events: StreamEvent[] = [];
+          for await (const event of provider.stream(params)) events.push(event);
+          expect(events.filter(event => event.type === 'text_delta')).toMatchObject([{ text: 'partial' }]);
+          expect(events.filter(event => event.type === 'error')).toHaveLength(1);
+          expect(events.some(event => event.type === 'message_end')).toBe(false);
+          delivered = events.find(event => event.type === 'error')?.error;
+        }
+        expect(delivered).toBeInstanceOf(ProviderError);
+        expect(failures).toMatchObject([{ phase: 'after_response', httpStatus: 200,
+          source: 'sdk_error', code: code === 'PRIVATE_CODE' ? 'unknown' : code,
+          lastEvent: method === 'stream' ? 'text_delta' : 'none', aborted: false }]);
+        expect(failures).toHaveLength(1);
+        if (code !== 'PRIVATE_CODE') expect(classifyRetryableError(delivered)).toBe(code === 'ECONNRESET' ? 'connection_dropped' : 'timeout');
+        expect(fetchStub).toHaveBeenCalledTimes(1);
+        expect(JSON.stringify(failures)).not.toContain('PRIVATE');
+      }
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it.each([
     ['complete', 'openai-completions'], ['stream', 'openai-completions'],
     ['complete', 'openai-responses'], ['stream', 'openai-responses'],
@@ -719,6 +770,61 @@ describe("Providers (pi-ai backed)", () => {
       expect(capturedPayload).not.toHaveProperty("reasoning_effort");
     });
 
+    it.each([
+      ["complete", "unsupported-off"], ["stream", "unsupported-off"],
+      ["complete", "supported-off"], ["stream", "supported-off"],
+      ["complete", "unknown-off"], ["stream", "unknown-off"],
+      ["complete", "explicit-high"], ["stream", "explicit-high"],
+    ] as const)("completes auxiliary GLM calls with declared thinking compatibility: %s / %s", async (method, scenario) => {
+      // GLM5.3's official contract supports low/high/max, not disabled.
+      // The requester approved retaining the official default for unsupported
+      // off requests, including when the provider has a configured effort.
+      const modelId = scenario === "supported-off" ? "glm-5.2" : "glm-5.3";
+      const model = getBuiltinModel("zai", modelId)!;
+      expect(model).toBeDefined();
+      if (scenario === "unsupported-off") expect(model.thinkingLevelMap?.off).toBeNull();
+      const unknownModel = { ...model, thinkingLevelMap: undefined };
+      const payloads: Record<string, any>[] = [];
+      const fetchStub = vi.fn(async (_input: unknown, init?: RequestInit) => {
+        const payload = JSON.parse(String(init?.body));
+        payloads.push(payload);
+        if (scenario === "unsupported-off" && payload.thinking?.type === "disabled") {
+          return new Response(JSON.stringify({ error: { message: "Fixture: unsupported thinking mode", type: "invalid_request_error" } }),
+            { status: 400, headers: { "content-type": "application/json" } });
+        }
+        const frames = [
+          { id: "fixture", model: modelId, choices: [{ index: 0, delta: { role: "assistant", content: "ready" }, finish_reason: null }] },
+          { id: "fixture", model: modelId, choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 } },
+        ];
+        return new Response(frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join("") + "data: [DONE]\n\n",
+          { headers: { "content-type": "text/event-stream" } });
+      });
+      vi.stubGlobal("fetch", fetchStub);
+      try {
+        const provider = createPiProvider({ provider: "zai", model: modelId, apiKey: "synthetic-key",
+          defaultReasoning: "low", ...(scenario === "unknown-off" ? { customModel: unknownModel } : {}) });
+        const params: CompletionParams = { model: modelId, reasoning: scenario === "explicit-high" ? "high" : "off",
+          messages: [{ role: "user", content: [{ type: "text", text: "Prepare a plan" }] }] };
+        if (method === "complete") {
+          expect(await provider.complete(params)).toMatchObject({ content: [{ type: "text", text: "ready" }], stopReason: "end_turn", usage: { inputTokens: 3, outputTokens: 1 } });
+        } else {
+          const events: StreamEvent[] = [];
+          for await (const event of provider.stream(params)) events.push(event);
+          expect(events.filter(event => event.type === "error")).toEqual([]);
+          expect(events.filter(event => event.type === "text_delta")).toMatchObject([{ text: "ready" }]);
+          expect(events.filter(event => event.type === "message_end")).toHaveLength(1);
+        }
+        expect(fetchStub).toHaveBeenCalledOnce();
+        expect(payloads[0].model).toBe(modelId);
+        if (scenario === "unsupported-off") {
+          expect(payloads[0]).not.toHaveProperty("thinking");
+          expect(payloads[0]).not.toHaveProperty("reasoning_effort");
+        } else if (scenario === "explicit-high") {
+          expect(payloads[0]).toMatchObject({ thinking: { type: "enabled" }, reasoning_effort: "high" });
+        } else expect(payloads[0]).toMatchObject({ thinking: { type: "disabled" } });
+      } finally { vi.unstubAllGlobals(); }
+    });
+
     it("preserves explicit DeepSeek off and effort choices on complete and stream", async () => {
       const model: Model<"openai-completions"> = {
         id: "deepseek-v4-flash",
@@ -1011,13 +1117,106 @@ describe("Providers (pi-ai backed)", () => {
       expect(together).not.toHaveProperty("reasoning");
     });
 
+    it.each(["claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"])(
+      "keeps the initial %s tool prefix stable when a tool is loaded later",
+      async (modelId) => {
+        let payload: any;
+        const provider = createPiProvider({
+          provider: "anthropic", model: modelId, apiKey: "synthetic-api-key",
+          onPayload(value) {
+            payload = value;
+            throw new Error("Claude tool payload captured before transport");
+          },
+        });
+        const tools: ToolDefinition[] = [
+          { name: "tool_load", description: "Load tools", inputSchema: { type: "object" } },
+          { name: "lookup", description: "Look up an item", inputSchema: { type: "object", properties: { item: { type: "string" } } } },
+        ];
+        const start: Message[] = [{ role: "user", content: [{ type: "text", text: "Look up an item" }] }];
+        async function capture(messages: Message[], definitions: ToolDefinition[]) {
+          await expect(provider.complete({
+            model: modelId, messages, tools: definitions, systemPrompt: "Stable tool directory", reasoning: "low",
+            onRequestFailure() {},
+          })).rejects.toThrow("Claude tool payload captured");
+          return structuredClone(payload);
+        }
+        const initial = await capture(start, tools.slice(0, 1));
+        const messages: Message[] = [
+          ...start,
+          { role: "assistant", content: [{ type: "tool_use", id: "load_1", name: "tool_load", input: {} }] },
+          { role: "user", content: [{ type: "tool_result", toolUseId: "load_1", content: "Loaded", addedToolNames: ["lookup"] }] },
+        ];
+        const loaded = await capture(messages, tools);
+        expect(loaded.system).toEqual(initial.system);
+        expect(loaded.tools).toEqual(initial.tools);
+        const additions = loaded.messages.flatMap((message: any) => Array.isArray(message.content) ? message.content : [])
+          .filter((block: any) => block.type === "tool_addition");
+        expect(additions).toHaveLength(1);
+        expect(additions[0]).toMatchObject({
+          tool: { type: "tool_definition", definition: {
+            name: "lookup", description: "Look up an item",
+            input_schema: { type: "object", properties: { item: { type: "string" } } },
+          } },
+        });
+        expect(loaded.thinking.block_binding).toEqual({ prefix_mismatch_behavior: "drop_block" });
+        expect(await capture(messages, tools)).toEqual(loaded);
+      },
+    );
+
+    it.each([undefined, "off", "low", "medium", "high"] as const)(
+      "sends Haiku 5.5 with adaptive thinking and supported effort %s for both auth paths",
+      async (reasoning) => {
+        // Inspect the real serializer before transport: non-default sampling
+        // and budget-based thinking are rejected by the Haiku 5.5 API.
+        for (const apiKey of ["synthetic-api-key", "sk-ant-oat-synthetic-haiku"]) {
+          for (const method of ["complete", "stream"] as const) {
+            let payload: any;
+            const provider = createPiProvider({
+              provider: "anthropic", model: "claude-haiku-5-5", apiKey,
+              onPayload(value) {
+                payload = value;
+                throw new Error("Haiku payload captured before transport");
+              },
+            });
+            const params: CompletionParams = {
+              model: "claude-haiku-5-5", reasoning, temperature: 0.25,
+              messages: [{ role: "user", content: [{ type: "text", text: "Answer" }] }],
+              onRequestFailure() {},
+            };
+            if (method === "complete") {
+              await expect(provider.complete(params)).rejects.toThrow("Haiku payload captured");
+            } else {
+              const events: StreamEvent[] = [];
+              for await (const event of provider.stream(params)) events.push(event);
+              expect(events.filter(event => event.type === "error")).toHaveLength(1);
+            }
+            expect(payload).toMatchObject({ model: "claude-haiku-5-5", thinking: { type: "adaptive" } });
+            expect(payload.thinking).not.toHaveProperty("budget_tokens");
+            expect(payload).not.toHaveProperty("temperature");
+            expect(payload).not.toHaveProperty("top_p");
+            expect(payload).not.toHaveProperty("top_k");
+            expect(payload.messages.at(-1).role).not.toBe("assistant");
+            if (reasoning && reasoning !== "off") {
+              // The last native system update overrides the stable initial
+              // effort so changing effort does not invalidate the prefix.
+              const effort = payload.messages.findLast((message: any) => message.output_config)?.output_config.effort
+                ?? payload.output_config?.effort;
+              expect(effort).toBe(reasoning);
+            }
+          }
+        }
+      },
+    );
+
     it.each([
       ["anthropic", "claude-fable-5-1", "anthropic"],
       ["anthropic", "claude-opus-5-5", "anthropic"],
       ["anthropic", "claude-sonnet-5-5", "anthropic"],
+      ["anthropic", "claude-haiku-5-5", "anthropic"],
       ["openrouter", "anthropic/claude-fable-5.1", "anthropic"],
       ["openrouter", "anthropic/claude-opus-5.5", "anthropic"],
       ["openrouter", "anthropic/claude-sonnet-5.5", "anthropic"],
+      ["openrouter", "anthropic/claude-haiku-5.5", "anthropic"],
       ["openrouter", "openai/gpt-6.1-sol", "openai"],
       ["openrouter", "anthropic/claude-opus-5", "anthropic"],
       ["google", "gemini-3.8-flash", "google"],
@@ -1926,6 +2125,16 @@ describe("Providers (pi-ai backed)", () => {
 });
 
 describe("pi-provider wrapError", () => {
+  it('keeps embedded accepted output out of context-overflow request recovery', () => {
+    const original = Object.assign(new Error('Provider rejected the response'), {
+      status: 400, error: { code: 'context_length_exceeded' },
+      cause: { code: 'PROVIDER_OUTPUT_UNCERTAIN' },
+    });
+    const wrapped = wrapErrorForTest(original, 'custom');
+    expect(wrapped).toBeInstanceOf(ProviderError);
+    expect(wrapped).not.toBeInstanceOf(ContextOverflowError);
+    expect(classifyRetryableError(wrapped)).toBeNull();
+  });
   it.each(['complete', 'stream'] as const)('retains host budget errors before SDK flattening in %s', async method => {
     const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const fetchStub = vi.fn(async () => { throw new Error('must not access network'); });

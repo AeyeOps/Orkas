@@ -69,7 +69,8 @@ describe('conversation detail first-paint boundary', () => {
     expect(handler).toContain('const [runtime, initialPage] = await Promise.all([');
     expect(handler).not.toContain('? await chats.getMessagesPageAtIndex(');
     expect(handler).toContain('chats.getMessagesPageAtIndex(');
-    expect(handler).toContain('requestedAroundIndex, requestedLimit, resolvedProjectId');
+    expect(handler).toContain('anchorIndex, requestedLimit, resolvedProjectId');
+    expect(handler).toContain('ctx.userId, cid, requestedAroundMessageId, requestedLimit, resolvedProjectId');
     expect(handler).toContain('resolvedProjectId,\n      );');
   });
 

@@ -1,0 +1,219 @@
+/** Display-only recovery of an interrupted CLI run. Canonical/model history,
+ * execution status and CLI resumption never depend on this projection. */
+import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
+import * as path from 'node:path';
+import { userLocalAgentRunsDir } from '../../paths';
+import { readJsonlPageWithOffsets } from '../../storage';
+import { redactPaths } from '../../util/redact';
+import { sanitizeLogTextForUpload } from '../../util/log-sanitize';
+import type { GroupMessage } from '../group_chat/visibility';
+import type { HistoryProcessPart } from '../conversation-process-cache';
+import { processTextChunks } from '../conversation-process-cache';
+import { CodexFileCitationStreamFilter } from './public-output';
+
+type Item = NonNullable<GroupMessage['process']>[number];
+type Candidate = { record: GroupMessage; users: Map<string, number>; settled: boolean; invalid: boolean };
+type Run = { directory: string; cid: string; agentId: string; cli: string;
+  startedAt: string; endedAt?: string; durationMs?: number; currentMessageId?: string };
+const MAX_LINE_BYTES = 16 * 1024 * 1024;
+
+async function openRegular(file: string): Promise<fsp.FileHandle> {
+  // O_NOFOLLOW is absent on Windows; lstat rejects links on both platforms.
+  const before = await fsp.lstat(file);
+  if (!before.isFile() || before.isSymbolicLink()) throw new Error('Invalid CLI archive');
+  const handle = await fsp.open(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  const after = await handle.stat();
+  if (!after.isFile() || before.dev !== after.dev || before.ino !== after.ino) {
+    await handle.close(); throw new Error('Changed CLI archive');
+  }
+  return handle;
+}
+
+/** Ignore an incomplete crash tail, while keeping each complete line before
+ * it. A damaged oversized line cannot make buffers grow with the whole run. */
+async function* archiveEvents(file: string): AsyncGenerator<Record<string, any>> {
+  const handle = await openRegular(file);
+  const stream = handle.createReadStream({ autoClose: false, highWaterMark: 64 * 1024 });
+  let chunks: Buffer[] = [], bytes = 0, oversized = false;
+  try {
+    for await (const block of stream) {
+      let start = 0;
+      while (start < block.length) {
+        const newline = block.indexOf(10, start);
+        const end = newline < 0 ? block.length : newline;
+        const chunk = block.subarray(start, end);
+        bytes += chunk.length;
+        if (bytes > MAX_LINE_BYTES) { oversized = true; chunks = []; }
+        if (!oversized) chunks.push(chunk);
+        if (newline < 0) break;
+        if (!oversized && bytes) {
+          let event;
+          try { event = JSON.parse(Buffer.concat(chunks, bytes).toString('utf8')); } catch { /* damaged line */ }
+          if (event && typeof event === 'object' && !Array.isArray(event)) yield event;
+        }
+        chunks = []; bytes = 0; oversized = false; start = newline + 1;
+      }
+    }
+  } finally { stream.destroy(); await handle.close(); }
+}
+
+async function archiveRuns(userId: string, cid: string, actors: Set<string>): Promise<Run[]> {
+  const root = userLocalAgentRunsDir(userId);
+  const runs: Run[] = [];
+  let entries;
+  try { entries = await fsp.opendir(root); } catch { return runs; }
+  for await (const entry of entries) {
+    if (!entry.isDirectory() || !/^[a-f0-9]{12}$/.test(entry.name)) continue;
+    const directory = path.join(root, entry.name);
+    let handle;
+    try {
+      handle = await openRegular(path.join(directory, 'meta.json'));
+      if ((await handle.stat()).size > 4 * 1024 * 1024) continue;
+      const meta = JSON.parse(await handle.readFile('utf8'));
+      if (meta.cid !== cid || !actors.has(meta.agentId)
+          || !['codex', 'claude', 'opencode', 'openclaw', 'hermes'].includes(meta.cli)) continue;
+      runs.push({ directory, cid: meta.cid, agentId: meta.agentId, cli: meta.cli,
+        startedAt: meta.startedAt, endedAt: meta.endedAt, durationMs: meta.durationMs,
+        currentMessageId: meta.currentMessageId });
+    } catch { /* Expired or incomplete diagnostic archives are optional. */ }
+    finally { await handle?.close(); }
+  }
+  return runs;
+}
+
+function collectTrigger(record: GroupMessage, candidate: Candidate): void {
+  if (candidate.settled) return;
+  if (record.from === candidate.record.from && (record.system_kind === 'reply_interrupted'
+      || record.source_message_id || record.process?.length || record.process_parts?.length)) {
+    // Official replies/already-saved trails close the preceding attempt.
+    // An async question with no terminal receipt does not end a CLI run.
+    candidate.settled = true;
+  } else if (record.from === 'user') {
+    const ts = Date.parse(record.ts);
+    if (!record.id || !Number.isFinite(ts)) { candidate.invalid = true; candidate.settled = true; }
+    else candidate.users.set(record.id, ts);
+  }
+}
+
+async function recoverRun(run: Run, store: (items: Item[]) => HistoryProcessPart | undefined): Promise<HistoryProcessPart[]> {
+  const parts: HistoryProcessPart[] = [];
+  let batch: Item[] = [];
+  const flush = () => {
+    if (!batch.length) return;
+    const part = store(batch);
+    if (part) parts.push(part);
+    batch = [];
+  };
+  const addText = (text: string) => {
+    // Only explicit public commentary is restored. Unfinished answers remain
+    // absent from the notice body and private reasoning is never replayed.
+    for (const chunk of processTextChunks(text)) {
+      batch.push({ type: 'progress', text: chunk,
+        event: { stream: 'assistant', data: { phase: 'commentary' } } });
+      if (batch.length >= 200) flush();
+    }
+  };
+  const filter = run.cli === 'codex' ? new CodexFileCitationStreamFilter() : null;
+  let commentary = '';
+  const flushText = () => {
+    if (filter) commentary += filter.flush();
+    if (commentary) addText(commentary);
+    commentary = '';
+  };
+  for await (const event of archiveEvents(path.join(run.directory, 'events.jsonl'))) {
+    if (event.type === 'text-delta') {
+      if (event.phase === 'commentary' && typeof event.text === 'string') {
+        commentary += filter ? filter.push(event.text) : event.text;
+        if (commentary.length >= 16 * 1024) { addText(commentary); commentary = ''; }
+      } else flushText();
+      continue;
+    }
+    flushText();
+    if (event.heartbeat === true || event.type === 'idle') continue;
+    if (event.type === 'thinking') {
+      // Old diagnostic archives may predate runner-side raw-thought removal.
+      // A summary already passed the public runner boundary; never copy text.
+      batch.push({ type: 'event', event: { stream: 'cli', data: {
+        type: 'thinking', chars: Number(event.chars) || 0,
+        ...(typeof event.summary === 'string' ? { summary: redactPaths(sanitizeLogTextForUpload(event.summary))
+          .replace(/\s+/g, ' ').trim().slice(0, 2048) } : {}),
+      } } });
+    } else if (['tool-event', 'file-change', 'status', 'permission-request',
+      'stderr-line', 'raw-line', 'log', 'media-output'].includes(event.type)) {
+      batch.push({ type: 'event', event: { stream: 'cli', data: event } });
+    }
+    if (batch.length >= 200) flush();
+  }
+  flushText(); flush();
+  return parts;
+}
+
+/** `before` names the byte start of this selected page, so a notice whose
+ * trigger is on the previous page does not require a whole-chat scan. */
+export async function restoreInterruptedCliHistory(
+  userId: string, sourceFile: string, records: GroupMessage[], before: number | null,
+  store: (items: Item[]) => HistoryProcessPart | undefined,
+): Promise<GroupMessage[]> {
+  const candidates: Candidate[] = [];
+  for (let index = 0; index < records.length; index++) {
+    const record = records[index];
+    if (record.system_kind !== 'reply_interrupted' || record.deleted_at
+        || record.process?.length || record.process_parts?.length) continue;
+    const candidate: Candidate = { record, users: new Map(), settled: false, invalid: false };
+    for (let n = index - 1; n >= 0 && !candidate.settled; n--) {
+      collectTrigger(records[n], candidate);
+    }
+    candidates.push(candidate);
+  }
+  if (!candidates.length) return records;
+  let cursor = before;
+  while (cursor && candidates.some(candidate => !candidate.settled)) {
+    const page = await readJsonlPageWithOffsets<GroupMessage>(sourceFile, 10, cursor);
+    for (let n = page.entries.length - 1; n >= 0; n--) {
+      for (const candidate of candidates) {
+        collectTrigger(page.entries[n].record, candidate);
+      }
+    }
+    if (page.nextCursor === cursor) break;
+    cursor = page.nextCursor;
+  }
+  if (!candidates.some(candidate => !candidate.invalid && candidate.users.size)) return records;
+  const runs = await archiveRuns(userId, path.basename(sourceFile, '.jsonl'), new Set(candidates.map(c => c.record.from)));
+  const recovered = new Map<string, GroupMessage>();
+  for (const { record, users, invalid } of candidates) {
+    if (invalid || !users.size) continue;
+    const end = Date.parse(record.ts);
+    const earliestUser = Math.min(...users.values());
+    const latestUser = Math.max(...users.values());
+    const matches = runs.filter(run => run.agentId === record.from
+      && Date.parse(run.startedAt) >= (run.currentMessageId ? users.get(run.currentMessageId) ?? Infinity : earliestUser)
+      && Date.parse(run.startedAt) < end
+      && (!run.endedAt || (Date.parse(run.endedAt) >= latestUser && Date.parse(run.endedAt) <= end)));
+    // A legacy archive has no trigger identity. Ambiguity must not show work
+    // from another run as if it belonged to this interrupted reply.
+    if (!matches.length || (matches.length > 1
+      && (matches.some(run => !run.currentMessageId) || new Set(matches.map(run => run.currentMessageId)).size !== 1))) continue;
+    try {
+      const parts: HistoryProcessPart[] = [];
+      for (const run of matches.sort((a, b) => Date.parse(a.startedAt) - Date.parse(b.startedAt))) {
+        parts.push(...await recoverRun(run, store));
+      }
+      // A single archived attempt has a defined elapsed time. Prefer its
+      // measured duration; use retained endpoints when both are known. Never
+      // count app downtime up to the later startup notice or invent a terminal
+      // success receipt merely to display the clock.
+      const run = matches.length === 1 ? matches[0] : undefined;
+      const span = run ? Date.parse(run.endedAt || '') - Date.parse(run.startedAt) : NaN;
+      const duration = typeof run?.durationMs === 'number' && Number.isFinite(run.durationMs) && run.durationMs >= 0
+        ? run.durationMs : span;
+      const runtime: Item[] = Number.isFinite(duration) && duration >= 0
+        ? [{ type: 'event', event: { stream: 'runtime', data: { phase: 'interrupted', duration_ms: Math.round(duration) } } }]
+        : [];
+      if (parts.length) recovered.set(record.id, { ...record,
+        ...(runtime.length ? { process: [...(record.process || []), ...runtime] } : {}),
+        process_parts: parts.map(part => 'ref' in part ? { ...part, message_id: record.id } : part) });
+    } catch { /* Missing archive/cache must not hide the interruption notice. */ }
+  }
+  return records.map(record => recovered.get(record.id) || record);
+}

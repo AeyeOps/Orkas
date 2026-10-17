@@ -43,6 +43,18 @@ afterEach(() => {
 });
 
 describe('PDF built-in tools', () => {
+  it('uses the default render scale for out-of-range values without changing the selected page', async () => {
+    await makePdf(path.join(root, 'source.pdf'), [300, 400]);
+    const render = tool('pdf_render');
+    const expected = await render.execute({ path: 'source.pdf', page: 2 }, context());
+    for (const scale of [-1, 0, 0.1, 4, 100]) {
+      const actual = await render.execute({ path: 'source.pdf', page: 2, scale }, context());
+      expect(actual.isError).toBeFalsy();
+      expect(actual.content).toBe(expected.content);
+      expect(actual.images).toEqual(expected.images);
+    }
+    expect(written).toEqual([]);
+  });
   it('exposes edit_pdf and pdf_render', () => {
     expect(createPdfTools({}).map((entry) => entry.name)).toEqual(['edit_pdf', 'pdf_render']);
   });

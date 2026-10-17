@@ -1,9 +1,12 @@
 /** Target-scoped Chromium input. No window activation or system input is used. */
-import type { MouseInputEvent, WebContents } from 'electron';
+import type { Input, MouseInputEvent, WebContents } from 'electron';
 import { OperationTimeoutError, withOperationTimeout } from '../util/operation-timeout';
 
+import { interruptOnWebAssistDialog, WebAssistDialogOpenedError } from './web_assist_dialogs';
+import { ownsWebAssistDebugger } from './web_assist_protocol';
+
 type Result = Record<string, unknown>;
-type Point = { x: number; y: number; width: number; height: number };
+type Point = { x: number; y: number; width: number; height: number; eventPoint?: { x: number; y: number; transform?: number[] } };
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const FRAME_CHECK_MS = 150;
 const WAKE_FRAME_MS = 1500;
@@ -18,7 +21,8 @@ const WAKE_SETTLE_MS = 800;
  *  Reasserting it wakes some platforms. On Windows Electron 42, a short focus
  *  emulation pulse is also needed. It makes the document virtually visible,
  *  without showing the view or activating a window. Rendering continues after
- *  disabling emulation and detaching; no virtual focus or debugger is retained.
+ *  disabling emulation. Detach a session created by this wake operation;
+ *  preserve the existing frame-controller session without virtual focus.
  *  Do not overwrite another debugger's unknown emulation state.
  *
  *  Input within about half a second of a woken page's navigation can be
@@ -32,13 +36,14 @@ export async function wakeWebAssistRendering(
   if (await frame(FRAME_CHECK_MS)) return 'rendering';
   contents.setBackgroundThrottling(false);
   if (!await frame(WAKE_FRAME_MS)) {
-    if (!canEmulateFocus() || contents.debugger.isAttached()) return 'not_rendered';
+    if (!canEmulateFocus() || (contents.debugger.isAttached() && !ownsWebAssistDebugger(contents))) return 'not_rendered';
     const focus = (enabled: boolean) => withOperationTimeout(
       contents.debugger.sendCommand('Emulation.setFocusEmulationEnabled', { enabled }),
       { timeoutMs: WAKE_FRAME_MS, code: 'input_timeout', stage: 'browser rendering' },
     );
+    const attachedHere = !contents.debugger.isAttached();
     try {
-      contents.debugger.attach('1.3');
+      if (attachedHere) contents.debugger.attach('1.3');
       try {
         await focus(true);
         await frame(WAKE_FRAME_MS);
@@ -46,7 +51,7 @@ export async function wakeWebAssistRendering(
         try {
           if (!contents.isDestroyed() && contents.debugger.isAttached()) await focus(false);
         } finally {
-          if (!contents.isDestroyed() && contents.debugger.isAttached()) contents.debugger.detach();
+          if (attachedHere && !contents.isDestroyed() && contents.debugger.isAttached()) contents.debugger.detach();
         }
       }
     } catch (error) {
@@ -61,12 +66,13 @@ export async function wakeWebAssistRendering(
   await pause(WAKE_SETTLE_MS);
   return 'woken';
 }
-const pendingPointer = new WeakMap<WebContents, { x: number; y: number; type: MouseInputEvent['type']; button?: string }>();
+const pendingPointer = new WeakMap<WebContents, { x: number; y: number; type: MouseInputEvent['type']; button?: string; eventPoint?: { x: number; y: number } }>();
 /** Consume one matching native event, never an entire in-flight command window. */
 export function consumeWebAssistPointerEvent(contents: WebContents, input: MouseInputEvent): boolean {
   const expected = pendingPointer.get(contents);
-  if (!expected || input.type !== expected.type || (expected.button && input.button !== expected.button)
-    || Math.abs(input.x - expected.x) >= 1 || Math.abs(input.y - expected.y) >= 1) return false;
+  if (!expected || input.type !== expected.type || (expected.button && input.button !== expected.button)) return false;
+  const matches = (point: { x: number; y: number }) => Math.abs(input.x - point.x) < 1 && Math.abs(input.y - point.y) < 1;
+  if (!matches(expected) && !(expected.eventPoint && matches(expected.eventPoint))) return false;
   pendingPointer.delete(contents);
   return true;
 }
@@ -78,15 +84,20 @@ export async function dispatchWebAssistPointer(
   scale: () => number,
   drag?: { x: number; y: number },
   onDispatch?: () => void,
+  mode: string = 'click',
 ): Promise<Result> {
   const deadline = Date.now() + 2000;
   const command = async (method: string, params: Record<string, unknown>) => {
     const type = params.type === 'mousePressed' ? 'mouseDown' : params.type === 'mouseReleased' ? 'mouseUp' : 'mouseMove';
-    pendingPointer.set(contents, { x: Number(params.x), y: Number(params.y), type,
-      ...(type !== 'mouseMove' ? { button: 'left' } : {}) });
+    const local = point?.eventPoint;
+    const [xx, xy, yx, yy] = local?.transform || [1, 0, 0, 1];
+    const dx = Number(params.x) - point!.x, dy = Number(params.y) - point!.y;
+    pendingPointer.set(contents, { x: Number(params.x) * factor, y: Number(params.y) * factor, type,
+      ...(local ? { eventPoint: { x: local.x + xx * dx + xy * dy, y: local.y + yx * dx + yy * dy } } : {}),
+      ...(type !== 'mouseMove' ? { button: String(params.button || 'left') } : {}) });
     try {
-      return await withOperationTimeout(contents.debugger.sendCommand(method, params),
-        { timeoutMs: 2000, code: 'input_timeout', stage: 'browser input' });
+      return await interruptOnWebAssistDialog(contents, () => withOperationTimeout(contents.debugger.sendCommand(method, params),
+        { timeoutMs: 2000, code: 'input_timeout', stage: 'browser input' }));
     } finally { pendingPointer.delete(contents); }
   };
   let previous: Point | undefined;
@@ -123,17 +134,26 @@ export async function dispatchWebAssistPointer(
   const invalid = validate();
   if (invalid) return invalid;
   const end = { x: point.x + (drag?.x || 0), y: point.y + (drag?.y || 0) };
-  if (end.x < 0 || end.y < 0 || end.x >= point.width || end.y >= point.height) {
-    return { ok: false, code: 'invalid_drag', error: 'The drag must end inside the page viewport.' };
-  }
   const factor = scale();
   const attachedHere = !contents.debugger.isAttached();
   let pressed = false;
-  let last = { x: point.x * factor, y: point.y * factor };
+  // CDP accepts page CSS coordinates and applies page zoom itself. Native
+  // receipts use viewport pixels, converted separately above.
+  let last = { x: point.x, y: point.y };
+  const release = async (clickCount: number) => {
+    try {
+      await command('Input.dispatchMouseEvent', { type: 'mouseReleased', ...last, button: mode === 'right_click' ? 'right' : 'left', buttons: 0, clickCount });
+    } catch (error) {
+      if (error instanceof WebAssistDialogOpenedError) pressed = false;
+      throw error;
+    }
+    pressed = false;
+  };
   try {
     if (attachedHere) contents.debugger.attach('1.3');
     onDispatch?.();
     await command('Input.dispatchMouseEvent', { type: 'mouseMoved', ...last });
+    if (mode === 'hover') return { ok: true, outcome: 'acted', action: 'hover' };
     // Hover handlers can replace or cover a control. Check again before pressing.
     const ready = await withOperationTimeout(prepare(), {
       timeoutMs: 2000, code: 'input_timeout', stage: 'browser target',
@@ -146,25 +166,79 @@ export async function dispatchWebAssistPointer(
     if (cancelled) return cancelled;
     if (scale() !== factor) return { ok: false, code: 'page_changed', error: 'The page resized; observe it again.' };
     pressed = true;
-    await command('Input.dispatchMouseEvent', { type: 'mousePressed', ...last, button: 'left', buttons: 1, clickCount: 1 });
+    await command('Input.dispatchMouseEvent', { type: 'mousePressed', ...last, button: mode === 'right_click' ? 'right' : 'left', buttons: mode === 'right_click' ? 2 : 1, clickCount: 1 });
     if (drag) {
       for (let step = 1; step <= 12; step++) {
         const stopped = validate();
         if (stopped) return stopped;
         if (scale() !== factor) return { ok: false, code: 'page_changed', error: 'The page resized during the drag; observe it again.' };
-        last = { x: (point.x + drag.x * step / 12) * factor, y: (point.y + drag.y * step / 12) * factor };
+        last = { x: point.x + drag.x * step / 12, y: point.y + drag.y * step / 12 };
         await command('Input.dispatchMouseEvent', { type: 'mouseMoved', ...last, button: 'left', buttons: 1 });
         await pause(16);
       }
     }
-    await command('Input.dispatchMouseEvent', { type: 'mouseReleased', ...last, button: 'left', buttons: 0, clickCount: 1 });
-    pressed = false;
+    await release(1);
+    if (mode === 'double_click') {
+      const invalid = validate(); if (invalid) return invalid;
+      pressed = true;
+      await command('Input.dispatchMouseEvent', { type: 'mousePressed', ...last, button: 'left', buttons: 1, clickCount: 2 });
+      await release(2);
+    }
     return { ok: true, outcome: 'acted' };
   } finally {
     // Release even after cancellation so a page cannot keep a stuck pointer.
     if (pressed && !contents.isDestroyed()) {
-      try { await command('Input.dispatchMouseEvent', { type: 'mouseReleased', ...last, button: 'left', buttons: 0, clickCount: 1 }); } catch { /* page may have gone */ }
+      try { await command('Input.dispatchMouseEvent', { type: 'mouseReleased', ...last, button: mode === 'right_click' ? 'right' : 'left', buttons: 0, clickCount: 1 }); } catch { /* page may have gone */ }
     }
+    if (attachedHere && !contents.isDestroyed() && contents.debugger.isAttached()) contents.debugger.detach();
+  }
+}
+
+const pendingKeys = new WeakMap<WebContents, { key: string; type: string }>();
+export function consumeWebAssistKeyEvent(contents: WebContents, input: Input): boolean {
+  const expected = pendingKeys.get(contents);
+  if (!expected || expected.type !== input.type || expected.key.toLowerCase() !== String(input.key || '').toLowerCase()) return false;
+  pendingKeys.delete(contents);
+  return true;
+}
+
+/** Explicit key syntax, not intent inference; no global/system keyboard input. */
+export async function dispatchWebAssistKeys(
+  contents: WebContents, chord: string, validate: () => Result | null, onDispatch?: () => void,
+): Promise<Result> {
+  const parts = chord.split('+');
+  const modifiersByName: Record<string, number> = { Alt: 1, Control: 2, Ctrl: 2, Meta: 4, Cmd: 4, Shift: 8 };
+  let modifiers = 0;
+  for (const modifier of parts.slice(0, -1)) {
+    if (!modifiersByName[modifier]) return { ok: false, code: 'invalid_keys', error: 'Use a key or explicit modifier chord.' };
+    modifiers |= modifiersByName[modifier];
+  }
+  const name = parts.at(-1) || '';
+  const keyCodes: Record<string, number> = { Enter: 13, Tab: 9, Escape: 27, Backspace: 8, Delete: 46, Space: 32, ArrowLeft: 37, ArrowUp: 38, ArrowRight: 39, ArrowDown: 40, Home: 36, End: 35, PageUp: 33, PageDown: 34 };
+  const virtualKey = keyCodes[name] || (name.length === 1 ? name.toUpperCase().charCodeAt(0) : /^F(?:[1-9]|1[0-9]|2[0-4])$/.test(name) ? 111 + Number(name.slice(1)) : 0);
+  if (!virtualKey) return { ok: false, code: 'invalid_keys', error: 'The key is unsupported.' };
+  const key = name === 'Space' ? ' ' : name;
+  const text = !(modifiers & 7) ? name.length === 1 ? name : name === 'Space' ? ' ' : name === 'Enter' ? '\r' : undefined : undefined;
+  const params = { key, modifiers, windowsVirtualKeyCode: virtualKey, nativeVirtualKeyCode: virtualKey, ...(text ? { text, unmodifiedText: text } : {}) };
+  const attachedHere = !contents.debugger.isAttached();
+  const stopped = validate(); if (stopped) return stopped;
+  let down = false;
+  const send = async (type: 'keyDown' | 'keyUp') => {
+    pendingKeys.set(contents, { key, type });
+    try { await interruptOnWebAssistDialog(contents, () => withOperationTimeout(contents.debugger.sendCommand('Input.dispatchKeyEvent', { type, ...params }), { timeoutMs: 2000, code: 'input_timeout', stage: 'browser keyboard' })); }
+    catch (error) {
+      if (type === 'keyUp' && error instanceof WebAssistDialogOpenedError) down = false;
+      throw error;
+    } finally { pendingKeys.delete(contents); }
+  };
+  try {
+    if (attachedHere) contents.debugger.attach('1.3');
+    onDispatch?.(); down = true;
+    await send('keyDown');
+    await send('keyUp'); down = false;
+    return { ok: true, outcome: 'acted', action: 'press' };
+  } finally {
+    if (down && !contents.isDestroyed()) await send('keyUp').catch(() => {});
     if (attachedHere && !contents.isDestroyed() && contents.debugger.isAttached()) contents.debugger.detach();
   }
 }

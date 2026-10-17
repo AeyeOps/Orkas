@@ -10,8 +10,10 @@ vi.mock('../../../src/main/features/image_gen', () => ({
 
 import {
   buildImageProductionQuoteSegment,
+  creditsFromMilli,
   estimateImageProductionCredits,
   imageProductionQuotePayloadSegments,
+  withCreditTwins,
 } from '../../../src/main/features/image_production_credits';
 
 function candidate(provider: string, supportsEdit = true): any {

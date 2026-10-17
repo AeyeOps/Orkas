@@ -1,4 +1,4 @@
-import { expect, test } from './fixtures/orkas';
+import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
 type AgentSummary = { agent_id: string; name: string; enabled?: boolean };
 type AgentDetail = AgentSummary & {
@@ -57,7 +57,7 @@ test.describe('agents and skills', () => {
     await orkas.invoke('config.setLanguage', { language: 'pt' });
 
     let page = await orkas.relaunch();
-    await page.locator('#agents-btn').click();
+    await openSidebarEntry(page, '#agents-btn');
     const card = page.locator('.agent-card[data-id="commander"]');
     await expect(card.locator('.agent-card-name')).toHaveText('Commander');
     await expect(card.locator('.agent-card-desc')).toContainText('camada de orquestração');
@@ -76,7 +76,7 @@ test.describe('agents and skills', () => {
     ).avatar).toEqual({ icon: 'crown', color: 'sky' });
 
     page = await orkas.relaunch();
-    await page.locator('#agents-btn').click();
+    await openSidebarEntry(page, '#agents-btn');
     const relaunchedCard = page.locator('.agent-card[data-id="commander"]');
     await expect(relaunchedCard.locator('.agent-card-name')).toHaveText('Commander');
     await expect(relaunchedCard.locator('.avatar-circle'))
@@ -152,7 +152,7 @@ test.describe('agents and skills', () => {
       '</agent>',
     ].join('\n'));
 
-    await page.locator('#agents-btn').click();
+    await openSidebarEntry(page, '#agents-btn');
     await page.locator('#create-agent-btn').click();
     await page.locator('#agent-name-input').fill('EditChatWebResearcher');
     await page.locator('#agent-desc-input').fill('Researches current sources from an edit conversation.');
@@ -196,7 +196,7 @@ test.describe('agents and skills', () => {
   test('creates an agent, persists its enabled state, and deletes it', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;
-    await page.locator('#agents-btn').click();
+    await openSidebarEntry(page, '#agents-btn');
     await expect(page.locator('#panel-agents')).toHaveClass(/\bactive\b/);
     await page.locator('#create-agent-btn').click();
 
@@ -221,7 +221,7 @@ test.describe('agents and skills', () => {
     }).toBe(false);
 
     const relaunchedPage = await orkas.relaunch();
-    await relaunchedPage.locator('#agents-btn').click();
+    await openSidebarEntry(relaunchedPage, '#agents-btn');
     const card = relaunchedPage.locator(`.agent-card[data-id="${agent?.agent_id}"]`);
     await expect(card).toHaveClass(/\bis-disabled\b/, { timeout: 30_000 });
     await card.click();
@@ -246,7 +246,7 @@ test.describe('agents and skills', () => {
   test('creates a skill, persists its enabled state, and deletes it', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
     const page = orkas.page;
-    await page.locator('#skills-btn').click();
+    await openSidebarEntry(page, '#skills-btn');
     await expect(page.locator('#panel-skills')).toHaveClass(/\bactive\b/);
     await page.locator('#create-skill-btn').click();
 
@@ -271,7 +271,7 @@ test.describe('agents and skills', () => {
     }).toBe(false);
 
     const relaunchedPage = await orkas.relaunch();
-    await relaunchedPage.locator('#skills-btn').click();
+    await openSidebarEntry(relaunchedPage, '#skills-btn');
     const card = relaunchedPage.locator(`.skill-card[data-id="${skill?.id}"]`);
     await expect(card).toHaveClass(/\bis-disabled\b/, { timeout: 30_000 });
     await card.click();

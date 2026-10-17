@@ -47,6 +47,18 @@ afterEach(() => {
 });
 
 describe('kb_embed supervisor', () => {
+  it('fails closed when the channel factory denies execution and recovers only with an explicit fake', async () => {
+    const denied = vi.fn(() => { throw new Error('Fixture embedding execution denied'); });
+    _setEmbedChannelFactoryForTest(denied);
+    await expect(embedTexts(['guard probe'])).rejects.toThrow('Fixture embedding execution denied');
+    expect(denied).toHaveBeenCalledOnce();
+    expect(channels).toHaveLength(0);
+
+    _setEmbedChannelFactoryForTest(factory);
+    expect(await embedQuery('recovery probe')).toEqual([0, 1]);
+    expect(channels).toHaveLength(1);
+  });
+
   it('empty input never spawns a worker', async () => {
     expect(await embedTexts([])).toEqual([]);
     expect(channels).toHaveLength(0);

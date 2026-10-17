@@ -28,6 +28,12 @@ vi.mock('../../../../src/main/features/local_agents/registry', async (original) 
   ...await original<typeof import('../../../../src/main/features/local_agents/registry')>(),
   resolveCliForDispatch: async (type: string) => ({ type, available: true, path: process.execPath, version: '2.0.0' }),
 }));
+// Like backend startup below, the external executable's help response is not
+// host preparation latency. Discovery/probe timing has owning runner cases.
+vi.mock('../../../../src/main/features/local_agents/runtime_options', async (original) => ({
+  ...await original<typeof import('../../../../src/main/features/local_agents/runtime_options')>(),
+  getLocalCliSupportedFlags: async () => ['--model', '--effort', '--include-hook-events'],
+}));
 vi.mock('../../../../src/main/features/local_agents/backends/claude', () => ({
   claudeBackend: { run: async (opts: any) => completeCliDispatch(opts) },
 }));
@@ -75,6 +81,10 @@ beforeAll(async () => {
   // Vitest's source transformation is harness startup, outside the loaded-app send budget.
   const { installSdkTimeoutPatch } = await import('../../../../src/main/model/core-agent/sdk-timeout-patch');
   installSdkTimeoutPatch();
+  // SDK 1.2 loads this transport lazily. Compile its module graph alongside
+  // the other loaded-app code, before the fixture data exists. Do not create
+  // an SDK client or send a request: both still happen on the measured path.
+  await import('@earendil-works/pi-ai/api/anthropic-messages');
   await import('#core-agent');
   await import('../../../../src/main/model/client');
   await import('../../../../src/main/features/local_agents/runner');

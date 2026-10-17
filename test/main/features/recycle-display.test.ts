@@ -21,6 +21,98 @@ afterEach(() => {
 });
 
 describe('recycle display preview', () => {
+  it('shows project automation names from their own configs and keeps attachments grouped', async () => {
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(UID);
+    const paths = await import('../../../src/main/paths');
+    const root = paths.userCloudRoot(UID);
+    const write = (rel: string, data: unknown) => {
+      const file = path.join(root, rel);
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(data));
+    };
+    write('projects/p_launch/project.json', { project_id: 'p_launch', name: 'Client Launch' });
+    write('projects/p_launch/auto_tasks/at_report/config.json', { title: 'Weekly report', content: 'Prepare report' });
+    write('auto_tasks/at_report/config.json', { title: 'Unrelated global task' });
+    write('auto_tasks/at_personal/config.json', { content: 'Personal digest\nDetails' });
+    const { buildRecycleDisplayPreview } = await import('../../../src/main/features/recycle_bin');
+    const items = await buildRecycleDisplayPreview(UID, [
+      'cloud/projects/p_launch/auto_tasks/at_report/config.json',
+      'cloud/projects/p_launch/auto_tasks/at_report/attachments/input.txt',
+      'cloud/auto_tasks/at_personal/config.json',
+    ]);
+    expect(items).toEqual([
+      { category: 'auto_task', id: 'at_report', title: 'Weekly report', detail: 'Client Launch',
+        path: 'cloud/projects/p_launch/auto_tasks/at_report/config.json' },
+      { category: 'auto_task', id: 'at_personal', title: 'Personal digest',
+        path: 'cloud/auto_tasks/at_personal/config.json' },
+    ]);
+  });
+
+  it('repairs legacy automation labels from archived configs without changing recovery data', async () => {
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(UID);
+    const paths = await import('../../../src/main/paths');
+    const batchId = 'legacy-automations';
+    const batchDir = path.join(paths.userRecycleDir(UID), batchId);
+    const configs = [
+      { path: 'cloud/projects/p_launch/auto_tasks/at_report/config.json', title: 'Archived report', project: 'p_launch' },
+      { path: 'cloud/auto_tasks/at_digest/config.json', title: 'Archived digest', project: 'p_launch' },
+    ];
+    for (const config of configs) {
+      const file = path.join(batchDir, 'files', config.path.slice('cloud/'.length));
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify({ title: config.title, project_id: config.project }));
+    }
+    const raw = {
+      id: batchId, source: 'cloud_sync', reason: 'remote_tombstone', created_at_ms: 1,
+      items: configs.map(config => ({ path: config.path, size: 30 })),
+      metadata: { project_rows: [{ project_id: 'p_launch', name: 'Client Launch' }] },
+      display_items: ['at_report', 'at_digest'].map(id => ({
+        category: 'auto_task', id, title: id, path: `cloud/auto_tasks/${id}/config.json`,
+      })),
+    };
+    const metaFile = path.join(batchDir, 'batch.json');
+    fs.writeFileSync(metaFile, JSON.stringify(raw));
+    const original = fs.readFileSync(metaFile, 'utf8');
+    const { listRecycleBatches } = await import('../../../src/main/features/recycle_bin');
+    const [batch] = await listRecycleBatches(UID);
+    expect(batch.display_items).toEqual([
+      { category: 'auto_task', id: 'at_report', title: 'Archived report', detail: 'Client Launch', path: configs[0].path },
+      { category: 'auto_task', id: 'at_digest', title: 'Archived digest', detail: 'Client Launch', path: configs[1].path },
+    ]);
+    expect(batch.items).toEqual(raw.items);
+    expect(batch.metadata).toEqual(raw.metadata);
+    expect(fs.readFileSync(metaFile, 'utf8')).toBe(original);
+  });
+
+  it.each([null, '{}', '{broken'])('keeps a cached automation name when its archived config has no readable title (%s)', async (archivedConfig) => {
+    const users = await import('../../../src/main/features/users');
+    users.activateUser(UID);
+    const paths = await import('../../../src/main/paths');
+    const batchDir = path.join(paths.userRecycleDir(UID), 'missing-automation');
+    fs.mkdirSync(batchDir, { recursive: true });
+    fs.writeFileSync(path.join(batchDir, 'batch.json'), JSON.stringify({
+      id: 'missing-automation', source: 'app', reason: 'app_delete', created_at_ms: 1,
+      items: [{ path: 'cloud/projects/p_launch/auto_tasks/at_report/config.json', size: 10 }],
+      display_items: [{ category: 'auto_task', id: 'at_report', title: 'Saved task name',
+        path: 'cloud/auto_tasks/at_report/config.json' }],
+    }));
+    const live = path.join(paths.userCloudRoot(UID), 'projects/p_launch/auto_tasks/at_report/config.json');
+    fs.mkdirSync(path.dirname(live), { recursive: true });
+    fs.writeFileSync(live, JSON.stringify({ title: 'Different task created later' }));
+    if (archivedConfig !== null) {
+      const archived = path.join(batchDir, 'files/projects/p_launch/auto_tasks/at_report/config.json');
+      fs.mkdirSync(path.dirname(archived), { recursive: true });
+      fs.writeFileSync(archived, archivedConfig);
+    }
+    const { listRecycleBatches } = await import('../../../src/main/features/recycle_bin');
+    const [batch] = await listRecycleBatches(UID);
+    expect(batch.display_items?.[0]).toEqual(expect.objectContaining({
+      title: 'Saved task name', path: 'cloud/projects/p_launch/auto_tasks/at_report/config.json',
+    }));
+  });
+
   it('shows skill edit chats as edit conversations and skills as skills', async () => {
     const users = await import('../../../src/main/features/users');
     users.activateUser(UID);

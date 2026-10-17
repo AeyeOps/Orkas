@@ -143,12 +143,12 @@ describe('ipc/connectors renderer DTO', () => {
     expect(_toClientInstanceForTest({ ...instance, origin: 'custom' }, true, 'u-ipc').reauthorization_required).toBeUndefined();
   });
 
-  it.each(['legacy', 'bot', 'mixed'])('projects %s Lark access issues separately from user reauthorization', async variant => {
+  it.each(['legacy', 'app', 'mixed'])('projects %s Lark issues into the common permission entry without resource warnings', async variant => {
     const runtime = await import('../../../src/main/features/connectors/local-cli');
     const { _toClientInstanceForTest } = await import('../../../src/main/ipc/connectors');
     const directory = runtime.localCliRuntimeDir('u-access', 'feishu');
     fs.mkdirSync(directory, { recursive: true });
-    const issue = { identity: 'bot', recovery: 'check_bot_availability', code: 230013, private_detail: 'must-not-cross-ipc' };
+    const issue = { identity: 'user', recovery: 'check_app_permissions', private_detail: 'must-not-cross-ipc' };
     fs.writeFileSync(path.join(directory, '.orkas-user-permissions.json'), JSON.stringify({
       profile: runtime.localCliProfileName('u-access', 'feishu'), reauthorize: true, unresolved_access: true,
       scopes: variant === 'mixed' ? ['im:message.send_as_user'] : [],
@@ -157,12 +157,26 @@ describe('ipc/connectors renderer DTO', () => {
     const instance = { ...baseInstance({ kind: 'stdio' }), id: 'feishu', origin: undefined };
     const dto = _toClientInstanceForTest(instance, true, 'u-access');
     expect(dto.status.kind).toBe('connected');
-    expect(dto.reauthorization_required).toBe(variant === 'mixed' ? true : undefined);
-    expect(dto.access_advisories).toEqual([variant === 'legacy' ? 'check_resource_access' : 'check_bot_availability']);
+    expect(dto.reauthorization_required).toBe(variant === 'legacy' ? undefined : true);
+    expect(dto.access_advisories).toBeUndefined();
     expect(JSON.stringify(dto)).not.toMatch(/must-not-cross-ipc|230013|orkas-/);
     expect(runtime.localCliMissingPermissions('u-access', 'feishu'))
-      .toEqual(variant === 'mixed' ? ['im:message.send_as_user'] : null);
+      .toEqual(variant === 'mixed' ? ['im:message.send_as_user'] : variant === 'app' ? [] : null);
     expect(_toClientInstanceForTest(instance, true, 'other-account').access_advisories).toBeUndefined();
+  });
+
+  it.each(['wecom', 'dingtalk'])('keeps unknown %s resource-access failures out of connector permission completeness', async id => {
+    const runtime = await import('../../../src/main/features/connectors/local-cli');
+    const { _toClientInstanceForTest } = await import('../../../src/main/ipc/connectors');
+    const directory = runtime.localCliRuntimeDir('u-resource', id);
+    fs.mkdirSync(directory, { recursive: true });
+    const file = path.join(directory, '.orkas-user-permissions.json');
+    const value = { profile: runtime.localCliProfileName('u-resource', id), reauthorize: true, scopes: [], unresolved_access: true };
+    fs.writeFileSync(file, JSON.stringify(value));
+    const instance = { ...baseInstance({ kind: 'stdio' }), id, origin: undefined };
+    expect(_toClientInstanceForTest(instance, true, 'u-resource').reauthorization_required).toBeUndefined();
+    fs.writeFileSync(file, JSON.stringify({ ...value, connector_level: true }));
+    expect(_toClientInstanceForTest(instance, true, 'u-resource').reauthorization_required).toBe(true);
   });
 
   it('accepts OAuth start without waiting for the browser callback', async () => {
@@ -358,6 +372,27 @@ describe('ipc/connectors renderer DTO', () => {
 
     expect(out.instances.map((inst) => inst.id)).toEqual(['custom-secret']);
     expect(restoreComposioConnectionsFromServer).not.toHaveBeenCalled();
+  });
+
+  // The renderer only needs to know whether a connector ever listed tools
+  // (an interrupted first local CLI setup vs. a usable one that lost access);
+  // the full schemas stay in the main process.
+  it('sends the renderer a tool count instead of the cached tool schemas', async () => {
+    const { _toClientInstanceForTest } = await import('../../../src/main/ipc/connectors');
+    const inst = baseInstance({ kind: 'stdio', command: 'node', args: [] });
+    inst.tools_cache = [
+      { name: 'list_sites', description: 'SCHEMA-MARKER lists sites', input_schema: { type: 'object', properties: { q: { type: 'string' } } } },
+      { name: 'get_site', description: 'SCHEMA-MARKER reads one site', input_schema: { type: 'object' } },
+    ];
+    inst.tools_cached_at = 123;
+
+    const dto: any = _toClientInstanceForTest(inst, true);
+
+    expect(dto.tools_count).toBe(2);
+    expect(dto.tools_cached_at).toBe(123);
+    expect(dto).not.toHaveProperty('tools_cache');
+    expect(JSON.stringify(dto)).not.toContain('SCHEMA-MARKER');
+    expect(_toClientInstanceForTest(baseInstance({ kind: 'stdio', command: 'node', args: [] }), true).tools_count).toBe(0);
   });
 
   it('does not expose stdio argv/env secrets', async () => {

@@ -16,7 +16,7 @@
  */
 
 import { validateWithOperatorPolicy } from './operator-policy';
-import { addEntryWithMaintenance, replaceEntryWithMaintenance } from './memory-maintenance';
+import { addMemoryEntry, replaceMemoryEntry } from './memory-writes';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
@@ -247,11 +247,11 @@ export interface Agent {
    * Maintained exclusively by the agent-edit LLM via the `<inputs>` child
    * of the `<agent>` container. */
   inputs?: AgentInput[];
-  /** Interactive agents need ongoing user back-and-forth (tutoring,
-   * Q&A, role-play). When the agent's plan step is `in_progress`, the
-   * group-chat input box auto-targets the agent so the user doesn't have
-   * to manually @-mention every reply. Maintained by the agent-edit LLM
-   * via the `<interactive>` child of `<agent>`; missing = false. */
+  /** Default multi-turn lifecycle (tutoring, Q&A, role-play). Interactive
+   * agents receive the open/closed protocol and retain an automatic hand-off
+   * until explicit handback; ordinary workers finish at a terminal turn.
+   * Formal hand-offs and valid input forms select their owner independently.
+   * Maintained by the agent-edit LLM via `<interactive>`; missing = false. */
   interactive?: boolean;
   /** How this agent collects user input in conversation. The platform default
    * `form` teaches the `<agent-input-form>` protocol; `prose` replaces it with
@@ -2453,7 +2453,7 @@ export async function addCustomAgentMemory(agentId: string, content: string) {
   const target = await _resolveAgentMemoryTarget(agentId);
   if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
   if (!_agentSupportsMemory(target.agent)) return _unsupportedCliAgentMemoryResult();
-  const res = await addEntryWithMaintenance(getActiveUserId(), { agent: agentId }, content);
+  const res = await addMemoryEntry(getActiveUserId(), { agent: agentId }, content);
   if (res.ok) _invalidateAgentListCache();
   return res;
 }
@@ -2475,7 +2475,7 @@ export async function updateCustomAgentMemory(agentId: string, oldText: string, 
   const target = await _resolveAgentMemoryTarget(agentId);
   if (!target) return { ok: false, error: 'agent not found or read-only', entries: [], usage: { current: 0, limit: 0 } };
   if (!_agentSupportsMemory(target.agent)) return _unsupportedCliAgentMemoryResult();
-  const res = await replaceEntryWithMaintenance(getActiveUserId(), { agent: agentId }, oldText, content);
+  const res = await replaceMemoryEntry(getActiveUserId(), { agent: agentId }, oldText, content);
   if (res.ok) _invalidateAgentListCache();
   return res;
 }

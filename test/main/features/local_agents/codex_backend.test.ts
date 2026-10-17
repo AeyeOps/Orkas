@@ -24,6 +24,8 @@ const fs = require('node:fs');
 const specialScenarios = [
   'exit-with-child',
   'bootstrap-hang',
+  'resume-hang',
+  'turn-start-hang',
   'protocol-failure',
   'fatal-lingers',
   'success-lingers',
@@ -98,13 +100,32 @@ process.stdin.on('data', (chunk) => {
       } else {
         send({ jsonrpc: '2.0', id: message.id, result: { userAgent: 'fake-codex' } });
       }
+    } else if (message.method === 'model/list') {
+      send({ id: message.id, result: { data: [{ id: 'gpt-6-sol', model: 'gpt-6-sol', supportedReasoningEfforts: [{ reasoningEffort: 'low' }, { reasoningEffort: 'high' }] }] } });
+    } else if (message.method === 'config/read') {
+      const flag = process.argv.indexOf('--configured-model');
+      const provider = process.argv.indexOf('--configured-provider');
+      send({ id: message.id, result: { config: {
+        model: flag >= 0 ? process.argv[flag + 1] : 'gpt-6.1-sol',
+        model_provider: provider >= 0 ? process.argv[provider + 1] : 'openai',
+      } } });
+    } else if (message.method === 'account/read') {
+      send({ id: message.id, result: { account: { type: process.argv.includes('--api-account') ? 'apiKey' : 'chatgpt' } } });
     } else if (message.method === 'thread/resume') {
+      if (scenario === 'resume-hang') continue;
       if (rejectUnnegotiatedPermissions(message)) continue;
       send({ jsonrpc: '2.0', id: message.id, error: { code: -32001, message: 'thread expired' } });
     } else if (message.method === 'thread/start') {
       if (rejectUnnegotiatedPermissions(message)) continue;
+      // Real 0.146.0 and 0.159.3 schemas omit these retired fields. An
+      // adapter must not depend on unknown-field tolerance in a future CLI.
+      if (['compactPrompt', 'includeApplyPatchTool', 'persistExtendedHistory'].some(key => key in message.params)) {
+        send({ id: message.id, error: { code: -32602, message: 'retired thread/start field' } });
+        continue;
+      }
       send({ jsonrpc: '2.0', id: message.id, result: { threadId: 'fresh-thread' } });
     } else if (message.method === 'turn/start') {
+      if (scenario === 'turn-start-hang') continue;
       if (rejectUnnegotiatedPermissions(message)) continue;
       send({ jsonrpc: '2.0', id: message.id, result: { turn: { id: 'turn-1' } } });
       if (scenario === 'exit-with-child') {
@@ -729,6 +750,51 @@ if (scenario.endsWith('-lingers') || scenario === 'hang' || scenario === 'bootst
     fs.rmSync(tempDir, { recursive: true, force: true });
   });
 
+
+  it.each([
+    { version: '0.156.1', model: undefined, blocked: false },
+    { version: '0.156.1', model: 'gpt-6.1-sol', blocked: true },
+    { version: '0.159.0', model: 'gpt-6.1-sol', blocked: true },
+    { version: '0.159.1', model: 'gpt-6.1-sol', blocked: false },
+    { version: '0.156.1', model: 'gpt-6.1-sol', extra: ['--api-account'], blocked: false },
+    { version: '0.156.1', model: 'gpt-6.1-sol', extra: ['--configured-provider', 'custom'], blocked: false },
+    { version: '0.156.1', model: 'custom/gpt-6.1-sol', blocked: false },
+  ])('checks native catalog compatibility before task side effects: $version / $model / $blocked', async ({ version, model, extra = [], blocked }) => {
+    const tracePath = path.join(tempDir, 'compat-trace-' + Math.random() + '.json');
+    const events: any[] = [];
+    await codexBackend.run({ binPath: fakeCodexPath, cliVersion: version, modelOverride: model,
+      resumeSessionId: 'existing-native-session', prompt: 'must not execute if incompatible',
+      customArgs: ['--trace', tracePath, ...extra], cwd: process.cwd(),
+      signal: new AbortController().signal, timeoutMs: 2000, onEvent: event => events.push(event) });
+    const requests = JSON.parse(fs.readFileSync(tracePath, 'utf8'));
+    const terminal = events.filter(event => event.type === 'done');
+    expect(terminal).toHaveLength(1);
+    if (blocked) {
+      expect(terminal[0]).toMatchObject({ status: 'failed', cliError: 'model_unsupported', retrySafe: false });
+      expect(terminal[0].error).not.toMatch(/upgrade|升级/i);
+      expect(requests.filter((request: any) => ['thread/start', 'thread/resume', 'turn/start'].includes(request.method))).toEqual([]);
+    } else {
+      expect(terminal[0].status).toBe('completed');
+      expect(requests.some((request: any) => request.method === 'turn/start')).toBe(true);
+      if (!model) {
+        expect(requests.find((request: any) => request.method === 'turn/start').params.model).toBe('gpt-6-sol');
+        expect(requests.find((request: any) => request.method === 'thread/start').params.model).toBe('gpt-6-sol');
+      }
+    }
+  });
+
+  it.each(['low', 'max'])('uses the actual native catalog for effort compatibility: %s', async effort => {
+    const tracePath = path.join(tempDir, 'effort-' + effort + '.json'); const events: any[] = [];
+    await codexBackend.run({ binPath: fakeCodexPath, cliVersion: '0.156.1', modelOverride: 'gpt-6-sol', thinkingLevel: effort,
+      prompt: 'fixture', customArgs: ['--trace', tracePath], cwd: process.cwd(),
+      signal: new AbortController().signal, timeoutMs: 2000, onEvent: event => events.push(event) });
+    const requests = JSON.parse(fs.readFileSync(tracePath, 'utf8'));
+    const turn = requests.find((entry: any) => entry.method === 'turn/start');
+    expect(turn.params.model).toBe('gpt-6-sol');
+    expect(turn.params.effort).toBe(effort === 'low' ? 'low' : undefined);
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ status: 'completed' });
+  });
   it('falls back from an expired resume, restores recovery context, and completes the turn', async () => {
     const tracePath = path.join(tempDir, 'resume-trace.json');
     const events: any[] = [];
@@ -1440,12 +1506,12 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
       const ids = deliveries.filter(row => row.channel === 'local-agent:user-input').map(row => row.payload.request_id);
       await ingress.submit({ id: 'test-control', text: 'continue' });
       await vi.waitFor(() => expect(deliveries.some(row => row.channel === 'local-agent:user-input_cancelled' && row.payload.request_ids.includes(ids[0]))).toBe(true));
-      expect(userInput.respond(ids[0], 'u-input', { scope: ['Late'] })).toEqual({ handled: false });
+      expect(await userInput.respond(ids[0], 'u-input', { scope: ['Late'] })).toEqual({ handled: false });
       if (boundary === 'resolved') {
-        expect(userInput.respond(ids[1], 'u-input', { scope: ['Current'] })).toEqual({ handled: true, cancelled: false });
+        expect(await userInput.respond(ids[1], 'u-input', { scope: ['Current'] })).toEqual({ handled: true, cancelled: false });
       }
       await run;
-      expect(userInput.respond(ids[1], 'u-input', { scope: ['Late'] })).toEqual({ handled: false });
+      expect(await userInput.respond(ids[1], 'u-input', { scope: ['Late'] })).toEqual({ handled: false });
       const replies = JSON.parse(fs.readFileSync(trace, 'utf8')).filter((row: any) => !row.method && [94, 95].includes(row.id));
       expect(replies).toEqual(boundary === 'resolved' ? [{ jsonrpc: '2.0', id: 95, result: { answers: { scope: { answers: ['Current'] } } } }] : []);
       expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
@@ -1514,7 +1580,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
         await expect(userInput.cancelRequest(requestId, 'u-input')).resolves.toEqual(
           boundary === 'host-closed' ? { handled: false, closed: true } : { handled: false, unknown: true },
         );
-        expect(userInput.respond(requestId, 'u-input', { scope: ['Late answer'] })).toEqual({ handled: false });
+        expect(await userInput.respond(requestId, 'u-input', { scope: ['Late answer'] })).toEqual({ handled: false });
       }
       await ingress.submit({ id: 'test-control', text: 'continue' });
       if (boundary === 'confirmed') await expect(cancel).resolves.toEqual({ handled: true, cancelled: true });
@@ -1785,7 +1851,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
       });
 
       const done = events.at(-1);
-      expect(done).toMatchObject({ type: 'done', status: 'failed', failureKind: 'cli_protocol', retrySafe: true });
+      expect(done).toMatchObject({ type: 'done', status: 'failed', failureKind: 'cli_protocol', bootstrapTimeout: true, retrySafe: true });
       expect(String(done.error)).toMatch(/bootstrap timed out/);
       expect(events.filter(event => event.type === 'done')).toHaveLength(1);
       await expectProcessToExit(pid);
@@ -1795,6 +1861,33 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
       if (pid > 0) {
         try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
       }
+    }
+  });
+
+  it.each(['resume-hang', 'turn-start-hang'])('marks %s recovery safety from task submission, not its acknowledgement', async scenario => {
+    const trace = path.join(tempDir, `${scenario}.json`);
+    const events: any[] = [];
+    const previous = process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS;
+    process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS = '500';
+    try {
+      await codexBackend.run({
+        binPath: fakeCodexPath, prompt: 'current task', resumeSessionId: 'old-thread',
+        resumeFallbackPrompt: 'bounded context and current task', cwd: tempDir,
+        customArgs: [`--${scenario}`, '--trace', trace], signal: new AbortController().signal,
+        timeoutMs: 5000, onEvent: event => events.push(event),
+      });
+      const requests = JSON.parse(fs.readFileSync(trace, 'utf8'));
+      expect(requests.some((request: any) => request.method === 'turn/start')).toBe(scenario === 'turn-start-hang');
+      if (scenario === 'resume-hang') {
+        expect(requests.some((request: any) => request.method === 'thread/start')).toBe(false);
+      }
+      expect(events.filter(event => event.type === 'done')).toEqual([
+        expect.objectContaining({ status: 'failed', bootstrapTimeout: true, retrySafe: scenario === 'resume-hang' }),
+      ]);
+      await expectProcessToExit(Number(events.find(event => event.type === 'process-info').pid));
+    } finally {
+      if (previous === undefined) delete process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS;
+      else process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS = previous;
     }
   });
 

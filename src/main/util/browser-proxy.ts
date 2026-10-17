@@ -1,9 +1,15 @@
 import type { ProxyConfig, Session, WebContents } from 'electron';
 import { createLogger } from '../logger';
 import { envProxyConfig } from './proxy-dispatcher';
+import { isIP } from 'node:net';
 
 const log = createLogger('browser-proxy');
 type Credentials = { username: string; password: string };
+
+export interface BrowserProxyDiagnostic {
+  browser_proxy_policy: 'system' | 'fixed_servers' | 'invalid';
+  browser_proxy_setup: 'ready' | 'pending' | 'failed';
+}
 
 /** Translate launch environment policy without changing Chromium's system/PAC defaults. */
 export function browserProxyConfig(env: NodeJS.ProcessEnv): {
@@ -43,6 +49,18 @@ export function browserProxyConfig(env: NodeJS.ProcessEnv): {
       bypass.push('*');
       continue;
     }
+    // macOS system exceptions include CIDR literals, which Chromium accepts
+    // directly. Validate the literal and prefix without dropping bypass policy.
+    const cidr = /^([^/]+)\/(\d{1,3})$/u.exec(token);
+    if (cidr) {
+      const family = isIP(cidr[1]);
+      const prefix = Number(cidr[2]);
+      if (!family || prefix > (family === 4 ? 32 : 128)) {
+        throw new Error('Invalid browser proxy bypass range');
+      }
+      bypass.push(`${cidr[1]}/${prefix}`);
+      continue;
+    }
     // NO_PROXY bare domains cover both the host and its subdomains. Chromium bare hosts do not.
     const match = /^(\[[\da-f:]+\]|::1|(?:\*?\.)?[\w.-]+)(:\d+)?$/iu.exec(token);
     if (!match) throw new Error('Unsupported browser proxy bypass rule');
@@ -67,10 +85,13 @@ export function browserProxyConfig(env: NodeJS.ProcessEnv): {
 export function prepareBrowserProxy(ses: Pick<Session, 'setProxy'>, env: NodeJS.ProcessEnv = process.env): {
   ready?: Promise<boolean>;
   attach: (contents: WebContents) => void;
+  diagnostic: () => BrowserProxyDiagnostic;
 } {
   try {
     const { config, credentials } = browserProxyConfig(env);
-    if (!config) return { attach: () => {} };
+    if (!config) return { attach: () => {},
+      diagnostic: () => ({ browser_proxy_policy: 'system', browser_proxy_setup: 'ready' }) };
+    let setup: BrowserProxyDiagnostic['browser_proxy_setup'] = 'pending';
     let timer: ReturnType<typeof setTimeout>;
     const ready = Promise.race([
       ses.setProxy(config).then(() => true),
@@ -80,9 +101,15 @@ export function prepareBrowserProxy(ses: Pick<Session, 'setProxy'>, env: NodeJS.
     ]).catch(() => {
       log.warn('browser proxy setup failed; browser requests remain blocked');
       return false;
-    }).finally(() => clearTimeout(timer!));
+    }).finally(() => clearTimeout(timer!)).then(applied => {
+      setup = applied ? 'ready' : 'failed';
+      return applied;
+    });
     return {
       ready,
+      // Policy/setup observations only; system/PAC and bypass resolution are
+      // deliberately not inferred and this performs no network lookup.
+      diagnostic: () => ({ browser_proxy_policy: 'fixed_servers', browser_proxy_setup: setup }),
       attach(contents) {
         if (!credentials.size) return;
         contents.on('login', (event, details, auth, callback) => {
@@ -99,6 +126,7 @@ export function prepareBrowserProxy(ses: Pick<Session, 'setProxy'>, env: NodeJS.
   } catch {
     // Never include an environment URL or upstream error: it may contain credentials.
     log.warn('browser proxy configuration is invalid; browser requests remain blocked');
-    return { ready: Promise.resolve(false), attach: () => {} };
+    return { ready: Promise.resolve(false), attach: () => {},
+      diagnostic: () => ({ browser_proxy_policy: 'invalid', browser_proxy_setup: 'failed' }) };
   }
 }

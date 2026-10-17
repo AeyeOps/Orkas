@@ -9,6 +9,7 @@ export interface BrowserTabLifetime {
 
 interface TaskTabs {
   runId?: string;
+  listeners?: Set<() => void>;
   tabs: Map<string, { lifetime: BrowserTabLifetime; close: () => void }>;
 }
 
@@ -31,6 +32,7 @@ export function beginBrowserTaskRun(uid: string, cid: string, runId: string): vo
   const task = taskTabs(uid, cid);
   if (task.runId === runId) return;
   task.runId = runId;
+  for (const listener of task.listeners || []) listener();
 }
 
 export function browserTaskRunId(uid: string, cid: string): string | undefined {
@@ -51,7 +53,7 @@ export function forgetBrowserTab(uid: string, cid: string, tabId: string): void 
   const task = tasks.get(key);
   if (!task) return;
   task.tabs.delete(tabId);
-  if (!task.runId && !task.tabs.size) tasks.delete(key);
+  if (!task.runId && !task.tabs.size && !task.listeners?.size) tasks.delete(key);
 }
 
 export function retainBrowserTab(
@@ -70,10 +72,21 @@ export function finishBrowserTaskRun(uid: string, cid: string, runId: string): v
   const task = tasks.get(key);
   if (!task || task.runId !== runId) return;
   task.runId = undefined;
+  for (const listener of task.listeners || []) listener();
   for (const [tabId, entry] of [...task.tabs]) {
     if (entry.lifetime.createdBy === 'user' || entry.lifetime.retention !== 'temporary') continue;
     task.tabs.delete(tabId);
     entry.close();
   }
-  if (!task.tabs.size) tasks.delete(key);
+  if (!task.tabs.size && !task.listeners?.size) tasks.delete(key);
+}
+
+/** Event-driven turn revocation for task-local native browser operations. */
+export function watchBrowserTaskRun(uid: string, cid: string, changed: () => void): () => void {
+  const task = taskTabs(uid, cid);
+  (task.listeners ||= new Set()).add(changed);
+  return () => {
+    task.listeners?.delete(changed);
+    if (!task.runId && !task.tabs.size && !task.listeners?.size) tasks.delete(keyFor(uid, cid));
+  };
 }

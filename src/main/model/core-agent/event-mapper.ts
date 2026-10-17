@@ -70,9 +70,37 @@ export function sanitizePublicReasoningSummary(value: unknown): string {
 const REASONING_PROGRESS_INTERVAL_MS = 250;
 const MAX_LIVE_REASONING_SUMMARY_CHARS = 2_048;
 
-function boundedLiveReasoningSummary(value: unknown): string {
-  const sanitized = sanitizePublicReasoningSummary(value);
-  if (sanitized.length <= MAX_LIVE_REASONING_SUMMARY_CHARS) return sanitized;
+// Start at a complete line, retaining the preceding redaction context too.
+// Secret-field separators and authentication schemes can span whitespace and
+// newlines. A single long line therefore requires full sanitization: a fixed
+// amount of slack cannot protect a token or path of arbitrary length.
+const LIVE_REASONING_SANITIZE_SLACK_CHARS = 4_096;
+
+export function boundedLiveReasoningSummary(value: unknown): string {
+  const raw = String(value ?? '');
+  let window = MAX_LIVE_REASONING_SUMMARY_CHARS + LIVE_REASONING_SANITIZE_SLACK_CHARS;
+  const lineStart = (end: number) => {
+    for (let i = end; i >= 0; i -= 1) {
+      const code = raw.charCodeAt(i);
+      if (code === 10 || code === 13) return i + 1;
+    }
+    return 0;
+  };
+  const contextStart = () => {
+    if (raw.length <= window) return 0;
+    let start = lineStart(raw.length - window);
+    let previous = start - 1;
+    while (previous >= 0 && /[\s=:]/.test(raw[previous])) previous -= 1;
+    return lineStart(previous);
+  };
+  let start = contextStart();
+  let sanitized = sanitizePublicReasoningSummary(raw.slice(start));
+  while (start > 0 && sanitized.length <= MAX_LIVE_REASONING_SUMMARY_CHARS) {
+    window *= 4;
+    start = contextStart();
+    sanitized = sanitizePublicReasoningSummary(raw.slice(start));
+  }
+  if (start === 0 && sanitized.length <= MAX_LIVE_REASONING_SUMMARY_CHARS) return sanitized;
   return `…${sanitized.slice(-(MAX_LIVE_REASONING_SUMMARY_CHARS - 1))}`;
 }
 
@@ -96,6 +124,10 @@ export interface MapCoreAgentEventsOptions {
    *  Repeated-failure guidance is isolated by object identity and is released
    *  automatically when the session cache releases the underlying session. */
   failureTrackingScope: object;
+  /** Provider of the candidate that owned the latest model call. Rotation can
+   *  end on another provider than the run's primary label; a terminal error
+   *  is attributed (and Orkas billing trusted) by the provider that produced it. */
+  outcomeProviderId?: () => string | undefined;
   /** Whether development-only process diagnostics may be rendered. Defaults
    *  to false so a missing caller option cannot expose internal routing. */
   isDev?: boolean;
@@ -342,12 +374,21 @@ const CUSTOM_ENDPOINT_FAILURE_THRESHOLD = 2;
 
 const NO_BODY_HTTP_RE = /\b(4\d\d)\s+status code\s*\(\s*no body\s*\)/i;
 
-function isEndpointLevelFailure(error: AgentErrorMeta, failureCode: string): boolean {
+/** Statuses that say the configured URL itself is wrong or retired. Any
+ * other 4xx only rejects this request: on 2026-09-20 two `400 (no body)`
+ * runs told a qwen user her endpoint was "dead or moved", and the same
+ * service answered again seven minutes later. */
+const ENDPOINT_GONE_STATUSES = new Set([404, 405, 410]);
+
+function endpointGoneStatus(error: AgentErrorMeta, failureCode: string): number | null {
   // Account failures already have authoritative status/code diagnostics. A
   // no-body SDK message must not overwrite them with endpoint suspicion.
-  if (providerCredentialFailure(error)) return false;
-  return /^provider_http_4\d\d$/.test(failureCode)
-    || NO_BODY_HTTP_RE.test(String(error.message || ''));
+  if (providerCredentialFailure(error)) return null;
+  const fromCode = /^provider_http_(4\d\d)$/.exec(failureCode)?.[1];
+  const fromMessage = NO_BODY_HTTP_RE.exec(String(error.message || ''))?.[1];
+  if (!fromCode && !fromMessage) return null;
+  const status = typeof error.statusCode === 'number' ? error.statusCode : Number(fromCode || fromMessage);
+  return ENDPOINT_GONE_STATUSES.has(status) ? status : null;
 }
 
 /** Exposed for unit tests so cases cannot inherit another case's WeakMap. */
@@ -383,16 +424,14 @@ function customEndpointDiagnostic(
   failureCode: string,
 ): string | null {
   if (providerId !== 'custom') return null;
-  if (!isEndpointLevelFailure(error, failureCode)) {
+  const status = endpointGoneStatus(error, failureCode);
+  if (status === null) {
     tracking.customEndpointConsecutiveFailures = 0;
     return null;
   }
   tracking.customEndpointConsecutiveFailures += 1;
   if (tracking.customEndpointConsecutiveFailures < CUSTOM_ENDPOINT_FAILURE_THRESHOLD) return null;
-  const status = typeof error.statusCode === 'number'
-    ? String(error.statusCode)
-    : (NO_BODY_HTTP_RE.exec(String(error.message || ''))?.[1] || '4xx');
-  return t('errors.custom_endpoint_suspect', { status });
+  return t('errors.custom_endpoint_suspect', { status: String(status) });
 }
 
 function localizeKnownRunnerError(error: AgentErrorMeta, providerId?: string): string {
@@ -1227,11 +1266,12 @@ export async function* mapCoreAgentEvents(
           };
         }
         if (result.meta.error) {
-          error = localizeKnownRunnerError(result.meta.error, result.meta.provider);
+          const errorProviderId = opts.outcomeProviderId?.() || result.meta.provider;
+          error = localizeKnownRunnerError(result.meta.error, errorProviderId);
           failureDetails = modelFailureDetails(
             result.meta.error,
             hasAssistantText,
-            result.meta.provider,
+            errorProviderId,
           );
           const endpointDiagnostic = customEndpointDiagnostic(
             failureTracking,
@@ -1265,6 +1305,18 @@ export async function* mapCoreAgentEvents(
           // can otherwise turn a preamble into a successful final answer when
           // the post-tool round emitted reasoning only.
           finalText = localizeKnownRunnerText(result.text || '');
+          const termination = result.meta.termination;
+          if (termination?.status === 'stopped' && termination.summaryIncomplete) {
+            // A structured host stop is not an empty provider response. Keep
+            // model-authored text and render only factual, localized status.
+            const limit = termination.toolRoundLimit;
+            const notice = termination.reason === 'tool_loop_limit' && Number.isInteger(limit) && Number(limit) > 0
+              ? t('model.stopped_tool_limit_summary_incomplete', { limit: Number(limit) })
+              : termination.reason === 'repetitive_tool_calls'
+                ? t('model.stopped_repeat_summary_incomplete')
+                : t('model.stopped_summary_incomplete');
+            finalText = [finalText, notice].filter(Boolean).join('\n\n');
+          }
           if (
             finalText
             && result.meta.convergenceSignals?.includes('output_limit_unrecovered')

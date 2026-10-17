@@ -17,6 +17,7 @@
 
 import { createLogger } from '../../../logger.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
+import { t } from '../../../i18n.js';
 import { AcpDiagnostics } from './acp-diagnostics.js';
 import {
   type LocalBackend,
@@ -64,6 +65,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       let resultText = '';
       let resultStatus: 'completed' | 'failed' | undefined;
       let resultError: string | undefined;
+      let compatibilityFailure = false;
       const toolNames = new Map<string, string>();
       // Captured upstream-provider error text from stderr. ACP servers
       // (notably hermes 0.9) treat upstream HTTP 400/auth errors as
@@ -108,9 +110,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         },
       });
 
-      // Include the model on session/new for ACP implementations that accept
-      // it there. session/set_model below covers implementations that require
-      // the explicit setter. Missing means the CLI/account default.
+      // session/new carries only protocol-defined environment fields.
       const mcpServers = opts.bridge ? [{
         name: 'orkas', command: opts.bridge.server.command, args: opts.bridge.server.args,
         env: Object.entries(opts.bridge.server.env).map(([name, value]) => ({ name, value })),
@@ -119,7 +119,6 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         cwd: opts.cwd,
         mcpServers,
       };
-      if (opts.modelOverride) sessionNewParams.model = opts.modelOverride;
       const requestedResumeId = def.resume ? String(opts.resumeSessionId || '') : '';
 
       let sessionStartSent = false;
@@ -151,21 +150,52 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           },
         });
       };
+      let sessionConfiguration: any;
+      let pendingSelection: { configId?: string; value: string } | undefined;
+      const selections = [
+        ...(opts.modelOverride ? [{ category: 'model', value: opts.modelOverride }] : []),
+        ...(opts.thinkingLevel ? [{ category: 'thought_level', value: opts.thinkingLevel }] : []),
+      ];
+      const failSelection = (parameter: string) => {
+        resultStatus = 'failed';
+        resultError = t('cli_agent.parameter_unsupported', { cli: def.clientName, parameter });
+        compatibilityFailure = true;
+        finishProtocol();
+      };
+      const applyNextSelection = (id: string) => {
+        const selection = selections.shift();
+        if (!selection) { sendPrompt(id); return; }
+        const configs = sessionConfiguration?.configOptions;
+        if (Array.isArray(configs)) {
+          const config = configs.find((option: any) => option?.category === selection.category
+            || (selection.category === 'model' && option?.id === 'model'));
+          const values = Array.isArray(config?.options)
+            ? config.options.flatMap((option: any) => Array.isArray(option?.options) ? option.options : [option]) : [];
+          if (selection.category === 'thought_level' && (!config
+            || !values.some((option: any) => option?.value === selection.value))) {
+            applyNextSelection(id); return;
+          }
+          if (!config || typeof config.id !== 'string' || !config.id
+            || config.type !== 'select' || !values.some((option: any) => option?.value === selection.value)) {
+            failSelection(selection.category); return;
+          }
+          pendingSelection = { configId: config.id, value: selection.value };
+          send({ jsonrpc: '2.0', id: 3, method: 'session/set_config_option',
+            params: { sessionId: id, configId: config.id, value: selection.value } });
+        } else if (selection.category === 'model') {
+          // Legacy Hermes 0.9 exposes its setter without configOptions. A
+          // rejection or absent acknowledgment must never run the default model.
+          pendingSelection = { value: selection.value };
+          send({ jsonrpc: '2.0', id: 3, method: 'session/set_model',
+            params: { sessionId: id, modelId: selection.value } });
+        } else { applyNextSelection(id); return; }
+        modelSetTimer = setTimeout(() => failSelection(selection.category), 3_000);
+        modelSetTimer.unref?.();
+      };
       const onSessionReady = (id: string) => {
         sessionId = id;
         opts.onEvent({ type: 'status', status: 'session_ready', sessionId });
-        if (opts.modelOverride) {
-          send({
-            jsonrpc: '2.0', id: 3, method: 'session/set_model',
-            params: { sessionId: id, modelId: opts.modelOverride },
-          });
-          // Version-skewed ACP servers may accept the setter without
-          // replying. Never let optional selection block the task.
-          modelSetTimer = setTimeout(() => sendPrompt(id), 250);
-          if (typeof modelSetTimer.unref === 'function') modelSetTimer.unref();
-        } else {
-          sendPrompt(id);
-        }
+        applyNextSelection(id);
       };
       child.stdout.setEncoding('utf8');
       child.stdout.on('data', chunk => {
@@ -258,7 +288,18 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             return;
           }
           if (Number(env.id) === 1 && !env.error) sendSessionStart();
-          if (Number(env.id) === 3 && sessionId) sendPrompt(sessionId);
+          if (Number(env.id) === 3 && sessionId && pendingSelection) {
+            if (modelSetTimer) clearTimeout(modelSetTimer);
+            const selection = pendingSelection; pendingSelection = undefined;
+            const accepted = !env.error && (!selection.configId ||
+              (Array.isArray(env.result?.configOptions) && env.result.configOptions.some((option: any) => option?.id === selection.configId
+                && option.currentValue === selection.value)));
+            if (!accepted) { failSelection(selection.configId || 'model'); return; }
+            if (selection.configId) sessionConfiguration = env.result;
+            applyNextSelection(sessionId);
+            return;
+          }
+          if (Number(env.id) === 2 && !env.error) sessionConfiguration = env.result;
           if (Number(env.id) === 2 && env.error) {
             resultStatus = 'failed';
             resultError = typeof env.error.message === 'string'
@@ -382,6 +423,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             });
             if (resultStatus === 'failed') return finish('failed', {
               error: resultError, output: resultText, stderrTail: tail.toString(),
+              ...(compatibilityFailure ? { cliError: 'parameter_unsupported', failureKind: 'cli_compatibility', retrySafe: false } : {}),
             });
             // Preserve the existing Hermes silent-provider-failure handling
             // for diagnostic evidence received before the protocol terminal.

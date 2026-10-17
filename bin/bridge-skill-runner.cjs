@@ -1,5 +1,7 @@
 'use strict';
 
+const { defaultNumericRange } = require('./tool-input-compat.cjs');
+
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -402,6 +404,7 @@ function createBridgeSkillRunner(options) {
       throw new Error('stream must be stdout or stderr');
     }
     if (!Number.isInteger(offset) || offset < 0) throw new Error('offset must be a non-negative integer');
+    limit = defaultNumericRange(limit, DEFAULT_READ_BYTES, 1, MAX_READ_BYTES);
     if (!Number.isInteger(limit) || limit < 1 || limit > MAX_READ_BYTES) {
       throw new Error(`limit must be an integer from 1 to ${MAX_READ_BYTES}`);
     }

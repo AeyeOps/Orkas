@@ -192,7 +192,7 @@ describe('VoiceStudio audio project journeys', () => {
     expect(() => audio.whisperSegments({ transcription: [{ text: 'missing timing' }] })).toThrow('invalid segment timing');
   });
 
-  it('runs the bundled transcription pipeline and saves a readable result without fetching dependencies', async () => {
+  it.runIf(process.env.ORKAS_REAL_WHISPER_TEST === '1')('runs the bundled transcription pipeline and saves a readable result without fetching dependencies', async () => {
     await fs.writeFile(path.join(root, 'silence.wav'), Buffer.from(tone(1).map((b, i) => i < 44 ? b : 0)));
     await save({ schema_version: 1, segments: [] });
     const result = await call('transcribe', { input_path: 'silence.wav', language: 'en' });

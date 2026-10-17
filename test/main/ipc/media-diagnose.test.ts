@@ -63,6 +63,20 @@ async function invoke(payload: Record<string, unknown>): Promise<any> {
 }
 
 describe('media.diagnose', () => {
+  it('identifies lexical OS temporary scope and ENOENT versus ENOTDIR with the existing single async stat', async () => {
+    const { chatMediaLocalUrl } = await import('../../../src/main/util/chat-media-url');
+    await invoke({ url: 'not a url' });
+    const syncLookup = vi.spyOn(fs, 'realpathSync');
+    for (const code of ['ENOENT', 'ENOTDIR']) {
+      const stat = vi.spyOn(fs.promises, 'stat').mockRejectedValue(Object.assign(new Error('private marker'), { code }));
+      const res = await invoke({ url: chatMediaLocalUrl(path.join(tmpDir, 'missing.mp4')), diagnosticOnly: true });
+      expect(res.media_failure_context).toBe(`local|os_temp|${code.toLowerCase()}`);
+      expect(stat).toHaveBeenCalledOnce();
+      expect(JSON.stringify(res)).not.toContain(tmpDir);
+      stat.mockRestore();
+    }
+    expect(syncLookup).not.toHaveBeenCalled();
+  });
   it('distinguishes an available local image without returning its path', async () => {
     const imagePath = path.join(tmpDir, 'image #1%.png');
     fs.writeFileSync(imagePath, Buffer.from('not decoded by this diagnostic'));
@@ -93,7 +107,7 @@ describe('media.diagnose', () => {
     const read = vi.spyOn(fs, 'readFileSync');
     const asyncStat = vi.spyOn(fs.promises, 'stat');
     const result = await invoke({ url: chatMediaLocalUrl(file), diagnosticOnly: true });
-    expect(result).toEqual({ ok: true, diagnosis: 'stat_available', media_kind: 'image' });
+    expect(result).toEqual({ ok: true, diagnosis: 'stat_available', media_kind: 'image', media_failure_context: 'local|os_temp|stat_available' });
     expect(asyncStat).toHaveBeenCalledOnce();
     expect(syncStat).not.toHaveBeenCalled();
     expect(read).not.toHaveBeenCalled();
@@ -106,7 +120,8 @@ describe('media.diagnose', () => {
       await invoke({ url: 'not a url' });
       const stat = vi.spyOn(fs.promises, 'stat').mockRejectedValue(Object.assign(new Error('private-source-marker'), { code }));
       const result = await invoke({ url: 'chat-media://local/private/source.mp4', diagnosticOnly: true });
-      expect(result).toEqual({ ok: true, diagnosis, media_kind: 'video' });
+      expect(result).toEqual({ ok: true, diagnosis, media_kind: 'video',
+        media_failure_context: `local|other_local|${code === 'EIO' ? 'io_error' : code.toLowerCase()}` });
       expect(stat).toHaveBeenCalledOnce();
       expect(JSON.stringify(result)).not.toContain('private');
     },

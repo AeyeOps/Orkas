@@ -171,6 +171,7 @@ export interface NarrationTrack {
     route_ref: string;
     voice_ref: string;
     display_name: string;
+    language: string;
     speed: number;
   };
   /** Legacy plans only; new plans use synthesis. */
@@ -543,7 +544,7 @@ export function validateEdl(obj: unknown): EdlValidation {
         const declared = referenceSources.get(source);
         if (!declared || declared.intent !== 'edit' || declared.media_type !== 'video'
           || !Array.isArray(declared.target_segment_ids) || !declared.target_segment_ids.includes(segment.id)) {
-          err(`segments[${rawSegments.indexOf(segment)}].spec`, 'E_SEMANTIC_EDIT_REFERENCE_UNDECLARED', `semantic edit source "${source}" must be a top-level video reference with intent=edit targeting segment "${String(segment.id)}"`);
+          err(`segments[${(rawSegments as unknown[]).indexOf(segment)}].spec`, 'E_SEMANTIC_EDIT_REFERENCE_UNDECLARED', `semantic edit source "${source}" must be a top-level video reference with intent=edit targeting segment "${String(segment.id)}"`);
         } else if (isObject(editStrategy)) {
           const strategyPreserve = Array.isArray(editStrategy.preserve) ? editStrategy.preserve.filter(isStr) : [];
           const strategyMayChange = Array.isArray(editStrategy.may_change) ? editStrategy.may_change.filter(isStr) : [];
@@ -551,7 +552,7 @@ export function validateEdl(obj: unknown): EdlValidation {
           const referenceMayChange = Array.isArray(declared.may_change) ? declared.may_change.filter(isStr) : [];
           if (strategyPreserve.some((item) => referenceMayChange.includes(item))
             || strategyMayChange.some((item) => referencePreserve.includes(item))) {
-            err(`segments[${rawSegments.indexOf(segment)}].spec`, 'E_SEMANTIC_EDIT_BOUNDARY_CONFLICT', `semantic edit strategy conflicts with the declared preserve/may_change boundary for "${source}"`);
+            err(`segments[${(rawSegments as unknown[]).indexOf(segment)}].spec`, 'E_SEMANTIC_EDIT_BOUNDARY_CONFLICT', `semantic edit strategy conflicts with the declared preserve/may_change boundary for "${source}"`);
           }
         }
       }

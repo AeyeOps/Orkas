@@ -1,4 +1,5 @@
-// Sidebar "Today's Tasks" aggregate. The section mirrors rows that also live
+// Sidebar "Recent Tasks" aggregate (today + yesterday; DOM ids and i18n keys
+// keep the historical "today" names). The section mirrors rows that also live
 // under a Project or in the catch-all Tasks list, so these cases load the real
 // conversation row renderer/handlers (conversation.js) next to the module and
 // assert what the user sees: which tasks appear, in what order, that opening
@@ -47,14 +48,16 @@ function makeContainer() {
   const rows: any[] = [];
   const container: any = {
     rows,
+    more: null as any,
     renameInput: null as any,
     querySelector(selector: string) {
+      if (selector === '[data-recent-conv-more]') return container.more;
       return selector.startsWith('input.conv-item-title-input') ? container.renameInput : null;
     },
     querySelectorAll(selector: string) {
       return selector === '.conv-item' ? rows : [];
     },
-    insertAdjacentHTML() {},
+    insertAdjacentHTML(_position: string, value: string) { container.innerHTML = html + value; },
     cids() { return rows.map((row) => row.dataset.cid); },
   };
   Object.defineProperty(container, 'innerHTML', {
@@ -63,6 +66,8 @@ function makeContainer() {
       html = value;
       rows.length = 0;
       for (const match of value.matchAll(/\sdata-cid="([^"]+)"/g)) rows.push(makeRow(match[1]));
+      container.more = value.includes('data-recent-conv-more') ? makeRow('more') : null;
+      if (container.more) container.more.focus = () => {};
     },
   });
   return container;
@@ -83,6 +88,7 @@ function loadTodayTasksRenderer() {
   const navigations: Array<[string, string]> = [];
   const trackedClicks: Array<[string, Record<string, unknown>]> = [];
   const projectReloads: unknown[] = [];
+  const windowListeners = new Map<string, Function[]>();
   let unreadRefreshes = 0;
   const context: any = {
     console, setTimeout, clearTimeout, setInterval, clearInterval,
@@ -126,7 +132,12 @@ function loadTodayTasksRenderer() {
       getElementById: (id: string) => (id === 'today-list' ? container : id === 'conversation-list' ? conversationList : null),
     },
     window: {
-      addEventListener() {},
+      addEventListener(type: string, listener: Function) {
+        windowListeners.set(type, [...(windowListeners.get(type) || []), listener]);
+      },
+      dispatchEvent(event: any) {
+        for (const listener of windowListeners.get(event.type) || []) listener(event);
+      },
       Monitor: true,
       uiIconHtml: () => '',
       ConversationRuntime: {},
@@ -137,6 +148,17 @@ function loadTodayTasksRenderer() {
   vm.runInContext(readModule('conv-bucket.js'), context);
   vm.runInContext(readModule('conversation.js'), context);
   vm.runInContext(readModule('today-tasks.js'), context);
+  const recentToggle = makeRow('today-section-toggle');
+  recentToggle.setAttribute = () => {};
+  const { initSidebarSections } = require('../../src/renderer/modules/sidebar-sections.js');
+  initSidebarSections({
+    querySelector: (selector: string) => selector === '.sidebar-today-section'
+      ? { classList: { toggle() {} } } : null,
+    getElementById: (id: string) => id === 'today-section-toggle' ? recentToggle
+      : id === 'today-list' ? container : null,
+  }, context.localStorage, context.t, (detail: any) => {
+    context.window.dispatchEvent({ type: 'sidebar-section-toggle', detail });
+  });
   return {
     context,
     container,
@@ -144,25 +166,213 @@ function loadTodayTasksRenderer() {
     navigations,
     trackedClicks,
     projectReloads,
+    recentToggle,
     unreadRefreshes: () => unreadRefreshes,
   };
 }
 
 describe('sidebar Today aggregate', () => {
-  it('lists every task active today across projects and the unprojected list, pinned first then newest', () => {
+  it.each([0, 10, 11])('shows at most ten recent tasks and offers more only when needed (%i tasks)', (count) => {
+    const h = loadTodayTasksRenderer();
+    h.context.conversations = Array.from({ length: count }, (_, i) => ({
+      conversation_id: `recent-${i}`, title: `Task ${i}`, last_active_at: at(HOUR - i),
+    }));
+    h.context.renderConversationList();
+    expect(h.container.cids()).toHaveLength(Math.min(count, 10));
+    expect(Boolean(h.container.more)).toBe(count > 10);
+    // Pagination belongs only to the mirror, not the shared cache or Tasks list.
+    expect(h.context.conversations).toHaveLength(count);
+    expect(h.conversationList.cids()).toHaveLength(count);
+  });
+
+  it('reveals ten more at a time, preserves expansion on refresh and paints newly visible running tasks', () => {
+    const h = loadTodayTasksRenderer();
+    h.context.conversations = Array.from({ length: 21 }, (_, i) => ({
+      conversation_id: `recent-${i}`, title: `Task ${i}`, project_id: 'p1', last_active_at: at(HOUR - i),
+    }));
+    h.context.pendingConvs.set('recent-10', { aborted: false });
+    h.context.renderConversationList();
+    expect(h.container.cids()).toEqual(Array.from({ length: 10 }, (_, i) => `recent-${i}`));
+    h.container.more.click();
+    expect(h.container.cids()).toEqual(Array.from({ length: 20 }, (_, i) => `recent-${i}`));
+    expect(h.container.rows[10].badges()).toEqual(['conv-status-badge is-streaming']);
+    h.context.renderConversationList();
+    expect(h.container.cids()).toHaveLength(20);
+    h.container.more.click();
+    expect(h.container.cids()).toEqual(Array.from({ length: 21 }, (_, i) => `recent-${i}`));
+    expect(h.container.more).toBeNull();
+    h.container.rows[20].click();
+    expect(h.navigations).toEqual([['conversation', 'recent-20']]);
+  });
+
+  it.each([1, 2])('returns to the first ten tasks after reopening with %i extra pages previously revealed', (pages) => {
+    const h = loadTodayTasksRenderer();
+    h.context.conversations = Array.from({ length: 21 }, (_, i) => ({
+      conversation_id: `recent-${i}`, title: `Task ${i}`, last_active_at: at(HOUR - i),
+    }));
+    h.context.pendingConvs.set('recent-0', { aborted: false });
+    h.context.renderConversationList();
+    for (let i = 0; i < pages; i += 1) h.container.more.click();
+    expect(h.container.cids()).toHaveLength(pages === 1 ? 20 : 21);
+
+    // Other section controls must not discard the Recent list's expansion.
+    h.context.window.dispatchEvent({ type: 'sidebar-section-toggle', detail: { name: 'projects', collapsed: false } });
+    h.context.renderConversationList();
+    expect(h.container.cids()).toHaveLength(pages === 1 ? 20 : 21);
+    h.recentToggle.click();
+    expect(h.container.hidden).toBe(true);
+    h.recentToggle.click();
+
+    expect(h.container.hidden).toBe(false);
+    expect(h.container.cids()).toEqual(Array.from({ length: 10 }, (_, i) => `recent-${i}`));
+    expect(h.container.rows[0].badges()).toEqual(['conv-status-badge is-streaming']);
+    expect(h.context.conversations).toHaveLength(21);
+    expect(h.conversationList.cids()).toHaveLength(21);
+    expect(h.projectReloads).toEqual([]);
+    h.container.more.click();
+    expect(h.container.cids()).toHaveLength(20);
+  });
+
+  it.each([
+    ['project page', 'list-first'],
+    ['project page', 'receipt-first'],
+    ['startup refresh', 'list-first'],
+    ['startup refresh', 'receipt-first'],
+    ['pagination', 'list-first'],
+    ['pagination', 'receipt-first'],
+  ])('keeps one running task when %s and its run receipt arrive %s', async (listKind, order) => {
+    const h = loadTodayTasksRenderer();
+    vm.runInContext(readModule('project-detail.js'), h.context);
+    const original = { conversation_id: 'run-one', project_id: 'p1', title: 'Original task',
+      created_at: at(HOUR), updated_at: at(HOUR) };
+    const current = { ...original, title: 'Renamed running task', title_manually_set: true,
+      updated_at: at(2 * HOUR), last_active_at: at(2 * HOUR), processing: true,
+      agent_ids: ['worker'], pinned_at: at(2 * HOUR) };
+    // The main process creates one conversation while admission is in flight.
+    // A concurrent read may observe it before the original run call returns.
+    const persisted = [current];
+    let releaseRun!: (value: unknown) => void;
+    let runCalls = 0;
+    h.context.window.orkas = { invoke: () => {
+      runCalls += 1;
+      return new Promise((resolve) => { releaseRun = resolve; });
+    } };
+    h.context.ensureModelConfigured = () => true;
+    h.context.apiFetch = async () => ({ json: async () => ({ ok: true,
+      conversations: persisted.map((row) => ({ ...row })), total: 1, next_offset: null,
+      unprojected_pagination: { total: 0, next_offset: null }, loaded_project_ids: [],
+    }) });
+    h.context.conversations.push({ conversation_id: 'unrelated', project_id: 'p-other',
+      title: 'Other task', last_active_at: at(3 * HOUR) });
+    const scope = { pid: 'p1', project: {}, tasks: [{ id: 't_one', status: 'todo' }] };
+    const run = h.context._runTodoTask('t_one', scope);
+    // Repeated user input while the same admission is pending must not
+    // produce a second run, independent of how the sidebar is refreshed.
+    await h.context._runTodoTask('t_one', scope);
+    const load = () => listKind === 'project page'
+      ? h.context.loadConversationProject('p1')
+      : listKind === 'startup refresh' ? h.context.loadConversations()
+        : Promise.resolve(h.context._appendConversationSlice(persisted));
+    if (order === 'list-first') await load();
+    releaseRun({ ok: true, cid: original.conversation_id, conversation: original });
+    await run;
+    if (order === 'receipt-first') await load();
+    h.context.renderConversationList();
+
+    expect(runCalls).toBe(1);
+    expect(persisted).toHaveLength(1);
+    expect(h.context.conversations.filter((row: any) => row.conversation_id === 'run-one'))
+      .toEqual([current]);
+    expect(h.container.cids().filter((cid: string) => cid === 'run-one')).toEqual(['run-one']);
+    if (listKind !== 'startup refresh') {
+      expect(h.context.conversations.some((row: any) => row.conversation_id === 'unrelated')).toBe(true);
+    }
+    // Navigation uses that one row; it does not dispatch the task again.
+    h.container.rows.find((row: any) => row.dataset.cid === 'run-one').click();
+    expect(h.navigations).toEqual([['conversation', 'run-one'], ['conversation', 'run-one']]);
+    expect(runCalls).toBe(1);
+  });
+
+  it('preserves a refreshed running task when an older auto-advance receipt is repeated', () => {
+    const h = loadTodayTasksRenderer();
+    vm.runInContext(readModule('project-detail.js'), h.context);
+    h.context._observeConversationRunFromPlanAction = () => {};
+    const current = { conversation_id: 'auto-one', project_id: 'p1', title: 'Updated title',
+      created_at: at(HOUR), updated_at: at(2 * HOUR), last_active_at: at(2 * HOUR),
+      processing: true, agent_ids: ['worker'] };
+    h.context._appendConversationSlice([current]);
+    const receipt = { projectId: 'p1', conversation: { conversation_id: 'auto-one', project_id: 'p1',
+      title: 'Creation title', created_at: at(HOUR), updated_at: at(HOUR) } };
+    h.context._onProjectAdvance(receipt);
+    h.context._onProjectAdvance(receipt);
+    expect(h.context.conversations).toEqual([current]);
+    expect(h.container.cids()).toEqual(['auto-one']);
+  });
+
+  it('keeps an optimistic request title while preserving list-only metadata', () => {
+    const h = loadTodayTasksRenderer();
+    const original = { conversation_id: 'new-one', created_at: at(HOUR), updated_at: at(HOUR) };
+    h.context._appendConversationSlice([{ ...original, title: 'Untitled',
+      last_active_at: at(HOUR), processing: false }]);
+    h.context._cacheCreatedConversation({ ...original, title: 'Review the brief' }, 'Review the brief');
+    h.context.renderConversationList();
+    expect(h.context.conversations).toEqual([{ ...original, title: 'Review the brief',
+      last_active_at: at(HOUR), processing: false }]);
+    expect(h.container.cids()).toEqual(['new-one']);
+  });
+
+  it('preserves a manual rename when creation and rename share the same timestamp', () => {
+    const h = loadTodayTasksRenderer();
+    const renamed = { conversation_id: 'renamed', title: 'User title', title_manually_set: true,
+      created_at: at(HOUR), updated_at: at(HOUR), last_active_at: at(HOUR) };
+    h.context._appendConversationSlice([renamed]);
+    h.context._cacheCreatedConversation({ conversation_id: 'renamed', title: 'Creation title',
+      created_at: at(HOUR), updated_at: at(HOUR) });
+    expect(h.context.conversations).toEqual([renamed]);
+  });
+
+  it('keeps admitted participants when creation and admission share the same timestamp', () => {
+    const h = loadTodayTasksRenderer();
+    const admitted = { conversation_id: 'admitted', title: 'Run task', created_at: at(HOUR),
+      updated_at: at(HOUR), last_active_at: at(HOUR), agent_ids: ['worker'],
+      commander_in_chat: true, participant_summary_updated_at: at(HOUR), processing: true };
+    h.context._appendConversationSlice([admitted]);
+    // Real createConversation receipts carry empty participant summaries.
+    // Second-resolution timestamps cannot order that receipt against admission.
+    h.context._cacheCreatedConversation({ ...admitted, agent_ids: [], commander_in_chat: false });
+    expect(h.context.conversations).toEqual([admitted]);
+  });
+
+  it('keeps one identity when a project page observes a conversation moved from another project', () => {
+    const h = loadTodayTasksRenderer();
+    const old = { conversation_id: 'moved', project_id: 'old-project', title: 'Moved task', last_active_at: at(HOUR) };
+    const unrelated = { conversation_id: 'unrelated', project_id: 'old-project', title: 'Other task', last_active_at: at(HOUR) };
+    h.context._appendConversationSlice([old, unrelated]);
+    h.context._replaceConversationSlice([{ ...old, project_id: 'new-project' }],
+      (row: any) => row.project_id === 'new-project');
+    h.context.renderConversationList();
+    expect(h.context.conversations).toHaveLength(2);
+    expect(h.context.conversations.filter((row: any) => row.conversation_id === 'moved'))
+      .toEqual([{ ...old, project_id: 'new-project' }]);
+    expect(h.context.conversations).toContainEqual(unrelated);
+    expect(h.container.cids().filter((cid: string) => cid === 'moved')).toEqual(['moved']);
+  });
+
+  it('lists every task active today or yesterday across projects and the unprojected list, pinned first then newest', () => {
     const h = loadTodayTasksRenderer();
     h.context.conversations.push(
       { conversation_id: 'unprojected-10', title: 'u', last_active_at: at(10 * HOUR) },
       // Lives under a collapsed project: never painted in the Projects tree.
       { conversation_id: 'collapsed-project-09', title: 'c', project_id: 'p-collapsed', last_active_at: at(9 * HOUR) },
       { conversation_id: 'yesterday-2359', title: 'y', project_id: 'p1', last_active_at: at(-1) },
+      { conversation_id: 'day-before-2359', title: 'd', project_id: 'p1', last_active_at: at(-24 * HOUR - 1) },
       { conversation_id: 'pinned-08', title: 'p', project_id: 'p1', pinned_at: at(8 * HOUR), last_active_at: at(8 * HOUR) },
       { conversation_id: 'ancient', title: 'a', updated_at: '2020-01-01T00:00:00.000Z' },
     );
 
     h.context.renderTodayTasksSection();
 
-    expect(h.container.cids()).toEqual(['pinned-08', 'unprojected-10', 'collapsed-project-09']);
+    expect(h.container.cids()).toEqual(['pinned-08', 'unprojected-10', 'collapsed-project-09', 'yesterday-2359']);
     // Same row markup as every other sidebar list, no bucket header inside
     // an all-today section.
     expect(h.container.innerHTML).toContain('class="conv-item');
@@ -183,9 +393,9 @@ describe('sidebar Today aggregate', () => {
   });
 
   it.each([
-    ['a task from yesterday', [{ conversation_id: 'yesterday', title: 'y', last_active_at: at(-HOUR) }]],
+    ['a task from the day before yesterday', [{ conversation_id: 'day-before', title: 'd', last_active_at: at(-25 * HOUR) }]],
     ['no task at all', []],
-  ])('shows the empty hint when nothing ran today and the list render clears the header cue (%s)', (_name, rows) => {
+  ])('shows the empty hint when nothing ran today or yesterday and the list render clears the header cue (%s)', (_name, rows) => {
     const h = loadTodayTasksRenderer();
     h.context.conversations.push(...rows);
 
@@ -235,7 +445,7 @@ describe('sidebar Today aggregate', () => {
     expect(h.unreadRefreshes()).toBe(renameInList ? 2 : 1);
   });
 
-  it('refreshes the project list only when the deleted Today row belonged to a project', async () => {
+  it('refreshes the project list only when the deleted Recent row belonged to a project', async () => {
     const h = loadTodayTasksRenderer();
     let bindOpts: any = null;
     h.context._bindConversationSidebarItems = (_container: unknown, opts: any) => { bindOpts = opts; };
@@ -245,7 +455,7 @@ describe('sidebar Today aggregate', () => {
     );
     h.context.renderTodayTasksSection();
 
-    expect(bindOpts?.scope).toBe('today');
+    expect(bindOpts?.scope).toBe('recent');
     await bindOpts.afterDelete('unprojected');
     expect(h.projectReloads).toEqual([]);
     await bindOpts.afterDelete('projected');

@@ -31,6 +31,13 @@
     let source;
     try { source = frame.contentWindow; } catch (_) { return false; }
     if (!source || event.source !== source) return false;
+    try {
+      const expected = new URL(frame.src);
+      // Node's URL treats custom schemes as opaque; Electron registers chat-app
+      // as standard and serializes its origin as scheme + host.
+      if (expected.protocol !== 'chat-app:' || !expected.host || expected.username || expected.password
+        || event.origin !== `chat-app://${expected.host}`) return false;
+    } catch (_) { return false; }
     const data = event.data;
     return !!data && typeof data === 'object' && data.__orkasArtifact === true;
   }

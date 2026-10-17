@@ -9,19 +9,14 @@ function register(shape: z.ZodRawShape, handler: (...args: any[]) => any) {
 }
 
 describe('tolerant MCP argument receipts', () => {
-  it('enforces closed tool schemas without enumerating unsupported names or invoking the handler', async () => {
+  it('ignores undeclared fields on writes and executes once with the declared content', async () => {
     const handler = vi.fn(async () => ({ content: [{ type: 'text', text: 'saved' }] }));
-    const [config, execute] = bridgeToolInput(z, 'Write fixture', { content: z.string() }, handler, true);
-    for (const field of ['project_id', 'dry_run', 'future_constraint']) {
-      const parsed = config.inputSchema.safeParse({ content: 'new', [field]: 'PRIVATE_VALUE' });
-      expect(parsed.success).toBe(false);
-      expect(parsed.error.message).toContain(field);
-      expect(parsed.error.message).not.toContain('PRIVATE_VALUE');
-    }
-    expect(handler).not.toHaveBeenCalled();
-    expect(await execute(config.inputSchema.parse({ content: 'new' }), {}))
-      .toEqual({ content: [{ type: 'text', text: 'saved' }] });
+    const call = register({ content: z.string() }, handler);
+    const result = await call({ content: 'new', future_option: 'PRIVATE_VALUE' });
     expect(handler).toHaveBeenCalledExactlyOnceWith({ content: 'new' }, {});
+    expect(result.content[0].text).toBe('saved');
+    expect(JSON.parse(result.content[1].text)).toEqual({ ignored_fields: ['future_option'] });
+    expect(JSON.stringify(result)).not.toContain('PRIVATE_VALUE');
   });
 
   it('preserves valid JSON, content blocks and a single execution while disclosing only extra names', async () => {

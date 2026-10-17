@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { estimateBudgetTokens } from '../../../../src/main/util/token-estimate';
+import { LOCALES } from '../../../../src/main/i18n';
 
 import {
   CLI_HISTORY_MAX_TURNS,
@@ -44,6 +45,13 @@ function plan() {
 }
 
 describe('local_agents/context › semantic CLI context', () => {
+  it.each(LOCALES)('uses the selected $code software language instead of an English fallback', ({ code, llmName }) => {
+    const instructions = buildCliDurableInstructions({ agentName: 'Locale agent', language: code });
+    expect(instructions).toContain(`responses and form labels in ${llmName} unless the user explicitly requests another language`);
+    expect(instructions).toContain('Keep XML tags, JSON keys, ids, file paths, and code unchanged');
+    if (code !== 'en') expect(instructions).not.toContain('responses and form labels in English');
+  });
+
   it.each(['recovery', 'incremental'] as const)('marks %s dialogue as a partial execution view without inventing archived facts', (mode) => {
     expect(buildCliConversationContext({ mode, turns: [] })).toBe('');
     const context = buildCliConversationContext({ mode, turns: [{ id: 'recent', messages: ['User: Check Cedar', 'Agent: Check completed'] }] });

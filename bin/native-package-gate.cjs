@@ -80,11 +80,13 @@ function sharpNativeContract(platform, arch) {
       id: 'sharp-binding',
       candidates: mac
         ? [
+            `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.5.node`,
             `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.4.node`,
             `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}-0.35.3.node`,
             `@img/sharp-darwin-${arch}/lib/sharp-darwin-${arch}.node`,
           ]
         : [
+            '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.5.node',
             '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.4.node',
             '@img/sharp-win32-x64/lib/sharp-win32-x64-0.35.3.node',
             '@img/sharp-win32-x64/lib/sharp-win32-x64.node',
@@ -94,11 +96,13 @@ function sharpNativeContract(platform, arch) {
       id: 'sharp-libvips-cpp',
       candidates: mac
         ? [
+            `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.7.dylib`,
             `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.6.dylib`,
             `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.18.3.dylib`,
             `@img/sharp-libvips-darwin-${arch}/lib/libvips-cpp.8.17.3.dylib`,
           ]
         : [
+            '@img/sharp-win32-x64/lib/libvips-cpp-8.18.7.dll',
             '@img/sharp-win32-x64/lib/libvips-cpp-8.18.6.dll',
             '@img/sharp-win32-x64/lib/libvips-cpp-8.18.3.dll',
             '@img/sharp-win32-x64/lib/libvips-cpp-8.17.3.dll',
@@ -121,18 +125,19 @@ function sharpPreparationFiles(platform, arch, version) {
   };
 }
 
-function nativePackageContract(nodeModules, platform, arch) {
+function nativePackageContract(nodeModules, platform, arch, onnxRuntime = null) {
   const key = targetKey(platform, arch);
   if (!TARGETS.has(key)) {
     throw new Error(`[native-package-gate] unsupported packaged native target: ${key}`);
   }
+
+  onnxRuntime ||= onnxRuntimePackage(nodeModules);
 
   const mac = platform === 'darwin';
   const esbuildPackage = mac ? `darwin-${arch}` : 'win32-x64';
   const sqlitePackage = mac ? `sqlite-vec-darwin-${arch}` : 'sqlite-vec-windows-x64';
   const canvasPackage = mac ? `canvas-darwin-${arch}` : 'canvas-win32-x64-msvc';
   const tokenizersPackage = mac ? 'tokenizers-darwin-universal' : 'tokenizers-win32-x64-msvc';
-  const onnxRuntime = onnxRuntimePackage(nodeModules);
   const onnxBase = `${onnxRuntime.base}/bin/napi-v3/${platform}/${arch}`;
   const onnxVersion = onnxRuntime.version;
 

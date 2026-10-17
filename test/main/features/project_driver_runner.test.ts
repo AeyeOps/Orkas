@@ -33,6 +33,7 @@ beforeEach(() => {
   vi.resetModules();
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -62,6 +63,56 @@ function deps(over: Partial<{
 }
 
 describe('project_driver_runner › advanceProjectIfDue', () => {
+  it.each([PID, ''])('pauses an old enabled config without dispatch or bookkeeping changes (%s)', async pid => {
+    const { runner, drv } = await load();
+    const paths = await import('../../../src/main/paths');
+    const file = pid ? paths.projectDriverFile(UID, pid) : paths.userTodoDriverFile(UID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ enabled: true, max_advances_per_day: 20 }));
+    const listTasks = vi.fn(async () => [mkTask('t_1', 'todo')]);
+    const advance = vi.fn(async () => ({ ok: true, cid: 'unexpected' }));
+    expect(await runner.advanceProjectIfDue(UID, pid, deps({ listTasks, advance }))).toBe('disabled');
+    expect(listTasks).not.toHaveBeenCalled();
+    expect(advance).not.toHaveBeenCalled();
+    expect(await drv.readState(UID, pid)).toEqual({});
+  });
+
+  it.each([PID, ''])('a synced foreign owner does not scan or dispatch the backlog (%s)', async pid => {
+    const { runner, drv } = await load();
+    const machine = await import('../../../src/main/features/machine_device_id');
+    const identity = vi.spyOn(machine, 'getDeviceId').mockReturnValue('device-a');
+    await drv.writeConfig(UID, pid, { enabled: true });
+    await drv.writeState(UID, pid, { advance_count: 3 });
+    identity.mockReturnValue('device-b');
+    const listTasks = vi.fn(async () => [mkTask('t_1', 'todo')]);
+    const advance = vi.fn(async () => ({ ok: true, cid: 'duplicate' }));
+    expect(await runner.advanceProjectIfDue(UID, pid, deps({ listTasks, advance }))).toBe('other_device');
+    expect(listTasks).not.toHaveBeenCalled();
+    expect(advance).not.toHaveBeenCalled();
+    expect(await drv.readState(UID, pid)).toEqual({ advance_count: 3 });
+  });
+
+  it.each(['disable', 'rebind'])('stops selection when a %s arrives while reading the backlog', async action => {
+    const { runner, drv } = await load();
+    const machine = await import('../../../src/main/features/machine_device_id');
+    const identity = vi.spyOn(machine, 'getDeviceId').mockReturnValue('device-a');
+    await drv.writeConfig(UID, PID, { enabled: true });
+    const advance = vi.fn(async () => ({ ok: true, cid: 'unexpected' }));
+    const listTasks = async () => {
+      if (action === 'disable') await drv.writeConfig(UID, PID, { enabled: false });
+      else {
+        identity.mockReturnValue('device-b');
+        await drv.writeConfig(UID, PID, { enabled: true });
+        identity.mockReturnValue('device-a');
+      }
+      return [mkTask('t_1', 'todo')];
+    };
+    expect(await runner.advanceProjectIfDue(UID, PID, deps({ listTasks, advance })))
+      .toBe(action === 'disable' ? 'disabled' : 'other_device');
+    expect(advance).not.toHaveBeenCalled();
+    expect(await drv.readState(UID, PID)).toEqual({});
+  });
+
   it('disabled project → no advance', async () => {
     const { runner } = await load();
     const advance = vi.fn(async () => ({ ok: true, cid: 'x' }));

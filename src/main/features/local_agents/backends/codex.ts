@@ -26,6 +26,9 @@
  * `thread/start` so the user's task still runs (matching multica).
  */
 
+import { t } from '../../../i18n.js';
+import { CODEX_NATIVE_MODEL_MINIMUMS, codexNativeModelMinimum, compatibleCodexDefault } from '../compatibility.js';
+import { cliVersionAtLeast } from '../version.js';
 import { createLogger } from '../../../logger.js';
 import { logErrorSummary } from '../../../util/log-redact.js';
 import { CliInputCancellation, CliInputNotSentError } from '../cli_input_cancel.js';
@@ -372,6 +375,7 @@ export const codexBackend: LocalBackend = {
     const mcpToolRunGrants = new Set<string>();
     let threadId: string | undefined;
     let activeTurnId: string | undefined;
+    let turnStartSent = false;
     let turnStarted = false;
     let turnAborted = false;
     let turnCompleted = false;
@@ -402,6 +406,7 @@ export const codexBackend: LocalBackend = {
 
     const rpc = (method: string, params: Record<string, unknown>): Promise<any> =>
       new Promise<any>((resolve, reject) => {
+        if (exited) { reject(new Error('codex shutting down')); return; }
         const id = nextRpcId++;
         pending.set(id, { method, resolve, reject });
         sendLine({ jsonrpc: '2.0', id, method, params });
@@ -1241,12 +1246,12 @@ export const codexBackend: LocalBackend = {
       resolveOuter();
     }
 
-    function failProtocol(error: string) {
+    function failProtocol(error: string, bootstrapTimeout = false) {
       // A JSON-RPC setup failure resolves before the normal close-driven
       // lifecycle. Explicitly terminate the detached process group so a CLI
       // that keeps its event loop alive cannot outlive the failed dispatch.
-      // No turn has started, so a short hard-kill fallback is safer than
-      // leaving an uncooperative bootstrap process in the background.
+      // A short hard-kill fallback also bounds teardown of an uncooperative
+      // process. Submission, not a missing acknowledgement, decides replay safety.
       const hardKill = setTimeout(() => killProcessTree(child, 'SIGKILL'), 250);
       if (typeof hardKill.unref === 'function') hardKill.unref();
       child.once('close', () => clearTimeout(hardKill));
@@ -1256,7 +1261,8 @@ export const codexBackend: LocalBackend = {
         error,
         stderrTail: tail.toString(),
         failureKind: 'cli_protocol',
-        retrySafe: !turnStarted,
+        retrySafe: !turnStartSent && !turnStarted,
+        ...(bootstrapTimeout ? { bootstrapTimeout: true } : {}),
       });
     }
 
@@ -1266,7 +1272,7 @@ export const codexBackend: LocalBackend = {
         error: (err as Error).message,
         stderrTail: tail.toString(),
         failureKind: 'cli_spawn',
-        retrySafe: !turnStarted,
+        retrySafe: !turnStartSent && !turnStarted,
       });
     });
     child.on('close', code => {
@@ -1289,7 +1295,7 @@ if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), 
         error: `codex exited with code ${code}` + (turnCompleted ? '' : ' (turn never completed)'),
         output,
         stderrTail: tail.toString(),
-        ...(!turnStarted ? { failureKind: 'cli_spawn', retrySafe: true } : {}),
+        ...(!turnStarted ? { failureKind: 'cli_spawn', retrySafe: !turnStartSent } : {}),
       });
     });
 
@@ -1300,7 +1306,7 @@ if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), 
     // that the candidate-fallback loop never sees.
     bootstrapTimer = setTimeout(() => {
       if (exited || turnStarted) return;
-      failProtocol('codex bootstrap timed out before turn/start');
+      failProtocol('codex bootstrap timed out before turn/start', true);
     }, codexBootstrapTimeoutMs());
     if (typeof bootstrapTimer.unref === 'function') bootstrapTimer.unref();
     (async () => {
@@ -1315,21 +1321,64 @@ if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), 
           capabilities: { experimentalApi: true },
         });
         notify('initialized');
+        const runtimeOptions = { ...opts };
 
-        const prepared = await startOrResumeThread(opts);
+        // Mandatory protocol support does not imply optional catalog support.
+        // Read effective configuration (including custom -c/profile arguments)
+        // before any thread/session/task side effects. API/custom-provider model
+        // ids are owned by that provider and must not be treated as native ids.
+        if (opts.cliVersion && (opts.thinkingLevel || Object.values(CODEX_NATIVE_MODEL_MINIMUMS)
+          .some(minimum => !cliVersionAtLeast(opts.cliVersion, minimum)))) {
+          const configResult = await rpc('config/read', { cwd: opts.cwd, includeLayers: false });
+          const config = configResult?.config || {};
+          const model = opts.modelOverride || config.model;
+          const minimum = codexNativeModelMinimum(model, opts.cliVersion);
+          if ((minimum || opts.thinkingLevel) && (!config.model_provider || config.model_provider === 'openai')) {
+            const accountResult = await rpc('account/read', { refreshToken: false });
+            if (accountResult?.account?.type === 'chatgpt') {
+              const catalog = await rpc('model/list', {});
+              const rows = Array.isArray(catalog?.data) ? catalog.data : [];
+              if (minimum) {
+                const fallback = !opts.modelOverride && compatibleCodexDefault(rows, opts.cliVersion);
+                if (!fallback) {
+                  finish('failed', { failureKind: 'cli_compatibility', retrySafe: false,
+                    cliError: 'model_unsupported', error: t('cli_agent.model_unsupported', { cli: 'Codex', model }) });
+                  reapCliAfterProtocolTerminal(child);
+                  return;
+                }
+                // Inherit an available default for this invocation only. Explicit
+                // model choices and the external CLI's saved config are preserved.
+                runtimeOptions.modelOverride = fallback.model || fallback.id;
+              }
+              const effectiveModel = runtimeOptions.modelOverride || model;
+              const selected = Array.isArray(catalog?.data)
+                ? catalog.data.find((entry: any) => entry?.model === effectiveModel || entry?.id === effectiveModel) : null;
+              const efforts = selected?.supportedReasoningEfforts;
+              if (opts.thinkingLevel && Array.isArray(efforts)
+                && !efforts.some((entry: any) => entry?.reasoningEffort === opts.thinkingLevel)) {
+                runtimeOptions.thinkingLevel = efforts.some((entry: any) => entry?.reasoningEffort === selected.defaultReasoningEffort)
+                  ? selected.defaultReasoningEffort : undefined;
+              }
+            }
+          }
+        }
+
+        const prepared = await startOrResumeThread(runtimeOptions);
         threadId = prepared.threadId;
         if (!threadId) {
           failProtocol('codex thread/start returned no thread id');
           return;
         }
 
+        // Once submitted, a lost response cannot prove the task did not run.
+        turnStartSent = true;
         await rpc('turn/start', {
           threadId,
           input: [{
             type: 'text',
             text: selectCodexTurnPrompt(opts, prepared.resumed),
           }],
-          ...buildCodexTurnRuntimeOverrides(opts),
+          ...buildCodexTurnRuntimeOverrides(runtimeOptions),
           ...buildCodexTurnPermissionOverrides(opts.cwd, opts.permissionPolicy || 'inherit'),
         });
         if (bootstrapTimer) { clearTimeout(bootstrapTimer); bootstrapTimer = null; }
@@ -1356,6 +1405,7 @@ if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), 
           const r = await rpc('thread/resume', {
             threadId: o.resumeSessionId,
             cwd: o.cwd,
+            ...(o.modelOverride ? { model: o.modelOverride } : {}),
             ...buildCodexThreadPermissionOverrides(o.permissionPolicy || 'inherit'),
             ...codexThreadDeveloperInstructionParams(o, true),
           });
@@ -1363,10 +1413,12 @@ if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), 
           if (tid) return { threadId: tid, resumed: true };
           log.warn('codex thread/resume returned no thread id; falling back to thread/start');
         } catch (err) {
+          if (exited) throw err;
           log.warn('codex thread/resume failed; falling back to thread/start', { error: logErrorSummary(err) });
         }
       }
       const r = await rpc('thread/start', {
+        ...(o.modelOverride ? { model: o.modelOverride } : {}),
         modelProvider: null,
         profile: null,
         cwd: o.cwd,
@@ -1374,10 +1426,7 @@ if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), 
         config: null,
         baseInstructions: null,
         ...codexThreadDeveloperInstructionParams(o, false),
-        compactPrompt: null,
-        includeApplyPatchTool: null,
         experimentalRawEvents: false,
-        persistExtendedHistory: true,
       });
       return { threadId: extractThreadId(r), resumed: false };
     }

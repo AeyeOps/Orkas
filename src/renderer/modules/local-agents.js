@@ -231,6 +231,7 @@ async function loadLocalCliEntries(options = {}) {
 // ── External-tab CLI selector (create modal) ───────────────────────────
 //
 let _extCliSelectApi = null;
+let _externalCliLastOnChange = null;
 
 function _setExternalCliDetectionBusy(
   busy,
@@ -323,7 +324,10 @@ function _mergePresenceWithCachedVersions(entries, cachedEntries) {
 function _renderExternalCliOptions(entries, onChange) {
   const mount = document.getElementById('agent-modal-ext-cli-select');
   if (!mount) return null;
+  if (typeof onChange === 'function') _externalCliLastOnChange = onChange;
+  onChange = _externalCliLastOnChange;
   _externalCliVisibleEntries = Array.isArray(entries) ? entries : [];
+  _renderExternalCliUpgrades(_externalCliVisibleEntries, onChange);
   const options = _externalCliOptions(entries);
   const hasAvailable = options.some(option => !option.disabled);
   const emptyLabel = options.length > 0 && !hasAvailable
@@ -482,3 +486,85 @@ window.mountExternalCliSelect = mountExternalCliSelect;
 window.getExternalCliValue = getExternalCliValue;
 window.getExternalCliSelectionWarning = getExternalCliSelectionWarning;
 window.setExternalCliValue = setExternalCliValue;
+
+/** Shared recovery action. Updates never replay a failed task or alter its model. */
+function createLocalCliUpgradeControl(target, { cli = target.type, chip = false } = {}) {
+  const root = document.createElement('div');
+  root.className = 'local-cli-upgrade-control' + (chip ? ' chat-app-nav-row' : '');
+  root.dataset.cli = cli || '';
+  root.dataset.named = chip ? '1' : '';
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'btn local-cli-upgrade-btn' + (chip ? ' chat-app-nav-btn' : '');
+  const status = document.createElement('span');
+  status.className = 'agents-detail-cli-note';
+  status.setAttribute('role', 'status');
+  status.setAttribute('aria-live', 'polite');
+  root.append(button, status);
+  _renderCliUpgradeState(root);
+  button.addEventListener('click', async () => {
+    if (button.disabled) return;
+    root.dataset.state = 'upgrading';
+    _renderCliUpgradeState(root);
+    try {
+      const result = await window.orkas.invoke('localAgents.upgrade', target);
+      if (result?.ok && result.entry?.available) {
+        root.dataset.state = 'success';
+        // Discovery refresh is separate from the updater's authoritative result.
+        _localCliEntries = null;
+        window.dispatchEvent(new CustomEvent('local-cli-upgraded', { detail: { type: result.type } }));
+      } else {
+        root.dataset.state = 'failure';
+      }
+    } catch (_) {
+      root.dataset.state = 'failure';
+    } finally { _renderCliUpgradeState(root); }
+  });
+  return root;
+}
+function _renderCliUpgradeState(root) {
+  const button = root.querySelector('button');
+  const pending = root.dataset.state === 'upgrading';
+  const cli = t('agent_modal.runtime_cli_' + root.dataset.cli);
+  button.textContent = t(pending ? 'cli_upgrade.pending'
+    : root.dataset.named === '1' ? 'cli_upgrade.named_action' : 'cli_upgrade.action', { cli });
+  button.disabled = pending;
+  button.classList.toggle('is-loading', pending);
+  button.setAttribute('aria-busy', String(pending));
+  root.querySelector('[role="status"]').textContent = root.dataset.state === 'success'
+    ? t('cli_upgrade.success') : root.dataset.state === 'failure' ? t('cli_upgrade.failed') : '';
+}
+function _renderExternalCliUpgrades(entries) {
+  const slot = document.getElementById('agent-modal-ext-cli-upgrades');
+  if (!slot) return;
+  const oldEntries = entries.filter(entry => entry.error === 'version_too_old');
+  const warning = document.getElementById('agent-modal-ext-cli-upgrade-warning');
+  if (warning) {
+    warning.textContent = oldEntries.map(entry => t('agent_modal.runtime_cli_' + entry.type) + ': ' + getLocalCliUnavailableHint(entry)).join(' · ');
+    warning.hidden = oldEntries.length === 0;
+  }
+  // Keep pending and terminal states mounted while discovery refreshes.
+  for (const row of slot.querySelectorAll('[data-cli]')) {
+    if (!oldEntries.some(entry => entry.type === row.dataset.cli) && !row.dataset.state) row.remove();
+  }
+  for (const entry of oldEntries) {
+    if (slot.querySelector('[data-cli="' + entry.type + '"]')) continue;
+    slot.appendChild(createLocalCliUpgradeControl({ type: entry.type }));
+  }
+}
+window.createLocalCliUpgradeControl = createLocalCliUpgradeControl;
+if (typeof window.addEventListener === 'function') {
+  window.addEventListener('i18n-change', () => {
+    for (const root of document.querySelectorAll('.local-cli-upgrade-control')) {
+      _renderCliUpgradeState(root);
+    }
+  });
+  window.addEventListener('local-cli-upgraded', () => {
+    const modal = document.getElementById('agent-modal');
+    if (modal?.classList.contains('open')) {
+      void loadLocalCliEntries({ force: true }).then(entries => {
+        _renderExternalCliOptions(entries, null);
+      }).catch(() => {});
+    }
+  });
+}

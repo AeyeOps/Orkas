@@ -253,6 +253,31 @@ function overlays(ctx: any): FakeElement[] {
 }
 
 describe('shared renderer dialogs', () => {
+  it('restores an action revealed by its focusable parent without focusing disabled or detached actions', () => {
+    const ctx = loadDialogs();
+    const parent = ctx._document.createElement('div');
+    parent.tabIndex = 0;
+    const action = ctx._document.createElement('button');
+    ctx._document.body.appendChild(parent);
+    parent.appendChild(action);
+    Object.defineProperty(action, 'parentElement', { value: { closest: () => parent } });
+    action.focus = () => {
+      if (ctx._document.activeElement === parent && !action.disabled) ctx._document.activeElement = action;
+    };
+    ctx._uiRestoreDialogFocus(action);
+    expect(ctx._document.activeElement).toBe(action);
+    const unrelated = ctx._document.createElement('button');
+    ctx._document.body.appendChild(unrelated);
+    unrelated.focus();
+    action.disabled = true;
+    ctx._uiRestoreDialogFocus(action);
+    expect(ctx._document.activeElement).toBe(unrelated);
+    action.disabled = false;
+    action.remove();
+    ctx._uiRestoreDialogFocus(action);
+    expect(ctx._document.activeElement).toBe(unrelated);
+  });
+
   it('keeps an async danger action visible and prevents duplicate confirmation or dismissal until it succeeds', async () => {
     const ctx = loadDialogs();
     let complete!: () => void;

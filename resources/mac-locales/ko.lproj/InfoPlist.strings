@@ -1,1 +1,3 @@
-"NSMicrophoneUsageDescription" = "Orkas는 음성 입력에 마이크를 사용합니다.";
+"NSMicrophoneUsageDescription" = "Orkas는 음성 입력과 사용자가 허용한 웹사이트에 마이크를 사용합니다.";
+"NSCameraUsageDescription" = "Orkas는 사용자의 허락을 받아 웹사이트에서 카메라를 사용합니다.";
+"NSBluetoothAlwaysUsageDescription" = "Orkas는 Bluetooth로 패스키가 저장된 휴대폰이 근처에 있는지 확인합니다.";

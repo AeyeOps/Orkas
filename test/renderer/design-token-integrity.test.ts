@@ -22,6 +22,7 @@ const RUNTIME_INJECTED = new Set([
   '--composer-model-marquee-distance', // modules/composer-model-picker.js
   '--composer-model-marquee-duration', // modules/composer-model-picker.js
   '--turn-nav-preview-y', // modules/conversation-turn-nav.js
+  '--activity-group-height', // modules/web-assist.js, set before `.is-contained` applies it
 ]);
 
 function readRendererCss() {

@@ -19,19 +19,10 @@ import { createHash } from "node:crypto";
  *  `shared`/`user` are global. */
 export type MemoryTier = 'agent' | 'project' | 'shared' | 'user';
 
-/** What a write had to discard to stay inside the store's caps. Present only
- *  when the write actually lost something; the host reports it because a
- *  caller that is never told silently loses memory it believes it saved. */
-export interface MemoryEvictionReport {
-  dropped_entries?: number;
-  truncated_entries?: number;
-}
-
 export interface MemoryHandlerResult {
   ok: boolean; error?: string; entries: string[];
   changed?: boolean;
   usage: { current: number; limit: number };
-  evicted?: MemoryEvictionReport;
 }
 
 /** Hosts may consolidate or publish asynchronously before completing a write. */
@@ -42,11 +33,18 @@ export interface MemoryToolHandler {
   list(tier: MemoryTier): MemoryHandlerResult;
 }
 
+/** One admission rule for every memory surface (native and CLI bridge). */
+export const MEMORY_ADMISSION_RULE =
+  'Entries load into every later conversation in scope. Before replying, even unasked, save only compact facts that guide them; leave specs, plans and progress in their files, tasks or library, at most as a pointer. Update or remove stale entries. Decide by meaning, not trigger words.';
+
 const TOOL_DESCRIPTION =
-  'Manage durable agent, shared, or user memory. Call this tool before replying whenever the conversation establishes, corrects, or invalidates stable, reusable information that should affect future conversations—even without an explicit save request. Decide from meaning, never trigger words. Do not store current-task progress, temporary plans, one-off status, or TODO/dependency state.';
+  'Manage durable agent, shared, or user memory. ' + MEMORY_ADMISSION_RULE;
 
 const TOOL_DESCRIPTION_WITH_PROJECT =
-  'Manage durable agent, project, shared, or user memory. Call this tool before replying whenever the conversation establishes, corrects, or invalidates stable, reusable information that should affect future conversations—even without an explicit save request. Decide from meaning, never trigger words. Use todo_tasks for task progress; do not store temporary plans, one-off status, or TODO/dependency state.';
+  'Manage durable agent, project, shared, or user memory. ' + MEMORY_ADMISSION_RULE;
+
+export const MEMORY_CONTENT_DESCRIPTION =
+  'Entry text for add and replace: one self-contained fact, ideally under 200 characters.';
 
 /** Appended for sub-agents: they may read project memory but not write it. */
 const PROJECT_READONLY_NOTE =
@@ -80,7 +78,8 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
     : ['agent', 'shared', 'user'];
   const projectReadOnly = !!opts.includeProjectTier && !!opts.projectTierReadOnly;
   const description = opts.globalTiersReadOnly
-    ? 'Manage durable memory by its intended scope, not write access. Save stable facts, corrections or invalidations for future conversations before replying, even without a save request; exclude task progress and temporary state. User/shared writes belong to Commander: hand back those changes without substituting or duplicating them in another store. Decide from meaning, never trigger words.'
+    ? 'Manage durable memory by its intended scope, not write access. ' + MEMORY_ADMISSION_RULE
+      + ' User/shared writes belong to Commander: hand back those changes without substituting or duplicating them in another store.'
       + (projectReadOnly ? PROJECT_READONLY_NOTE : '')
     : opts.includeProjectTier
     ? TOOL_DESCRIPTION_WITH_PROJECT + (projectReadOnly ? PROJECT_READONLY_NOTE : '')
@@ -111,7 +110,7 @@ export function createCrossSessionMemoryTool(handler: MemoryToolHandler, opts: C
         },
         content: {
           type: 'string',
-          description: 'Entry text; required for add and replace.',
+          description: MEMORY_CONTENT_DESCRIPTION,
         },
         old_text: {
           type: 'string',

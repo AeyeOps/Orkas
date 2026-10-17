@@ -1,18 +1,247 @@
 import { composerAccessorSource } from './composer-test-source';
-import { describe, expect, it } from 'vitest';
+import { conversationCacheSource } from './conversation-cache-test-source';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
+import ts from 'typescript';
 
 const rendererDir = path.join(__dirname, '../../src/renderer');
-const source = fs.readFileSync(path.join(rendererDir, 'modules/project-detail.js'), 'utf8');
+const conversation = ts.createSourceFile('conversation.js', fs.readFileSync(path.join(rendererDir, 'modules/conversation.js'), 'utf8'),
+  ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+const sendNames = new Set(['_composerSendIsEmpty', '_resolvedMentionSpans', '_quotedLineRanges', '_buildMentionRe', '_escapeForRegex',
+  '_COMMANDER', '_composerAgentScopes', '_MENTION_FALLBACK_CLASS']);
+const sendSource = conversation.statements.filter(node =>
+  ts.isFunctionDeclaration(node) ? sendNames.has(node.name?.text || '') : ts.isVariableStatement(node)
+    && node.declarationList.declarations.some(declaration => ts.isIdentifier(declaration.name) && sendNames.has(declaration.name.text)))
+  .map(node => node.getText(conversation)).join('\n');
+const markdown = ts.createSourceFile('strip-structural-blocks.js', fs.readFileSync(path.join(rendererDir, 'modules/strip-structural-blocks.js'), 'utf8'),
+  ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+const markdownSource = markdown.statements.filter(node => ts.isFunctionDeclaration(node) && node.name?.text === '_splitMarkdownProseCode')
+  .map(node => node.getText(markdown)).join('\n');
+const source = [conversationCacheSource, sendSource, markdownSource, fs.readFileSync(path.join(rendererDir, 'modules/project-detail.js'), 'utf8')].join('\n');
 
 // The editor uploads through the shared renderer base64 helper (utils.js).
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const rendererUtils = require('../../src/renderer/modules/utils.js');
 
+function cardNodes(node: any): any[] {
+  return [node, ...(node.children || []).flatMap(cardNodes)];
+}
+
 describe('project to-do controls', () => {
-  it.each(['todo', 'progress', 'review'])('opens an immediate run from a %s task menu', async (status) => {
+  it.each(['same board', 'account', 'project', 'grouping'])('keeps reading positions only within the mounted scope: %s', (change) => {
+    const element = (): any => ({
+      children: [], dataset: {}, scrollTop: 0, scrollLeft: 0,
+      appendChild(child: any) { child.parentElement = this; this.children.push(child); },
+      setAttribute() {}, addEventListener() {},
+      querySelectorAll(selector: string) {
+        return this.children.flatMap((child: any) => [
+          ...(child.className?.split(' ').includes(selector.slice(1)) ? [child] : []),
+          ...child.querySelectorAll(selector),
+        ]);
+      },
+    });
+    const context = vm.createContext({
+      currentUserId: 'me', createLogger: () => ({ warn() {} }),
+      document: { readyState: 'loading', addEventListener() {}, createElement: element },
+      window: { addEventListener() {} }, t: (key: string) => key, escapeHtml: String,
+    });
+    vm.runInContext(source, context);
+    const host = element();
+    const board = context._renderTodoBoard([], {}, 'project:one');
+    host.appendChild(board);
+    host.scrollTop = 120;
+    board.scrollLeft = 60;
+    const bodies = board.querySelectorAll('.todo-column-body');
+    bodies[0].scrollTop = 300;
+    bodies[1].scrollTop = 80;
+    const snapshot = context._captureTodoScroll(host);
+    if (change === 'account') context.currentUserId = 'other';
+    const scope = change === 'project' ? 'project:two' : change === 'grouping' ? 'global:status' : 'project:one';
+    const next = context._renderTodoBoard([], {}, scope);
+    host.children = [];
+    host.scrollTop = 0;
+    host.appendChild(next);
+    // Column order is irrelevant to status-specific reading positions.
+    next.children.reverse();
+    context._restoreTodoScroll(host, snapshot);
+    const retained = change === 'same board';
+    expect(host.scrollTop).toBe(retained ? 120 : 0);
+    expect(next.scrollLeft).toBe(retained ? 60 : 0);
+    const columnTops = Object.fromEntries(next.querySelectorAll('.todo-column-body')
+      .map((body: any) => [body.parentElement.dataset.status, body.scrollTop]));
+    expect(columnTops).toEqual({ todo: retained ? 300 : 0, progress: retained ? 80 : 0, review: 0, done: 0 });
+  });
+
+  it.each(['private', 'global'])('discloses %s card text without editing or writing, retaining state only in its account and scope', (kind) => {
+    const element = (tag: string): any => {
+      const node: any = { tag, children: [], dataset: {}, className: '', attributes: {},
+        appendChild(child: any) { this.children.push(child); return child; },
+        setAttribute(key: string, value: string) { this.attributes[key] = value; },
+        querySelector() { return this.children.find((child: any) => child.className === 'project-todo-title'); },
+      };
+      node.classList = {
+        add(value: string) { node.className += ` ${value}`; },
+        toggle(value: string, enabled: boolean) {
+          const classes = node.className.split(' ').filter((name: string) => name !== value);
+          if (enabled) classes.push(value);
+          node.className = classes.join(' ');
+        },
+      };
+      return node;
+    };
+    let click!: (event: any) => void;
+    const invoke = vi.fn();
+    const editor = vi.fn();
+    const context = vm.createContext({
+      currentUserId: 'me', createLogger: () => ({ warn() {} }),
+      document: { readyState: 'loading', addEventListener() {}, createElement: element },
+      window: { addEventListener() {}, orkas: { invoke } },
+      t: (key: string) => key, escapeHtml: (value: unknown) => String(value),
+    });
+    vm.runInContext(source, context);
+    context._openProjectTodoEditor = editor;
+    const task = Object.freeze({ id: 'same_id', content: 'Title\n<literal> & Full content',
+      status: 'todo', assignee_uid: 'other' });
+    const scope = { pid: kind === 'global' ? '' : 'p_one', global: kind === 'global', tasks: [task],
+      project: {}, agents: [], members: [] };
+    const row = context._renderTodoCard(task, scope);
+    const title = row.querySelector('.project-todo-title');
+    expect(title.attributes['aria-expanded']).toBe('false');
+    expect(title.textContent).toBe(task.content);
+    context._bindTodoListActions({ dataset: {}, addEventListener(_type: string, handler: any) { click = handler; } }, () => scope);
+    const target = (action?: string, control = false) => ({ closest(selector: string) {
+      if (selector === '.project-todo-item') return row;
+      if (action && selector === `[data-action="${action}"]`) return title;
+      if (control && selector.startsWith('button,')) return title;
+      return null;
+    } });
+    click({ target: target(title.dataset.action, true) });
+    expect(title.attributes['aria-expanded']).toBe('true');
+    expect(row.className).toContain('is-expanded');
+    expect(editor).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
+    expect(context._renderTodoCard(task, scope).querySelector().attributes['aria-expanded']).toBe('true');
+    expect(context._renderTodoCard(task, { ...scope, pid: 'p_other' }).querySelector().attributes['aria-expanded']).toBe('false');
+    expect(context._renderTodoCard(task, { ...scope, global: !scope.global }).querySelector().attributes['aria-expanded']).toBe('false');
+    context.currentUserId = 'another_account';
+    expect(context._renderTodoCard(task, scope).querySelector().attributes['aria-expanded']).toBe('false');
+    context.currentUserId = 'me';
+    // An interactive child outside disclosure must not toggle it.
+    click({ target: target(undefined, true) });
+    expect(title.attributes['aria-expanded']).toBe('true');
+    // The next click on plain card padding collapses it.
+    click({ target: target() });
+    expect(title.attributes['aria-expanded']).toBe('false');
+    expect(row.className).not.toContain('is-expanded');
+    expect(context._renderTodoCard(task, scope).querySelector().attributes['aria-expanded']).toBe('false');
+    expect(task).toEqual({ id: 'same_id', content: 'Title\n<literal> & Full content', status: 'todo', assignee_uid: 'other' });
+    expect(editor).not.toHaveBeenCalled();
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('marks collapsed lanes, so the project board can narrow them, and keeps the choice per board', () => {
+    const element = (tag: string): any => {
+      const node: any = { tag, children: [] as any[], dataset: {}, attributes: {} as Record<string, string>,
+        handlers: {} as Record<string, () => void>, className: '', hidden: false, innerHTML: '', textContent: '',
+        appendChild(child: any) { this.children.push(child); return child; },
+        setAttribute(key: string, value: string) { this.attributes[key] = value; },
+        addEventListener(key: string, handler: () => void) { this.handlers[key] = handler; } };
+      node.classList = { toggle(name: string, enabled: boolean) {
+        const names = node.className.split(' ').filter((value: string) => value && value !== name);
+        if (enabled) names.push(name);
+        node.className = names.join(' ');
+      } };
+      return node;
+    };
+    const context = vm.createContext({
+      currentUserId: 'me', createLogger: () => ({ warn() {} }),
+      document: { readyState: 'loading', addEventListener() {}, createElement: element },
+      window: { addEventListener() {} }, t: (key: string) => key, escapeHtml: String,
+    });
+    vm.runInContext(source, context);
+    const lanes = (board: any) => Object.fromEntries(board.children.map((column: any) => [column.dataset.status, column]));
+    const collapsed = (board: Record<string, any>) => Object.entries(board)
+      .filter(([, column]) => column.className.split(' ').includes('is-collapsed')).map(([status]) => status);
+    const toggle = (column: any) => column.children[0].children[0];
+    let board = lanes(context._renderTodoBoard([], {}, 'project:one'));
+    expect(collapsed(board)).toEqual(['done']);
+    expect(toggle(board.done).innerHTML).toContain('<span class="todo-collapse-label">project.todo.status_done</span>');
+    toggle(board.done).handlers.click();
+    expect(collapsed(board)).toEqual([]);
+    expect(board.done.children[1].hidden).toBe(false);
+    expect(toggle(board.done).attributes['aria-expanded']).toBe('true');
+    toggle(board.todo).handlers.click();
+    expect(collapsed(board)).toEqual(['todo']);
+    expect(board.todo.children[1].hidden).toBe(true);
+    // A repaint keeps the choice for this board only.
+    board = lanes(context._renderTodoBoard([], {}, 'project:one'));
+    expect(collapsed(board)).toEqual(['todo']);
+    expect(collapsed(lanes(context._renderTodoBoard([], {}, 'project:two')))).toEqual(['done']);
+  });
+
+  it.each(['todo', 'progress', 'review', 'done'])('shows the same %s status and footer controls on project and account cards', (stage) => {
+    const element = (tag: string): any => {
+      const node: any = { tag, children: [] as any[], dataset: {}, className: '', attributes: {},
+        appendChild(child: any) { this.children.push(child); return child; },
+        setAttribute(key: string, value: string) { this.attributes[key] = value; },
+      };
+      node.classList = { add(name: string) { node.className += ` ${name}`; } };
+      return node;
+    };
+    const context = vm.createContext({
+      currentUserId: 'me', createLogger: () => ({ warn() {}, info() {}, error() {} }),
+      document: { readyState: 'loading', addEventListener() {}, createElement: element },
+      window: { addEventListener() {} }, t: (key: string) => key, escapeHtml: String,
+      setTimeout, clearTimeout,
+    });
+    vm.runInContext(composerAccessorSource, context);
+    vm.runInContext(source, context);
+    const task = { id: 't_one', content: 'Review', status: stage };
+    const status = (card: any) => cardNodes(card).find((child: any) => child.dataset.action === 'todo-status');
+    const project = status(context._renderTodoCard(task, vm.runInContext('_projectTodoContext()', context)));
+    expect(project.className).toBe('btn btn-sm project-todo-status-select is-' + stage);
+    expect(project.innerHTML).toBe('<span class="project-todo-status-dot"></span>'
+      + '<span class="project-todo-status-label">project.todo.status_' + stage + '</span>');
+    expect(project.title).toBe('project.todo.status_' + stage);
+    expect(project.attributes['aria-haspopup']).toBe('menu');
+    const account = status(context._renderTodoCard(task, { global: true, pid: '', tasks: [task], agents: [] }));
+    expect(account.className).toBe(project.className);
+    expect(account.innerHTML).toBe(project.innerHTML);
+    for (const scope of [vm.runInContext('_projectTodoContext()', context), { global: true, tasks: [task], agents: [] }]) {
+      const footer = context._renderTodoCard(task, scope).children.find((child: any) => child.className === 'todo-card-meta');
+      expect(footer).toBeDefined();
+      expect(cardNodes(footer).filter((child: any) => child.dataset.action).map((child: any) => child.dataset.action))
+        .toEqual(['todo-assign', 'todo-status']);
+    }
+  });
+
+  it('shows only the active tab\'s tools on the project tab row', () => {
+    const node = (dataset: Record<string, string>) => ({ dataset, hidden: false, tabIndex: 0,
+      classList: { toggle() {} }, setAttribute() {} });
+    const tabs = ['tasks', 'auto', 'todo'].map(projectTab => node({ projectTab }));
+    const panels = ['tasks', 'auto', 'todo'].map(projectPanel => node({ projectPanel }));
+    const tools = ['auto', 'todo'].map(projectTools => node({ projectTools }));
+    const context = vm.createContext({
+      currentUserId: 'me', createLogger: () => ({ warn() {} }),
+      document: { readyState: 'loading', addEventListener() {}, querySelectorAll(selector: string) {
+        return ({ '.project-detail-tab': tabs, '.project-detail-tab-panel': panels, '[data-project-tools]': tools } as
+          Record<string, unknown[]>)[selector] || [];
+      } },
+      window: { addEventListener() {} }, t: (key: string) => key,
+    });
+    vm.runInContext(source, context);
+    for (const [active, shown] of [['tasks', []], ['auto', ['auto']], ['todo', ['todo']]] as const) {
+      context.__active = active;
+      vm.runInContext('_projectDetailActiveTab = __active', context);
+      context._syncProjectDetailTabState();
+      expect(tools.filter(group => !group.hidden).map(group => group.dataset.projectTools)).toEqual(shown);
+      expect(panels.filter(panel => !panel.hidden).map(panel => panel.dataset.projectPanel)).toEqual([active]);
+    }
+  });
+
+  it.each(['todo', 'progress', 'review', 'done'])('offers immediate processing only for unfinished %s tasks', async (status) => {
     const calls: any[] = [];
     const navigations: any[] = [];
     let items: any[] = [];
@@ -34,6 +263,13 @@ describe('project to-do controls', () => {
       pid: 'p_test', tasks: [{ id: 't_123456789abc', title: 'Continue work', status }],
     });
     const run = items.find((item) => item.label === 'project.todo.run');
+    if (status === 'done') {
+      expect(run).toBeUndefined();
+      await context._runTodoTask('t_123456789abc', { pid: 'p_test', tasks: [{ id: 't_123456789abc', status }] });
+      expect(calls).toEqual([]);
+      expect(navigations).toEqual([]);
+      return;
+    }
     expect(run).toBeDefined();
     await run.onClick();
     expect(calls).toEqual([{ channel: 'projects.tasks.run', payload: { projectId: 'p_test', taskId: 't_123456789abc' } }]);
@@ -72,6 +308,7 @@ describe('project to-do controls', () => {
       id: 't_123456789abc', title: 'Linked task', status: 'progress', origin_cid: 'c_linked',
     };
     const context = vm.createContext({
+      currentUserId: 'me',
       console,
       createLogger: () => ({ warn() {}, info() {}, error() {} }),
       document: {
@@ -92,7 +329,7 @@ describe('project to-do controls', () => {
     vm.runInContext(source, context, { filename: 'project-detail.js' });
 
     const card = context._renderTodoCard(task, { pid: 'p_test', tasks: [task], agents: [] });
-    const conversationEntry = card.children.find((child: any) => child.dataset?.action === 'todo-conversation');
+    const conversationEntry = cardNodes(card).find((child: any) => child.dataset?.action === 'todo-conversation');
     expect(conversationEntry).toBeDefined();
     expect(conversationEntry.innerHTML).toBe(`<svg></svg><span>${label}</span>`);
     expect(conversationEntry.attributes['aria-label']).toBe(translations['project.todo.open_conversation']);
@@ -100,11 +337,11 @@ describe('project to-do controls', () => {
       { id: 't_abcdef123456', title: 'Unlinked task', status: 'todo' },
       { pid: 'p_test', tasks: [], agents: [] },
     );
-    expect(unlinked.children.some((child: any) => child.dataset?.action === 'todo-conversation')).toBe(false);
+    expect(cardNodes(unlinked).some((child: any) => child.dataset?.action === 'todo-conversation')).toBe(false);
     // Host execution facts are available to models, without adding a visible card indicator.
     for (const is_running of [true, false, null]) {
       const executionCard = context._renderTodoCard({ ...task, is_running }, { pid: 'p_test', tasks: [], agents: [] });
-      const badge = executionCard.children.find((child: any) => child.dataset?.role === 'todo-execution');
+      const badge = cardNodes(executionCard).find((child: any) => child.dataset?.role === 'todo-execution');
       expect(badge).toBeUndefined();
     }
 
@@ -146,6 +383,7 @@ describe('project to-do controls', () => {
       'project-todo-count': { textContent: '' },
     };
     const context = vm.createContext({
+      currentUserId: 'me',
       console,
       createLogger: () => ({ warn() {}, info() {}, error() {} }),
       document: {
@@ -260,6 +498,7 @@ describe('project to-do controls', () => {
       'project-todo-count': { textContent: '' },
     };
     const context = vm.createContext({
+      currentUserId: 'me',
       console,
       createLogger: () => ({ warn() {}, info() {}, error() {} }),
       document: {
@@ -320,10 +559,10 @@ describe('project to-do controls', () => {
 
     // Unassigned task: the menu offers the bound agent and no "unassign" entry.
     await listeners.click({ target: assignTarget });
-    expect(menuItems.map((item) => item.label)).toEqual(['Researcher']);
+    expect(menuItems.map((item) => item.label)).toEqual(['chat.recipient_commander', 'Researcher']);
 
     // Picking the agent writes owner_agent + owner_agent_id via projects.tasks.update.
-    await menuItems[0].onClick!();
+    await menuItems.find(item => item.label === 'Researcher')!.onClick!();
     let updates = invocations.filter((call) => call.channel === 'projects.tasks.update');
     expect(updates).toHaveLength(1);
     expect(updates[0].payload).toMatchObject({
@@ -336,7 +575,7 @@ describe('project to-do controls', () => {
     // The post-assign re-fetch now reports the owner. The menu only switches
     // agents; clearing moved to the × revealed directly on the assigned chip.
     await listeners.click({ target: assignTarget });
-    expect(menuItems.map((item) => item.label)).toEqual(['Researcher']);
+    expect(menuItems.map((item) => item.label)).toEqual(['chat.recipient_commander', 'Researcher']);
 
     // Clicking that × clears both owner fields (empty strings → backend drops
     // the owner) without opening the assignment menu.
@@ -385,6 +624,7 @@ describe('project to-do controls', () => {
       'project-todo-add-btn': { dataset: {}, addEventListener() {} },
     };
     const context = vm.createContext({
+      currentUserId: 'me',
       console,
       createLogger: () => ({ warn() {}, info() {}, error() {} }),
       document: {
@@ -425,18 +665,20 @@ describe('project to-do controls', () => {
     await context._loadProjectTodos('p_test');
 
     const row = { dataset: { tid: 't_edit123abcd', status: 'todo' } };
-    const editButton = { dataset: { action: 'todo-edit' } };
+    const editButton = { dataset: { action: 'todo-menu' } };
     const editTarget = {
       closest(selector: string) {
         if (selector === '.project-todo-item') return row;
-        if (selector === '[data-action="todo-edit"]') return editButton;
+        if (selector === '[data-action="todo-menu"]') return editButton;
         return null;
       },
     };
 
-    // Clicking the card content opens the shared editor directly; the restored
-    // overflow menu remains a separate explicit target.
+    // Editing remains an explicit overflow-menu action.
+    const menuItems: any[] = [];
+    context.showContextMenu = (_event: any, items: any[]) => menuItems.push(...items);
     await listeners.click({ target: editTarget });
+    menuItems.find(item => item.label === 'project.todo.edit').onClick();
     expect(editor.hidden).toBe(false);
     expect(input.value).toBe('Old content\nFull requirements');
 
@@ -696,6 +938,87 @@ describe('project to-do controls', () => {
     expect(toasts[1].opts).toMatchObject({ variant: 'info' });
   });
 
+  it('shows the executing device name and disables then re-enables on the current device', async () => {
+    let click!: () => Promise<void>;
+    const toggle: any = { dataset: {}, disabled: false, _pressed: 'false',
+      getAttribute() { return this._pressed; },
+      setAttribute(_key: string, value: string) { this._pressed = value; },
+      addEventListener(_type: string, callback: typeof click) { click = callback; } };
+    const suffix = { textContent: '' };
+    const sets: boolean[] = [];
+    const device = { id: 'device-b', name: 'Laptop B' };
+    let config: any = { enabled: true, device_id: 'device-a', device_name: '<Office Mac>' };
+    const context = vm.createContext({
+      createLogger: () => ({ warn() {} }),
+      document: { readyState: 'loading', addEventListener() {}, getElementById(id: string) {
+        return id === 'project-driver-toggle' ? toggle : id === 'project-driver-device' ? suffix : null;
+      } },
+      window: { addEventListener() {}, orkas: { async invoke(channel: string, payload: any) {
+        if (channel === 'projects.driver.set') {
+          sets.push(payload.enabled);
+          config = { enabled: payload.enabled, ...(payload.enabled ? { device_id: device.id, device_name: device.name } : {}) };
+        }
+        return { config, device };
+      } } }, t: String,
+    });
+    vm.runInContext(source, context);
+    vm.runInContext("_projectDetailPid = 'p_device'; _bindProjectDriver();", context);
+    await context._loadProjectDriver('p_device');
+    expect(toggle._pressed).toBe('true');
+    // Hostnames are user data and remain text, including markup look-alikes.
+    expect(suffix.textContent).toBe(' · <Office Mac>');
+    await click();
+    expect(toggle._pressed).toBe('false');
+    expect(suffix.textContent).toBe('');
+    await click();
+    expect(toggle._pressed).toBe('true');
+    expect(suffix.textContent).toBe(' · auto.device_current');
+    expect(sets).toEqual([false, true]);
+    context._setProjectDriverToggleState({ enabled: true, device_id: device.id }, device);
+    expect(suffix.textContent).toBe(' · auto.device_current');
+    context._setProjectDriverToggleState({ enabled: true, device_id: 'device-a', device_name: device.name }, device);
+    expect(suffix.textContent).toBe(' · Laptop B');
+    context._setProjectDriverToggleState({ enabled: true, device_id: 'device-a' }, device);
+    expect(suffix.textContent).toBe(' · device-a');
+  });
+
+  it('ignores reordered driver reads across project navigation and blocks toggling unknown state', async () => {
+    let click!: () => Promise<void>;
+    const toggle: any = { dataset: {}, disabled: false, _pressed: 'false',
+      getAttribute() { return this._pressed; },
+      setAttribute(_key: string, value: string) { this._pressed = value; },
+      addEventListener(_type: string, callback: typeof click) { click = callback; } };
+    const suffix = { textContent: '' };
+    const pending: Array<(value: any) => void> = [];
+    const sets: any[] = [];
+    const context = vm.createContext({
+      createLogger: () => ({ warn() {} }),
+      document: { readyState: 'loading', addEventListener() {}, getElementById(id: string) {
+        return id === 'project-driver-toggle' ? toggle : id === 'project-driver-device' ? suffix : null;
+      } },
+      window: { addEventListener() {}, orkas: { invoke(channel: string, payload: any) {
+        if (channel === 'projects.driver.set') sets.push(payload);
+        return new Promise(resolve => pending.push(resolve));
+      } } }, t: String,
+    });
+    vm.runInContext(source, context);
+    vm.runInContext("_projectDetailPid = 'p_old'; _bindProjectDriver();", context);
+    const old = context._loadProjectDriver('p_old');
+    expect(toggle.disabled).toBe(true);
+    await click();
+    expect(sets).toEqual([]);
+    vm.runInContext("_projectDetailPid = 'p_new';", context);
+    const fresh = context._loadProjectDriver('p_new');
+    pending[1]({ config: { enabled: true, device_id: 'device-b', device_name: 'Remote B' }, device: { id: 'device-a' } });
+    await fresh;
+    expect(toggle.disabled).toBe(false);
+    expect(suffix.textContent).toBe(' · Remote B');
+    pending[0]({ config: { enabled: false }, device: { id: 'device-a' } });
+    await old;
+    expect(toggle._pressed).toBe('true');
+    expect(suffix.textContent).toBe(' · Remote B');
+  });
+
   it('surfaces a driver-advanced conversation into the shared conversation list', () => {
     const conversationsArr: any[] = [];
     let renderCalls = 0;
@@ -719,8 +1042,8 @@ describe('project to-do controls', () => {
     // A background driver advance pushes its new conversation; it lands in the
     // shared list (like a human-started run) and the list re-renders.
     context._onProjectAdvance({ projectId: 'p_test', conversation: { conversation_id: 'c_drv1', project_id: 'p_test' } });
-    expect(conversationsArr).toHaveLength(1);
-    expect(conversationsArr[0]).toMatchObject({ conversation_id: 'c_drv1' });
+    expect(context.conversations).toHaveLength(1);
+    expect(context.conversations[0]).toMatchObject({ conversation_id: 'c_drv1' });
     expect(renderCalls).toBe(1);
     // It also attaches the run observer so the conversation shows the in-progress
     // breathing badge, like a human-started run.
@@ -730,8 +1053,8 @@ describe('project to-do controls', () => {
 
     // Same cid again updates in place — never duplicates the running task.
     context._onProjectAdvance({ projectId: 'p_test', conversation: { conversation_id: 'c_drv1', project_id: 'p_test', title: 'x' } });
-    expect(conversationsArr).toHaveLength(1);
-    expect(conversationsArr[0]).toMatchObject({ title: 'x' });
+    expect(context.conversations).toHaveLength(1);
+    expect(context.conversations[0]).toMatchObject({ title: 'x' });
   });
 
   it('refreshes the open project to-do list on a background task-change broadcast', async () => {
@@ -794,6 +1117,7 @@ describe('project to-do controls', () => {
       ensureModelConfigured: () => true,
       _getQuotes: () => [],
       _referenceSnapshotsForQuotes: () => [],
+      _chatAttachList: () => [],
       consumeChatUseSelections: () => [],
       getChatRecipient: () => ({ kind: 'commander' }),
       transformWithChatUse: (value: string) => value,
@@ -1022,6 +1346,7 @@ describe('project to-do controls', () => {
   });
 
   it('keeps the project composer intact and records failure when attachment adoption fails', async () => {
+    const messages = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales/en.json'), 'utf8'));
     const invocations: any[] = [];
     const alerts: string[] = [];
     const input = { value: 'Review the attached brief' };
@@ -1054,7 +1379,8 @@ describe('project to-do controls', () => {
       },
       conversations: [],
       currentCid: null,
-      t: (key: string) => key,
+      t: (key: string, params: Record<string, unknown> = {}) => String(messages[key] || key)
+        .replace(/\{(\w+)\}/g, (_: string, name: string) => String(params[name] ?? `{${name}}`)),
       ensureModelConfigured: () => true,
       _getQuotes: () => [{ id: 'quote-1' }],
       _referenceSnapshotsForQuotes: () => [],
@@ -1071,7 +1397,7 @@ describe('project to-do controls', () => {
       apiFetch: async (url: string) => ({
         json: async () => url.endsWith('/create')
           ? { ok: true, conversation: { conversation_id: 'c_failed_adopt', title: 'New task' } }
-          : { ok: false, error: 'disk unavailable' },
+          : { ok: false, error: 'EPERM: rename C:\\PRIVATE_ATTACHMENT_PATH\\draft to conversation' },
       }),
       uiAlert: async (message: string) => { alerts.push(message); },
       renderConversationList() {},
@@ -1097,7 +1423,8 @@ describe('project to-do controls', () => {
     expect(clearedQuotes).toBe(0);
     expect(consumedSelections).toBe(0);
     expect(sends).toBe(0);
-    expect(alerts).toEqual(['chat.attach_adopt_failed']);
+    expect(alerts).toEqual(['Could not confirm the attachments. Your message and files are still here; try again.']);
+    expect(alerts.join(' ')).not.toContain('PRIVATE_ATTACHMENT_PATH');
   });
 
   it('sends the server-assigned attachment name after successful adoption', async () => {
@@ -1239,5 +1566,33 @@ describe('todo attachment preview recovery', () => {
     }]]);
     expect(calls.every(call => call.channel === 'projects.tasks.attachments.absPath'
       && call.payload.projectId === 'p_other' && call.payload.taskId === 't_123456abcdef')).toBe(true);
+  });
+});
+
+
+describe('todo chip track wheel ownership', () => {
+  it.each(['ltr', 'rtl'])('scrolls forward/backward and releases the page at both %s boundaries', direction => {
+    const parsed = ts.createSourceFile('todos.js', fs.readFileSync(path.join(rendererDir, 'modules/todos.js'), 'utf8'), ts.ScriptTarget.Latest, true, ts.ScriptKind.JS);
+    const binding = parsed.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === '_bindTodoScrollTrack')!;
+    let wheel: any;
+    let position = 0;
+    const track = {
+      get scrollLeft() { return position; },
+      set scrollLeft(value: number) { position = direction === 'rtl' ? Math.max(-500, Math.min(0, value)) : Math.max(0, Math.min(500, value)); },
+      addEventListener(type: string, callback: any) { if (type === 'wheel') wheel = callback; },
+    };
+    const context = vm.createContext({getComputedStyle: () => ({direction}), _updateTodoScrollTrackFade() {}});
+    vm.runInContext(binding.getText(parsed), context);
+    context._bindTodoScrollTrack(track);
+    const event = (deltaY: number, deltaX = 0) => ({deltaY, deltaX, preventDefault: vi.fn()});
+    const forward = event(400); wheel(forward);
+    expect(Math.abs(position)).toBe(400); expect(forward.preventDefault).toHaveBeenCalledOnce();
+    const horizontal = event(1, 20); wheel(horizontal);
+    expect(Math.abs(position)).toBe(400); expect(horizontal.preventDefault).not.toHaveBeenCalled();
+    wheel(event(400)); expect(Math.abs(position)).toBe(500);
+    const end = event(400); wheel(end); expect(end.preventDefault).not.toHaveBeenCalled();
+    const back = event(-500); wheel(back);
+    expect(position).toBe(0); expect(back.preventDefault).toHaveBeenCalledOnce();
+    const start = event(-400); wheel(start); expect(start.preventDefault).not.toHaveBeenCalled();
   });
 });

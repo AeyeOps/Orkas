@@ -184,6 +184,16 @@ describe('renderer local Agent structured user input', () => {
     });
   });
 
+  it('retains the card when IPC rejects an expired answer or a failed history write', async () => {
+    const h = loadHarness();
+    h.push('local-agent:user-input', { request_id: 'save-answer', cid: 'chat-1', questions: [choiceQuestion] });
+    h.invoke.mockResolvedValueOnce({ handled: false, save_failed: true } as any);
+    expect(await h.requests[0].submit(['Staging'], [['Staging']])).toBe(false);
+    h.invoke.mockResolvedValueOnce({ handled: false } as any);
+    expect(await h.requests[0].submit(['Staging'], [['Staging']])).toBe(false);
+    expect(await h.requests[0].submit(['Staging'], [['Staging']])).toBe(true);
+  });
+
   it('reports a failed reply so the card can keep the answer for a retry', async () => {
     const harness = loadHarness();
     harness.invoke.mockRejectedValueOnce(new Error('ipc down'));
@@ -193,6 +203,23 @@ describe('renderer local Agent structured user input', () => {
     await flush();
     expect(await harness.requests[0].submit(['Staging'], [['Staging']])).toBe(false);
     expect(await harness.requests[0].submit(['Staging'], [['Staging']])).toBe(true);
+  });
+
+  it.each(['retry', null])('retains collected dialog answers across a failed save, then handles %s', async decision => {
+    const h = loadHarness({ dock: false });
+    h.uiPrompt.mockResolvedValue('Retained answer');
+    h.uiChoice.mockResolvedValue(decision);
+    h.invoke.mockResolvedValueOnce({ handled: false, save_failed: true } as any);
+    h.push('local-agent:user-input', { request_id: 'dialog-save', cid: 'chat-1', questions: [textQuestion] });
+    await flush();
+    expect(h.uiPrompt).toHaveBeenCalledOnce();
+    expect(h.uiChoice).toHaveBeenCalledWith(expect.objectContaining({ message: 'chat.cli_question.send_failed' }));
+    expect(h.invoke.mock.calls.map(([, payload]) => payload)).toEqual([
+      { request_id: 'dialog-save', answers: { note: ['Retained answer'] }, cancelled: false },
+      decision === 'retry'
+        ? { request_id: 'dialog-save', answers: { note: ['Retained answer'] }, cancelled: false }
+        : { request_id: 'dialog-save', answers: {}, cancelled: true },
+    ]);
   });
 
   it('accepts only confirmed cancellation or native closure, never IPC receipt alone', async () => {

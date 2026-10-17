@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import mutableFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import AdmZip from 'adm-zip';
@@ -633,6 +635,46 @@ describe('skills › applySkillContainerFromCommander › create', () => {
   });
 });
 
+describe('skills › resolveSkillContainerTarget', () => {
+  const bindings = new Map([
+    ['review-notes-1', { id: 'release-review-notes' }],
+    ['shipped-1', { id: 'shipped' }],
+  ]);
+  const container = (skillId?: string) => ({ skillId, files: [], metadata: { description_en: 'x' } });
+
+  it('maps the run-scoped read ref the model used to the host Skill id', async () => {
+    const s = await loadSkills();
+    for (const ref of ['@skill/review-notes-1', '@skill/review-notes-1/SKILL.md', '  @skill/review-notes-1/  ']) {
+      const r = s.resolveSkillContainerTarget(container(ref), bindings);
+      expect(r).toMatchObject({ ok: true, container: { skillId: 'release-review-notes', metadata: { description_en: 'x' } } });
+    }
+  });
+
+  it('keeps plain ids and create containers unchanged', async () => {
+    const s = await loadSkills();
+    expect(s.resolveSkillContainerTarget(container('release-review-notes'), bindings))
+      .toEqual({ ok: true, container: container('release-review-notes') });
+    expect(s.resolveSkillContainerTarget(container(undefined), bindings))
+      .toEqual({ ok: true, container: container(undefined) });
+  });
+
+  it('fails an unknown or malformed ref instead of falling back to create', async () => {
+    const s = await loadSkills();
+    for (const ref of ['@skill/unknown-9', '@skill/', '@skill/review-notes-1/references/a.md', '@skill/../x']) {
+      const r = s.resolveSkillContainerTarget({ ...container(ref), files: [{ path: 'SKILL.md', content: '---\nname: "x"\n---\n' }] }, bindings);
+      expect(r.ok, ref).toBe(false);
+      if (!r.ok) expect(r.error).toMatch(/not found|不存在|找不到/i);
+    }
+  });
+
+  it('does not treat look-alike ids as refs', async () => {
+    const s = await loadSkills();
+    for (const id of ['skill/review-notes-1', '@skills/review-notes-1', 'review-notes-1']) {
+      expect(s.resolveSkillContainerTarget(container(id), bindings)).toEqual({ ok: true, container: container(id) });
+    }
+  });
+});
+
 describe('skills › applySkillContainerFromCommander › edit', () => {
   it('writes blocks to existing custom skill', async () => {
     writeCustomSkill('beta', 'name: "beta"\ndescription_en: "old"', 'old body');
@@ -669,6 +711,57 @@ describe('skills › applySkillContainerFromCommander › edit', () => {
     expect(after).toContain('description_en: "old"');
     const meta = JSON.parse(fs.readFileSync(path.join(customSkillsDir(), 'beta', '_meta.json'), 'utf8'));
     expect(meta.category).toBe('data');
+  });
+
+  // A single-language description edit must persist and be what the Skill
+  // reports afterwards; the host previously wrote the old frontmatter
+  // description back and returned `updated` (2026-10-17 app-assist finding).
+  it.each(['en', 'zh'] as const)('persists a description_en-only edit on an English-only Skill (UI %s)', async (lang) => {
+    writeCustomSkill('review-notes', 'name: "review-notes"\ndescription: "Review release notes."', '# Release review\n');
+    const { setLanguage } = await import('../../../src/main/features/config');
+    setLanguage(lang);
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'review-notes', files: [],
+      metadata: { description_en: 'Review release notes and report blocking evidence.' },
+    });
+    expect(r.ok).toBe(true);
+    const skill = await s.getCustomSkill('review-notes');
+    expect(skill?.description_en).toBe('Review release notes and report blocking evidence.');
+    const md = fs.readFileSync(path.join(customSkillsDir(), 'review-notes', 'SKILL.md'), 'utf8');
+    expect(md).toContain('# Release review');
+    expect(md).not.toContain('description_en:');
+  });
+
+  it.each([
+    ['en', 'description_en', '审查发布说明。', 'Review notes and blockers.'],
+    ['zh', 'description_en', '审查发布说明。', 'Review notes and blockers.'],
+    ['en', 'description_zh', '审查发布说明并报告阻塞证据。', 'Review release notes.'],
+    ['zh', 'description_zh', '审查发布说明并报告阻塞证据。', 'Review release notes.'],
+  ] as const)('keeps the other language when editing one side of a bilingual Skill (UI %s, %s)', async (lang, field, zh, en) => {
+    writeCustomSkill('bilingual', 'name: "bilingual"\ndescription: "Review release notes."', 'body');
+    fs.writeFileSync(path.join(customSkillsDir(), 'bilingual', '_meta.json'),
+      JSON.stringify({ descriptions: { zh: '审查发布说明。', en: 'Review release notes.' } }));
+    const { setLanguage } = await import('../../../src/main/features/config');
+    setLanguage(lang);
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'bilingual', files: [], metadata: { [field]: field === 'description_en' ? en : zh },
+    });
+    expect(r.ok).toBe(true);
+    const skill = await s.getCustomSkill('bilingual');
+    expect(skill?.description_zh).toBe(zh);
+    expect(skill?.description_en).toBe(en);
+  });
+
+  it('accepts whitespace the host normalizes in a description edit', async () => {
+    writeCustomSkill('spacing', 'name: "spacing"\ndescription: "Old."', 'body');
+    const s = await loadSkills();
+    const r = await s.applySkillContainerFromCommander({
+      skillId: 'spacing', files: [], metadata: { description_en: 'New   spaced\ndescription.' },
+    });
+    expect(r.ok).toBe(true);
+    expect((await s.getCustomSkill('spacing'))?.description_en).toBe('New spaced description.');
   });
 
   it('rejects edit on builtin skill (read-only outside dev panel)', async () => {
@@ -1473,7 +1566,7 @@ describe('skills › createFromDir', () => {
       zip.writeZip(archive);
 
       const s = await loadSkills();
-      const result = await s.importSkillPackageFromPath(archive);
+      const result = await s.importSkillPackageFromPath(archive, { all: true });
 
       expect(result.ok, JSON.stringify(result)).toBe(true);
       expect(result.skills?.map((skill: any) => skill.id)).toEqual(['good-skill']);
@@ -1611,6 +1704,192 @@ describe('skills › createFromDir', () => {
   });
 });
 
+describe('skills › selected batch package import', () => {
+  let source: string;
+  beforeEach(() => { source = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-batch-source-')); });
+  afterEach(() => fs.rmSync(source, { recursive: true, force: true }));
+  function skill(key: string, name = path.basename(key), extraFiles = 0) {
+    const dir = path.join(source, key);
+    fs.mkdirSync(path.join(dir, 'references'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: A selected import fixture\n---\n\n# Instructions\nRead references when needed.\n`);
+    for (let i = 0; i < extraFiles; i++) fs.writeFileSync(path.join(dir, 'references', `${i}.md`), `Reference ${i}.\n`);
+    return dir;
+  }
+
+  it.each([false, true])('keeps native path identity across legacy aliases; source redirected=%s', async redirected => {
+    const dir = skill('selected', 'selected', 1);
+    const nativeRealpath = fs.realpathSync.native;
+    const legacyRealpath = fs.realpathSync;
+    const promiseRealpath = fs.promises.realpath;
+    const canonicalSource = nativeRealpath(source);
+    const alias = `${canonicalSource}-legacy-alias`;
+    fs.symlinkSync(source, alias, 'junction');
+    let redirectObserved = false;
+    // Windows legacy realpathSync preserves short names/casing that the
+    // native promise API expands. Both spellings still name the same source.
+    const legacy = vi.spyOn(mutableFs, 'realpathSync').mockImplementation(((value: fs.PathLike, options?: any) => {
+      const resolved = legacyRealpath(value, options);
+      return typeof resolved === 'string' && (resolved === canonicalSource || resolved.startsWith(canonicalSource + path.sep))
+        ? alias + resolved.slice(canonicalSource.length) : resolved;
+    }) as typeof fs.realpathSync);
+    Object.assign(legacy, { native: nativeRealpath });
+    syncBuiltinESMExports();
+    const canonical = vi.spyOn(fs.promises, 'realpath').mockImplementation((async (value: fs.PathLike, options?: any) => {
+      if (redirected && String(value) === nativeRealpath(dir)) {
+        redirectObserved = true;
+        return canonicalSource;
+      }
+      return promiseRealpath(value, options);
+    }) as typeof fs.promises.realpath);
+    syncBuiltinESMExports();
+    try {
+      const s = await loadSkills();
+      const result = await s.importSkillPackageFromPath(source, { all: true });
+      expect(result.ok, JSON.stringify(result)).toBe(!redirected);
+      if (redirected) {
+        expect(redirectObserved).toBe(true);
+        expect(fs.existsSync(path.join(customSkillsDir(), 'selected'))).toBe(false);
+      } else {
+        expect(fs.readFileSync(path.join(customSkillsDir(), 'selected', 'references', '0.md'), 'utf8')).toBe('Reference 0.\n');
+      }
+    } finally {
+      canonical.mockRestore();
+      legacy.mockRestore();
+      syncBuiltinESMExports();
+      fs.rmSync(alias, { recursive: true, force: true });
+    }
+  });
+
+  it('previews 265 Skills without writes, imports only selected roots and preserves nested references', async () => {
+    for (let i = 0; i < 265; i++) skill(`skills/item-${String(i).padStart(3, '0')}`);
+    const dir = skill('plugins/vendor/skills/large', 'large', 320);
+    fs.mkdirSync(path.join(dir, 'references', 'nested'));
+    fs.writeFileSync(path.join(dir, 'references', 'nested', 'SKILL.md'), '# Nested reference, not a separate installation\n');
+    fs.writeFileSync(path.join(source, '.mcp.json'), '{}');
+    const s = await loadSkills();
+    const preview = await s.importSkillPackageFromPath(source);
+    expect(preview.preview?.candidates).toHaveLength(266);
+    expect(preview.preview?.unsupported).toContain('connectors');
+    expect(preview.skills).toBeUndefined();
+    expect(fs.existsSync(customSkillsDir()) ? fs.readdirSync(customSkillsDir()) : []).toEqual([]);
+    const result = await s.importSkillPackageFromPath(source, {
+      expectedFingerprint: preview.preview!.fingerprint, selection: ['plugins/vendor/skills/large', 'skills/item-000'],
+    });
+    expect(result.ok).toBe(true);
+    expect(result.skills?.map(x => x.id).sort()).toEqual(['item-000', 'large']);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'large', 'references', '319.md'), 'utf8')).toBe('Reference 319.\n');
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'large', 'references', 'nested', 'SKILL.md'), 'utf8')).toContain('# Nested reference');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'item-001'))).toBe(false);
+    expect(fs.existsSync(path.join(customSkillsDir(), '.mcp.json'))).toBe(false);
+    expect(fs.readFileSync(path.join(dir, 'references', '319.md'), 'utf8')).toBe('Reference 319.\n');
+  });
+
+  it('continues all-selection in bounded batches and does not overwrite on replay', async () => {
+    for (let i = 0; i < 12; i++) skill(`skills/skill-${String(i).padStart(2, '0')}`);
+    const s = await loadSkills();
+    const preview = await s.importSkillPackageFromPath(source, { preview: true });
+    const first = await s.importSkillPackageFromPath(source, { all: true, expectedFingerprint: preview.preview!.fingerprint });
+    expect(first.skills).toHaveLength(10);
+    expect(first.nextOffset).toBe(10);
+    const final = await s.importSkillPackageFromPath(source, { all: true, offset: first.nextOffset!, expectedFingerprint: preview.preview!.fingerprint });
+    expect(final.skills).toHaveLength(2);
+    expect(final.nextOffset).toBeNull();
+    const file = path.join(customSkillsDir(), 'skill-00', 'SKILL.md');
+    const bytes = fs.readFileSync(file);
+    const retry = await s.importSkillPackageFromPath(source, { selection: ['skills/skill-00'] });
+    expect(retry.ok).toBe(false);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    expect(fs.readdirSync(customSkillsDir()).filter(x => x.startsWith('skill-'))).toHaveLength(12);
+  });
+
+  it('isolates file and byte limits while installing valid siblings', async () => {
+    skill('valid', 'valid', 999);
+    skill('too-many', 'too-many', 1000);
+    const large = skill('too-large');
+    fs.writeFileSync(path.join(large, 'references', 'large.bin'), Buffer.alloc(10 * 1024 * 1024));
+    const s = await loadSkills();
+    const result = await s.importSkillPackageFromPath(source, { all: true });
+    expect(result.skills?.map(x => x.id)).toEqual(['valid']);
+    expect(result.failures?.map(x => x.sourceName).sort()).toEqual(['too-large', 'too-many']);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'too-many'))).toBe(false);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'too-large'))).toBe(false);
+  });
+
+  it('rejects stale previews, traversal and an empty selection before writes', async () => {
+    const dir = skill('one'); skill('two');
+    const s = await loadSkills();
+    const preview = await s.importSkillPackageFromPath(source, { preview: true });
+    fs.appendFileSync(path.join(dir, 'SKILL.md'), '\nChanged.\n');
+    const stale = await s.importSkillPackageFromPath(source, { selection: ['one'], expectedFingerprint: preview.preview!.fingerprint });
+    expect(stale).toMatchObject({ ok: false, error: expect.stringContaining('changed') });
+    for (const selection of [[], ['../outside'], ['one', 'one']]) {
+      expect((await s.importSkillPackageFromPath(source, { selection })).ok).toBe(false);
+    }
+    const controller = new AbortController(); controller.abort();
+    expect((await s.importSkillPackageFromPath(source, { all: true, signal: controller.signal })).ok).toBe(false);
+    expect(fs.existsSync(customSkillsDir()) ? fs.readdirSync(customSkillsDir()) : []).toEqual([]);
+  });
+
+  it('keeps ZIP previews stable and reports duplicate names without copying unrelated files', async () => {
+    const first = skill('a', 'same'); skill('b', 'same');
+    fs.writeFileSync(path.join(source, 'settings.json'), 'private settings');
+    const archive = path.join(source, 'source.zip');
+    const zip = new AdmZip();
+    zip.addLocalFolder(first, 'a'); zip.addLocalFolder(path.join(source, 'b'), 'b');
+    zip.addFile('settings.json', Buffer.from('private settings')); zip.writeZip(archive);
+    const s = await loadSkills();
+    const preview = await s.importSkillPackageFromPath(archive, { preview: true });
+    expect(preview.preview?.candidates.every(x => x.duplicate)).toBe(true);
+    const result = await s.importSkillPackageFromPath(archive, { selection: ['a'], expectedFingerprint: preview.preview!.fingerprint });
+    expect(result.skills?.map(x => x.id)).toEqual(['same']);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'same', 'settings.json'))).toBe(false);
+    expect((await s.importSkillPackageFromPath(archive, { preview: true })).preview?.candidates.every(x => x.installed)).toBe(true);
+  });
+
+  it('stops between Skills on cancellation and resumes without skipping uninstalled siblings', async () => {
+    skill('first', 'first', 1); skill('second'); skill('third');
+    const s = await loadSkills();
+    const controller = new AbortController();
+    // The test logger supplies a deterministic interruption after the first
+    // install. Final files and the resumable receipt are the outcome oracle.
+    const info = console.info;
+    const spy = vi.spyOn(console, 'info').mockImplementation((...args) => {
+      info(...args);
+      if (args[0] === '[skills]' && args[1] === 'created-from-dir direct skill install') controller.abort();
+    });
+    let stopped: Awaited<ReturnType<typeof s.importSkillPackageFromPath>>;
+    try { stopped = await s.importSkillPackageFromPath(source, { all: true, signal: controller.signal }); }
+    finally { spy.mockRestore(); }
+    expect(controller.signal.aborted).toBe(true);
+    expect(stopped.skills?.map(x => x.id)).toEqual(['first']);
+    expect(stopped.nextOffset).toBe(1);
+    expect(stopped.failures?.[0].error).toContain('cancelled');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'second'))).toBe(false);
+    const resumed = await s.importSkillPackageFromPath(source, { all: true, offset: stopped.nextOffset! });
+    expect(resumed.skills?.map(x => x.id)).toEqual(['second', 'third']);
+    expect(resumed.nextOffset).toBeNull();
+  });
+
+  it('does not copy linked files or discover linked Skill directories', async () => {
+    const dir = skill('selected');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-batch-outside-'));
+    try {
+      fs.writeFileSync(path.join(outside, 'secret.txt'), 'must remain outside');
+      fs.writeFileSync(path.join(outside, 'SKILL.md'), '---\nname: outside\ndescription: Outside\n---\nInstructions\n');
+      fs.symlinkSync(outside, path.join(source, 'linked'), 'junction');
+      fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(dir, 'references', 'linked.txt'));
+      const s = await loadSkills();
+      const preview = await s.importSkillPackageFromPath(source, { preview: true });
+      expect(preview.preview?.candidates.map(x => x.name)).toEqual(['selected']);
+      expect(preview.preview?.unsupported).toContain('symbolic_links');
+      const result = await s.importSkillPackageFromPath(source, { selection: ['selected'], expectedFingerprint: preview.preview!.fingerprint });
+      expect(result.skills?.map(x => x.id)).toEqual(['selected']);
+      expect(fs.existsSync(path.join(customSkillsDir(), 'selected', 'references', 'linked.txt'))).toBe(false);
+      expect(fs.existsSync(path.join(customSkillsDir(), 'outside'))).toBe(false);
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+});
+
 describe('skills › createFromUrl', () => {
   it('creates an editable draft without silently fetching or modeling a GitHub URL', async () => {
     const modelCalls: any[] = [];
@@ -1658,6 +1937,15 @@ describe('skills › createFromUrl', () => {
 });
 
 describe('skills › updateCustomSkill', () => {
+  it('preserves the authoritative sidecar category during a description-only edit, while explicit changes and clearing still work', async () => {
+    const s = await loadSkills();
+    await s.createCustomSkill('categorized-review', 'Review notes.', 'data');
+    const edited = await s.updateCustomSkill('categorized-review', { description_en: 'Review release evidence.' });
+    expect(edited?.category).toBe('data');
+    expect((await s.listSkills()).find(skill => skill.id === 'categorized-review')?.category).toBe('data');
+    expect((await s.updateCustomSkill('categorized-review', { category: 'office' }))?.category).toBe('office');
+    expect((await s.updateCustomSkill('categorized-review', { category: '' }))?.category).toBe('');
+  });
   it('rewrites SKILL.md with new description, preserving body', async () => {
     // Frontmatter name must match the dir id; otherwise updateCustomSkill
     // treats meta.name as a rename target and refuses "already exists".

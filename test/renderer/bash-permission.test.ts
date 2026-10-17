@@ -187,12 +187,16 @@ interface DialogView {
   showModeControl: boolean;
   allowRun: boolean;
   choices: string[];
+  /** The highlighted choice, which also receives initial focus. */
+  primary: string;
+  choiceLabels: Record<string, string>;
 }
 
 function dialogView(overlay: FakeElement): DialogView {
   const text = (selector: string) => overlay.querySelector(selector)?.textContent ?? '';
   const options = overlay.querySelectorAll('.bash-permission-mode-option');
-  const choices = overlay.querySelectorAll('[data-act="choice"]').map((button) => button.dataset.id);
+  const choiceButtons = overlay.querySelectorAll('[data-act="choice"]');
+  const choices = choiceButtons.map((button) => button.dataset.id);
   return {
     title: text('.ui-dialog-title'),
     context: text('.ui-dialog-context'),
@@ -211,6 +215,8 @@ function dialogView(overlay: FakeElement): DialogView {
     showModeControl: overlay.querySelector('.bash-permission-mode-control') !== null,
     allowRun: choices.includes('allow_run'),
     choices,
+    primary: choiceButtons.find((button) => button.classes.has('btn-primary'))?.dataset.id ?? '',
+    choiceLabels: Object.fromEntries(choiceButtons.map((button) => [button.dataset.id, button.textContent])),
   };
 }
 
@@ -1273,67 +1279,6 @@ describe('renderer bash permission prompt', () => {
   });
 });
 
-describe('web assist page actions reuse the same permission dialog', () => {
-  const handback = {
-    request_id: 'web-assist-request',
-    cid: 'task-1',
-    tab_id: '0123456789ab',
-    page_title: 'ChatGPT',
-    page_origin: 'https://chatgpt.com',
-    control_label: 'Send prompt',
-    control_kind: 'button',
-    reason: 'high_impact_action',
-  };
-
-  it('offers a task grant and answers with the run decision', async () => {
-    const h = loadHarness('allow_run');
-    h.emitPush('web-assist:action-confirm', handback);
-    await flush();
-    expect(h.dialogs[0]).toMatchObject({
-      title: 'Allow this action on the page?',
-      currentMode: 'all_files_approval',
-      // The repeat is the case this gate exists for, so the grant is offered.
-      allowRun: true,
-      showModeControl: true,
-    });
-    for (const detail of ['ChatGPT', 'https://chatgpt.com', 'Send prompt']) {
-      expect(h.dialogs[0].message).toContain(detail);
-    }
-    expect(h.invokeCalls.at(-1)).toEqual({
-      channel: 'webAssist.actionConfirmResponse',
-      payload: { request_id: handback.request_id, decision: 'run' },
-    });
-  });
-
-  it('answers once without a grant', async () => {
-    const h = loadHarness('allow_once');
-    h.emitPush('web-assist:action-confirm', handback);
-    await flush();
-    expect(h.invokeCalls.at(-1)).toEqual({
-      channel: 'webAssist.actionConfirmResponse',
-      payload: { request_id: handback.request_id, decision: 'once' },
-    });
-  });
-
-  it('declines with a deny decision the host can distinguish from an approval', async () => {
-    const h = loadHarness('deny');
-    h.emitPush('web-assist:action-confirm', handback);
-    await flush();
-    expect(h.invokeCalls.at(-1)).toEqual({
-      channel: 'webAssist.actionConfirmResponse',
-      payload: { request_id: handback.request_id, decision: 'deny' },
-    });
-  });
-
-  it('drops a withdrawn request without answering it', async () => {
-    const h = loadHarness('pending');
-    h.emitPush('web-assist:action-confirm', handback);
-    h.emitPush('web-assist:action-confirm-cancelled', { request_ids: [handback.request_id], cid: 'task-1' });
-    await flush();
-    expect(h.invokeCalls.some(call => call.channel === 'webAssist.actionConfirmResponse')).toBe(false);
-  });
-});
-
 describe('Web application sensitive approval', () => {
   it.each(['zh', 'en', 'ja', 'pt'] as const)('uses the shared dialog with a usage button and no additional explanation in %s', async locale => {
     const table = JSON.parse(fs.readFileSync(path.join(__dirname, '../../src/renderer/locales', `${locale}.json`), 'utf8'));
@@ -1368,7 +1313,7 @@ it('application windows ignore task prompts and cancellations while showing thei
 
 
 describe('global request attribution', () => {
-  it.each(['bash:permission', 'connectors:action-confirm', 'web-assist:action-confirm', 'local-agent:permission'])(
+  it.each(['bash:permission', 'connectors:action-confirm', 'local-agent:permission'])(
     'identifies the source of %s even while a different task is open', async channel => {
       const h = loadHarness('pending', undefined, { locale: 'zh' });
       h.context.currentConvId = 'unrelated';

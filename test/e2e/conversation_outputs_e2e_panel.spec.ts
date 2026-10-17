@@ -11,7 +11,7 @@
 //
 // The first reply below deliberately does NOT paste a media link; the second
 // one does, and must not gain a duplicate underneath it.
-import { appendFileSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 
@@ -223,6 +223,31 @@ test('surfaces produced files, outside files, and artifacts for one conversation
   // The badge is the user's cue that the turn produced something; an artifact
   // is one of those things.
   await expect(page.locator('#conversation-info-tab-count-files')).toHaveText('4');
+
+  // Revealing a file that has moved away explains the recovery in the UI language,
+  // without the host reason or its local path. (UI review capture: zh, default window.)
+  const movedNotes = `${notesPath}.moved`;
+  const previousLang = await page.evaluate(() => (window as any).getLang());
+  try {
+    await page.evaluate(() => (window as any).setLang('zh'));
+    const escapedNotesPath = await page.evaluate(value => CSS.escape(value), notesPath);
+    const notesRow = panel.locator(`.conversation-info-file[data-file-path="${escapedNotesPath}"]`);
+    await expect(notesRow).toHaveCount(1);
+    const reports = panel.locator('details.conversation-info-dir');
+    if (!await reports.evaluate(node => (node as HTMLDetailsElement).open)) await reports.locator('> summary').click();
+    await notesRow.scrollIntoViewIfNeeded(); await notesRow.hover();
+    await notesRow.locator('.conversation-info-file-menu-btn').click();
+    renameSync(notesPath, movedNotes);
+    await page.locator('.ctx-row-menu-item[data-action="reveal"]').click();
+    const revealAlert = page.locator('.ui-dialog-overlay:visible');
+    await expect(revealAlert.locator('.ui-dialog-message')).toHaveText('无法打开所在文件夹，文件可能已被移动或删除。');
+    await expect(revealAlert).not.toContainText(listing.root);
+    await revealAlert.locator('.ui-dialog').screenshot({ path: testInfo.outputPath('ui-review', '11-folder-reveal-failed.png') });
+    await revealAlert.locator('[data-act="ok"]').click(); await expect(revealAlert).toHaveCount(0);
+  } finally {
+    try { renameSync(movedNotes, notesPath); } catch { /* not moved */ }
+    await page.evaluate(lang => (window as any).setLang(lang), previousLang);
+  }
 
   // Opening the artifact from the panel reaches the same frame the bubble uses.
   const artifactPreview = await orkas.openPreview(() => panel.locator('.conversation-info-file[data-artifact-id]').click());

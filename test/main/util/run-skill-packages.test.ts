@@ -130,6 +130,27 @@ describe('run-skill.cjs › external packages root', () => {
     expect(JSON.parse(r.stdout.trim()).marker).toBe('from-package-deps');
   });
 
+  it('preserves package-local ESM import conditions and legacy require conditions', () => {
+    writePackageSkill('mypack', 'pkg-esm', 'pkg-esm');
+    writeRegistry({ version: 1, packages: [{ name: 'mypack', skill_roots: ['skills'], enabled: true }] });
+    const packageDir = path.join(pkgsDir(), 'mypack');
+    const scripts = path.join(packageDir, 'skills', 'pkg-esm', 'scripts');
+    const markerDir = path.join(packageDir, 'node_modules', 'pkg-marker');
+    fs.writeFileSync(path.join(markerDir, 'package.json'), JSON.stringify({
+      name: 'pkg-marker', exports: { import: './import.mjs', require: './index.js' },
+    }));
+    fs.writeFileSync(path.join(markerDir, 'import.mjs'), 'export default await Promise.resolve("from-esm-package");');
+    fs.rmSync(path.join(scripts, 'hello.js'));
+    fs.writeFileSync(path.join(scripts, 'hello.mjs'), `
+      import marker from 'pkg-marker';
+      export default async ({ args }) => ({ marker, legacy: require('pkg-marker'), args });
+    `);
+    const r = runSkill('pkg-esm', 'hello', ['two words']);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toEqual({ marker: 'from-esm-package', legacy: 'from-package-deps', args: ['two words'] });
+  });
+
   it('does not resolve skills from disabled packages', () => {
     writePackageSkill('mypack', 'pkg-hello', 'pkg-hello');
     writeRegistry({

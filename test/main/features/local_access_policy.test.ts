@@ -94,6 +94,45 @@ describe('local_access_policy', () => {
     )).toEqual(['sensitive_path']);
   });
 
+  it('offers a folder grant only for reads sensitive solely for their personal location', async () => {
+    const previousHome = process.env.HOME;
+    const previousUserProfile = process.env.USERPROFILE;
+    const home = path.join(tmpDir, 'home');
+    process.env.HOME = home;
+    if (process.platform === 'win32') process.env.USERPROFILE = home;
+    try {
+      const policy = await import('../../../src/main/features/local_access_policy');
+      const ads = path.join(home, 'Desktop', 'ads');
+      fs.mkdirSync(ads, { recursive: true });
+      fs.mkdirSync(path.join(home, '.ssh'), { recursive: true });
+      const image = path.join(ads, 'a.png');
+      fs.writeFileSync(image, 'png');
+      fs.writeFileSync(path.join(ads, '.env'), 'TOKEN=1');
+      fs.writeFileSync(path.join(home, '.ssh', 'config'), 'Host x');
+      fs.symlinkSync(path.join(home, '.ssh', 'config'), path.join(ads, 'notes.txt'));
+      fs.writeFileSync(path.join(tmpDir, 'plain.txt'), 'plain');
+
+      expect(policy.locationOnlyRead(image)).toEqual({
+        folder: ads, realPath: fs.realpathSync(image), realFolder: fs.realpathSync(ads),
+      });
+      // A listed directory grants itself; a file not created yet, its parent.
+      expect(policy.locationOnlyRead(ads)).toMatchObject({ folder: ads, realFolder: fs.realpathSync(ads) });
+      expect(policy.locationOnlyRead(path.join(ads, 'later.png'))).toMatchObject({ folder: ads });
+      // Intrinsic secrets, links to them, unprotected paths and trusted
+      // workspaces never carry a folder grant.
+      expect(policy.locationOnlyRead(path.join(ads, '.env'))).toBeUndefined();
+      expect(policy.locationOnlyRead(path.join(home, '.ssh', 'config'))).toBeUndefined();
+      expect(policy.locationOnlyRead(path.join(ads, 'notes.txt'))).toBeUndefined();
+      expect(policy.locationOnlyRead(path.join(tmpDir, 'plain.txt'))).toBeUndefined();
+      expect(policy.locationOnlyRead(image, { trustedRoots: [ads] })).toBeUndefined();
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+      else process.env.USERPROFILE = previousUserProfile;
+    }
+  });
+
   it('applies server-configured sensitive paths and command patterns immediately', async () => {
     const { clientConfig } = await import('../../../src/main/features/client_config');
     const policy = await import('../../../src/main/features/local_access_policy');

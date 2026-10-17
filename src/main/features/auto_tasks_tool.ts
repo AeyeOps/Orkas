@@ -35,13 +35,17 @@ export function createAutoTasksTool(opts: {
   projectId?: string | null;
   /** Saved automation id, for the host's click-through offer. Not called for a
    *  delete: there is nothing left to open. */
-  onSaved?: (taskId: string) => void;
+  onSaved?: (taskId: string, title: string) => void;
+  /** Deleted automation id, so the host withdraws an offer staged earlier in
+   *  the same turn (a create followed by a delete must not leave a dead link). */
+  onDeleted?: (taskId: string) => void;
 }): AgentTool {
   const schema = z.object(contract.shape(z, opts.projectId !== undefined)).strict();
   return {
     name: 'auto_tasks',
     description: contract.description,
     inputSchema: contract.inputSchema(z, opts.projectId !== undefined),
+    compatibilityInputFields: Object.keys(contract.shape(z, false)),
     async execute(input) {
       const fail = (error: string) => ({ content: JSON.stringify({ ok: false, error }), isError: true });
       const parsed = schema.safeParse(input);
@@ -75,7 +79,10 @@ export function createAutoTasksTool(opts: {
         }, { sourceAttachmentCid: opts.cid, projectId: opts.projectId });
         if (!result.ok && result.error && !/^[a-z][a-z0-9_]*$/.test(result.error)) return fail('automation operation failed');
         if (result.ok && result.taskId && result.kind !== 'deleted') {
-          try { opts.onSaved?.(result.taskId); } catch { /* navigation is an offer, never a failure */ }
+          try { opts.onSaved?.(result.taskId, result.task?.title || result.title || ''); } catch { /* navigation is an offer, never a failure */ }
+        }
+        if (result.ok && result.taskId && result.kind === 'deleted') {
+          try { opts.onDeleted?.(result.taskId); } catch { /* withdrawing an offer never fails the delete */ }
         }
         return { content: JSON.stringify({ ...result, ...(result.task ? { task: taskView(result.task) } : {}) }), isError: !result.ok };
       } catch (err) {

@@ -11,6 +11,7 @@ import {
   compactGitHubSnapshotReplay,
   fetchGitHubRepositorySnapshot,
   identifyGitHubRepositoryResource,
+  renderGitHubSnapshotView,
 } from "./github-repository-fetch.js";
 import {
   DEFAULT_WEB_FETCH_TIMEOUT_MS,
@@ -55,6 +56,9 @@ export function configureWebFetchRenderer(renderer: WebFetchRenderer | null): vo
 type WebFetchCacheEntry = {
   epoch: number;
   result: Promise<ToolResult>;
+  /** End of the furthest character range already returned for this URL. After
+   * context compaction, only windows at or beyond it are served again. */
+  servedThrough?: number;
 };
 
 type WebFetchFailurePolicyState = {
@@ -154,7 +158,7 @@ function fetchFailureDisposition(result: ToolResult): FetchFailureDisposition | 
     return "auth_origin";
   }
   if (
-    /\bHTTP\s+(?:404|410)\b|\b(?:PAGE_NOT_FOUND|JS_OR_NAV_SHELL|E_FETCH_RESPONSE_TOO_LARGE)\b/i
+    /\bHTTP\s+(?:404|410)\b|\b(?:PAGE_NOT_FOUND|JS_OR_NAV_SHELL|E_FETCH_RESPONSE_TOO_LARGE|E_WEB_FETCH_BINARY_CONTENT)\b/i
       .test(result.content)
   ) {
     return "permanent_url";
@@ -246,19 +250,161 @@ function applyExplicitCharacterLimit(result: ToolResult, maxChars: number | null
   };
 }
 
-function compactCacheReplay(result: ToolResult): ToolResult {
-  const reusableHeader = result.content
-    .split("\n")
-    .filter((line) =>
-      /^(?:Title|URL|Accessed at|Retrieved by|HTTP Last-Modified|Embedded document dates \(newest first\)):/i.test(line),
-    )
-    .slice(0, 6)
-    .join("\n");
+const REUSABLE_HEADER_RE = /^(?:Title|URL|Accessed at|Retrieved by|HTTP Last-Modified|Embedded document dates \(newest first\)):/i;
+
+/** Source header lines (title, URL, access time) from the block before the body. */
+function reusableHeader(content: string): string {
+  const blankLine = content.indexOf("\n\n");
+  const head = blankLine < 0 ? content.slice(0, 2_000) : content.slice(0, blankLine);
+  return head.split("\n").filter((line) => REUSABLE_HEADER_RE.test(line)).slice(0, 6).join("\n");
+}
+
+/** Headings named in a truncation receipt, and how far past the cut to look. */
+const RECEIPT_MAX_HEADINGS = 10;
+const RECEIPT_HEADING_SCAN_CHARS = 200_000;
+const RECEIPT_HEADING_MAX_CHARS = 80;
+const NUMBERED_HEADING_RE = /^(?:\d{1,2}(?:\.\d{1,2}){0,3}|[A-Z](?:\.\d{1,2}){1,3})\.?\s+\S/;
+const SENTENCE_END_RE = /[.,;:!。，；：！…、]$/;
+
+function looksLikeTitle(line: string, maxLength: number): boolean {
+  if (line.length > maxLength || SENTENCE_END_RE.test(line)) return false;
+  if (/https?:\/\/|www\.|\|/.test(line) || line.split(" ").length > 12) return false;
+  if (!/^[\p{Lu}\p{Lo}\d]/u.test(line)) return false;
+  // Table rows and figure data are mostly digits and symbols.
+  const visible = line.replace(/\s/g, "");
+  const letters = visible.match(/\p{L}/gu)?.length ?? 0;
+  return letters >= visible.length * 0.6;
+}
+
+/**
+ * Lines after `from` that look like section headings, used only to describe
+ * the unread remainder in a truncation receipt. Markdown and numbered headings
+ * are listed alone when there are enough of them; otherwise short title-like
+ * lines are included. Character counts and offsets in a receipt are exact; this
+ * outline is best effort.
+ */
+function detectHeadingsAfter(content: string, from: number): { headings: string[]; more: number } {
+  let tail = content.slice(from, from + RECEIPT_HEADING_SCAN_CHARS);
+  if (from > 0 && content[from - 1] !== "\n") {
+    // Skip the line the window boundary cut through.
+    const lineEnd = tail.indexOf("\n");
+    tail = lineEnd < 0 ? "" : tail.slice(lineEnd + 1);
+  }
+  const candidates: Array<{ title: string; structural: boolean }> = [];
+  const seen = new Set<string>();
+  for (const raw of tail.split("\n")) {
+    const line = raw.replace(/\s+/g, " ").trim();
+    if (line.length < 3) continue;
+    const markdown = /^#{1,6}\s+(.+?)\s*#*$/.exec(line);
+    const structural = Boolean(markdown) || (NUMBERED_HEADING_RE.test(line) && looksLikeTitle(line, 90));
+    if (!structural && !looksLikeTitle(line, RECEIPT_HEADING_MAX_CHARS)) continue;
+    const title = (markdown ? markdown[1] : line).slice(0, RECEIPT_HEADING_MAX_CHARS);
+    const key = title.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    candidates.push({ title, structural });
+  }
+  const structuralCount = candidates.filter((candidate) => candidate.structural).length;
+  const pool = structuralCount >= 3 ? candidates.filter((candidate) => candidate.structural) : candidates;
+  const headings = pool.slice(0, RECEIPT_MAX_HEADINGS).map((candidate) => candidate.title);
+  return { headings, more: pool.length - headings.length };
+}
+
+/** Exact remainder facts plus the offset that continues the same URL. */
+function continuationReceipt(content: string, end: number, opening: string): string {
+  const { headings, more } = detectHeadingsAfter(content, end);
+  return [
+    `\n...(${opening}; ${content.length - end} more characters remain.`,
+    ...(headings.length
+      ? [`Headings after this point (detected): ${headings.join(" | ")}${more > 0 ? ` (+${more} more)` : ""}.`]
+      : []),
+    `Continue with the same url and "offset": ${end}; later windows come from this run's cache without another network request.)`,
+  ].join("\n");
+}
+
+type FetchView = {
+  result: ToolResult;
+  /** End of the character range this view returned in reading order. */
+  servedEnd: number | null;
+};
+
+/**
+ * Render one call's view of a complete fetch result. Offset 0 returns the
+ * prefix that fits maxChars (a GitHub snapshot fits its README instead);
+ * a positive offset returns the window starting there, with the source header
+ * repeated so the window stands on its own as evidence.
+ */
+function renderFetchView(
+  result: ToolResult,
+  maxChars: number | null,
+  offset: number,
+  githubSnapshot: boolean,
+): FetchView {
+  if (result.isError) return { result: applyExplicitCharacterLimit(result, maxChars), servedEnd: null };
+  const content = result.content;
+  const total = content.length;
+  if (offset === 0) {
+    if (githubSnapshot) {
+      const view = renderGitHubSnapshotView(content, maxChars);
+      if (view) return { result: { ...result, content: view.content }, servedEnd: view.servedEnd };
+    }
+    if (maxChars === null || total <= maxChars) return { result, servedEnd: total };
+    return {
+      result: {
+        ...result,
+        content: content.slice(0, maxChars) + continuationReceipt(
+          content,
+          maxChars,
+          `truncated at the explicitly requested maxChars: characters 0-${maxChars} of ${total} shown`,
+        ),
+      },
+      servedEnd: maxChars,
+    };
+  }
+  if (offset >= total) {
+    return {
+      result: {
+        content:
+          `E_WEB_FETCH_OFFSET_OUT_OF_RANGE: offset ${offset} is at or past the end of this URL's `
+          + `extracted content (${total} characters). Use an offset below ${total}.`,
+        isError: true,
+      },
+      servedEnd: null,
+    };
+  }
+  const end = maxChars === null ? total : Math.min(total, offset + maxChars);
+  const header = reusableHeader(content);
+  const windowLine = `Window: characters ${offset}-${end} of ${total} (continued from this run's cached fetch; no network request was made)`;
+  return {
+    result: {
+      ...result,
+      content: `${header ? `${header}\n` : ""}${windowLine}\n\n${content.slice(offset, end)}`
+        + (end < total
+          ? continuationReceipt(content, end, `window ends at character ${end} of ${total}`)
+          : `\n...(end of the extracted content at character ${total}.)`),
+    },
+    servedEnd: end,
+  };
+}
+
+function parseOffset(value: unknown): number | string {
+  if (value === undefined || value === null || value === "") return 0;
+  const offset = Number(value);
+  if (Number.isInteger(offset) && offset >= 0) return offset;
+  return `Error: offset must be a non-negative integer character position (received ${JSON.stringify(String(value).slice(0, 40))}); `
+    + "use 0 or the offset a truncated result reported.";
+}
+
+function compactCacheReplay(result: ToolResult, servedThrough: number): ToolResult {
+  const total = result.content.length;
   return {
     content: [
       "WEB_FETCH_RUN_CACHE_HIT: this normalized URL already succeeded earlier in this run; no network request was made.",
-      reusableHeader,
+      reusableHeader(result.content),
       "The full page is intentionally not re-injected after context compaction. Use the durable evidence/file ledger and saved exact quotes. Do not request this URL again merely to recover compacted context.",
+      servedThrough < total
+        ? `Characters ${servedThrough}-${total} have not been read in order yet; to continue, call web_fetch with "offset": ${servedThrough}.`
+        : "",
     ].filter(Boolean).join("\n"),
   };
 }
@@ -340,6 +486,58 @@ export function extractEmbeddedDocumentDates(html: string): string[] {
     if (Number.isFinite(timestamp)) values.add(new Date(timestamp).toISOString());
   }
   return [...values].sort((a, b) => b.localeCompare(a)).slice(0, 5);
+}
+
+const BINARY_APPLICATION_TYPES = new Set([
+  "application/zip",
+  "application/gzip",
+  "application/x-gzip",
+  "application/x-tar",
+  "application/x-bzip2",
+  "application/x-xz",
+  "application/x-7z-compressed",
+  "application/vnd.rar",
+  "application/x-rar-compressed",
+  "application/java-archive",
+  "application/x-msdownload",
+  "application/msword",
+]);
+
+/** Share of NUL, control, and replacement characters that marks decoded bytes as binary. */
+const BINARY_NOISE_RATIO = 0.1;
+
+/**
+ * Name the binary payload a response carries, or null for readable text.
+ * Decoding a PDF or archive as text produced pages of mojibake that were
+ * returned as a successful fetch; the content type and the PDF signature are
+ * authoritative. A body without a textual type counts as binary only when its
+ * decoded prefix is mostly non-text characters; text types keep their existing
+ * handling even when a missing charset garbles them.
+ */
+function binaryContentKind(contentType: string, raw: string): string | null {
+  const type = contentType.split(";")[0]?.trim().toLowerCase() ?? "";
+  if (type === "application/pdf" || raw.startsWith("%PDF-")) return "a PDF document";
+  if (
+    (/^(?:image|audio|video|font)\//.test(type) && type !== "image/svg+xml")
+    || BINARY_APPLICATION_TYPES.has(type)
+    || /^application\/vnd\.(?:openxmlformats-officedocument|ms-|oasis\.opendocument)/.test(type)
+  ) {
+    return `a binary file (${type})`;
+  }
+  if (/^text\//.test(type) || /xml|json|javascript|html/.test(type)) return null;
+  const sample = raw.slice(0, 4_096);
+  if (!sample) return null;
+  let noise = 0;
+  for (const char of sample) {
+    const code = char.charCodeAt(0);
+    if (char === "\uFFFD" || code === 0 || (code < 32 && code !== 9 && code !== 10 && code !== 12 && code !== 13)) {
+      noise += 1;
+    }
+  }
+  if (sample.includes("\u0000") || noise > sample.length * BINARY_NOISE_RATIO) {
+    return type ? `a binary file (${type})` : "a binary file";
+  }
+  return null;
 }
 
 /** Bounds for the shell-by-emptiness rule in `classifyFetchContent`. */
@@ -497,6 +695,19 @@ async function httpFetchPage(url: string, signal?: AbortSignal): Promise<DirectF
       };
     }
 
+    const binaryKind = binaryContentKind(body.contentType, body.raw);
+    if (binaryKind) {
+      return {
+        result: {
+          content:
+            `E_WEB_FETCH_BINARY_CONTENT: ${response.url || url} returned ${binaryKind}, not readable HTML or text; `
+            + "web_fetch does not extract binary files. Use an HTML or text version of the same document, or another source.",
+          isError: true,
+        },
+        browserRecoverable: false,
+      };
+    }
+
     if (body.contentType.includes("json")) {
       try {
         return { result: { content: JSON.stringify(JSON.parse(body.raw), null, 2) }, browserRecoverable: false };
@@ -608,6 +819,11 @@ export const webFetchTool: AgentTool = defineTool({
         type: "number",
         description: "Optional explicit character limit. Omit it to return the complete extracted body to the host Result Store.",
       },
+      offset: {
+        type: "integer",
+        minimum: 0,
+        description: "Optional zero-based character position in the complete extracted result to start from; a result cut by maxChars reports the next offset. Windows of a URL fetched earlier in this run come from the run cache without a network request.",
+      },
     },
     required: ["url"],
   },
@@ -624,26 +840,39 @@ export const webFetchTool: AgentTool = defineTool({
     if (!/^https?:\/\//i.test(url)) {
       return { content: "Error: only http:// and https:// URLs are supported", isError: true };
     }
+    const offset = parseOffset(input.offset);
+    if (typeof offset === "string") return { content: offset, isError: true };
 
     const fetchCache = fetchCacheForState(ctx.state);
     const failurePolicy = failurePolicyForState(ctx.state);
     const githubResource = identifyGitHubRepositoryResource(url);
-    const requestKey = githubResource?.kind === "repository"
+    const githubSnapshot = githubResource?.kind === "repository";
+    const requestKey = githubSnapshot
       ? `github:${githubResource.key}`
       : normalizedFetchUrl(url);
     const origin = fetchOrigin(url);
     const epoch = contextEpoch(ctx.state);
+    const serveView = (entry: WebFetchCacheEntry, result: ToolResult): ToolResult => {
+      const view = renderFetchView(result, maxChars, offset, githubSnapshot);
+      if (view.servedEnd !== null) {
+        entry.servedThrough = Math.max(entry.servedThrough ?? 0, view.servedEnd);
+      }
+      return view.result;
+    };
     const cached = fetchCache.get(requestKey);
     if (cached) {
+      const servedThrough = cached.servedThrough ?? 0;
+      // After compaction a window is served only to continue past what was
+      // already returned, never to re-inject text the model has seen.
+      const compactReplay = epoch > cached.epoch && !(offset > 0 && offset >= servedThrough);
       log.info("run cache hit; skipped network request", {
         maxChars: maxChars ?? "complete",
-        compactReplay: epoch > cached.epoch,
+        offset,
+        compactReplay,
       });
       const result = await cached.result;
       if (result.isError) return failedCacheReplay(result);
-      return epoch > cached.epoch
-        ? compactCacheReplay(result)
-        : applyExplicitCharacterLimit(result, maxChars);
+      return compactReplay ? compactCacheReplay(result, servedThrough) : serveView(cached, result);
     }
 
     const priorGitHubSnapshot = githubResource
@@ -673,7 +902,7 @@ export const webFetchTool: AgentTool = defineTool({
     const request = githubResource?.kind === "repository"
       ? fetchGitHubRepositorySnapshot(githubResource, ctx.signal)
       : fetchGeneralUrl(url, ctx.signal);
-    const cacheEntry = { epoch, result: request };
+    const cacheEntry: WebFetchCacheEntry = { epoch, result: request };
     fetchCache.set(requestKey, cacheEntry);
     let result = await request;
     const disposition = fetchFailureDisposition(result);
@@ -715,6 +944,6 @@ export const webFetchTool: AgentTool = defineTool({
         cacheEntry.result = Promise.resolve(result);
       }
     }
-    return applyExplicitCharacterLimit(result, maxChars);
+    return serveView(cacheEntry, result);
   },
 });

@@ -131,7 +131,9 @@ async function processImage(operation, buffer, options = {}) {
     ...(options.density !== undefined ? { density: options.density } : {}),
   });
   if (operation === 'metadata') return pipeline.metadata();
-  if (options.resize) pipeline = pipeline.resize(options.resize.width, options.resize.height, { fit: options.resize.fit });
+  if (options.composite) pipeline = pipeline.composite(options.composite);
+  if (options.extract) pipeline = pipeline.extract(options.extract);
+  if (options.resize) pipeline = pipeline.resize(options.resize);
   const encodeOptions = options.encodeOptions || {};
   if (options.format === 'png') pipeline = pipeline.png(encodeOptions);
   else if (options.format === 'jpeg') pipeline = pipeline.jpeg(encodeOptions);

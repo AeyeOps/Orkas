@@ -53,12 +53,13 @@ import { createLogger } from "../shared/logger.js";
 import { providerCredentialFailure, providerErrorFacts } from "../shared/provider-error-facts.js";
 import type { CompletionParams, CompletionResult, LLMProvider, ToolDefinition } from "./base.js";
 
+import { createResponsesTerminalReasoning } from './responses-terminal-reasoning.js';
 import { createResponsesStatusDiagnostics } from './responses-status-diagnostics.js';
 import { createRequestDiagnostics, type ProviderFailureSource } from "./request-diagnostics.js";
 import { createProviderErrorCapture } from "./provider-error-capture.js";
 import { ToolInputDiagnostics } from "./tool-input-diagnostics.js";
 
-import { replayOrigin, projectReplay, compatibleReplay, replayMessageSource, projectResponsesItemIds, needsDeepSeekToolReasoning, projectDeepSeekToolReasoning } from "./replay-compatibility.js";
+import { replayOrigin, projectReplay, compatibleReplay, replayMessageSource, mixedReplayToolIds, projectResponsesItemIds, needsDeepSeekToolReasoning, projectDeepSeekToolReasoning } from "./replay-compatibility.js";
 
 const log = createLogger("pi-provider");
 
@@ -172,7 +173,7 @@ type RuntimePiContext = PiContext & { hostMessageIndexes: number[]; foreignRespo
  * ordering in `transform-messages`, one image trailer per contiguous tool-result
  * batch in `openai-completions`). Bump only after re-checking those rules against
  * the new release; `providers.test.ts` pins the installed package to this value. */
-export const MIRRORED_PI_AI_SERIALIZER_VERSION = "0.99.1";
+export const MIRRORED_PI_AI_SERIALIZER_VERSION = "1.2.0";
 
 /** pi-ai's portable history has no developer role. Responses has one, so
  * restore explicitly typed host messages at the native serialization boundary.
@@ -252,6 +253,7 @@ function buildPiContext(
   const hostMessageIndexes: number[] = [];
   let userMessageIndex = 0;
   const toolNameByCallId = new Map<string, string>();
+  const replayToolIds = model && origin ? mixedReplayToolIds(messages, model, origin) : new Map<string, string>();
   const foreignResponsesCalls: boolean[] = [];
   // pi-ai 0.87.1 models deferred tools as transcript system additions. Keep
   // these definitions out of the initial tool set so the SDK can insert them
@@ -290,7 +292,7 @@ function buildPiContext(
         }
         piMessages.push({
           role: "toolResult",
-          toolCallId: tr.toolUseId,
+          toolCallId: replayToolIds.get(tr.toolUseId) ?? tr.toolUseId,
           toolName,
           content: [
             { type: "text", text: tr.content },
@@ -362,7 +364,7 @@ function buildPiContext(
           foreignResponsesCalls.push(!!origin && !compatibleReplay(source, origin));
           piContent.push({
             type: "toolCall",
-            id: toolCallId,
+            id: replayToolIds.get(toolCallId) ?? toolCallId,
             name: toolName,
             arguments: c.input as JsonObject,
             ...(c.thoughtSignature ? { thoughtSignature: c.thoughtSignature } : {}),
@@ -758,8 +760,8 @@ export function normalizeReasoningForProvider(
  * Pi-ai's raw adapters historically turn an omitted reasoning option into an
  * explicit provider-specific "off" value. Omission has a different meaning:
  * the selected model should retain its official thinking toggle and effort.
- * Remove only those synthesized-off controls; explicit caller choices use a
- * separate path and remain untouched.
+ * Remove only those synthesized-off controls. Explicit off uses this path
+ * only when the SDK declares that the selected model cannot disable thinking.
  */
 function restoreOfficialReasoningDefaults(
   payload: unknown,
@@ -1010,9 +1012,10 @@ export function createPiProvider(config: {
       const context = buildPiContext(params.messages, params.systemPrompt, params.tools, model, statusDiagnostics, origin);
       const reasoning = effectiveReasoning(params.reasoning);
       const sessionId = cacheSafeSessionId(params.sessionId);
+      const terminalReasoning = createResponsesTerminalReasoning(model.api, params.signal);
       const useOfficialReasoningDefaults = model.reasoning === true
-        && params.reasoning === undefined
-        && config.defaultReasoning === undefined;
+        && ((params.reasoning === undefined && config.defaultReasoning === undefined)
+          || (params.reasoning === "off" && model.thinkingLevelMap?.off === null));
       const useProviderOutputDefault = params.requestMetadata?.outputLimitSource === "provider_default";
       const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders);
       const headers = turnRouting?.headers ?? suppliedHeaders;
@@ -1095,6 +1098,7 @@ export function createPiProvider(config: {
             cacheRetention: params.cacheRetention,
             sessionId,
             onResponse,
+            onProviderStreamEvent: terminalReasoning?.observe,
             ...(model.api === 'openai-completions' || model.api === 'openai-responses' || model.api === 'openai-codex-responses' || model.api === 'anthropic-messages'
               ? { fetch: requestFetch } : {}),
             ...(onPayload ? { onPayload: onPayload as any } : {}),
@@ -1111,6 +1115,7 @@ export function createPiProvider(config: {
             cacheRetention: params.cacheRetention,
             sessionId,
             onResponse,
+            onProviderStreamEvent: terminalReasoning?.observe,
             ...(model.api === 'openai-completions' || model.api === 'openai-responses' || model.api === 'openai-codex-responses' || model.api === 'anthropic-messages'
               ? { fetch: requestFetch } : {}),
             ...(onPayload ? { onPayload: onPayload as any } : {}),
@@ -1123,10 +1128,11 @@ export function createPiProvider(config: {
           throw error;
         }
 
-        statusDiagnostics?.output(result.content, result.rawStopReason);
+        const completedContent = terminalReasoning?.apply(result) ?? result.content;
+        statusDiagnostics?.output(completedContent, result.rawStopReason);
         return {
           content: mapProviderContent(
-            result.content,
+            completedContent,
             config.normalizeLiteralLeadingThinkText === true,
             (result as PiAssistantMessage & { googleNativeReplay?: GoogleNativeReplay }).googleNativeReplay,
             origin,
@@ -1152,9 +1158,10 @@ export function createPiProvider(config: {
       const context = buildPiContext(params.messages, params.systemPrompt, params.tools, model, statusDiagnostics, origin);
       const reasoning = effectiveReasoning(params.reasoning);
       const sessionId = cacheSafeSessionId(params.sessionId);
+      const terminalReasoning = createResponsesTerminalReasoning(model.api, params.signal);
       const useOfficialReasoningDefaults = model.reasoning === true
-        && params.reasoning === undefined
-        && config.defaultReasoning === undefined;
+        && ((params.reasoning === undefined && config.defaultReasoning === undefined)
+          || (params.reasoning === "off" && model.thinkingLevelMap?.off === null));
       const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders);
       const headers = turnRouting?.headers ?? suppliedHeaders;
       const errorCapture = createProviderErrorCapture(
@@ -1237,6 +1244,7 @@ export function createPiProvider(config: {
               cacheRetention: params.cacheRetention,
               sessionId,
               onResponse,
+              onProviderStreamEvent: terminalReasoning?.observe,
               ...(model.api === 'openai-completions' || model.api === 'openai-responses' || model.api === 'openai-codex-responses' || model.api === 'anthropic-messages'
                 ? { fetch: requestFetch } : {}),
               onPayload: onPayload as any,
@@ -1252,6 +1260,7 @@ export function createPiProvider(config: {
               cacheRetention: params.cacheRetention,
               sessionId,
               onResponse,
+              onProviderStreamEvent: terminalReasoning?.observe,
               ...(model.api === 'openai-completions' || model.api === 'openai-responses' || model.api === 'openai-codex-responses' || model.api === 'anthropic-messages'
                 ? { fetch: requestFetch } : {}),
               onPayload: onPayload as any,
@@ -1319,7 +1328,8 @@ export function createPiProvider(config: {
               yield { type: "tool_use_end", id: event.toolCall.id };
               break;
             case "done":
-              statusDiagnostics?.output(event.message.content, event.message.rawStopReason);
+              const completedContent = terminalReasoning?.apply(event.message) ?? event.message.content;
+              statusDiagnostics?.output(completedContent, event.message.rawStopReason);
               {
                 const text = leadingThinkFilter?.finish() || "";
                 yield* takeLeadingThinkEvents();
@@ -1331,7 +1341,7 @@ export function createPiProvider(config: {
                 stopReason: mapStopReason(event.reason),
                 usage: mapUsage(event.message.usage),
                 content: mapProviderContent(
-                  event.message.content,
+                  completedContent,
                   config.normalizeLiteralLeadingThinkText === true,
                   (event.message as PiAssistantMessage & { googleNativeReplay?: GoogleNativeReplay }).googleNativeReplay,
                   origin,
@@ -1531,11 +1541,17 @@ function wrapError(err: unknown, providerId: string): Error {
     return new StorageFullError(msg, original);
   }
 
+  const facts = providerErrorFacts(err, false);
+  // Embedded output outranks a context/credential rejection: its accepted
+  // work must not enter Runner's request-rebuild recovery path.
+  if (facts.codes.includes('PROVIDER_OUTPUT_UNCERTAIN')) {
+    return new ProviderError(msg, providerId, facts.status, original);
+  }
+
   if (err instanceof AuthError || err instanceof RateLimitError || err instanceof ContextOverflowError) {
     return err;
   }
 
-  const facts = providerErrorFacts(err, false);
   if (facts.codes.some(code => code === 'context_length_exceeded' || code === 'CONTEXT_OVERFLOW')) {
     return new ContextOverflowError(`${providerId} context overflow: ${msg}`, original);
   }

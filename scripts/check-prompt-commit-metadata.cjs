@@ -11,6 +11,14 @@ const PROMPT_PATH_PATTERNS = [
   /(^|\/)prompts\/.*\.(?:md|ts|js)$/,
   /(^|\/)docs\/architecture\/(?:system-prompt-engineering-contract|core-agent-runtime-engineering-contract|core-agent-tool-contract-policy)\.md$/,
   /(^|\/)(?:Common\/)?docs\/reviews\/REVIEW_PROCESS\.md$/,
+  // Rule documents that resident CLAUDE.md clauses require reading in full or
+  // that automation loads on every run; editing them changes model behavior.
+  /(^|\/)Common\/docs\/(?:engineering-quality|agent-authoring|test-case-design|git-delivery)\.md$/,
+  /(^|\/)Common\/docs\/evaluation\/daily-harness-evaluation\.md$/,
+  /(^|\/)Common\/docs\/reviews\/PRODUCTION_SAMPLING_PROCESS\.md$/,
+  /(^|\/)Common\/AutoFix\/AUTOFIX_PROCESS\.md$/,
+  /(^|\/)PC\/docs\/design\/PATTERNS\.md$/,
+  /(^|\/)PC\/docs\/architecture\/(?:skill-engineering-contract\.md|core-agent-tool-approvals\.json)$/,
 ];
 
 const SYSTEM_PROMPT_PATH_PATTERN = /^PC\/(?:src\/main\/prompts\/.*\.(?:md|ts|js)|resources\/builtin\/system\/skills\/.*\.md)$/;

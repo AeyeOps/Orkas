@@ -15,6 +15,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { spawnSync } from 'node:child_process';
 
 let tmpDir: string;
 let prevWs: string | undefined;
@@ -160,6 +161,51 @@ describe('ipc/local_agents.readToolResult', () => {
     expect(r.truncated).toBe(true);
     expect(r.content.length).toBe(256 * 1024);
     expect(r.content.startsWith('A')).toBe(true);
+  });
+
+  it.skipIf(process.platform === 'win32')('rejects a FIFO without waiting for a writer on the main-process read path', () => {
+    const file = path.join(sessionDir(), 'not-a-file.txt');
+    const fifo = spawnSync('mkfifo', [file], { encoding: 'utf8' });
+    expect(fifo.status).toBe(0);
+    const root = path.resolve(__dirname, '../../..');
+    const script = `
+      require(${JSON.stringify(path.join(root, 'src/main/features/users.ts'))}).activateUser('u1');
+      const {invokeHandlers} = require(${JSON.stringify(path.join(root, 'src/main/ipc/local_agents.ts'))});
+      process.stdout.write('FIFO_OPEN_READY\\n');
+      invokeHandlers['localAgents.readToolResult']({path:${JSON.stringify(file)}})
+        .then(value => { process.stdout.write('\\nFIFO_RESULT:' + JSON.stringify(value)); process.exit(0); })
+        .catch(error => { console.error(error); process.exit(1); });`;
+    // Native Electron ABI, real IPC handler, bounded child: a blocking FIFO
+    // cannot hang the test runner or be mistaken for a successful rejection.
+    const run = spawnSync(process.execPath, ['-r', require.resolve('tsx/cjs'), '-e', script], {
+      cwd: root, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1', NODE_OPTIONS: '' },
+      timeout: 6000, encoding: 'utf8', maxBuffer: 1024 * 1024,
+    });
+    expect(run.stdout, run.stderr).toContain('FIFO_OPEN_READY');
+    expect((run.error as NodeJS.ErrnoException | undefined)?.code ?? null, run.stderr).toBeNull();
+    expect(run.status, run.stderr).toBe(0);
+    expect(JSON.parse(run.stdout.split('FIFO_RESULT:').at(-1)!)).toMatchObject({ ok: false, error: 'not a regular file' });
+  });
+
+  it('continues at UTF-8 byte boundaries without losing Unicode, escaping text or rereading previous output', async () => {
+    const filePath = path.join(sessionDir(), 'unicode.txt');
+    const original = 'a'.repeat(256 * 1024 - 1) + '🌟界\n<script>private fixture</script>' + '🌟'.repeat(90_000) + '\nEOF';
+    fs.writeFileSync(filePath, original);
+    let cursor: number | null = 0;
+    const pieces: string[] = [];
+    for (let n = 0; cursor !== null && n < 8; n++) {
+      const r = await callHandler({ path: filePath, cursor });
+      expect(r.ok).toBe(true);
+      expect(Buffer.byteLength(r.content)).toBeLessThanOrEqual(256 * 1024);
+      expect(r.content).not.toContain('\uFFFD');
+      expect(r.next_cursor === null || Number.isSafeInteger(r.next_cursor) && r.next_cursor > cursor!).toBe(true);
+      pieces.push(r.content); cursor = r.next_cursor;
+    }
+    expect(cursor).toBeNull();
+    expect(pieces.join('')).toBe(original);
+    for (const invalid of [-1, 0.5, Number.MAX_SAFE_INTEGER, '0']) {
+      expect(await callHandler({ path: filePath, cursor: invalid })).toMatchObject({ ok: false });
+    }
   });
 
   it('rejects when a symlink points OUT of tool-results/', async () => {

@@ -1,3 +1,4 @@
+import { taskForPath, type TaskOwnership } from './conversation_deletions';
 /**
  * Conversations (per-user) — CRUD + message reads.
  *
@@ -23,12 +24,13 @@ import { randomUUID } from 'node:crypto';
 import { turnIndexRequest } from './conversation-history-client';
 
 import {
-  userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile,
+  userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile, userProjectsDir,
   WS_ROOT,
   localCliDirectoryFile,
 } from '../paths';
 import {
   conversationLayout,
+  cloudRelForAbs,
   assertConversationRelocationReady,
   setConversationRelocationBlocked,
   chatAttachmentDirForConversation,
@@ -55,7 +57,7 @@ import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t } from '../i18n';
 import {
-  ZH_FILLER_RE, EN_FILLER_RE, truncateTitleToWidth,
+  ZH_FILLER_RE, EN_FILLER_RE, truncateTitleToWidth, CONVERSATION_TITLE_MAX_UNITS,
 } from '../util/auto-title';
 import { isExpiredIsoTombstone, pruneExpiredDeletedRecords } from '../util/tombstone_retention';
 import {
@@ -73,8 +75,10 @@ import {
 } from './local_agents/public-output';
 import {
   readConversationHistoryWindow,
+  readConversationHistoryWindowAtMessage,
   purgeConversationHistoryCache,
   readConversationHistoryPage,
+  readConversationProcessPage,
 } from './conversation_history_cache';
 
 const log = createLogger('chats');
@@ -132,12 +136,17 @@ export function normalizeConnectorSetupAssistance(raw: unknown): ConnectorSetupA
   return { kind: 'connector_setup', connector_id: value.connector_id };
 }
 
-export type ConversationAssistance = ConnectorSetupAssistance | { kind: 'app_creation' };
+export type ConversationAssistance = ConnectorSetupAssistance | { kind: 'app_creation'; appType?: 'local' | 'web' };
 
 /** Persist only known entry metadata, never caller-authored model instructions. */
 export function normalizeConversationAssistance(raw: unknown): ConversationAssistance | undefined {
   if (raw && typeof raw === 'object' && !Array.isArray(raw)
-    && (raw as Record<string, unknown>).kind === 'app_creation') return { kind: 'app_creation' };
+    && (raw as Record<string, unknown>).kind === 'app_creation') {
+    const suppliedType=(raw as Record<string,unknown>).appType;
+    const appType=suppliedType==='cloud'?'web':suppliedType;
+    if(appType!==undefined&&appType!=='local'&&appType!=='web')return undefined;
+    return {kind:'app_creation',...(appType ? {appType} : {})} as ConversationAssistance;
+  }
   return normalizeConnectorSetupAssistance(raw);
 }
 
@@ -678,10 +687,52 @@ export async function listActiveConversationIds(userId: string): Promise<string[
   return Array.from(ids);
 }
 
+/** Destructive maintenance must not turn unreadable indexes into an empty account.
+ * Unindexed metadata directories are retained for the normal recovery path. */
+export async function retainedConversationIdsForEditCleanup(uid: string): Promise<Set<string>> {
+  const roots = [{ dir: userChatsDir(uid), indexFile: conversationIndexFile(uid) }];
+  let projects: fs.Dirent[] = [];
+  try { projects = await fsp.readdir(userProjectsDir(uid), { withFileTypes: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  for (const entry of projects) {
+    if (entry.isSymbolicLink()) throw new Error('unsafe project root');
+    if (entry.isDirectory() && safeId(entry.name)) roots.push({ dir: projectChatsDir(uid, entry.name), indexFile: projectChatIndexFile(uid, entry.name) });
+  }
+  const ids = new Set<string>();
+  for (const root of roots) {
+    let entries: fs.Dirent[];
+    try {
+      if ((await fsp.lstat(root.dir)).isSymbolicLink()) throw new Error('unsafe conversation root');
+      entries = await fsp.readdir(root.dir, { withFileTypes: true });
+    } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+    for (const entry of entries) {
+      if (entry.isSymbolicLink()) throw new Error('unsafe conversation entry');
+      if (entry.isDirectory() && safeId(entry.name)) ids.add(entry.name);
+    }
+    let raw: any;
+    try { raw = JSON.parse(await fsp.readFile(root.indexFile, 'utf8')); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') continue; throw error; }
+    const items = Array.isArray(raw) ? raw : raw?.items;
+    if (!Array.isArray(items)) throw new Error('invalid conversation index');
+    for (const item of items) {
+      const row = _normaliseConversation(item);
+      if (!row) throw new Error('invalid conversation record');
+      if (!isDeletedConversation(row)) ids.add(row.conversation_id);
+    }
+  }
+  return ids;
+}
+
 export interface ConversationDisplayRow {
   conversation_id: string;
   title: string;
   project_id: string;
+}
+
+/** Metadata-only maintenance snapshot; avoids loading every conversation's history. */
+export async function listCleanupConversationRows(userId: string): Promise<Conversation[]> {
+  const { items } = _mergeNormalizedConversationRows(await _readIndexConversations(userId));
+  return items.filter(row => !isDeletedConversation(row));
 }
 
 /** Compact search/display catalog. Reuses the central parsed index snapshot
@@ -1043,20 +1094,13 @@ async function _repairConversationIndexFromDiskUnlocked(
       await _removeConversationMeta(userId, c.conversation_id);
       continue;
     }
-    const deletedMs = tsMs(c.deleted_at);
-    if (!deletedMs || st.mtimeMs <= deletedMs) {
-      await _removeConversationMeta(userId, c.conversation_id);
-      if (isExpiredIsoTombstone(c.deleted_at)) {
-        try { await fsp.unlink(file); } catch { /* ignore */ }
-        invalidateLineCount(file);
-      }
-      continue;
+    // A sync download has a fresh filesystem mtime too. Only an explicit
+    // restore/recreation may clear the record tombstone.
+    await _removeConversationMeta(userId, c.conversation_id);
+    if (isExpiredIsoTombstone(c.deleted_at)) {
+      try { await fsp.unlink(file); } catch { /* ignore */ }
+      invalidateLineCount(file);
     }
-    delete c.deleted_at;
-    const restoredAt = new Date(Number.isFinite(st.mtimeMs) ? st.mtimeMs : Date.now()).toISOString();
-    if (tsMs(c.updated_at) < tsMs(restoredAt)) c.updated_at = restoredAt;
-    _stampConversationSync(userId, c);
-    resurrected += 1;
   }
   const compacted = pruneExpiredDeletedRecords(items) as Conversation[];
   const expiredTombstoneCount = items.length - compacted.length;
@@ -1419,10 +1463,10 @@ export interface ConversationPage extends ConversationPageInfo {
 }
 
 export const CONVERSATION_LIST_PAGE_SIZE = 10;
-// A renderer-provided local midnight can be 25 hours behind during a DST
-// fallback day. Keep one extra hour of tolerance without allowing an
-// untrusted renderer to turn the startup slice into an all-history load.
-const STARTUP_ACTIVE_SINCE_MAX_LOOKBACK_MS = 26 * 60 * 60 * 1000;
+// The renderer includes today and yesterday, so the previous local midnight
+// can be 49 hours behind across a DST fallback. Keep one extra hour of
+// tolerance while bounding the startup slice to the recent calendar window.
+const STARTUP_ACTIVE_SINCE_MAX_LOOKBACK_MS = 50 * 60 * 60 * 1000;
 
 function _conversationActivityMs(c: Conversation): number {
   return Math.max(tsMs(c.updated_at), tsMs(c.created_at));
@@ -1475,8 +1519,8 @@ async function _enrichConversationPage(
  * per-conversation state/member/history enrichment is limited to rows that can
  * actually appear on first paint. Project and unprojected task lists each use
  * one chronological 10-row page; time buckets are only a renderer grouping.
- * Rows active at or after `activeSinceMs` (the renderer's local day start) are
- * always included, whatever their project, so the sidebar's Today aggregate can
+ * Rows active at or after `activeSinceMs` (the renderer's previous local day start) are
+ * always included, whatever their project, so the sidebar's recent-task aggregate can
  * show tasks under collapsed projects; page totals and cursors are unchanged. */
 export async function listStartupConversations(
   userId: string,
@@ -1993,7 +2037,7 @@ export interface CreateConversationOptions {
 
 function normaliseConversationTitle(raw: unknown): string {
   let title = typeof raw === 'string' ? raw.trim() : '';
-  title = limitNameDisplayText(title);
+  title = limitNameDisplayText(title, CONVERSATION_TITLE_MAX_UNITS);
   return title || t('chat.default_title');
 }
 
@@ -2311,7 +2355,7 @@ function purgeSession(userId: string, sessionId: string): void {
   deleteSessionFileForUser(userId, sessionId);
 }
 
-async function _purgeDeletedConversationFiles(userId: string, cid: string, removed?: Conversation): Promise<void> {
+async function _purgeDeletedConversationFiles(userId: string, cid: string, ownership: TaskOwnership, removed?: Conversation): Promise<void> {
   // A completed turn may still be materializing remote image/video output in
   // the background. Abort it before removing the message file; attachment
   // purge also holds the writer lock so a response already past abort cannot
@@ -2357,6 +2401,7 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, remov
       const sessionIds = new Set<string>();
       for (const name of names) {
         if (!name.startsWith(gmemberPrefix)) continue;
+        if (taskForPath(ownership, cloudRelForAbs(userId, path.join(sessionsDir, name)))?.cid !== cid) continue;
         // A model-state reset can leave only retained historical outputs.
         const suffix = ['.jsonl', '.tool-results'].find((ext) => name.endsWith(ext));
         if (suffix) sessionIds.add(name.slice(0, -suffix.length));
@@ -2400,12 +2445,21 @@ export async function deleteConversation(
   userId: string,
   cid: string,
   projectIdHint?: string | null,
+  beforeDelete?: (current: Conversation) => Promise<boolean>,
 ): Promise<boolean> {
   let removed: Conversation | null = null;
+  let ownership: TaskOwnership = new Map();
   const found = await _withConversationIndexStore(userId, async (store) => {
     const target = await store.findTarget(cid, projectIdHint);
     if (!target) return false;
+    if (beforeDelete && !await beforeDelete(target.conversation)) return false;
     removed = target.conversation;
+    // Reuse the already loaded root; bulk cleanup must not scan every project's
+    // index twice per task just to disambiguate member-session prefixes.
+    ownership = new Map((await store.readRoot(target.rootKey)).map(row => [
+      `${target.rootKey}/${row.conversation_id}`,
+      { cid: row.conversation_id, projectId: target.rootKey || null },
+    ]));
     if (!isDeletedConversation(target.conversation)) {
       const deletedAt = nowIso();
       const tombstone = _stampConversationSync(userId, {
@@ -2413,6 +2467,8 @@ export async function deleteConversation(
         deleted_at: deletedAt,
         updated_at: deletedAt,
       });
+      // Capture can yield; revalidate the cleanup receipt before committing it.
+      if (beforeDelete && !await beforeDelete(target.conversation)) return false;
       await store.persistTarget(target, tombstone);
     } else {
       try {
@@ -2422,7 +2478,8 @@ export async function deleteConversation(
     return true;
   });
   if (!found || !removed) return false;
-  await _purgeDeletedConversationFiles(userId, cid, removed);
+  await _purgeDeletedConversationFiles(userId, cid, ownership, removed);
+  await (await import('./saved_apps')).cleanupEditSnapshots(userId, false, cid);
   return true;
 }
 
@@ -2453,6 +2510,14 @@ export async function listProducedPaths(userId: string, cid: string, limit = 200
   const out: string[] = [];
   for (const message of records) out.push(..._producedPathsForDisplay(message, context).display);
   return out;
+}
+
+/** Resolve process disclosure through the same account/project layout as history. */
+export async function getConversationProcessPage(
+  userId: string, cid: string, ref: string, cursor: number, messageId: string, projectIdHint?: string | null,
+) {
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
+  return readConversationProcessPage(userId, sourceFile, ref, cursor, messageId);
 }
 
 /** Bounded, cursor-paged message reads for the conversation detail view.
@@ -2515,6 +2580,44 @@ export async function getMessagesPageAtIndex(
   const page = project
     ? await readConversationHistoryWindow(userId, sourceFile, pageStart, wanted)
     : await readJsonlWindow<MessageRecord>(sourceFile, pageStart, wanted);
+  return _indexedHistoryPage(userId, cid, projectIdHint, page, pageStart, project);
+}
+
+/** Load the page holding a quoted message known only by its stable id, or
+ * null when it no longer exists. One worker pass finds and reads the page;
+ * the source index is the same one getMessagesPageAtIndex pages by. */
+export async function getMessagesPageAtMessageId(
+  userId: string,
+  cid: string,
+  messageId: string,
+  limit = 10,
+  projectIdHint?: string | null,
+): Promise<(Awaited<ReturnType<typeof getMessagesPageAtIndex>> & { messageIndex: number }) | null> {
+  if (!messageId) return null;
+  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  const page = await readConversationHistoryWindowAtMessage(userId, sourceFile, messageId, wanted);
+  if (!page) return null;
+  return {
+    ...await _indexedHistoryPage(userId, cid, projectIdHint, page, page.start, true),
+    messageIndex: page.index,
+  };
+}
+
+async function _indexedHistoryPage(
+  userId: string,
+  cid: string,
+  projectIdHint: string | null | undefined,
+  page: { records: MessageRecord[]; previousCursor: number | null; followingCursor: number | null },
+  pageStart: number,
+  project: boolean,
+): Promise<{
+  history: MessageRecord[];
+  historyIndexes: number[];
+  nextCursor: number | null;
+  followingCursor: number | null;
+  pageStart: number;
+}> {
   const visible = page.records
     .map((message, offset) => ({ message, index: pageStart + offset }))
     .filter(({ message }) => !message.deleted_at);
@@ -2553,59 +2656,6 @@ export async function getMessagesPageAfter(
   const context = await _messageDisplayContext(userId, cid, projectIdHint);
   return { history: records.map(message => _messageForDisplay(message, context)),
     nextCursor: previousCursor, followingCursor: cursor };
-}
-
-/** Resolve a stable message id only when an index-based anchor became stale
- * after sync rewrote/reordered the source JSONL. Normal navigation stays on
- * the direct index window and never pays for this streaming fallback. */
-export async function findMessageIndexById(
-  userId: string,
-  cid: string,
-  messageId: string,
-  projectIdHint?: string | null,
-): Promise<number | null> {
-  if (!messageId) return null;
-  const sourceFile = conversationMessageReadFile(userId, cid, projectIdHint);
-  let stream: fs.ReadStream | null = null;
-  let lines: readline.Interface | null = null;
-  let recordIndex = 0;
-  let malformedRecordReported = false;
-  try {
-    stream = fs.createReadStream(sourceFile, { encoding: 'utf8' });
-    lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-    for await (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-      let record: any;
-      try { record = JSON.parse(trimmed); } catch (err) {
-        if (!malformedRecordReported) {
-          malformedRecordReported = true;
-          log.warn('conversation message lookup skipped malformed records', {
-            file: logPathRef(sourceFile),
-            error: logErrorSummary(err),
-          });
-        }
-        continue;
-      }
-      const sourceIndex = recordIndex;
-      recordIndex += 1;
-      if (String(record?.id || '') === messageId && !record?.deleted_at) return sourceIndex;
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
-  } finally {
-    lines?.close();
-    if (stream && !stream.closed) {
-      // destroy() schedules the Windows file-handle close asynchronously.
-      // Callers may immediately delete or replace the conversation tree, so
-      // do not report the scan complete until that handle is actually closed.
-      await new Promise<void>((resolve) => {
-        stream!.once('close', resolve);
-        stream!.destroy();
-      });
-    }
-  }
-  return null;
 }
 
 // Navigation work owns a separate lazy worker lane: a cold index must not
@@ -2911,4 +2961,11 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
   });
   if (swept) log.info(`cleared ${swept} stale running conversations`);
   return { swept };
+}
+
+/** Serialize explicit recycle restoration with ordinary task lifecycle writes. */
+export async function withConversationLifecycleWrite<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+  _invalidateConversationListCache(userId);
+  try { return await _withConversationWrite(userId, fn); }
+  finally { _invalidateConversationListCache(userId); }
 }

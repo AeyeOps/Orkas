@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as vm from 'node:vm';
@@ -38,10 +38,13 @@ class FakeNode {
     final: { children: [], textContent: '', replaceChildren() { this.children = []; this.textContent = ''; } },
   };
 
+  processDisclosure: any = null;
   querySelector(selector: string) {
+    if (selector === '.stream-process') return this.processDisclosure;
     if (selector === '[data-role="process"]') return this.bodies.process;
     if (selector === '[data-role="final"]') return this.bodies.final;
-    if (selector === '.chat-bubble') return { querySelector: () => null, appendChild() {} };
+    if (selector === '.chat-bubble') return { querySelector: () => null, appendChild() {},
+      insertBefore: (child: any) => { this.processDisclosure = child; } };
     return null;
   }
 
@@ -63,6 +66,7 @@ class FakeContainer {
   }
 
   appendChild(node: FakeNode) {
+    node.parentElement?.removeChild(node);
     node.parentElement = this as any;
     this.rows.push(node);
     return node;
@@ -81,7 +85,9 @@ class FakeContainer {
     node.parentElement = null;
   }
 
+  processDisclosure: any = null;
   querySelector(selector: string) {
+    if (selector === '.stream-process') return this.processDisclosure;
     return this.matchRows(selector)[0] || null;
   }
 
@@ -114,6 +120,7 @@ function loadRenderer(cid: string) {
   const appended: any[] = [];
   const pendingConvs = new Map<string, any>();
   const groupBusyConvs = new Map<string, boolean>();
+  const documentListeners = new Map<string, Function[]>();
 
   const context: any = {
     console, setTimeout, clearTimeout, setInterval, clearInterval,
@@ -138,7 +145,9 @@ function loadRenderer(cid: string) {
       // 'loading' keeps module-level boot wiring from running during eval —
       // these tests drive the event handler directly.
       readyState: 'loading',
-      addEventListener() {},
+      addEventListener(name: string, callback: Function) {
+        documentListeners.set(name, [...(documentListeners.get(name) || []), callback]);
+      },
       querySelector: () => null,
       querySelectorAll: () => [],
       getElementById: (id: string) => (id === 'chat-history' ? container : null),
@@ -187,9 +196,8 @@ function loadRenderer(cid: string) {
       // branch) so a merged record's earlier segments reach the row.
       if (legacy._narration && legacy._narration.length) {
         for (var i = 0; i < legacy._narration.length; i++) {
-          _appendNarrationBlock(node, legacy._narration[i].seg, legacy._narration[i].text, { deferFold: true });
+          _appendNarrationBlock(node, legacy._narration[i].seg, legacy._narration[i].text, { paint: false });
         }
-        _applyNarrationFold(node);
       }
       (opts.container || __container).appendChild(node);
       return node;
@@ -203,7 +211,10 @@ function loadRenderer(cid: string) {
     _startPlaceholderActivity = function() {};
     _stampPlaceholderTriggerMsg = function() {};
     _streamingAppendFinalDelta = function(node, text) {
-      node.bodies.final.textContent += text;
+      // Production replaces the painted body from its buffer; it never
+      // appends to the DOM's existing text during snapshot recovery.
+      node.dataset.streamBuf = (node.dataset.streamBuf || '') + text;
+      node.bodies.final.textContent = node.dataset.streamBuf;
     };
     _streamingAppendProgress = function(node) { node.bodies.process.children.push(1); };
     _streamingUpdateActivity = function() {};
@@ -230,11 +241,188 @@ function loadRenderer(cid: string) {
   context.__appended = appended;
   context.__makeNode = () => new FakeNode();
 
-  return { context, container, finalized, appended };
+  return { context, container, finalized, appended, documentListeners };
+}
+
+function configureDisplayRecovery(context: any) {
+  context.performance = performance;
+  context.convAgentEnabledByCid = new Map();
+  context.pollMsgCounts = new Map();
+  context._agentsCache = [];
+  for (const name of ['_setChatScrollOffset', '_ensureCreateAgentInlineObserver',
+    '_ensureConvCreateAgentInline', '_syncFailedFromHistory',
+    '_setLoadEarlierHistory', '_setLoadNewerHistory', '_setHistoryLatestAction',
+    '_bindAutoLoadEarlierHistory', '_scheduleConversationTurnNavigation', '_renderConvDisabledBanner',
+    '_scrollToBottomNoAnim', '_observeConversationRunFromPlanAction', '_startRuntimeActorRecovery',
+    '_captureHistoryReloadScroll', '_restoreHistoryReloadScroll', '_stickBottomIfPinned']) {
+    context[name] = () => {};
+  }
 }
 
 const CID = 'c1';
 const TURN = 'turn-1';
+
+describe('keyed rendering › durable terminal recovery', () => {
+  it('keeps a saved-task shortcut when an otherwise empty Commander reply hands off the work', () => {
+    const h = loadRenderer(CID);
+    const record = { from: 'commander', text: '', process: [{ type: 'event', event: {
+      stream: 'tool', data: { name: 'hand_off_to', phase: 'end', isError: false },
+    } }] };
+    expect(h.context._isVisibleGroupHistoryRecord(record)).toBe(false);
+    expect(h.context._isVisibleGroupHistoryRecord({ ...record, saved_tasks: [{
+      kind: 'todo', task_id: 'saved-todo', project_id: '', title: 'Review release',
+    }] })).toBe(true);
+  });
+
+  const actor = 'codex-agent';
+  const terminalRecord = (status = 'success', seg = 0): any => ({
+    id: 'saved-terminal', from: actor, to: ['user'], turn_id: TURN, seg,
+    text: 'Canonical result', ts: '2026-10-08T09:13:19Z', source_message_id: 'user-trigger',
+    process: [{ type: 'event', event: { stream: 'runtime', data: {
+      phase: 'end', duration_ms: 239_326, status,
+      aborted: status === 'cancelled', errored: status === 'error',
+    } } }],
+  });
+  function setup(seg = 0) {
+    const h = loadRenderer(CID);
+    configureDisplayRecovery(h.context);
+    const row = h.context._ensureActorPlaceholder(CID, actor, null, TURN, null, undefined, seg);
+    row.dataset.placeholder = '1';
+    row.dataset.streamBuf = 'Partial result';
+    row.bodies.final.textContent = 'Partial result';
+    return { ...h, row };
+  }
+
+  it('recovers a missing terminal record before stream cleanup removes the reply', async () => {
+    const h = setup();
+    let release!: () => void;
+    h.context.apiFetch = async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { ok: true, json: async () => ({ ok: true, history: [terminalRecord()] }) };
+    };
+    h.context.stopPolling = () => {};
+    h.context.pendingConvs.set(CID, { loadingEl: h.row });
+    const settling = h.context._finishStreamingMsg(CID);
+    expect(h.container.rows).toEqual([h.row]);
+    release();
+    await settling;
+    expect(h.container.rows).toEqual([h.row]);
+    expect(h.row.dataset.msgId).toBe('saved-terminal');
+    expect(h.finalized[0].gm.text).toBe('Canonical result');
+  });
+
+  it('preserves an unconfirmed reply when history recovery fails', async () => {
+    const h = setup();
+    h.context.apiFetch = async () => ({ ok: false, json: async () => ({ ok: false }) });
+    await h.context._settleFinishedConversationDisplay(CID, false);
+    expect(h.container.rows).toEqual([h.row]);
+    expect(h.row.dataset.msgId).toBeUndefined();
+  });
+
+  it('does not purge a newer turn that starts during terminal recovery', async () => {
+    const h = setup();
+    let release!: () => void;
+    h.context.apiFetch = async () => {
+      await new Promise<void>((resolve) => { release = resolve; });
+      return { ok: true, json: async () => ({ ok: true, history: [terminalRecord()] }) };
+    };
+    const settling = h.context._settleFinishedConversationDisplay(CID, false);
+    const next = h.context._ensureActorPlaceholder(CID, actor, null, 'next-turn', null, undefined, 0);
+    h.context.pendingConvs.set(CID, { loadingEl: next });
+    release();
+    await settling;
+    expect(h.container.rows).toEqual([h.row, next]);
+    expect(next.dataset.msgId).toBeUndefined();
+  });
+
+  // A dropped terminal IPC event must be recoverable from durable history,
+  // regardless of how execution ended. No reply text is used as a status signal.
+  it.each(['success', 'error', 'cancelled', 'waiting_input'])(
+    'settles the existing reply when polling recovers a %s terminal', async (status) => {
+      const h = setup();
+      await h.context._recoverPolledVisibleMessages(CID, [terminalRecord(status)]);
+      expect(h.container.rows).toEqual([h.row]);
+      expect(h.row.dataset.msgId).toBe('saved-terminal');
+      expect(h.row.dataset.turnEnd).toBe('1');
+      expect(h.finalized).toHaveLength(1);
+      expect(h.finalized[0].gm.text).toBe('Canonical result');
+      expect(h.appended).toHaveLength(0);
+    },
+  );
+
+  it('settles a row advanced beyond the terminal segment without losing earlier narration', async () => {
+    const h = setup(2);
+    const earlier = { ...terminalRecord(), id: 'segment-0', text: 'Earlier explanation', process: [] };
+    await h.context._recoverPolledVisibleMessages(CID, [earlier, terminalRecord('success', 1)]);
+    expect(h.container.rows).toEqual([h.row]);
+    expect(h.row.dataset.msgId).toBe('saved-terminal');
+    expect(h.finalized).toHaveLength(1);
+    expect(h.finalized[0].gm._narration.map((item: any) => item.text)).toEqual(['Earlier explanation']);
+    expect(h.row.dataset.turnEnd).toBe('1');
+  });
+
+  it('keeps recovered completion absorbing while another turn of the same actor runs', async () => {
+    const h = setup();
+    const record = terminalRecord();
+    await h.context._recoverPolledVisibleMessages(CID, [record]);
+    const next = h.context._ensureActorPlaceholder(CID, actor, null, 'next-turn', null, undefined, 0);
+    next.bodies.final.textContent = 'New live text';
+    await h.context._recoverPolledVisibleMessages(CID, [record]);
+    h.context._handleGroupBusEvent(CID, null, { type: 'message', msg: record, turn_end: true });
+    h.context._handleGroupBusEvent(CID, null, { type: 'process', actor, turn_id: TURN, seg: 0,
+      data: { type: 'delta', text: 'Late old delta' } });
+    h.context._restoreLiveDisplaySnapshot(CID, { sequence: 10, turns: [{ actor, turn_id: TURN,
+      records: [{ ...record, id: '', text: 'Stale old snapshot' }] }] });
+    expect(h.container.rows).toEqual([h.row, next]);
+    expect(h.finalized).toHaveLength(1);
+    expect(next.bodies.final.textContent).toBe('New live text');
+    expect(next.dataset.msgId).toBeUndefined();
+    expect(next.dataset.turnEnd).toBeUndefined();
+  });
+
+  it.each(['segment_end', 'retrying', 'duration-only', 'tool-end', 'unpersisted'])(
+    'preserves live work when recovery contains only %s evidence', async (shape) => {
+      const h = setup();
+      const record = terminalRecord();
+      if (shape === 'unpersisted') record.id = '';
+      else if (shape === 'tool-end') record.process[0].event.stream = 'tool';
+      else if (shape === 'duration-only') delete record.process[0].event.data.phase;
+      else record.process[0].event.data.phase = shape;
+      await h.context._recoverPolledVisibleMessages(CID, [record]);
+      expect(h.container.rows).toEqual([h.row]);
+      expect(h.finalized).toHaveLength(0);
+      expect(h.row.dataset.turnEnd).toBeUndefined();
+      expect(h.row.dataset.msgId).toBeUndefined();
+    },
+  );
+
+  it('retains a durable terminal through a cold load with stale active-turn and display snapshots', async () => {
+    const h = loadRenderer(CID);
+    configureDisplayRecovery(h.context);
+    h.context.document.createDocumentFragment = () => new FakeContainer();
+    const append = h.container.appendChild.bind(h.container);
+    h.container.appendChild = (node: any) => {
+      if (node instanceof FakeContainer) {
+        for (const row of [...node.rows]) append(row);
+        return node;
+      }
+      return append(node);
+    };
+    const record = terminalRecord();
+    const active = [{ actor, turn_id: TURN, started_at_ms: Date.now() }];
+    h.context.apiFetch = async () => ({ json: async () => ({ ok: true, history: [record],
+      conversation: { processing: true, processing_since: new Date().toISOString(),
+        active_turns: active, in_flight: [actor] },
+      live_display: { sequence: 1, active_turns: active, turns: [{ actor, turn_id: TURN,
+        records: [{ ...record, id: '', text: 'Stale partial result', process: [] }] }] },
+    }) });
+    await h.context.loadConversationHistory(CID);
+    expect(h.container.rows).toHaveLength(1);
+    expect(h.container.rows[0].dataset.msgId).toBe(record.id);
+    expect(h.container.rows[0].dataset.turnEnd).toBe('1');
+    expect(h.container.rows[0].bodies.final.textContent).toBe(record.text);
+  });
+});
 
 describe('keyed rendering › reconnect history', () => {
   it('recovers missing replies once without merging same-text replies from different turns', async () => {
@@ -444,11 +632,11 @@ describe('keyed rendering › a turn that settles before its records arrive', ()
     const row = container.rows[0];
     // The DOM fold suite covers the default presentation of six blocks.
     // A passive record delivery must not switch that presentation to open.
-    row.dataset.narrationExpanded = '0';
+    row.processDisclosure = { open: false, remove() {} };
     context._handleGroupBusEvent(CID, null, seg(0, 'part 0', 'rec-0'));
     expect(container.rows).toHaveLength(1);
     expect(row._narration).toHaveLength(6);
-    expect(row.dataset.narrationExpanded).toBe('0');
+    expect(row.processDisclosure.open).toBe(false);
     expect(row.dataset.msgId).toBe('rec-6');
   });
 
@@ -499,31 +687,23 @@ describe('keyed rendering › a turn split across history pages', () => {
       .toEqual([[0, 'first']]);
   });
 
-  it('expands the bubble it absorbed into, so auto-load cannot fire back to back', () => {
-    // A folded narration block adds no height. If absorbing left the bubble
-    // folded, `scrollHeight` would not move, `scrollTop` would stay under
-    // HISTORY_AUTO_LOAD_THRESHOLD, and the next scroll event would load
-    // another page immediately — pages firing back to back to the start of the
-    // conversation. That is what "scrolling stutters" was (2026-09-18).
+  it.each([false, true])('preserves settled process open=%s when older history is absorbed', (open) => {
     const { context, container } = loadRenderer(CID);
     settle(context, 'T1', 9);
-    container.rows[0].dataset.narrationExpanded = '0';
+    container.rows[0].processDisclosure = { open, remove() {} };
     context._mergeNativeSegmentRecords([record('T1', 5, 'fifth')], CID);
-    expect(container.rows[0].dataset.narrationExpanded,
-      'older segments are what the reader scrolled up for').toBe('1');
+    expect(container.rows[0].processDisclosure.open === true,
+      'loading data must not change the reader\'s disclosure state').toBe(open);
   });
 
-  it('does not override a fold the reader chose', () => {
-    // Absorbing expands so auto-load cannot fire back to back, but that must
-    // not undo an explicit collapse (2026-09-18: switching conversations and
-    // back re-opened it).
+  it('keeps the shared process disclosure collapsed for passive history reconciliation', () => {
     const { context, container } = loadRenderer(CID);
     settle(context, 'T-chosen', 9);
-    context._rememberNarrationFoldChoice('T-chosen', false);
-    container.rows[0].dataset.narrationExpanded = '0';
-    context._mergeNativeSegmentRecords([record('T-chosen', 5, 'fifth')], CID);
-    expect(container.rows[0].dataset.narrationExpanded,
-      'the reader decided this one').toBe('0');
+    container.rows[0].processDisclosure = { open: false, remove() {} };
+    context._absorbEarlierTurnPage(CID, 'agent-1', 'T-chosen',
+      [record('T-chosen', 5, 'fifth')]);
+    expect(container.rows[0].processDisclosure.open === true).toBe(false);
+    expect((container.rows[0] as any)._persistedProcessItems[0].text).toBe('fifth');
   });
 
   it('leaves a record alone when no rendered bubble owns its turn', () => {
@@ -736,6 +916,24 @@ describe('keyed rendering › silent turns', () => {
 
     expect(commanderRows(container)).toHaveLength(1);
     expect(container.rows[0].dataset.msgId).toBe('msg-0');
+  });
+
+  it('retains a persisted commentary-only Commander bubble at the dispatch boundary', () => {
+    const { context, container } = loadRenderer(CID);
+    context._handleGroupBusEvent(CID, null, {
+      ...delta(0, 'I will delegate the requested work.'),
+      data: { type: 'delta', phase: 'commentary', text: 'I will delegate the requested work.' },
+    });
+    const message: any = segMessage(0, '', 'commentary-segment');
+    message.msg.process = [
+      { type: 'progress', text: 'I will delegate the requested work.',
+        event: { stream: 'assistant', data: { phase: 'commentary' } } },
+      { type: 'event', event: { stream: 'tool', data: { name: 'dispatch_to', phase: 'start' } } },
+    ];
+    context._handleGroupBusEvent(CID, null, message);
+    context._handleGroupBusEvent(CID, null, { type: 'segment_boundary', cid: CID, actor: 'commander', turn_id: TURN });
+    expect(commanderRows(container)).toHaveLength(1);
+    expect(container.rows[0].dataset.msgId).toBe('commentary-segment');
   });
 
   it('never drops a persisted segment when its turn goes silent', () => {
@@ -1255,8 +1453,8 @@ describe('keyed rendering › one bubble per external-CLI turn', () => {
     expect(finalized).toHaveLength(1);
     expect(finalized[0].gm.text).toBe('改完了。');
     expect(finalized[0].gm._narration.map((item: any) => item.seg)).toEqual([0, 1]);
-    expect(finalized[0].gm.process.map((item: any) => item.event.data.name + ':' + item.event.data.phase))
-      .toEqual(['read_file:start', 'bash:start', 'bash:end']);
+    expect(finalized[0].gm.process.map((item: any) => item.text || item.event.data.name + ':' + item.event.data.phase))
+      .toEqual(['开始改。', 'read_file:start', '我在核对。', 'bash:start', 'bash:end']);
     expect(appended).toHaveLength(0);
   });
 
@@ -1294,7 +1492,7 @@ describe('keyed rendering › one bubble per external-CLI turn', () => {
     expect(appended).toHaveLength(1);
     expect(row.dataset.msgId).toBe('native-3');
     expect((row as any)._narration.map((item: any) => item.seg).sort()).toEqual([0, 1, 2]);
-    expect((row as any)._persistedProcessItems.map((item: any) => item.event.data.duration_ms)).toEqual([0, 1, 2, 30]);
+    expect((row as any)._persistedProcessItems.map((item: any) => item.text ?? item.event.data.duration_ms)).toEqual(['过程 0', 0, '过程 1', 1, '过程 2', 2, 30]);
     const otherActor = nativeMessage(0, '另一位成员', 'other-actor', false).msg;
     otherActor.from = 'agent-other';
     expect(context._mergeNativeSegmentRecords([otherActor], CID)).toHaveLength(1);
@@ -1413,7 +1611,7 @@ describe('keyed rendering › one bubble per external-CLI turn', () => {
     expect(container.rows.map(row => row.dataset.msgId)).toEqual(['native-2']);
     expect(finalized).toHaveLength(1);
     expect(finalized[0].gm._narration.map((item: any) => item.seg)).toEqual([0, 1]);
-    expect(finalized[0].gm.process.map((item: any) => item.text)).toEqual(['读取文件', '运行测试', '收尾']);
+    expect(finalized[0].gm.process.map((item: any) => item.text)).toEqual(['开始改。', '读取文件', '我在核对。', '运行测试', '收尾']);
     expect(appended).toHaveLength(0);
   });
 
@@ -1438,6 +1636,198 @@ describe('keyed rendering › one bubble per external-CLI turn', () => {
 
 
 describe('active transcript recovery after task switching', () => {
+  it('defers an in-flight foreground snapshot after the window hides, then restores it when visible', async () => {
+    const { context, container } = loadRenderer(CID);
+    configureDisplayRecovery(context);
+    const actor = 'codex-agent';
+    context._handleGroupBusEvent(CID, null, delta(0, 'Visible prefix', actor));
+    const row = container.rows[0];
+    row.dataset.placeholder = '1';
+    context.pendingConvs.set(CID, { loadingEl: row, controller: {}, needsIndicator: false });
+    const snapshot = { ok: true, history: [],
+      conversation: { processing: true, processing_since: new Date().toISOString(),
+        active_turns: [{ actor, turn_id: TURN }] },
+      live_display: { sequence: 2, turns: [{ actor, turn_id: TURN,
+        records: [{ id: '', from: actor, turn_id: TURN, seg: 0, text: 'Latest hidden text', process: [] }] }] },
+    };
+    let resolve!: (response: any) => void;
+    context.apiFetch = () => new Promise(release => { resolve = release; });
+    const refreshing = context.loadConversationHistory(CID, { preserveScroll: true, refreshDisplay: true });
+    context._onConversationWindowVisibility({ active: false });
+    resolve({ json: async () => snapshot });
+    await refreshing;
+    expect(row.bodies.final.textContent).toBe('Visible prefix');
+    context.apiFetch = async () => ({ json: async () => snapshot });
+    context._onConversationWindowVisibility({ active: true });
+    await vi.waitFor(() => expect(row.bodies.final.textContent).toBe('Latest hidden text'));
+    expect(container.rows).toEqual([row]);
+  });
+
+  // Typical trigger: the app restores the last task at startup while the user
+  // has switched to another window. The completed cold or anchored load must
+  // still end with its paging rows and its target once the window is active.
+  it.each(['native-hidden', 'other-panel'])('replays a full history load that finished while not visible: %s', async (surface) => {
+    const { context } = loadRenderer(CID);
+    configureDisplayRecovery(context);
+    // A cold load stages its rows off-DOM before mounting them.
+    context.document.createDocumentFragment = () => new FakeContainer();
+    const rows: any[] = [];
+    const revealed: string[] = [];
+    context._setLoadEarlierHistory = (_el: any, cid: string, cursor: any) => rows.push(['earlier', cid, cursor]);
+    context._setLoadNewerHistory = (_el: any, cid: string, cursor: any) => rows.push(['newer', cid, cursor]);
+    context._revealConversationHistorySearchTarget = (_cid: string, target: any) => { revealed.push(target.msgId); return true; };
+    const page = { ok: true, next_cursor: 40, following_cursor: 41,
+      history: [{ id: 'm-40', from: 'commander', text: 'Quoted original', ts: '2026-10-01T00:00:00Z', _history_index: 40 }],
+      conversation: { processing: false, active_turns: [] },
+      live_display: { sequence: 1, active_turns: [], turns: [] } };
+    let requests = 0;
+    let resolve!: (response: any) => void;
+    context.apiFetch = () => { requests++; return new Promise(release => { resolve = release; }); };
+    const loading = context.loadConversationHistory(CID, { searchTarget: { msgId: 'm-40' } });
+    if (surface === 'native-hidden') context._onConversationWindowVisibility({ active: false });
+    else context.currentView = 'agents';
+    resolve({ json: async () => page });
+    await loading;
+    expect(rows).toEqual([]);
+    expect(revealed).toEqual([]);
+
+    context.apiFetch = async () => { requests++; return { json: async () => page }; };
+    if (surface === 'native-hidden') context._onConversationWindowVisibility({ active: true });
+    else { context.currentView = 'conversation'; context._refreshVisibleConversationDisplay(CID); }
+    await vi.waitFor(() => expect(revealed).toEqual(['m-40']));
+    expect(rows).toEqual([['earlier', CID, 40], ['newer', CID, 41]]);
+    expect(requests).toBe(2);
+  });
+
+  it('refreshes once on foreground, preserves older mounted history, and continues from the latest snapshot', async () => {
+    const { context, container, documentListeners } = loadRenderer(CID);
+    configureDisplayRecovery(context);
+    const actor = 'codex-agent';
+    context._handleGroupBusEvent(CID, null, {
+      type: 'message', msg: { id: 'older', from: 'commander', text: 'Older history stays mounted', ts: '2026-01-01T00:00:00Z' },
+    });
+    const older = container.rows[0];
+    context._handleGroupBusEvent(CID, null, delta(0, 'Before hiding', actor));
+    context.document.visibilityState = 'hidden';
+    for (const handler of documentListeners.get('visibilitychange') || []) handler();
+    context._handleGroupBusEvent(CID, null, { ...delta(0, ' unseen text', actor), display_seq: 1 });
+    expect(container.rows[1].bodies.final.textContent).toBe('Before hiding');
+    let requests = 0;
+    let resolveHistory!: (response: any) => void;
+    context.apiFetch = () => { requests++; return new Promise(resolve => { resolveHistory = resolve; }); };
+    context.document.visibilityState = 'visible';
+    for (const handler of documentListeners.get('visibilitychange') || []) handler();
+    context._refreshVisibleConversationDisplay(CID);
+    expect(requests).toBe(1);
+    context._handleGroupBusEvent(CID, null, { ...delta(0, ' latest', actor), display_seq: 2 });
+    const active = [{ actor, turn_id: TURN }];
+    resolveHistory({ json: async () => ({ ok: true, history: [],
+      conversation: { processing: true, processing_since: new Date().toISOString(), active_turns: active },
+      live_display: { sequence: 2, active_turns: active, turns: [{ actor, turn_id: TURN, records: [{
+        id: '', from: actor, turn_id: TURN, seg: 0, text: 'Before hiding unseen text latest', process: [],
+      }] }] },
+    }) });
+    await vi.waitFor(() => expect(container.rows.find(row => row.dataset.turnId === TURN)?.bodies.final.textContent)
+      .toBe('Before hiding unseen text latest'));
+    expect(container.rows[0]).toBe(older);
+    context._handleGroupBusEvent(CID, null, { ...delta(0, ' next', actor), display_seq: 3 });
+    expect(container.rows.find(row => row.dataset.turnId === TURN)?.bodies.final.textContent)
+      .toBe('Before hiding unseen text latest next');
+    expect(requests).toBe(1);
+  });
+
+  it('recovers the saved terminal reply when the task finishes while hidden', async () => {
+    const { context, container } = loadRenderer(CID);
+    configureDisplayRecovery(context);
+    context.document.visibilityState = 'hidden';
+    const reply = { id: 'terminal', from: 'codex-agent', turn_id: TURN, seg: 0, text: 'Saved final result' };
+    context._handleGroupBusEvent(CID, null, { type: 'message', turn_end: true, msg: reply });
+    expect(container.rows).toHaveLength(0);
+    context.document.visibilityState = 'visible';
+    context.apiFetch = async () => ({ json: async () => ({ ok: true, history: [reply],
+      conversation: { processing: false, active_turns: [] },
+      live_display: { sequence: 4, active_turns: [], turns: [] },
+    }) });
+    await context.loadConversationHistory(CID, { preserveScroll: true, refreshDisplay: true });
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'Late old text', reply.from), display_seq: 4 });
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0].dataset.msgId).toBe('terminal');
+    expect(container.rows[0].bodies.final.textContent).toBe(reply.text);
+  });
+
+  it('keeps a terminal arriving during post-paint recovery ahead of the older live snapshot', async () => {
+    const { context, container } = loadRenderer(CID);
+    configureDisplayRecovery(context);
+    const actor = 'codex-agent';
+    context.document.visibilityState = 'hidden';
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'Partial', actor), display_seq: 1 });
+    context.document.visibilityState = 'visible';
+    const active = [{ actor, turn_id: TURN }];
+    context.apiFetch = async () => ({ json: async () => ({ ok: true, history: [],
+      conversation: { processing: true, processing_since: new Date().toISOString(), active_turns: active },
+      live_display: { sequence: 1, active_turns: active, turns: [{ actor, turn_id: TURN, records: [{
+        id: '', from: actor, turn_id: TURN, seg: 0, text: 'Partial', process: [],
+      }] }] },
+    }) });
+    let release!: () => void;
+    let waiting = false;
+    context._evaluateAutoRecipient = () => {
+      if (waiting) return Promise.resolve();
+      waiting = true;
+      return new Promise<void>(resolve => { release = resolve; });
+    };
+    const refreshing = context.loadConversationHistory(CID, { preserveScroll: true, refreshDisplay: true });
+    await vi.waitFor(() => expect(waiting).toBe(true));
+    context._handleGroupBusEvent(CID, null, { type: 'message', turn_end: true,
+      msg: { id: 'terminal', from: actor, turn_id: TURN, seg: 0, text: 'Saved complete result' },
+    });
+    release();
+    await refreshing;
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0].dataset.msgId).toBe('terminal');
+    expect(container.rows[0].bodies.final.textContent).toBe('Saved complete result');
+  });
+
+  it.each(['hidden-window', 'native-hidden', 'other-panel', 'other-task'])('consumes background process events without painting or waiting for frames: %s', (surface) => {
+    const { context, container } = loadRenderer(CID);
+    if (surface === 'hidden-window') context.document.visibilityState = 'hidden';
+    if (surface === 'native-hidden') {
+      context.document.visibilityState = 'visible';
+      context._onConversationWindowVisibility({ active: false });
+    }
+    if (surface === 'other-panel') context.currentView = 'agents';
+    if (surface === 'other-task') context.currentCid = 'other';
+    const yieldToPaint = context._makeStreamPaintYield(() => context._isConversationDisplayVisible(CID));
+    for (let i = 1; i <= 600; i++) {
+      context._handleGroupBusEvent(CID, null, { ...delta(0, 'chunk', 'codex-agent'), display_seq: i });
+      expect(yieldToPaint()).toBeNull();
+    }
+    expect(container.rows).toHaveLength(0);
+    expect(vm.runInContext('_offViewLiveDisplayDirty.has(currentCid === "other" ? "c1" : currentCid)', context)).toBe(true);
+    // Task state still reaches its consumer while no transcript can be painted.
+    const tasks: any[] = [];
+    context.window.TaskBoard = { onEvent: (_cid: string, event: any) => tasks.push(event.task) };
+    context._handleGroupBusEvent(CID, null, { type: 'task_state', task: { task_id: 'task-1', status: 'done' } });
+    expect(tasks).toEqual([{ task_id: 'task-1', status: 'done' }]);
+  });
+
+  it('shows the complete latest display once and ignores the delayed IPC prefix from every turn', () => {
+    const { context, container } = loadRenderer(CID);
+    const actor = 'codex-agent';
+    context.document.visibilityState = 'hidden';
+    for (let i = 1; i <= 600; i++) context._handleGroupBusEvent(CID, null, { ...delta(0, 'chunk', actor), display_seq: i });
+    expect(container.rows).toHaveLength(0);
+    context.document.visibilityState = 'visible';
+    context._restoreLiveDisplaySnapshot(CID, { sequence: 600, turns: [{ actor, turn_id: TURN, records: [{
+      id: '', from: actor, turn_id: TURN, seg: 0, text: 'Latest complete text', process: [],
+    }] }] });
+    context._handleGroupBusEvent(CID, null, { ...delta(0, 'Old turn'), turn_id: 'finished-turn', display_seq: 590 });
+    for (let i = 1; i <= 600; i++) context._handleGroupBusEvent(CID, null, { ...delta(0, 'chunk', actor), display_seq: i });
+    context._handleGroupBusEvent(CID, null, { ...delta(0, ' plus live text', actor), display_seq: 601 });
+    expect(container.rows).toHaveLength(1);
+    expect(container.rows[0].bodies.final.textContent).toBe('Latest complete text plus live text');
+  });
+
   it('joins events received during the history request without replaying the snapshot prefix', () => {
     const { context, container } = loadRenderer(CID);
     const actor = 'codex-agent';
@@ -1454,6 +1844,20 @@ describe('active transcript recovery after task switching', () => {
     expect(container.rows).toHaveLength(1);
     expect(container.rows[0].bodies.final.textContent).toBe('Beginning middle end');
     expect(context.__load.processEvents).toEqual([]);
+  });
+
+  it.each([0, 1])('retires the previous body when recovery reports an empty segment %s', (seg) => {
+    const { context, container } = loadRenderer(CID);
+    const actor = 'codex-agent';
+    context._handleGroupBusEvent(CID, null, delta(0, 'Earlier body', actor));
+    const row = container.rows[0];
+    context._restoreLiveDisplaySnapshot(CID, { sequence: 2, turns: [{ actor, turn_id: TURN, records: [{
+      id: '', from: actor, turn_id: TURN, seg, text: '', process: [],
+    }] }] });
+    expect(container.rows).toEqual([row]);
+    expect(row.bodies.final.textContent).toBe('');
+    context._handleGroupBusEvent(CID, null, { ...delta(seg, 'Current body', actor), display_seq: 3 });
+    expect(row.bodies.final.textContent).toBe('Current body');
   });
 
   it('keeps a terminal reply that arrives before the active snapshot can be restored', () => {
@@ -1496,7 +1900,7 @@ describe('active transcript recovery after task switching', () => {
     });
     expect(container.rows).toHaveLength(1);
     expect(finalized[0].gm._narration.map((item: any) => item.text)).toEqual(['First message']);
-    expect(finalized[0].gm.process.map((item: any) => item.text)).toEqual(['Read', 'Check']);
+    expect(finalized[0].gm.process.map((item: any) => item.text)).toEqual(['First message', 'Read', 'Check']);
   });
 
   it('restores more than 300 operations and continues a partial reply once', () => {

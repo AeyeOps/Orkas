@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import * as crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -57,6 +58,19 @@ function writeFixture(): { root: string; file: string; contract: Record<string, 
 describe('packaged-resource-gate', () => {
   it('pins the offline XLS reader including its license and worker', () => {
     expect(verifyXlsReaderRoot(path.join(process.cwd(), 'resources/xls-reader'))).toBe('resource:xls-reader:2.0.2');
+  });
+
+  it('preserves pinned XLS bytes through Windows Git checkout filters', () => {
+    const root = path.join(tmpDir, 'windows-checkout');
+    fs.mkdirSync(path.join(root, '2.0.2'), { recursive: true });
+    for (const name of ['LICENSE', 'read.py', 'xlrd-2.0.2-py2.py3-none-any.whl']) {
+      const tracked = `resources/xls-reader/2.0.2/${name}`;
+      const bytes = execFileSync('git', [
+        '-c', 'core.autocrlf=true', 'cat-file', '--filters', `--path=${tracked}`, `HEAD:${tracked}`,
+      ], { cwd: process.cwd(), timeout: 10_000 });
+      fs.writeFileSync(path.join(root, '2.0.2', name), bytes);
+    }
+    expect(verifyXlsReaderRoot(root)).toBe('resource:xls-reader:2.0.2');
   });
 
   it.each(['Orkas.app/Contents/Resources', 'win-unpacked/resources'])('verifies XLS resources in %s and rejects missing or changed payloads', layout => {

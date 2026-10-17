@@ -27,6 +27,7 @@
 import { describe, it, expect } from 'vitest';
 
 import * as mainAutoTitle from '../../src/main/util/auto-title';
+import { limitNameDisplayText } from '../../src/main/util/name-limit';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const rendererAutoTitle = require('../../src/renderer/modules/auto-title.js');
 import { autoTitle as backendAutoTitle } from '../../src/main/features/chats';
@@ -36,6 +37,7 @@ const renderer: {
   _AUTO_TITLE_ZH_FILLER: RegExp;
   _AUTO_TITLE_EN_FILLER: RegExp;
   _AUTO_TITLE_MAX_UNITS: number;
+  _CONVERSATION_TITLE_MAX_UNITS: number;
   _truncateTitleToWidth: (text: string) => string;
 } = rendererAutoTitle;
 
@@ -59,6 +61,13 @@ describe('auto-title parity › regex source / flags match across main + rendere
   it('the display-width budget matches', () => {
     expect(renderer._AUTO_TITLE_MAX_UNITS).toBe(mainAutoTitle.TITLE_MAX_UNITS);
   });
+
+  it('the stored conversation-title cap matches and keeps a full auto title intact', () => {
+    expect(renderer._CONVERSATION_TITLE_MAX_UNITS).toBe(mainAutoTitle.CONVERSATION_TITLE_MAX_UNITS);
+    const full = mainAutoTitle.truncateTitleToWidth('一'.repeat(80));
+    expect(full.endsWith('…')).toBe(true);
+    expect(limitNameDisplayText(full, mainAutoTitle.CONVERSATION_TITLE_MAX_UNITS)).toBe(full);
+  });
 });
 
 /**
@@ -70,16 +79,16 @@ describe('auto-title parity › regex source / flags match across main + rendere
  */
 describe('auto-title parity › width table agrees on every script class', () => {
   const widthCases: Array<[string, string]> = [
-    ['Han', '一'.repeat(40)],
-    ['Hangul', '가'.repeat(40)],
-    ['Hiragana', 'あ'.repeat(40)],
-    ['fullwidth Latin', 'Ａ'.repeat(40)],
-    ['halfwidth Latin', 'A'.repeat(80)],
-    ['emoji', '🙂'.repeat(40)],
-    ['emoji with a variation selector', '☘️'.repeat(40)],
-    ['combining marks', 'e\u0301'.repeat(60)],
-    ['mixed scripts at the boundary', `${'一'.repeat(20)}${'A'.repeat(12)}`],
-    ['CJK punctuation', '，'.repeat(40)],
+    ['Han', '一'.repeat(80)],
+    ['Hangul', '가'.repeat(80)],
+    ['Hiragana', 'あ'.repeat(80)],
+    ['fullwidth Latin', 'Ａ'.repeat(80)],
+    ['halfwidth Latin', 'A'.repeat(160)],
+    ['emoji', '🙂'.repeat(80)],
+    ['emoji with a variation selector', '☘️'.repeat(80)],
+    ['combining marks', 'e\u0301'.repeat(120)],
+    ['mixed scripts at the boundary', `${'一'.repeat(40)}${'A'.repeat(24)}`],
+    ['CJK punctuation', '，'.repeat(80)],
   ];
 
   for (const [label, input] of widthCases) {

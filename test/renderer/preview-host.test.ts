@@ -58,3 +58,14 @@ describe('non-conversation image previews', () => {
     })]);
   });
 });
+
+
+it('preserves a structured commercial refusal for the invoking viewer to present', async () => {
+  const receipt = { ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' };
+  const alert = vi.fn(), invoke = vi.fn(async () => receipt);
+  const context: any = { uiAlert: alert, window: { orkas: { invoke, onPushEvent: vi.fn() } } };
+  vm.runInNewContext(readFileSync(path.resolve(__dirname, '../../src/renderer/modules/commercial-entry.js'), 'utf8'), context);
+  vm.runInNewContext(readFileSync(path.resolve(__dirname, '../../src/renderer/modules/preview-windows.js'), 'utf8'), context);
+  await expect(context.window.OrkasPreviewWindows.open({ kind: 'file', path: '/fixture/app.html' })).resolves.toBe(receipt);
+  expect(alert).not.toHaveBeenCalled(); expect(invoke).toHaveBeenCalledOnce();
+});

@@ -126,7 +126,8 @@ describe('conversation history auto-load', () => {
     const row = { dataset: { state: 'idle', cursor: '120', cid: 'c1' } };
     const container = {
       scrollTop: 32,
-      querySelector: () => row,
+      _historyEarlierRow: row,
+      contains: (node: unknown) => node === row,
     };
     const context: any = {
       Number,
@@ -143,6 +144,7 @@ describe('conversation history auto-load', () => {
     vm.createContext(context);
     vm.runInContext([
       extractFunction('_historyNextCursor'),
+      extractFunction('_historyLoaderRow'),
       extractFunction('_maybeAutoLoadEarlierHistory'),
     ].join('\n'), context);
 
@@ -166,12 +168,14 @@ describe('conversation history auto-load', () => {
     vm.createContext(context);
     vm.runInContext([
       extractFunction('_historyNextCursor'),
+      extractFunction('_historyLoaderRow'),
       extractFunction('_maybeAutoLoadEarlierHistory'),
     ].join('\n'), context);
 
-    context._maybeAutoLoadEarlierHistory({ scrollTop: 12, querySelector: () => row });
+    const holding = (scrollTop: number) => ({ scrollTop, _historyEarlierRow: row, contains: (node: unknown) => node === row });
+    context._maybeAutoLoadEarlierHistory(holding(12));
     context._isProgrammaticStickyScroll = () => false;
-    context._maybeAutoLoadEarlierHistory({ scrollTop: 80, querySelector: () => row });
+    context._maybeAutoLoadEarlierHistory(holding(80));
 
     expect(calls).toBe(0);
   });
@@ -184,7 +188,8 @@ describe('conversation history auto-load', () => {
       getBoundingClientRect: () => ({ top: 100, bottom: 140 }),
     };
     const container = {
-      querySelector: (selector: string) => selector === '.chat-history-load-newer' ? row : null,
+      _historyNewerRow: row,
+      contains: (node: unknown) => node === row,
       getBoundingClientRect: () => ({ top: 0, bottom: 500 }),
       addEventListener: (name: string, listener: (event?: any) => void) => { listeners[name] = listener; },
     };
@@ -197,6 +202,7 @@ describe('conversation history auto-load', () => {
     };
     vm.createContext(context);
     vm.runInContext([
+      extractFunction('_historyLoaderRow'),
       extractFunction('_maybeAutoLoadNewerHistory'),
       extractFunction('_bindAutoLoadEarlierHistory'),
     ].join('\n'), context);
@@ -206,6 +212,68 @@ describe('conversation history auto-load', () => {
     expect(calls).toEqual([]);
     listeners.wheel({ deltaY: 100 });
     expect(calls).toEqual(['c1']);
+  });
+
+  // Scroll and wheel events fire at 60-120 Hz on a transcript that grows with
+  // every page the reader visits; finding the two loader rows must not search
+  // it, and on the latest page (no newer row) that search used to visit every
+  // node on every event.
+  it('handles scroll and wheel without searching the transcript for loader rows', () => {
+    const listeners: Record<string, (event?: any) => void> = {};
+    const calls: string[] = [];
+    let searches = 0;
+    const container: any = {
+      scrollTop: 400,
+      querySelector: () => { searches += 1; return null; },
+      contains: (node: any) => node?.parentElement === container,
+      getBoundingClientRect: () => ({ top: 0, bottom: 500 }),
+      addEventListener: (name: string, listener: (event?: any) => void) => { listeners[name] = listener; },
+    };
+    const context: any = {
+      Number, String, currentCid: 'c1', HISTORY_AUTO_LOAD_THRESHOLD: 48,
+      _isProgrammaticStickyScroll: () => false,
+      _loadOlderConversationHistory: (cid: string, cursor: number) => { calls.push(`older:${cid}:${cursor}`); },
+      _loadNewerConversationHistory: (cid: string) => { calls.push(`newer:${cid}`); },
+      _setEarlierHistoryLoaderState: (row: any, state: string) => { row.dataset.state = state; },
+    };
+    vm.createContext(context);
+    vm.runInContext([
+      extractFunction('_historyNextCursor'),
+      rendererSource.includes('function _historyLoaderRow') ? extractFunction('_historyLoaderRow') : '',
+      extractFunction('_maybeAutoLoadEarlierHistory'),
+      extractFunction('_maybeAutoLoadNewerHistory'),
+      extractFunction('_bindAutoLoadEarlierHistory'),
+    ].join('\n'), context);
+    context._bindAutoLoadEarlierHistory(container);
+
+    // Latest page and start of history: no loader rows at all.
+    for (let i = 0; i < 3; i += 1) listeners.scroll();
+    listeners.wheel({ deltaY: 100 });
+    listeners.wheel({ deltaY: -100 });
+    expect(calls).toEqual([]);
+
+    const newer = { parentElement: container, dataset: { cid: 'c1', state: 'idle' },
+      getBoundingClientRect: () => ({ top: 480, bottom: 520 }) };
+    container._historyNewerRow = newer;
+    listeners.wheel({ deltaY: 100 });
+    expect(calls).toEqual(['newer:c1']);
+
+    const earlier = { parentElement: container, dataset: { cid: 'c1', cursor: '120', state: 'error' } };
+    container._historyEarlierRow = earlier;
+    listeners.scroll();
+    expect(earlier.dataset.state).toBe('idle');
+    container.scrollTop = 10;
+    listeners.scroll();
+    expect(calls).toEqual(['newer:c1', 'newer:c1', 'older:c1:120', 'newer:c1']);
+
+    // A rebuilt transcript detaches the rows; their stale references are ignored.
+    newer.parentElement = null;
+    earlier.parentElement = null;
+    calls.length = 0;
+    listeners.scroll();
+    listeners.wheel({ deltaY: 100 });
+    expect(calls).toEqual([]);
+    expect(searches).toBe(0);
   });
 
   it('keeps the previous reading anchor after prepending older content', () => {

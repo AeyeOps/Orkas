@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { scanPowerShell, MAX_POWERSHELL_CHAIN_COMMANDS, type PowerShellLexicalEvidence } from "./powershell-lexical.js";
 
 export type PowerShellChain =
   | { kind: "none" }
@@ -6,7 +7,6 @@ export type PowerShellChain =
   | { kind: "chain"; commands: string[]; operators: Array<"&&" | "||"> };
 
 const MAX_CHAIN_CHARS = 64 * 1024;
-const MAX_CHAIN_COMMANDS = 32;
 // Grammar keywords cannot be treated as ordinary command invocations.
 const STATEMENT_KEYWORDS = new Set([
   "if", "elseif", "else", "switch", "foreach", "for", "while", "do",
@@ -19,66 +19,31 @@ const STATEMENT_KEYWORDS = new Set([
  * This is not a general shell translator. Preserve operand bytes and reject
  * expressions, pipelines, redirections and statements rather than guessing.
  */
-export function parsePowerShellChain(command: string): PowerShellChain {
+export function parsePowerShellChain(command: string, evidence?: PowerShellLexicalEvidence): PowerShellChain {
   if (!command.includes("&&") && !command.includes("||")) return { kind: "none" };
   if (command.length > MAX_CHAIN_CHARS) return { kind: "unsupported" };
+  const lexical = evidence ?? scanPowerShell(command);
+  if (!lexical.operators.length) return { kind: "none" };
+  if (!lexical.simpleChainSyntax || lexical.operators.length >= MAX_POWERSHELL_CHAIN_COMMANDS) return { kind: "unsupported" };
   const commands: string[] = [];
+  const surfaces: string[] = [];
   const operators: Array<"&&" | "||"> = [];
-  let quote = "";
   let start = 0;
-  let unsupported = false;
-  let commandHasContent = false;
-  const environmentVariable = /\$env:[a-z_][a-z0-9_]*/iy;
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    const atCommandStart = !commandHasContent;
-    if (/\S/.test(ch)) commandHasContent = true;
-    if (/[\r\n\0\u0085\u2028\u2029\u2018\u2019\u201c\u201d]/.test(ch)) unsupported = true;
-    if (quote === "'") {
-      if (ch === "'" && command[i + 1] === "'") i++;
-      else if (ch === "'") quote = "";
-      continue;
-    }
-    if (ch === "`") {
-      // PowerShell escapes with backticks, not backslashes. Escapes outside
-      // strings remain outside the supported grammar, but cannot split a chain.
-      if (!quote || i + 1 >= command.length || /[\r\n]/.test(command[i + 1])) unsupported = true;
-      i++;
-      continue;
-    }
-    if (ch === "$") {
-      environmentVariable.lastIndex = i;
-      if (!environmentVariable.test(command)) unsupported = true;
-    }
-    if (quote === '"') {
-      if (ch === '"' && command[i + 1] === '"') i++;
-      else if (ch === '"') quote = "";
-      continue;
-    }
-    if (ch === "'" || ch === '"') { quote = ch; continue; }
-    if (ch === "#") { unsupported = true; break; }
-    // Stop-parsing changes the meaning of all following operators. Smart
-    // quotes above are also PowerShell delimiters outside this small grammar.
-    if (command.startsWith("--%", i)) unsupported = true;
-    if ((ch === "&" || ch === "|") && command[i + 1] === ch) {
-      commands.push(command.slice(start, i).trim());
-      operators.push(ch === "&" ? "&&" : "||");
-      start = ++i + 1;
-      commandHasContent = false;
-      if (operators.length >= MAX_CHAIN_COMMANDS) return { kind: "unsupported" };
-      continue;
-    }
-    if (";|<>(){}[]@".includes(ch)) unsupported = true;
-    // A leading call operator supports quoted executable paths. A trailing
-    // single ampersand would instead change the execution lifecycle.
-    if (ch === "&" && !atCommandStart) unsupported = true;
+  for (const entry of lexical.operators) {
+    commands.push(command.slice(start, entry.offset).trim());
+    surfaces.push(lexical.surface.slice(start, entry.offset).trim());
+    operators.push(entry.operator);
+    start = entry.offset + 2;
   }
-  if (!operators.length) return { kind: "none" };
   commands.push(command.slice(start).trim());
-  if (quote || unsupported || commands.some(part => {
+  surfaces.push(lexical.surface.slice(start).trim());
+  if (commands.some((part, index) => {
     const first = part.split(/\s/, 1)[0].toLowerCase();
+    const surface = surfaces[index];
+    // Only a leading call operator is within the established simple grammar.
     return !part || STATEMENT_KEYWORDS.has(first)
-      || /^["'$@]/.test(part) || first === "." || part === "&";
+      || /^["'$@]/.test(part) || first === "." || part === "&"
+      || surface.slice(surface.startsWith("&") ? 1 : 0).includes("&");
   })) return { kind: "unsupported" };
   return { kind: "chain", commands, operators };
 }

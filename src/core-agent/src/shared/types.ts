@@ -166,8 +166,20 @@ export type StreamEvent =
     }
   | {
       type: "provider_fallback";
-      reason: "auth" | "no_first_event_timeout" | "server_model_fallback";
+      reason:
+        | "auth"
+        | "balance"
+        | "permission"
+        | "rate_limit"
+        | "unavailable"
+        | "no_first_event_timeout"
+        | "server_model_fallback";
       providerId: string;
+      /** Provider of the candidate the run moves to, when known. */
+      toProviderId?: string;
+      /** The credential was skipped before this run tried it (still cooling
+       *  down, or not usable); nothing failed in this run. */
+      skipped?: boolean;
       candidateIndex?: number;
       candidateCount?: number;
       fromModel?: string;

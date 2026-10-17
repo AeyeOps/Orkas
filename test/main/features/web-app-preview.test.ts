@@ -83,3 +83,69 @@ it('accepts only its own trusted frame, token and narrow operations, then revoke
   expect(resource).toBeUndefined(); expect(contents.listenerCount('ipc-message')).toBe(0);
   expect(fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('orkas-preview-storage-')).sort()).toEqual(before);
 });
+
+it('settles the current bundle document after local navigation and rejects foreign or revoked frames', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { createPreviewSdk } = await import('../../../src/main/features/web_apps/preview');
+  manifest();
+  fs.writeFileSync(path.join(path.dirname(entry), 'second.html'), '<h1>Second page</h1>');
+  const contents: any = new EventEmitter();
+  Object.assign(contents, { id: 20, mainFrame: { frames: [] }, isDestroyed: () => false });
+  const ses: any = { protocol: { handle() {}, unhandle() {} } };
+  const preview = await createPreviewSdk(ses, contents, (await previewBundle(entry))!);
+  let painted = 0;
+  const foreign = { url: 'https://example.invalid/second.html', executeJavaScript() { throw new Error('Foreign frame executed'); } };
+  const current = { url: preview.origin + '/second.html', async executeJavaScript() { painted++; } };
+  try {
+    contents.mainFrame.frames = [foreign];
+    await expect(preview.settle()).rejects.toThrow('E_BUNDLE');
+    contents.mainFrame.frames.push(current);
+    await preview.settle();
+    expect(painted).toBe(1);
+  } finally { await preview.dispose(); }
+  await expect(preview.settle()).rejects.toThrow('E_BUNDLE');
+});
+
+it('keeps preview data in disposable storage: writes are readable during the session and leave no files afterwards', async () => {
+  const { EventEmitter } = await import('node:events');
+  const { createPreviewSdk } = await import('../../../src/main/features/web_apps/preview');
+  const data = { version: 1, tables: [{ id: 'notes', name: 'notes', fields: [{ id: 'body', name: 'body', type: 'string' }], access: { read: ['body'], insert: ['body'], count: true } }] };
+  manifest(JSON.stringify({ sdkVersion: 1, capabilities: ['data'], data }));
+  const workspace = process.env.ORKAS_WORKSPACE_ROOT!;
+  const inventory = (dir: string) => fs.existsSync(dir) ? fs.readdirSync(dir, { recursive: true }).map(String).sort() : [];
+  const temporary = () => fs.readdirSync(os.tmpdir()).filter(name => name.startsWith('orkas-preview-storage-')).sort();
+  const workspaceBefore = inventory(workspace), sourceBefore = inventory(path.dirname(entry)), tempBefore = temporary();
+  const session = async () => {
+    const contents: any = new EventEmitter(), replies: any[] = [];
+    const frame: any = { detached: false, frames: [], send: (_channel: string, value: any) => replies.push(value) };
+    let token = '';
+    Object.assign(contents, { id: 31, mainFrame: frame, isDestroyed: () => false,
+      // attach() hands the trusted shell its instance; capture it like the shell would.
+      executeJavaScript: async (script: string) => { const opened = JSON.parse(/attach\(frame, (\{.*?\})\);/s.exec(script)![1]); token = opened.token; frame.frames = [{ url: opened.url }]; } });
+    const preview = await createPreviewSdk({ protocol: { handle() {}, unhandle() {} } } as any, contents, (await previewBundle(entry))!);
+    contents.getURL = () => preview.shellUrl; await preview.attach();
+    let sequence = 0;
+    const invoke = async (method: string, args: unknown) => {
+      const id = String(++sequence);
+      contents.emit('ipc-message', { senderFrame: frame }, 'orkas.web-app-preview', { id, operation: 'webApps.call', payload: { token, requestId: 'r' + id, method, args } });
+      for (let tries = 0; tries < 500 && !replies.some(reply => reply.id === id); tries++) await new Promise(resolve => setTimeout(resolve, 5));
+      return replies.find(reply => reply.id === id)?.event;
+    };
+    return { preview, invoke };
+  };
+  const first = await session();
+  let created: string[] = [];
+  try {
+    expect(await first.invoke('data.insert', { table: 'notes', values: { body: 'preview only' } })).toMatchObject({ type: 'result', ok: true });
+    expect(await first.invoke('data.query', { table: 'notes' })).toEqual({ type: 'result', ok: true, value: { records: [{ body: 'preview only' }] } });
+    created = temporary().filter(name => !tempBefore.includes(name));
+    expect(created.length).toBeGreaterThan(0);
+  } finally { await first.preview.dispose(); }
+  // Compare only this session's directories so concurrent suites cannot interfere.
+  expect(temporary().filter(name => created.includes(name))).toEqual([]);
+  expect(inventory(workspace)).toEqual(workspaceBefore);
+  expect(inventory(path.dirname(entry))).toEqual(sourceBefore);
+  const second = await session();
+  try { expect(await second.invoke('data.count', { table: 'notes' })).toEqual({ type: 'result', ok: true, value: { count: 0 } }); }
+  finally { await second.preview.dispose(); }
+});

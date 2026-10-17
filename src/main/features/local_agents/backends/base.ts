@@ -98,7 +98,8 @@ export interface LocalEvent {
    *                                  exitCode?, protocolRecordCount?, protocolErrorSeen?,
    *                                  finalMessageText?: string (Claude's last native result),
    *                                  timeoutPhase?: 'foreground'|'background',
-   *                                  failureKind?: 'cli_spawn'|'cli_protocol', retrySafe?: boolean }
+   *                                  failureKind?: 'cli_spawn'|'cli_protocol', retrySafe?: boolean,
+   *                                  bootstrapTimeout?: boolean (Codex control-call deadline) }
    */
   [key: string]: unknown;
 }
@@ -172,6 +173,11 @@ export interface BackendRunOptions {
    * on resume, but must restore it if resume falls back to a fresh session. */
   reuseSessionInstructions?: boolean;
   cwd: string;
+  /** Actual selected binary version, refreshed for each fallback attempt. */
+  cliVersion?: string;
+  /** Optional flags advertised by that binary's bounded help probe. Missing
+   * capability data never establishes support for a new optional flag. */
+  cliFlags?: readonly string[];
   customArgs?: string[];
   /** Per-Agent overrides. Missing values deliberately leave selection to the
    * CLI/account configuration. */
@@ -184,8 +190,8 @@ export interface BackendRunOptions {
    * treated as a denial by every backend. */
   requestPermission?: (request: LocalCliPermissionRequest) => Promise<LocalCliPermissionDecision>;
   /** Host-owned bridge for native CLI requests that pause for structured user
-   * input. Answers stay in memory and are returned only to the requesting
-   * process; they are never emitted as LocalEvents or persisted in run logs. */
+   * input. The host saves non-secret replies in conversation history; answers
+   * are never emitted as LocalEvents or persisted in run logs. */
   requestUserInput?: (request: LocalCliUserInputRequest) => Promise<LocalCliUserInputResponse>;
   /** When set, ask the CLI to resume a prior session by id (claude:
    *  `--resume <id>`). The group-chat caller consults the registry's resume

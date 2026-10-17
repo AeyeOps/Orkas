@@ -63,6 +63,7 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
         max_fetches_per_subquestion: 4,
         max_depth: 2,
       },
+      caps_reason: 'The user asked for a quick check of at most six sources.',
     });
 
     const result = runScript('caps', [
@@ -82,6 +83,30 @@ describe('DeepResearch bundled Skill scripts through run-skill.cjs', () => {
     expect(output.data.fetch_budget_per_subquestion).toBe(3);
     expect(output.data.dropped.duplicates).toEqual(['What is the current policy?']);
     expect(output.data.dropped.over_cap).toEqual(['What evidence is required?']);
+    expect(output.data.caps_reason).toBe('The user asked for a quick check of at most six sources.');
+  });
+
+  it('refuses lowered fetch caps without a reason and writes no plan', () => {
+    // The 2026-10-02 "detailed research" run chose 12/5 with no budget behind it.
+    writeJson('caps_input.json', {
+      depth: 1,
+      subquestions: ['Name and demonstrations', 'Spatial optimization', 'Evaluation'],
+      caps: { max_fetches: 12, max_fetches_per_subquestion: 5 },
+    });
+
+    const result = runScript('caps', [
+      '--op', 'plan',
+      '--input', 'caps_input.json',
+      '--out', 'caps_plan.json',
+    ]);
+
+    expect(result.status).toBe(1);
+    const error = JSON.parse(result.stderr.trim());
+    expect(error.ok).toBe(false);
+    expect(error.error).toContain('max_fetches 12, max_fetches_per_subquestion 5');
+    expect(error.error).toContain('max_fetches 40, max_fetches_per_subquestion 8');
+    expect(error.error).toContain('caps_reason');
+    expect(fs.existsSync(path.join(tmpDir, 'caps_plan.json'))).toBe(false);
   });
 
   it('compresses workspace evidence under the requested hard character budget', () => {

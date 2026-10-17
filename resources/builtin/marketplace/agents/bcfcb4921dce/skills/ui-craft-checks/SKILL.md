@@ -39,7 +39,7 @@ The artifact fails the craft pass if any P0 is present:
 - **Detached revision**: a normal follow-up creates a new sibling or regenerates an unrelated artifact instead of inspecting and patching the canonical artifact in place, losing accepted content or user edits.
 - **Broken artifact boundary**: a standalone deliverable has no stable artifact directory or valid manifest/entry, or it depends on missing local files, machine-specific absolute paths, undeclared secrets, or an unmentioned build step that prevents sharing or packaging.
 - **Source drift**: screenshot, Figma/design-source, or explicit contract structure is replaced by an unrelated dashboard, table, chart, sidebar, pricing page, or kanban board.
-- **Missing critical states**: a data-fetching or data-transforming surface does not implement reachable loading, populated, empty, error, and edge/partial states. Mentioning them in rationale while shipping only populated DOM still fails.
+- **Missing critical states**: a surface does not implement the states its user, brief, or existing product calls for: populated and empty for data, plus loading, error, or edge/partial states when requested, already shown by the product, or central to the brief. Mentioning them in rationale while shipping only populated DOM still fails. An unrequested demo state switcher is not required.
 - **Broken form validation**: required fields lack labels/helper/error wiring, or the prototype omits pristine, dirty/touched invalid, submitted-pending, recoverable server-error, or success behavior that the workflow can reach. A user-requested success/failure outcome that exists only in an untriggered branch still fails.
 - **Keyboard/accessibility failure**: interactive controls are not keyboard reachable, focus-visible is absent, icon-only controls lack names, or native elements are replaced with inert divs.
 - **Unsafe live data**: live-ready artifacts persist tokens, credentials, cookies, auth headers, raw provider responses, or secret-like fields.
@@ -56,6 +56,8 @@ Fix or explicitly note these before handoff:
 - **Contrast and focus**: body text, muted text, control borders, semantic status, and focus rings need sufficient contrast.
 - **State composition**: empty states need a headline, explanation, and recovery action; errors need what happened, why, and how to recover.
 - **Typography hierarchy**: hierarchy should use at least two vectors such as size, weight, spacing, color, position, or grouping; avoid both flat hierarchy and noisy hierarchy.
+- **Visual craft baseline**: the executor's Visual Craft Baseline holds: product scale and tokens, few size tiers, parallel content at one level with one component, balanced grids, space that fits content, shared alignment, CJK text, and live-product consistency. `html_preview` design warnings are fixed or justified.
+- **Failure handling**: for launch QA of a real data-fetching surface, say how loading and failure behave, either a dedicated view or a deliberate fallback to the empty state.
 - **Motion discipline**: motion should explain state, space, or feedback. Avoid ambient motion in work tools. Translate/scale/rotate/parallax motion should respect reduced motion.
 - **Form timing**: do not show error chrome on pristine fields; validate after blur/submit, then clear errors as the user fixes input.
 - **Responsive behavior**: navigation, filters, tables, side panels, fixed boards, and action bars need a defined mobile behavior.
@@ -90,6 +92,7 @@ Before final delivery, internally verify this matrix:
 - Accessibility:
 - Form behavior:
 - Typography hierarchy:
+- Visual craft baseline:
 - Motion:
 - Responsive:
 - Live/security:

@@ -9,7 +9,7 @@ import {
 import path from 'node:path';
 import type { Page } from '@playwright/test';
 
-import { expect, test, type OrkasTestApp } from './fixtures/orkas';
+import { openSidebarEntry, expect, test, type OrkasTestApp } from './fixtures/orkas';
 import { estimateBudgetTokens } from '../../src/main/util/token-estimate';
 
 async function createCliAgent(
@@ -102,7 +102,7 @@ test.describe('CLI Agent runtime settings', () => {
       info: { mode: 'custom', path: selectedProjectDir, exists: true },
     });
 
-    await page.locator('#agents-btn').click();
+    await openSidebarEntry(page, '#agents-btn');
     const card = page.locator(`.agent-card[data-id="${agentId}"]`);
     await expect(card).toBeVisible({ timeout: 30_000 });
     await card.click();
@@ -185,13 +185,16 @@ test.describe('CLI Agent runtime settings', () => {
   });
 
   test('persists overrides, resets model-specific thinking, and restores CLI defaults', async ({ cliOrkas }) => {
+    // Three cold application launches are fixture preparation, not a single
+    // interaction's latency budget. Keep each model/element wait unchanged.
+    test.setTimeout(240_000);
     const agentName = 'CodexRuntimeSettingsE2E';
     const { page, agentId } = await createCliAgent(cliOrkas, agentName, 'codex');
     await cliOrkas.invoke('agents.update', {
       agent_id: agentId,
       updates: { icon: 'code', color: 'lime' },
     });
-    await page.locator('#agents-btn').click();
+    await openSidebarEntry(page, '#agents-btn');
     const card = page.locator(`.agent-card[data-id="${agentId}"]`);
     await expect(card).toBeVisible({ timeout: 30_000 });
     await card.click();
@@ -291,7 +294,7 @@ test.describe('CLI Agent runtime settings', () => {
       kind: 'cli', cli: 'codex', model_override: 'gpt-e2e-deep', thinking_level: 'low',
     });
     const relaunchedPage = await cliOrkas.relaunch();
-    await relaunchedPage.locator('#agents-btn').click();
+    await openSidebarEntry(relaunchedPage, '#agents-btn');
     await relaunchedPage.locator(`.agent-card[data-id="${agentId}"]`).click();
     await expect(relaunchedPage.locator('#agents-detail-cli-settings [data-role="model"]'))
       .toHaveAttribute('data-value', 'gpt-e2e-deep', { timeout: 30_000 });
@@ -324,7 +327,7 @@ test.describe('CLI Agent runtime settings', () => {
 
     // Clear each override through the real candidates tagged as defaults, then
     // prove the persisted runtime and the next native turn both omit the fields.
-    await relaunchedPage.locator('#agents-btn').click();
+    await openSidebarEntry(relaunchedPage, '#agents-btn');
     await relaunchedPage.locator(`.agent-card[data-id="${agentId}"]`).click();
     await expect(relaunchedPage.locator('#agents-detail-cli-settings [data-role="thinking"]'))
       .toHaveAttribute('data-value', 'low', { timeout: 30_000 });
@@ -355,7 +358,7 @@ test.describe('CLI Agent runtime settings', () => {
     expect(avatarAfterSettingsReset).toEqual(avatarBeforeSettingsReset);
 
     const defaultPage = await cliOrkas.relaunch();
-    await defaultPage.locator('#agents-btn').click();
+    await openSidebarEntry(defaultPage, '#agents-btn');
     await defaultPage.locator(`.agent-card[data-id="${agentId}"]`).click();
     await expect(defaultPage.locator('#agents-detail-cli-settings [data-role="model"]'))
       .toHaveAttribute('data-value', '', { timeout: 30_000 });
@@ -373,6 +376,38 @@ test.describe('CLI Agent runtime settings', () => {
     expect(defaultInvocation?.effort).toBeUndefined();
   });
 
+  test.describe('Claude body streaming', () => {
+
+    test('paints Claude body chunks after thinking before the full assistant record or result exists', async ({ cliOrkas }, testInfo) => {
+      const name = 'ClaudeStreamingBodyE2E';
+      const { page, agentId } = await createCliAgent(cliOrkas, name, 'claude');
+      const gate = cliOrkas.cliStatePath + '.claude-stream-stage';
+      writeFileSync(gate, '0');
+      const cid = await sendNewChat(page, `@${name} E2E_CLAUDE_STREAM_BODY`);
+      const body = page.locator('#chat-history .chat-message.assistant [data-role="final"]');
+      // The CLI withholds both the full text record and result. A renderer
+      // that paints only on completion cannot satisfy either prefix assertion.
+      await expect(body).toContainText('First paragraph.', { timeout: 30_000 });
+      await expect(body).not.toContainText('Second paragraph.');
+      await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+      writeFileSync(gate, '1');
+      await expect(body).toContainText('Second paragraph.');
+      await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+      await expect(page.locator('#chat-history .chat-message.assistant')).toHaveCount(1);
+      const live = await cliOrkas.invoke<any>('conversations.history', { cid });
+      expect(live.history.filter((row: any) => row.from === agentId)).toHaveLength(0);
+      await page.screenshot({ path: testInfo.outputPath('claude-streaming-body.png') });
+      writeFileSync(gate, '2');
+      await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+      await expect(body.locator('h2')).toHaveText('Report');
+      await expect(body.locator('p')).toHaveText(['First paragraph.', 'Second paragraph.']);
+      const saved = await cliOrkas.invoke<any>('conversations.history', { cid });
+      expect(saved.history.filter((row: any) => row.from === agentId).map((row: any) => row.text))
+        .toEqual(['## Report\n\nFirst paragraph.\n\nSecond paragraph.']);
+      expect(cliOrkas.readCliState().invocations.filter(run => run.cli === 'claude')).toHaveLength(1);
+    });
+  });
+
   test('labels Claude aliases and remembers only the matching concrete model', async ({ cliOrkas }) => {
     const agentName = 'ClaudeModelAliasE2E';
     const { page, agentId } = await createCliAgent(cliOrkas, agentName, 'claude');
@@ -383,7 +418,7 @@ test.describe('CLI Agent runtime settings', () => {
       },
     });
 
-    await page.locator('#agents-btn').click();
+    await openSidebarEntry(page, '#agents-btn');
     await page.locator(`.agent-card[data-id="${agentId}"]`).click();
     const model = page.locator('#agents-detail-cli-settings [data-role="model"]');
     await expect(model.locator('.ai-select-trigger'))
@@ -407,7 +442,7 @@ test.describe('CLI Agent runtime settings', () => {
     });
 
     const relaunchedPage = await cliOrkas.relaunch();
-    await relaunchedPage.locator('#agents-btn').click();
+    await openSidebarEntry(relaunchedPage, '#agents-btn');
     await relaunchedPage.locator(`.agent-card[data-id="${agentId}"]`).click();
     const relaunchedModel = relaunchedPage.locator(
       '#agents-detail-cli-settings [data-role="model"]',
@@ -656,6 +691,45 @@ test.describe('CLI failed-turn recovery', () => {
     expect(codexRuns[1].prompt).not.toContain('E2E_CODEX_DEFAULT_OK');
   });
 
+  test('continues a hung Codex resume in a fresh process with canonical recovery context and saves its replacement session', async ({ cliOrkas }, testInfo) => {
+    const agentName = 'CodexBootstrapRecoveryE2E';
+    const { page, agentId } = await createCliAgent(cliOrkas, agentName, 'codex');
+    const cid = await sendNewChat(page, `@${agentName} Earlier requirement: use amber-field.`);
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+      hasText: 'E2E_CODEX_DEFAULT_OK',
+    })).toHaveCount(1, { timeout: 30_000 });
+    await expect.poll(() => {
+      try { return JSON.parse(readFileSync(cliSessionFile(cliOrkas, cid), 'utf8'))[agentId]?.sessionId; }
+      catch { return null; }
+    }).toBe(cliOrkas.readCliState().invocations[0].sessionId);
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), codexResumeHangs: 1 }));
+    await cliOrkas.electronApp!.evaluate(() => { process.env.ORKAS_CODEX_BOOTSTRAP_TIMEOUT_MS = '1500'; });
+    await sendFollowUp(page, `@${agentName} Continue the earlier requirement.`);
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+      hasText: 'E2E_CODEX_DEFAULT_OK',
+    })).toHaveCount(2, { timeout: 30_000 });
+    await expect(page.locator('#chat-history .bubble-retry-btn')).toHaveCount(0);
+    const state = cliOrkas.readCliState();
+    const runs = state.invocations.filter(run => run.cli === 'codex');
+    expect(runs).toHaveLength(2); // The hung child never received the task.
+    expect(state.codexThreadRequests?.map(request => request.method)).toEqual(['thread/start', 'thread/resume', 'thread/start']);
+    expect(state.codexThreadRequests?.[1].pid).not.toBe(state.codexThreadRequests?.[2].pid);
+    expect(runs[1].resumeSessionId).toBeNull();
+    expect(runs[1].sessionId).not.toBe(runs[0].sessionId);
+    expect(runs[1].prompt).toContain('Earlier requirement: use amber-field.');
+    expect(runs[1].prompt).toContain('Continue the earlier requirement.');
+    await expect.poll(() => JSON.parse(readFileSync(cliSessionFile(cliOrkas, cid), 'utf8'))[agentId]?.sessionId)
+      .toBe(runs[1].sessionId);
+    await expect.poll(async () => JSON.stringify((await cliOrkas.invoke<{ history: unknown[] }>('conversations.history', { cid, limit: 20 })).history))
+      .toContain('cli-bootstrap-timeout');
+    await page.screenshot({ path: testInfo.outputPath('codex-bootstrap-recovered.png'), fullPage: true });
+    await sendFollowUp(page, `@${agentName} Check the saved requirement.`);
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+      hasText: 'E2E_CODEX_DEFAULT_OK',
+    })).toHaveCount(3, { timeout: 30_000 });
+    expect(cliOrkas.readCliState().invocations[2].resumeSessionId).toBe(runs[1].sessionId);
+  });
+
   test('steers a composer update into the active Codex App Server turn without starting another CLI run', async ({ cliOrkas }) => {
     // Queue absorption retired the local queue rows and their per-row "Send
     // now": steering the live turn is the composer steer button, visible only
@@ -688,6 +762,42 @@ test.describe('CLI failed-turn recovery', () => {
     expect(codexRuns).toHaveLength(1);
     expect(codexRuns[0].steers).toHaveLength(1);
     expect(codexRuns[0].steers?.[0].text).toContain('E2E_CODEX_SEND_NOW_UPDATE');
+  });
+
+  test.describe('native question history', () => {
+    for (const cli of ['claude', 'codex'] as const) {
+      test(`shows a native ${cli} answer once in the conversation and retains it after reload`, async ({ cliOrkas }, testInfo) => {
+        const name = cli === 'claude' ? 'ClaudeQuestionHistory' : 'CodexQuestionHistory';
+        const { page } = await createCliAgent(cliOrkas, name, cli);
+        const cid = await sendNewChat(page, `@${name} E2E_CLI_NATIVE_QUESTION`);
+        const card = page.locator('#chat-cli-questions');
+        await expect(card.getByRole('textbox', { name: 'Which scope?' })).toBeVisible({ timeout: 30_000 });
+        await card.getByRole('button', { name: 'Current', exact: true }).click();
+        await card.getByRole('button', { name: 'Send answer', exact: true }).click();
+        await expect(card).toBeHidden();
+        const answer = page.locator('#chat-history .chat-message.user', { hasText: 'Which scope?' });
+        await expect(answer).toHaveCount(1);
+        await expect(answer).toContainText('Current');
+        await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+          hasText: 'E2E_CLI_QUESTION_CONTINUED',
+        })).toBeVisible({ timeout: 30_000 });
+        const history = await cliOrkas.invoke<{ history: Array<{ from: string; text: string }> }>('conversations.history', { cid, limit: 20 });
+        expect(history.history.filter(row => row.from === 'user' && row.text === 'Which scope?\nCurrent')).toHaveLength(1);
+        await page.screenshot({ path: testInfo.outputPath('native-question-answer.png'), fullPage: true });
+        await Promise.all([
+          page.waitForEvent('domcontentloaded'),
+          cliOrkas.electronApp!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].webContents.reload()),
+        ]);
+        await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+        await expect(answer).toHaveCount(1);
+        await expect(answer).toContainText('Current');
+        await expect(card).toBeHidden();
+        const runs = cliOrkas.readCliState().invocations.filter(item => item.cli === cli);
+        expect(runs).toHaveLength(1);
+        expect(runs[0].questionAnswers).toEqual(cli === 'claude'
+          ? { 'Which scope?': 'Current' } : { scope: { answers: ['Current'] } });
+      });
+    }
   });
 
   test('cancels a live Codex question without an answer and keeps it dismissed after switching and reload', async ({ cliOrkas }) => {
@@ -732,7 +842,7 @@ test.describe('CLI failed-turn recovery', () => {
     const agentName = 'OpenCodeSendNowE2E';
     const { page } = await createCliAgent(cliOrkas, agentName, 'opencode');
     await sendNewChat(page, `@${agentName} E2E_CLI_SEND_NOW_ACTIVE`);
-    await expect.poll(() => cliOrkas.readCliState().invocations.length).toBe(1);
+    await expect.poll(() => cliOrkas.readCliState().invocations.length, { timeout: 30_000 }).toBe(1);
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
 
     const input = page.locator('#chat-input');

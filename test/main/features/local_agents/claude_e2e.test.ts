@@ -16,6 +16,7 @@ import {
   claudeBackend,
 } from '../../../../src/main/features/local_agents/backends/claude';
 import * as userInput from '../../../../src/main/features/local_agents/cli_user_input';
+import { ClaudeStreamDiagnostics } from '../../../../src/main/features/local_agents/backends/claude-stream-diagnostics';
 
 const isWindows = process.platform === 'win32';
 const itPosix = isWindows ? it.skip : it;
@@ -62,6 +63,83 @@ describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
     }
   });
 
+  it.each([false, true])('preserves streamed replies with diagnostic collection enabled=%s', async enabled => {
+    const prior = [process.env.ORKAS_DEVTOOLS, process.env.ORKAS_CLAUDE_STREAM_DIAGNOSTICS];
+    delete process.env.ORKAS_DEVTOOLS;
+    if (enabled) process.env.ORKAS_CLAUDE_STREAM_DIAGNOSTICS = '1';
+    else delete process.env.ORKAS_CLAUDE_STREAM_DIAGNOSTICS;
+    const reads = vi.spyOn(ClaudeStreamDiagnostics.prototype, 'beginRead');
+    const records = vi.spyOn(ClaudeStreamDiagnostics.prototype, 'record');
+    const forwards = vi.spyOn(ClaudeStreamDiagnostics.prototype, 'recordForward');
+    const summaries = vi.spyOn(ClaudeStreamDiagnostics.prototype, 'summary');
+    try {
+      const fake = writeNodeExecutable(tmpDir, 'claude-diagnostics', emitAfterPrompt([
+        { type: 'system', subtype: 'init', session_id: 'fixture-session' },
+        { type: 'stream_event', event: { type: 'message_start', message: { id: 'fixture-message' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Fixture reply.' } } },
+        { type: 'result', subtype: 'success', result: 'Fixture reply.' },
+      ].map(record => JSON.stringify(record))));
+      const events: any[] = [];
+      await claudeBackend.run({ binPath: fake, prompt: 'Describe the fixture', cwd: tmpDir,
+        signal: new AbortController().signal, timeoutMs: 3_000, onEvent: event => events.push(event) });
+      expect(events.filter(e => e.type === 'text-delta').map(e => e.text)).toEqual(['Fixture reply.']);
+      expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed', output: 'Fixture reply.' });
+      // Disabled diagnostics must skip collection itself, not merely hide its log.
+      for (const spy of [reads, records, forwards, summaries]) {
+        if (enabled) expect(spy).toHaveBeenCalled();
+        else expect(spy).not.toHaveBeenCalled();
+      }
+    } finally {
+      for (const spy of [reads, records, forwards, summaries]) spy.mockRestore();
+      ['ORKAS_DEVTOOLS', 'ORKAS_CLAUDE_STREAM_DIAGNOSTICS'].forEach((key, i) => {
+        if (prior[i] === undefined) delete process.env[key]; else process.env[key] = prior[i];
+      });
+    }
+  });
+
+  it.each([
+    { version: '2.0.0', flags: [] as string[], effort: undefined },
+    { version: '2.1.112', flags: ['--include-hook-events', '--effort'], effort: 'high' },
+  ])('executes with compatible parameters on Claude $version without changing the selected model', async ({ version, flags, effort }) => {
+    const trace = path.join(tmpDir, 'argv.json');
+    const fake = writeNodeExecutable(tmpDir, 'strict-claude', `
+const args = process.argv.slice(2);
+require('node:fs').writeFileSync(${JSON.stringify(trace)}, JSON.stringify(args));
+if (${version === '2.0.0'} && (args.includes('--include-hook-events') || args.includes('--effort'))) process.exit(2);
+` + emitAfterPrompt([
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'strict-session' }),
+      JSON.stringify({ type: 'result', subtype: 'success', result: 'compatible task completed' }),
+    ]) + "process.stdin.on('end', () => process.exit(0));\n");
+    const events: any[] = [];
+    await claudeBackend.run({
+      binPath: fake, cliVersion: version, cliFlags: flags, thinkingLevel: effort,
+      modelOverride: 'opus', prompt: 'Inspect the fixture', cwd: tmpDir,
+      signal: new AbortController().signal, onEvent: event => events.push(event), timeoutMs: 3_000,
+    });
+    expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed', output: 'compatible task completed' });
+    const args = JSON.parse(fs.readFileSync(trace, 'utf8'));
+    expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 2)).toEqual(['--model', 'opus']);
+    expect(args.includes('--include-hook-events')).toBe(version !== '2.0.0');
+    expect(args.includes('--effort')).toBe(version !== '2.0.0');
+    expect(args).not.toContain('--permission-mode');
+  });
+
+  it('uses the native default when an older supported CLI lacks the saved optional effort', async () => {
+    const proof = path.join(tmpDir, 'unwanted-task');
+    const fake = writeNodeExecutable(tmpDir, 'old-claude',
+      `require('node:fs').writeFileSync(${JSON.stringify(proof)}, JSON.stringify(process.argv.slice(2)));\n`
+      + emitAfterPrompt([JSON.stringify({ type: 'result', subtype: 'success', result: 'compatible run' })])
+      + "process.stdin.on('end', () => process.exit(0));\n");
+    const events: any[] = [];
+    await claudeBackend.run({
+      binPath: fake, cliVersion: '2.0.0', cliFlags: [], thinkingLevel: 'high',
+      prompt: 'Inspect the fixture', cwd: tmpDir,
+      signal: new AbortController().signal, onEvent: event => events.push(event), timeoutMs: 3_000,
+    });
+    expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed', output: 'compatible run' });
+    expect(JSON.parse(fs.readFileSync(proof, 'utf8'))).not.toContain('--effort');
+  });
+
   it('uses an exact 24-hour production background cap', () => {
     expect(CLAUDE_BACKGROUND_TIMEOUT_MS).toBe(24 * 60 * 60_000);
   });
@@ -80,6 +158,33 @@ describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
       expect.objectContaining({ type: 'done', status: 'failed', error: 'API connection failed' }),
     ]);
     expect(events).not.toContainEqual(expect.objectContaining({ type: 'status', status: 'result' }));
+  });
+
+  it('keeps forwarded child reports out of the reply across background continuation', async () => {
+    const fake = writeNodeExecutable(tmpDir, 'claude', emitAfterPrompt([
+      { type: 'system', subtype: 'init', session_id: 'forwarded-session' },
+      { type: 'system', subtype: 'task_started', task_id: 'audit', task_type: 'local_agent' },
+      { type: 'assistant', parent_tool_use_id: null, message: { id: 'main-1', content: [{ type: 'text', text: 'Reviewing.' }] } },
+      { type: 'assistant', parent_tool_use_id: 'audit-call', message: { id: 'child', content: [{ type: 'text', text: 'Child report.' }] } },
+      { type: 'result', subtype: 'success', result: 'Reviewing.' },
+      // A new foreground phase can reuse ids; parser de-duplication is turn scoped.
+      { type: 'assistant', parent_tool_use_id: 'audit-call', message: { id: 'child', content: [{ type: 'text', text: 'Child follow-up.' }] } },
+      { type: 'system', subtype: 'task_notification', task_id: 'audit', status: 'completed' },
+      { type: 'assistant', message: { id: 'main-2', content: [{ type: 'text', text: 'Final summary.' }] } },
+      { type: 'result', subtype: 'success', result: 'Final summary.' },
+    ].map(record => JSON.stringify(record))) + "process.stdin.on('end', () => process.exit(0));\n");
+    const events: any[] = [];
+    await claudeBackend.run({
+      binPath: fake, prompt: 'Review the fixture', cwd: tmpDir,
+      signal: new AbortController().signal, onEvent: event => events.push(event), timeoutMs: 3_000,
+    });
+    expect(events.filter(event => event.type === 'text-delta').map(event => event.text))
+      .toEqual(['Reviewing.', 'Final summary.']);
+    expect(events.filter(event => event.status === 'tool-progress').map(event => [event.callId, event.message]))
+      .toEqual([['audit-call', 'Child report.'], ['audit-call', 'Child follow-up.']]);
+    expect(events.filter(event => event.type === 'done')).toEqual([
+      expect.objectContaining({ status: 'completed', output: 'Reviewing.\n\nFinal summary.', finalMessageText: 'Final summary.' }),
+    ]);
   });
 
   it('parses a minimal completed conversation', async () => {
@@ -562,11 +667,11 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
       const firstId = deliveries[0].payload.request_id;
       await ingress.submit({ id: 'test-control', text: 'continue' });
       await vi.waitFor(() => expect(deliveries.some(row => row.channel === 'local-agent:user-input_cancelled' && row.payload.request_ids.includes(firstId))).toBe(true));
-      expect(userInput.respond(firstId, 'u-input', { 'question-0': ['Late'] })).toEqual({ handled: false });
+      expect(await userInput.respond(firstId, 'u-input', { 'question-0': ['Late'] })).toEqual({ handled: false });
       if (boundary === 'cancel') {
         await vi.waitFor(() => expect(requests).toEqual(['ask-1', 'ask-3']));
         const lastId = deliveries.filter(row => row.channel === 'local-agent:user-input').at(-1)!.payload.request_id;
-        expect(userInput.respond(lastId, 'u-input', { 'question-0': ['Current'] })).toEqual({ handled: true, cancelled: false });
+        expect(await userInput.respond(lastId, 'u-input', { 'question-0': ['Current'] })).toEqual({ handled: true, cancelled: false });
       }
       await run;
       const replies = JSON.parse(fs.readFileSync(trace, 'utf8'));
@@ -631,7 +736,7 @@ require('node:readline').createInterface({ input: process.stdin }).on('line', li
         await expect(userInput.cancelRequest(requestId, 'u-input')).resolves.toEqual(
           boundary === 'host-closed' ? { handled: false, closed: true } : { handled: false, unknown: true },
         );
-        expect(userInput.respond(requestId, 'u-input', { scope: ['Late answer'] })).toEqual({ handled: false });
+        expect(await userInput.respond(requestId, 'u-input', { scope: ['Late answer'] })).toEqual({ handled: false });
       }
       await ingress.submit({ id: 'test-control', text: 'continue' });
       if (boundary === 'confirmed') await expect(cancel).resolves.toEqual({ handled: true, cancelled: true });
@@ -1119,12 +1224,13 @@ process.stdin.on('data', (buf) => {
 
   /** User-confirmed shared budget: background work cannot renew a dispatch. */
   itPosix('stops background work at the original dispatch deadline without resuming side effects', async () => {
-    // Leave enough headroom for the fake CLI process to receive its first CPU
-    // slice under the full parallel suite. The background delay still exceeds
-    // the cap plus one watchdog polling quantum, so resetting or suspending
-    // the watchdog would incorrectly allow the later foreground work.
+    // Test the shared deadline after a real foreground/background handshake,
+    // independently of when the native process receives its first CPU slice.
+    // Timers and the child stay real. Advancing the parent's input clock at
+    // those observable boundaries must not renew or suspend the 2s budget.
     const foregroundTimeoutMs = 2_000;
     const backgroundDelayMs = foregroundTimeoutMs + Math.floor(foregroundTimeoutMs / 4) + 200;
+    const lateProof = path.join(tmpDir, 'past-original-deadline.txt');
     const fake = writeNodeExecutable(tmpDir, 'claude', `
 let started = false;
 const w = (line) => process.stdout.write(line + '\\n');
@@ -1135,6 +1241,7 @@ process.stdin.on('data', (buf) => {
   w('{"type":"system","subtype":"task_started","task_id":"bg-1","task_type":"local_bash","description":"slow job"}');
   w('{"type":"result","subtype":"success","result":"kicked off","total_cost_usd":0,"duration_ms":1}');
   setTimeout(() => {
+    require('node:fs').writeFileSync(${JSON.stringify(lateProof)}, 'forbidden continuation');
     w('{"type":"system","subtype":"task_notification","task_id":"bg-1","status":"completed","summary":"slow job done"}');
     w('{"type":"assistant","message":{"content":[{"type":"text","text":"foreground resumed"}]}}');
     // This continuation must never run after the original dispatch deadline.
@@ -1143,19 +1250,46 @@ process.stdin.on('data', (buf) => {
 `);
     const events: any[] = [];
     let pid = 0;
+    const controller = new AbortController();
+    const dispatchStartedAt = Date.now();
+    let clockNow = dispatchStartedAt;
+    let enteredForeground = false, enteredBackground = false;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => clockNow);
+    let completionGuard: ReturnType<typeof setTimeout> | undefined;
     try {
-      await claudeBackend.run({
+      const run = claudeBackend.run({
         binPath: fake,
         prompt: 'start the slow job',
         cwd: tmpDir,
-        signal: new AbortController().signal,
+        signal: controller.signal,
         onEvent: event => {
           events.push(event);
           if (event.type === 'process-info') pid = Number(event.pid);
+          if (event.type === 'status' && event.status === 'running' && !enteredForeground) {
+            enteredForeground = true;
+            clockNow = dispatchStartedAt + foregroundTimeoutMs / 2;
+          }
+          if (event.type === 'text-delta' && event.text === 'foreground resumed') controller.abort();
         },
-        onBackgroundRun: () => {},
+        onBackgroundRun: () => {
+          enteredBackground = true;
+          clockNow = dispatchStartedAt + foregroundTimeoutMs;
+        },
         timeoutMs: foregroundTimeoutMs,
       });
+      await Promise.race([
+        run,
+        new Promise<never>((_, reject) => {
+          completionGuard = setTimeout(() => {
+            controller.abort();
+            reject(new Error('The original dispatch deadline did not stop the background process'));
+          }, 5_000);
+        }),
+      ]);
+      clearTimeout(completionGuard);
+      clock.mockRestore();
+      expect(enteredForeground).toBe(true);
+      expect(enteredBackground).toBe(true);
       expect(events).not.toContainEqual(expect.objectContaining({
         type: 'text-delta',
         text: 'foreground resumed',
@@ -1167,7 +1301,11 @@ process.stdin.on('data', (buf) => {
         timeoutKind: 'wall',
       });
       await expectProcessToExit(pid, 2_000);
+      expect(fs.existsSync(lateProof)).toBe(false);
     } finally {
+      clearTimeout(completionGuard);
+      clock.mockRestore();
+      controller.abort();
       if (pid > 0) {
         try { process.kill(-pid, 'SIGKILL'); } catch { /* already exited */ }
       }

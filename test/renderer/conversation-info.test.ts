@@ -179,6 +179,39 @@ describe('ConversationInfo files tab', () => {
     });
   });
 
+  it('dismisses only the owning browser and remembers background dismissal without changing Files or Attachments', async () => {
+    await renderFilesResult({ history: [], files: { items: [] } }, context => {
+      const info = context.window.ConversationInfo;
+      const panel = context.document.getElementById('conversation-info-panel');
+      const body = context.document.getElementById('conversation-info-body');
+      info.openAndSetTab('browser');
+      info.closeBrowserForTask('c1');
+      expect(panel.hidden).toBe(true);
+      // Returning to the task must retain the automatic dismissal.
+      info.bind('c2');
+      info.bind('c1');
+      expect(panel.hidden).toBe(true);
+      info.openAndSetTab('browser');
+      info.bind('c2');
+      info.openAndSetTab('browser');
+      info.closeBrowserForTask('c1');
+      expect(panel.hidden).toBe(false);
+      info.bind('c1');
+      expect(panel.hidden).toBe(true);
+      for (const tab of ['files', 'attachments']) {
+        info.openAndSetTab(tab);
+        info.closeBrowserForTask('c1');
+        expect(panel.hidden).toBe(false);
+        expect(body.hidden).toBe(false);
+        info.bind('c2');
+        info.closeBrowserForTask('c1');
+        info.bind('c1');
+        expect(panel.hidden).toBe(false);
+        expect(body.hidden).toBe(false);
+      }
+    });
+  });
+
   // Membership now arrives already merged from
   // `features/conversation_outputs.ts`; what the panel still owns is where each
   // entry lands. A file written outside the workspace has no tree position, and

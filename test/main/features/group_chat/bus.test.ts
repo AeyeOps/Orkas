@@ -36,6 +36,8 @@ const streamProbe = vi.hoisted(() => ({
   dispatchResults: [] as string[],
   maxToolLoops: [] as Array<number | undefined>,
   toolLists: [] as Array<string[] | undefined>,
+  releaseDiagnostics: null as null | ((event: any) => void),
+  registerLateDiagnostics: null as null | ((pending: Promise<any>) => void),
 }));
 
 // Mock the model client so `runTurn` doesn't try to do a real LLM call.
@@ -55,6 +57,21 @@ vi.mock('../../../../src/main/model/client', () => ({
     streamProbe.maxToolLoops.push(typeof _opts?.maxToolLoops === 'number' ? _opts.maxToolLoops : undefined);
     streamProbe.toolLists.push(Array.isArray(_opts?.toolList) ? [..._opts.toolList] : undefined);
     const message = rawMessage;
+    if (message.includes('LATE_ROUTE_REGISTRATION_TEST')) {
+      streamProbe.registerLateDiagnostics = _opts.onDiagnosticsPending;
+      yield { type: 'final', text: 'Original task complete' };
+      yield { type: 'done' };
+      return;
+    }
+    if (message.includes('ASYNC_MODEL_ROUTE_TEST')) {
+      _opts.onDiagnosticsPending?.(new Promise(resolve => { streamProbe.releaseDiagnostics = resolve; }));
+      if (message.includes('CANCEL')) {
+        await new Promise<void>(resolve => _opts.abortSignal.addEventListener('abort', () => resolve(), { once: true }));
+        yield { type: 'error', text: 'Stopped', aborted: true };
+      } else yield { type: 'final', text: 'Answer delivered before diagnostics' };
+      yield { type: 'done' };
+      return;
+    }
     const reasoningMarker = 'REASONING_PROCESS_PERSISTENCE_TEST:';
     const reasoningIdx = message.indexOf(reasoningMarker);
     if (isCommanderTurn && reasoningIdx >= 0) {
@@ -178,6 +195,18 @@ vi.mock('../../../../src/main/model/client', () => ({
       );
       streamProbe.dispatchResults.push(String(result?.content || ''));
       yield { type: 'final', text: data.tool === 'hand_off_to' ? '' : 'commander synthesis ok' };
+      yield { type: 'done' };
+      return;
+    }
+    const steerDispatchMarker = 'CLI_STEER_DISPATCH_TEST:';
+    const steerDispatchIndex = message.indexOf(steerDispatchMarker);
+    if (isCommanderTurn && steerDispatchIndex >= 0) {
+      const data = JSON.parse(Buffer.from(message.slice(steerDispatchIndex + steerDispatchMarker.length)
+        .split(/\s/, 1)[0], 'base64').toString('utf8'));
+      const tool = _opts.extraTools.find((candidate: any) => candidate.name === 'dispatch_to');
+      const result = await tool.execute({ to: AGENT_NAME, message: data.task }, { signal: _opts.abortSignal });
+      streamProbe.dispatchResults.push(String(result?.content || ''));
+      yield { type: 'final', text: 'Commander received the CLI result.' };
       yield { type: 'done' };
       return;
     }
@@ -379,6 +408,7 @@ const cliRunMock = vi.hoisted(() => ({
   nextEvents: [] as any[],
   afterEvent: null as null | ((event: any) => void),
   activeIngress: null as any,
+  publishIngress: true,
   releaseActiveIngressRun: null as null | (() => void),
   submittedSteers: [] as any[],
 }));
@@ -390,7 +420,7 @@ vi.mock('../../../../src/main/features/local_agents/runner', () => ({
     cliRunMock.calls.push(opts);
     if (cliRunMock.activeIngress) {
       const ingress = cliRunMock.activeIngress;
-      opts.onActiveRunIngress?.(ingress);
+      if (cliRunMock.publishIngress) opts.onActiveRunIngress?.(ingress);
       await new Promise<void>((resolve) => { cliRunMock.releaseActiveIngressRun = resolve; });
       opts.onActiveRunIngress?.(null);
     }
@@ -419,6 +449,32 @@ const AGENT_ID = 'a83d30d995fd';
 const cidsToDrop = new Set<string>();
 const AGENT_NAME = '软件工程师';
 
+/** D29 default planner for bus tests: every mentioned actor gets the whole
+ * message as one parallel task. Tests that pin a specific split (order,
+ * fan-in, fallback) install their own stub. */
+async function defaultPlannerStub({ request }: { request?: { text: string; candidates: Array<{ key: string; mentioned: boolean }> } }): Promise<string> {
+  const tasks = (request?.candidates || []).filter((c) => c.mentioned)
+    .map((c, i) => ({ key: `t${i + 1}`, assignee: c.key, part: request!.text, after: [] }));
+  return JSON.stringify({ tasks, references: [], question: null });
+}
+
+/** A planner stub that returns this exact split. `assignee` is the planner's
+ * actor key: mentioned actors are a1, a2, … in first-mention order, and the
+ * Commander is `commander`. */
+function planFor(tasks: Array<{ assignee: string; part: string; after?: string[] }>, extra: Record<string, unknown> = {}) {
+  return async () => JSON.stringify({
+    tasks: tasks.map((task, i) => ({ key: `t${i + 1}`, after: [], ...task })),
+    references: [],
+    question: null,
+    ...extra,
+  });
+}
+
+async function installPlanner(model: Parameters<typeof import('../../../../src/main/features/group_chat/dispatch_planner')._setDispatchPlannerModelForTest>[0]): Promise<void> {
+  const planner = await import('../../../../src/main/features/group_chat/dispatch_planner');
+  planner._setDispatchPlannerModelForTest(model);
+}
+
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bus-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
@@ -432,6 +488,7 @@ beforeEach(async () => {
   cliRunMock.afterEvent = null;
   cliRunMock.activeIngress = null;
   cliRunMock.releaseActiveIngressRun = null;
+  cliRunMock.publishIngress = true;
   cliRunMock.submittedSteers.length = 0;
   streamProbe.messages.length = 0;
   streamProbe.conversationHistories.length = 0;
@@ -444,6 +501,7 @@ beforeEach(async () => {
   cidsToDrop.clear();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
+  await installPlanner(defaultPlannerStub);
 
   // Point the workspace at the `<tmpDir>/workspace` path these fixtures
   // already assume. Produced-file finalization is scoped to the roots Orkas
@@ -527,6 +585,24 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     await waitForQuiescent(TEST_UID, cid);
     expect(meter.taskTokens(cid)).toBe(0);
     expect(streamProbe.messages.length).toBeGreaterThan(before);
+  });
+
+  // 2026-10-04: an Agent reply that only named the commander in prose
+  // (`… 不带代码格式的 @指挥官 …`) was routed to it, started an unsolicited
+  // commander turn, and lost the mention from the persisted text.
+  it('an Agent reply naming @指挥官 in prose stays with the user and starts no commander turn', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = 'agent-prose-commander-mention';
+    cidsToDrop.add(cid);
+    const before = streamProbe.messages.length;
+    const text = '原因：那一格写的是不带代码格式的 @指挥官，系统就把整条回复当成了发给指挥官的消息。@commander 也一样。';
+    const msg = await bus.enqueue({ uid: TEST_UID, cid, fromActorId: AGENT_ID, text, turn_end: true });
+    await waitForQuiescent(TEST_UID, cid);
+    expect(msg.to).toEqual(['user']);
+    expect(msg.text).toContain('@指挥官');
+    expect(msg.text).toContain('@commander');
+    expect(streamProbe.messages).toHaveLength(before);
+    expect((await bus.listConversationTasks(TEST_UID, cid)).some((task) => task.assignee === 'commander')).toBe(false);
   });
 
   it('foreground enqueue cancels reflection and drains its started write before model execution', async () => {
@@ -770,6 +846,9 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const records = [
       { type: 'stream_event', event: { type: 'message_start', message: { id: 'm1' } } },
       { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: first.slice(0, 3) } } },
+      { type: 'stream_event', parent_tool_use_id: 'audit-child', event: { type: 'message_start', message: { id: 'child' } } },
+      { type: 'stream_event', parent_tool_use_id: 'audit-child', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Child audit report.' } } },
+      { type: 'assistant', parent_tool_use_id: 'audit-child', message: { id: 'child', content: [{ type: 'text', text: 'Child audit report.' }] } },
       { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: first.slice(3) } } },
       { type: 'assistant', message: { id: 'm1', content: [
         { type: 'text', text: first },
@@ -799,9 +878,21 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       .trim().split('\n').map(line => JSON.parse(line)).filter(row => row.from === AGENT_ID);
     expect(rows.map(row => row.text)).toEqual([first, '核对后是 8 万。', '已保存。']);
     expect(rows.map(row => row.seg)).toEqual([0, 1, 2]);
+    expect(rows.map(row => row.display_phase)).toEqual(['commentary', 'commentary', 'final_answer']);
+    expect(rows[0].process[0]).toEqual({ type: 'progress', text: first,
+      event: { stream: 'assistant', data: { phase: 'commentary', native_segment: 0 } } });
+    expect(rows[1].process[0].text).toBe('核对后是 8 万。');
+    const classified = live.filter(event => event.type === 'process' && event.data?.type === 'native-message-finalized');
+    expect(classified.map(event => event.data.text)).toEqual([first, '核对后是 8 万。']);
+    expect(live.indexOf(classified[0])).toBeLessThan(live.findIndex(event => event.type === 'process' && event.seg === 1 && event.data?.type === 'delta'));
     expect(new Set(rows.map(row => row.turn_id)).size).toBe(1);
     expect(rows[0].process).toContainEqual(expect.objectContaining({
       event: { stream: 'cli', data: expect.objectContaining({ tool: 'Read' }) },
+    }));
+    expect(rows[0].process).toContainEqual(expect.objectContaining({
+      event: { stream: 'cli', data: expect.objectContaining({
+        type: 'status', status: 'tool-progress', callId: 'audit-child', message: 'Child audit report.',
+      }) },
     }));
     expect(rows.slice(1).flatMap(row => row.process || [])
       .filter(item => item.event?.data?.tool === 'Read')).toEqual([]);
@@ -832,6 +923,9 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       .trim().split('\n').map(line => JSON.parse(line)).filter(row => row.from === AGENT_ID);
     expect(rows).toHaveLength(2);
     expect(rows[0].text).toBe('已核实的数据。');
+    expect(rows[0].display_phase).toBe('commentary');
+    expect(rows[0].process[0].text).toBe('已核实的数据。');
+    expect(rows[1].display_phase).toBe('final_answer');
     expect(rows[1].text).not.toContain('正在进行后续操作。');
     expect(rows[1].text).toContain(status === 'cancelled' ? 'Run aborted' : '⚠️');
     expect(rows[1].process).toContainEqual(expect.objectContaining({ type: 'progress', text: '正在进行后续操作。' }));
@@ -1144,11 +1238,66 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(msg.model_text).toBe('Please resolve the conflict using the hidden protocol.');
     expect(streamProbe.messages.some((m) => m.includes('Please resolve the conflict using the hidden protocol.'))).toBe(true);
     expect(streamProbe.messages.some((m) => m.includes('请帮我处理冲突。'))).toBe(false);
+    expect(streamProbe.messages.join('\n')).not.toContain('application-generated instructions is not a user language choice');
     expect(streamProbe.conversationHistories[0]).toMatchObject({
       source: `group-main-v8:${cid}`,
       messages: [],
     });
   });
+
+  it.each(['commander', AGENT_ID])('keeps original user language requirements on an internal turn from %s', async (sender) => {
+    const config = await import('../../../../src/main/features/config');
+    config.setLanguage('fr');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = `cid-internal-language-${sender}`;
+    cidsToDrop.add(cid);
+    const payload = '<continuation>Original user request: reply in Korean. Continue the work.</continuation>';
+    const msg = await bus.enqueue({ uid: TEST_UID, cid, fromActorId: sender,
+      forceTo: ['commander'], dispatch: true, text: 'Internal continuation', model_text: payload });
+    await waitForQuiescent(TEST_UID, cid);
+    expect(msg.model_text).toBe(payload);
+    const input = streamProbe.messages.find(message => message.includes(payload));
+    expect(input).toContain('Preserve the response language established by the original user request');
+    expect(input).toContain('including explicit language requirements');
+    expect(input).toContain('If no response language was established, use French (Français)');
+    expect(input?.match(/application-generated instructions is not a user language choice/g)).toHaveLength(1);
+  });
+
+  it.each([AGENT_NAME, 'commander'])( 'delivers a quote-only request to the explicitly mentioned %s', async (name) => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const msg = await bus.enqueue({
+      uid: TEST_UID, cid: TEST_CID, fromActorId: 'user', text: `@${name}`,
+      references: [{ source_cid: 'source-cid', source_msg_id: 'source-msg',
+        from_actor: 'user', source_ts: '2026-10-10T07:00:00Z',
+        text: 'Explain the root cause and proposed solution. @commander is quoted context.' }],
+    });
+    await waitForQuiescent(TEST_UID, TEST_CID);
+    expect(msg.to).toEqual([name === 'commander' ? 'commander' : AGENT_ID]);
+    expect(streamProbe.messages).toHaveLength(1);
+    expect(streamProbe.messages[0]).toContain('Explain the root cause and proposed solution.');
+    expect(streamProbe.messages[0]).toContain('<referenced-messages>');
+  });
+
+  it.each([`@${AGENT_NAME}`, '@commander', `@${AGENT_NAME} @commander`])(
+    'rejects an empty addressed request without saving a bubble or resetting stopped state: %s', async (text) => {
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const layout = await import('../../../../src/main/util/project-layout');
+      const board = await import('../../../../src/main/features/group_chat/task_board');
+      await state.setStatus(TEST_UID, TEST_CID, 'aborted');
+      const events: any[] = [];
+      const unsubscribe = bus.subscribe(TEST_UID, TEST_CID, (event) => events.push(event));
+      try {
+        await expect(bus.enqueue({ uid: TEST_UID, cid: TEST_CID, fromActorId: 'user', text }))
+          .rejects.toMatchObject({ code: 'E_EMPTY_MESSAGE' });
+        expect(fs.existsSync(layout.conversationMessageFile(TEST_UID, TEST_CID))).toBe(false);
+        expect(await board.listTasks(TEST_UID, TEST_CID)).toEqual([]);
+        expect((await state.readState(TEST_UID, TEST_CID)).status).toBe('aborted');
+        expect(events.filter((event) => event.type === 'message' || event.type === 'task_created')).toEqual([]);
+        expect(streamProbe.messages).toEqual([]);
+      } finally { unsubscribe(); }
+    },
+  );
 
   it('persists structured references and injects them as inert model context', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
@@ -1690,7 +1839,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       .not.toContain('AGENT_INTERPOSED_CANONICAL_COMMANDER_FACT');
   });
 
-  it('passes the explicit 100-round tool budget into a named agent run', async () => {
+  it('passes the explicit 500-round tool budget into a named agent run', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     await bus.enqueue({
       uid: TEST_UID, cid: TEST_CID, fromActorId: 'user',
@@ -1700,7 +1849,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
     const callIndex = streamProbe.messages.findIndex((message) => message.includes('执行一个长程任务'));
     expect(callIndex).toBeGreaterThanOrEqual(0);
-    expect(streamProbe.maxToolLoops[callIndex]).toBe(100);
+    expect(streamProbe.maxToolLoops[callIndex]).toBe(500);
   });
 
   it('admits a named Agent turn only after the short runtime-content publish window', async () => {
@@ -2705,6 +2854,45 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     }
   });
 
+  it.each(['claude', 'codex'])('persists and broadcasts a blocking %s question reply without starting another task', async cli => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+    cliRunMock.activeIngress = { submit: vi.fn(async () => ({ mode: 'steered' })) };
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = 'cid-cli-blocking-' + cli;
+    cidsToDrop.add(cid);
+    const events: any[] = [];
+    const unsub = bus.subscribe(TEST_UID, cid, event => events.push(event));
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Inspect this project.', forceTo: [AGENT_ID] });
+      await vi.waitFor(() => expect(cliRunMock.calls).toHaveLength(1));
+      const save = cliRunMock.calls[0].saveUserInput;
+      expect(save).toBeTypeOf('function');
+      await save('Which scope?\nCurrent', 'native-input-reply');
+      // A retry after the durable append must reuse the same message identity.
+      await save('Which scope?\nCurrent', 'native-input-reply');
+      await expect(save('Which scope?\nAll', 'native-input-reply')).rejects.toThrow('CLI answer identity conflict');
+      const replies = events.filter(event => event.msg?.id === 'native-input-reply');
+      expect(replies).toHaveLength(2);
+      expect(replies[0].msg).toMatchObject({ from: 'user', to: [AGENT_ID], text: 'Which scope?\nCurrent' });
+      cliRunMock.releaseActiveIngressRun?.();
+      cliRunMock.releaseActiveIngressRun = null;
+      await waitForQuiescent(TEST_UID, cid);
+      const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), cid + '.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(rows.filter(row => row.id === 'native-input-reply')).toHaveLength(1);
+      expect(rows.find(row => row.id === 'native-input-reply').text).toBe('Which scope?\nCurrent');
+      expect(cliRunMock.calls).toHaveLength(1);
+      expect(cliRunMock.activeIngress.submit).not.toHaveBeenCalled();
+    } finally {
+      cliRunMock.releaseActiveIngressRun?.();
+      cliRunMock.releaseActiveIngressRun = null;
+      unsub();
+    }
+  });
+
   it('keeps native async questions and their answers separate from the terminal reply without queueing another run', async () => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
@@ -2938,6 +3126,77 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(rows.every((task) => task.status === 'done')).toBe(true);
     expect(rows[0].result_msg_id).toBeTruthy();
     expect(rows[1].result_msg_id).toBe(rows[0].result_msg_id);
+  });
+
+  it.each(['steered', 'queued_followup', 'unavailable'] as const)('Send now into a Commander-dispatched CLI preserves the task and result when ingress is %s', async (mode) => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'codex' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+    cliRunMock.nextResult = { runId: 'dispatched-cli', status: 'completed', output: 'CLI task result.' };
+    cliRunMock.publishIngress = mode !== 'unavailable';
+    cliRunMock.activeIngress = {
+      submit: vi.fn(async (input: any) => {
+        cliRunMock.submittedSteers.push(input);
+        return { mode, acceptedId: input.id };
+      }),
+    };
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const board = await import('../../../../src/main/features/group_chat/task_board');
+    const cid = `cid-dispatched-cli-steer-${mode}`;
+    cidsToDrop.add(cid);
+    const chats = await import('../../../../src/main/features/chats');
+    await chats.createConversation(TEST_UID, { conversationId: cid });
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user',
+        text: `CLI_STEER_DISPATCH_TEST:${Buffer.from(JSON.stringify({ task: 'Implement the CLI feature.' })).toString('base64')}` });
+      await vi.waitFor(() => expect(cliRunMock.calls).toHaveLength(1));
+      expect(bus.runtimeSnapshot(TEST_UID, cid).activeTurns).toEqual([
+        expect.objectContaining({ actor: AGENT_ID, steerable: mode !== 'unavailable' }),
+      ]);
+      const child = (await board.listTasks(TEST_UID, cid)).find(task => task.created_by === 'commander')!;
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Discuss the plan first.', forceTo: [AGENT_ID] });
+      const queued = (await board.listTasks(TEST_UID, cid)).find(task => task.status === 'queued')!;
+      const promotion = await bus.sendConversationTaskNow(TEST_UID, cid, queued.task_id);
+      if (mode === 'unavailable') {
+        expect(promotion).toEqual({ ok: false, error: 'turn_not_steerable' });
+        expect(cliRunMock.submittedSteers).toHaveLength(0);
+      } else {
+        expect(promotion).toMatchObject({ ok: true, turn_id: child.turn_id });
+        await vi.waitFor(() => expect(cliRunMock.submittedSteers).toHaveLength(1));
+        expect(cliRunMock.submittedSteers[0].text).toContain('Discuss the plan first.');
+      }
+      if (mode === 'steered') {
+        await vi.waitFor(async () => expect((await board.listTasks(TEST_UID, cid)).find(task => task.task_id === queued.task_id))
+          .toMatchObject({ status: 'running', absorbed_into_task_id: child.task_id }));
+      } else {
+        expect((await board.listTasks(TEST_UID, cid)).find(task => task.task_id === queued.task_id))
+          .toMatchObject({ status: 'queued' });
+      }
+      cliRunMock.activeIngress = null;
+      cliRunMock.releaseActiveIngressRun?.();
+      cliRunMock.releaseActiveIngressRun = null;
+      await waitForQuiescent(TEST_UID, cid);
+      const rows = await board.listTasks(TEST_UID, cid);
+      const settledChild = rows.find(task => task.task_id === child.task_id)!;
+      const update = rows.find(task => task.task_id === queued.task_id)!;
+      expect(settledChild).toMatchObject({ status: 'done', instruction: 'Implement the CLI feature.' });
+      expect(update.status).toBe('done');
+      expect(streamProbe.dispatchResults).toHaveLength(1);
+      expect(streamProbe.dispatchResults[0]).toContain('CLI task result.');
+      expect(cliRunMock.calls).toHaveLength(mode === 'steered' ? 1 : 2);
+      if (mode === 'steered') expect(update.result_msg_id).toBe(settledChild.result_msg_id);
+      else expect(cliRunMock.calls[1].prompt).toContain('Discuss the plan first.');
+      const messages = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+        .split('\n').filter(Boolean).map(line => JSON.parse(line));
+      expect(messages.filter(message => message.from === 'user' && message.text === 'Discuss the plan first.')).toHaveLength(1);
+      expect(loggerMocks.warn).not.toHaveBeenCalled();
+    } finally {
+      cliRunMock.activeIngress = null;
+      cliRunMock.releaseActiveIngressRun?.();
+      cliRunMock.releaseActiveIngressRun = null;
+    }
   });
 
   it('keeps an explicitly non-steering CLI message in FIFO despite Send now attribution', async () => {
@@ -3393,12 +3652,10 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     // Nothing the commander says can write an automation any more: the reply
     // is prose and the `auto_tasks` tool is the only writer.
     expect(await autoTasks.listTasks(TEST_UID)).toEqual([]);
-    // The user picked this agent with an explicit `@` mention, so the capability
-    // handback buys the commander THIS turn only — the microphone stays with
-    // the agent and the user's next mention-less message returns to it.
+    // An explicit CLI bridge transfer returns the default reply target too.
     const handbackFloor = await state.readState(TEST_UID, cid);
-    expect(handbackFloor.active_recipient).toBe(AGENT_ID);
-    expect(handbackFloor.active_recipient_source).toBe('user_selection');
+    expect(handbackFloor.active_recipient).toBeUndefined();
+    expect(handbackFloor.active_recipient_source).toBeUndefined();
 
     // The handback itself is what this case owns; the automation write lives in
     // the `auto_tasks` tool (`auto_tasks_tool.test.ts`) since the container
@@ -3409,7 +3666,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       && String(row.text || '').includes('benchmark automation'))).toHaveLength(1);
   });
 
-  it('lends the commander one turn on a capability handback and routes the next message back to the user-picked agent', async () => {
+  it('returns the reply target to Commander on an explicit CLI capability handback', async () => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
     const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
@@ -3440,17 +3697,12 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(streamProbe.messages.some((message) => (
       message.includes('CLI_USER_FLOOR_HANDBACK_TEST')
     ))).toBe(true);
-    // ...without taking the microphone the user handed to the agent.
+    // ...and owns the next ordinary user reply as well.
     const afterHandback = await state.readState(TEST_UID, cid);
-    expect(afterHandback.active_recipient).toBe(AGENT_ID);
-    expect(afterHandback.active_recipient_source).toBe('user_selection');
+    expect(afterHandback.active_recipient).toBeUndefined();
+    expect(afterHandback.active_recipient_source).toBeUndefined();
 
     // The next message carries NO mention, so it routes purely by the floor.
-    cliRunMock.nextResult = {
-      runId: 'user-floor-follow-up',
-      status: 'completed',
-      output: 'Picking the work back up.',
-    };
     const followUp = await bus.enqueue({
       uid: TEST_UID,
       cid,
@@ -3459,11 +3711,12 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     });
     await waitForQuiescent(TEST_UID, cid);
 
-    expect(followUp.to).toEqual([AGENT_ID]);
+    expect(followUp.to).toEqual(['commander']);
+    expect(cliRunMock.calls).toHaveLength(1);
     const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
       .trim().split('\n').map((line) => JSON.parse(line));
     const followUpRow = rows.find((row: any) => row.text === 'keep going');
-    expect(followUpRow?.to).toEqual([AGENT_ID]);
+    expect(followUpRow?.to).toEqual(['commander']);
   });
 
   it('does not wake Commander from a handoff request attached to a failed CLI run', async () => {
@@ -3851,6 +4104,52 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       type: 'event',
       event: { stream: 'cli', data: safeEvent },
     });
+  });
+
+  it('publishes a CLI shell-created file from this turn but not an existing workspace file', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'claude' };
+    fs.writeFileSync(agentFile, JSON.stringify(spec));
+
+    const cid = 'cid-cli-shell-output';
+    const workspace = path.join(tmpDir, 'cli-shell-workspace');
+    const screenshot = path.join(workspace, 'shots', 'dialog.png');
+    const olderFile = path.join(workspace, 'notes', 'existing.png');
+    fs.mkdirSync(path.dirname(olderFile), { recursive: true });
+    fs.writeFileSync(olderFile, Buffer.from('pre-existing bytes'));
+    const past = new Date(Date.now() - 60 * 60 * 1000);
+    fs.utimesSync(olderFile, past, past);
+
+    // An existing user file rewritten during the run stays foreign: only
+    // files created by the run may be adopted.
+    const editedFile = path.join(workspace, 'notes', 'edited.png');
+    fs.writeFileSync(editedFile, Buffer.from('user bytes'));
+    let accepted: string[] | undefined;
+    // A native shell command (e.g. a Playwright screenshot) writes the file;
+    // no Write/Edit tool event names it.
+    cliRunMock.nextEvents.push({ type: 'text-delta', text: 'Captured.', itemId: 'm1' });
+    cliRunMock.afterEvent = () => {
+      if (accepted) return;
+      fs.mkdirSync(path.dirname(screenshot), { recursive: true });
+      fs.writeFileSync(screenshot, Buffer.from('png bytes'));
+      fs.writeFileSync(editedFile, Buffer.from('user bytes, edited'));
+      accepted = cliRunMock.calls[0].onOutputsPublished([screenshot, olderFile, editedFile]);
+    };
+    cliRunMock.nextResult = { runId: 'cli-shell-output', status: 'completed', output: 'Captured.' };
+
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} take the screenshot`, forceTo: [AGENT_ID] });
+    await waitForQuiescent(TEST_UID, cid);
+
+    expect(accepted).toEqual([screenshot]);
+    const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === AGENT_ID);
+    expect(reply?.produced).toEqual([screenshot]);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(olderFile)).toBe(false);
+    expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(editedFile)).toBe(false);
   });
 
   it('publishes a managed Codex image file inline and does not restore it as an unsent attachment', async () => {
@@ -4365,6 +4664,26 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(failure?.text).not.toContain('internal raw timeout detail');
   });
 
+
+  it.each(['model_unsupported', 'parameter_unsupported'])('persists a structured CLI compatibility recovery: %s', async cliError => {
+    const paths = await import('../../../../src/main/paths');
+    const file = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+    const spec = JSON.parse(fs.readFileSync(file, 'utf8'));
+    spec.runtime = { kind: 'cli', cli: 'codex', model_override: 'gpt-6.1-sol' };
+    fs.writeFileSync(file, JSON.stringify(spec));
+    cliRunMock.nextResult = { runId: 'compatibility-fixture', status: 'failed', cliError,
+      error: 'A selected CLI capability needs an upgrade.' };
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = 'cid-cli-compat-' + cliError;
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} run the task` });
+    await waitForQuiescent(TEST_UID, cid);
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), cid + '.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    const failure = rows.find(row => row.from === AGENT_ID && row.failure_kind === 'dependency');
+    expect(failure?.failure_code).toBe(cliError);
+    expect(failure?.text).toContain('A selected CLI capability needs an upgrade.');
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).runtime.model_override).toBe('gpt-6.1-sol');
+    expect(cliRunMock.calls).toHaveLength(1);
+  });
   it('reports an installed CLI version-probe timeout separately from not found', async () => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
@@ -5845,29 +6164,27 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
     } finally { release(); streamProbe.slowGate = null; }
   });
 
-  it('edits a waiting segment without rewriting its running sibling or breaking the dependency', async () => {
+  it('keeps planned tasks read-only because their message entered history before planning', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
-    const cid = 'cid-edit-queued-segment';
+    const cid = 'cid-edit-planned-task';
     cidsToDrop.add(cid);
+    await installPlanner(planFor([
+      { assignee: 'commander', part: 'DEFERRED_SLOW_TURN_TEST predecessor' },
+      { assignee: 'a1', part: 'later part', after: ['t1'] },
+    ]));
     let release: () => void = () => {};
     streamProbe.slowGate = new Promise<void>((resolve) => { release = resolve; });
-    const original = `@commander DEFERRED_SLOW_TURN_TEST predecessor @${AGENT_NAME} obsolete segment`;
     try {
-      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: original, multiDispatch: 'serial' });
-      const before = await userRows(cid);
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user',
+        text: `@commander DEFERRED_SLOW_TURN_TEST predecessor @${AGENT_NAME} later part` });
+      expect(await userRows(cid)).toHaveLength(1);
       const queued = (await bus.listConversationTasks(TEST_UID, cid)).find((row) => row.status === 'queued')!;
-      expect(queued.after).toBeTruthy();
-      const result = await bus.editConversationTask(TEST_UID, cid, queued.task_id, 'DEFERRED_SLOW_TURN_TEST revised segment only', queued.instruction);
-      expect(result).toMatchObject({ ok: true, task: {
-        task_id: queued.task_id, assignee: AGENT_ID, after: queued.after, instruction: 'DEFERRED_SLOW_TURN_TEST revised segment only',
-      } });
-      expect(result.task!.source_msg_id).not.toBe(queued.source_msg_id);
-      expect(await userRows(cid)).toEqual(before);
+      expect(queued).toMatchObject({ assignee: AGENT_ID, instruction: 'later part' });
+      expect(queued.after).toHaveLength(1);
+      expect(bus.beginConversationTaskEdit(TEST_UID, cid, queued.task_id)).toMatchObject({ ok: false, error: 'not_editable' });
     } finally { release(); streamProbe.slowGate = null; }
     await waitForQuiescent(TEST_UID, cid, 5000);
-    expect((await userRows(cid)).at(-1)).toBe('DEFERRED_SLOW_TURN_TEST revised segment only');
-    expect(streamProbe.messages.some((message) => message.includes('DEFERRED_SLOW_TURN_TEST revised segment only'))).toBe(true);
-    expect((await bus.listConversationTasks(TEST_UID, cid)).find((row) => row.assignee === AGENT_ID)?.status).toBe('done');
+    expect((await bus.listConversationTasks(TEST_UID, cid)).every((row) => row.status === 'done')).toBe(true);
   });
 
   it('rejects edits while Send now is still persisting the original message', async () => {
@@ -6076,83 +6393,89 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
     expect(['done', 'stopped', 'failed', 'cancelled']).toContain(promoted?.status);
   });
 
-  it('cancels every parallel recipient when their shared bubble cannot persist', async () => {
+  it('creates no task when a planned send cannot persist its message', async () => {
     const storage = await import('../../../../src/main/storage');
     const append = vi.spyOn(storage, 'appendJsonlAtomic')
-      .mockRejectedValueOnce(new Error('injected deferred history failure'));
+      .mockRejectedValueOnce(new Error('injected history failure'));
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const taskBoard = await import('../../../../src/main/features/group_chat/task_board');
-    const cid = 'cid-deferred-shared-persist-failure';
+    const cid = 'cid-planned-persist-failure';
     cidsToDrop.add(cid);
+    let planned = 0;
+    await installPlanner(async (input) => { planned += 1; return defaultPlannerStub(input); });
 
-    await bus.enqueue({
+    await expect(bus.enqueue({
       uid: TEST_UID,
       cid,
       fromActorId: 'user',
       text: `@指挥官 inspect persistence @${AGENT_NAME} do not execute`,
-      multiDispatch: 'parallel',
-    });
+    })).rejects.toThrow('injected history failure');
     await waitForQuiescent(TEST_UID, cid, 5000);
     append.mockRestore();
 
+    expect(planned).toBe(0);
     expect(await userRows(cid)).toEqual([]);
-    expect(streamProbe.messages.join('\n')).not.toContain('inspect persistence');
     expect(streamProbe.messages.join('\n')).not.toContain('do not execute');
-    const rows = await taskBoard.listTasks(TEST_UID, cid);
-    expect(rows.filter((task) => task.source_msg_id).map((task) => task.status))
-      .toEqual(['cancelled', 'cancelled']);
+    expect(await taskBoard.listTasks(TEST_UID, cid)).toEqual([]);
   });
 });
 
-describe('D22 segmentation: commander segments (2026-08-27)', () => {
-  // An unaddressed first instruction belongs to the default recipient.
-  // Both implicit and explicit Commander segments precede the Agent's own
-  // instruction without broadcasting the full text to either recipient.
-  async function boardRows(cid: string) {
-    const taskBoard = await import('../../../../src/main/features/group_chat/task_board');
-    return taskBoard.listTasks(TEST_UID, cid);
+describe('D29 planned dispatch (2026-10-04)', () => {
+  // A user who orchestrates several actors gets the arranged tasks on the
+  // board directly: one planner call proposes the split, the host validates
+  // it, and every task receives the whole message plus its own part — the
+  // text is never cut at mention positions again.
+  async function userRows(cid: string): Promise<string[]> {
+    const paths = await import('../../../../src/main/paths');
+    const file = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+    if (!fs.existsSync(file)) return [];
+    return fs.readFileSync(file, 'utf8').trim().split('\n')
+      .filter(Boolean).map((line) => JSON.parse(line))
+      .filter((row: any) => row.from === 'user').map((row: any) => String(row.text));
   }
 
-  it('dispatches a substantive preamble to Commander before the mentioned Agent segment', async () => {
+  it('plans prose before a mention; each task gets the whole message and its own part', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
-    const cid = 'cid-d22-preamble';
+    const taskBoard = await import('../../../../src/main/features/group_chat/task_board');
+    const cid = 'cid-d29-preamble';
     cidsToDrop.add(cid);
-    await bus.enqueue({
-      uid: TEST_UID,
-      cid,
-      fromActorId: 'user',
-      text: `写一个登录页 @${AGENT_NAME} 出这个页面的视觉稿`,
-    });
+    await installPlanner(planFor([
+      { assignee: 'commander', part: 'WRITE_LOGIN_PAGE' },
+      { assignee: 'a1', part: 'DESIGN_THE_PAGE', after: ['t1'] },
+    ]));
+    const text = `写一个登录页 WRITE_LOGIN_PAGE，然后 @${AGENT_NAME} 出这个页面的视觉稿 DESIGN_THE_PAGE`;
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text });
     await waitForQuiescent(TEST_UID, cid, 5000);
 
-    const rows = await boardRows(cid);
-    const commanderRow = rows.find((t) => t.assignee === 'commander');
-    const agentRow = rows.find((t) => t.assignee === AGENT_ID);
-    expect(commanderRow?.instruction).toBe('写一个登录页');
-    expect(commanderRow?.after).toBeUndefined();
-    expect(agentRow?.instruction).toBe('出这个页面的视觉稿');
-    expect(agentRow?.after).toBe(commanderRow?.task_id);
+    const rows = await taskBoard.listTasks(TEST_UID, cid);
+    const commanderRow = rows.find((t) => t.assignee === 'commander')!;
+    const agentRow = rows.find((t) => t.assignee === AGENT_ID)!;
+    expect(commanderRow).toMatchObject({ instruction: 'WRITE_LOGIN_PAGE', status: 'done' });
+    expect(commanderRow.after).toBeUndefined();
+    expect(agentRow).toMatchObject({ instruction: 'DESIGN_THE_PAGE', after: [commanderRow.task_id] });
+    const inputs = streamProbe.messages.filter((message) => message.includes('<task-assignment>'));
+    expect(inputs).toHaveLength(2);
+    for (const input of inputs) {
+      expect(input).toContain('写一个登录页 WRITE_LOGIN_PAGE');
+      expect(input).toContain('出这个页面的视觉稿 DESIGN_THE_PAGE');
+    }
+    expect(await userRows(cid)).toEqual([text]);
   });
 
-  it('an explicit @指挥官 mention segments instead of broadcasting the full text', async () => {
+  it('never calls the planner for a message that starts with its only mentioned actor', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
-    const cid = 'cid-d22-mixed';
+    const taskBoard = await import('../../../../src/main/features/group_chat/task_board');
+    const cid = 'cid-d29-direct';
     cidsToDrop.add(cid);
-    await bus.enqueue({
-      uid: TEST_UID,
-      cid,
-      fromActorId: 'user',
-      text: `@指挥官 总结一下现状 @${AGENT_NAME} 跑一遍回归`,
-    });
+    let planned = 0;
+    await installPlanner(async (input) => { planned += 1; return defaultPlannerStub(input); });
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} 先做a，再做b @${AGENT_NAME} 都由你来` });
     await waitForQuiescent(TEST_UID, cid, 5000);
-
-    const rows = await boardRows(cid);
-    const commanderRow = rows.find((t) => t.assignee === 'commander');
-    const agentRow = rows.find((t) => t.assignee === AGENT_ID);
-    // Each actor got ONLY its own span — no same-text broadcast.
-    expect(commanderRow?.instruction).toBe('总结一下现状');
-    expect(agentRow?.instruction).toBe('跑一遍回归');
-    expect(agentRow?.after).toBe(commanderRow?.task_id);
+    expect(planned).toBe(0);
+    const rows = await taskBoard.listTasks(TEST_UID, cid);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ assignee: AGENT_ID });
+    expect(streamProbe.messages.some((message) => message.includes('<task-assignment>'))).toBe(false);
   });
 });
 

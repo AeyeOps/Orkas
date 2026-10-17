@@ -1,6 +1,17 @@
 import type { Page } from '@playwright/test';
 import { expect, test } from './fixtures/orkas';
 
+// Classic-script globals are available in the renderer's main world. These
+// declarations let presentation cases control OS state without changing the
+// machine's notification settings or opening System Settings.
+declare const _settingsState: {
+  taskNotifications: {
+    enabled: boolean;
+    permission: { state: string; can_open_settings: boolean };
+  };
+};
+declare function _settingsRenderTaskNotifications(): void;
+
 async function openGeneralSettings(page: Page): Promise<void> {
   await page.locator('#settings-btn').click();
   await expect(page.locator('#panel-settings')).toHaveClass(/\bactive\b/);
@@ -11,6 +22,72 @@ async function openGeneralSettings(page: Page): Promise<void> {
 }
 
 test.describe('settings persistence', () => {
+
+  for (const [language, width] of [['en', 1280], ['zh', 620]] as const) {
+    test.describe(`notification permission recovery ${language}`, () => {
+      test(`keeps the warning with task notifications at ${width}px`, async ({ appPage }, testInfo) => {
+        await appPage.setViewportSize({ width, height: 900 });
+        await openGeneralSettings(appPage);
+        await appPage.evaluate(async language => { await (window as any).setLang(language); }, language);
+        await expect(appPage.locator('html')).toHaveAttribute('lang', language === 'zh' ? 'zh-CN' : 'en');
+        const toggle = appPage.locator('#settings-task-notifications-toggle');
+        await expect(toggle).toBeEnabled();
+        const warning = appPage.locator('#settings-task-notification-permission');
+        const openSettings = appPage.locator('#settings-task-notification-open-settings');
+        const validation = appPage.locator('#settings-operator-title');
+        const render = async (state: string, enabled = true) => {
+          await appPage.evaluate(({ state, enabled }) => {
+            _settingsState.taskNotifications = {
+              enabled, permission: { state, can_open_settings: true },
+            };
+            _settingsRenderTaskNotifications();
+          }, { state, enabled });
+        };
+
+        await render('denied');
+        await expect(warning).toBeVisible();
+        await expect(openSettings).toBeVisible();
+        await expect(toggle).toBeChecked();
+        const layout = await warning.evaluate(element => {
+          const previous = element.previousElementSibling!;
+          const sheet = element.parentElement!;
+          const style = getComputedStyle(element);
+          return {
+            followsNotifications: !!previous.querySelector('#settings-task-notifications-toggle'),
+            borderTop: style.borderTopColor,
+            borderLeft: style.borderLeftColor,
+            borderWidth: style.borderTopWidth,
+            fitsSheet: element.getBoundingClientRect().right <= sheet.getBoundingClientRect().right,
+            noOverflow: sheet.scrollWidth <= sheet.clientWidth + 1,
+          };
+        });
+        expect.soft(layout.followsNotifications).toBe(true);
+        expect.soft(layout.borderTop).toBe(layout.borderLeft);
+        expect(layout.borderWidth).toBe('1px');
+        expect(layout.fitsSheet).toBe(true);
+        expect(layout.noOverflow).toBe(true);
+        const warningBox = (await warning.boundingBox())!;
+        const validationBox = (await validation.boundingBox())!;
+        expect.soft(warningBox.y + warningBox.height).toBeLessThanOrEqual(validationBox.y);
+        await openSettings.focus();
+        await expect(openSettings).toBeFocused();
+        await warning.locator('..').screenshot({ path: testInfo.outputPath(`notification-recovery-${language}-${width}.png`) });
+
+        for (const state of ['granted', 'not_determined', 'unknown']) {
+          await render(state);
+          await expect(warning).toBeHidden();
+        }
+        await render('denied', false);
+        await expect(warning).toBeHidden();
+        await expect(toggle).not.toBeChecked();
+        await render('presentation_disabled');
+        await expect(warning).toBeVisible();
+        await expect(appPage.locator('#settings-task-notification-permission-text'))
+          .toHaveAttribute('data-i18n', 'settings.task_notifications.presentation_disabled');
+        await expect(validation).toBeVisible();
+      });
+    });
+  }
 
   test('switches tabs immediately while settings loads and preserves the choice after repeated loads', async ({ orkas }) => {
     const page = orkas.page!;

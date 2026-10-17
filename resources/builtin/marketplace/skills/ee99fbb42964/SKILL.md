@@ -26,6 +26,9 @@ This Skill performs deterministic processing only; it never calls a model.
   discovery leads only; never use them as support for a delivered factual claim.
 - `caps` values are ceilings, not collection targets. Stop early when evidence is
   sufficient; do not raise platform tool or network limits.
+- Keep the default caps for a detailed or comprehensive research request. Lower
+  the fetch caps only for a stated user, task, cost, or resume budget, recorded
+  as `caps_reason`.
 - On the compact landscape path, use at most five initial fetches, then choose
   the smallest useful follow-up batch after an evidence/readiness check. Eight
   total fetches is an efficiency target, never a completeness test or default
@@ -60,15 +63,26 @@ This Skill performs deterministic processing only; it never calls a model.
 3. For long evidence, run `compress`, use its ranked `data.kept` result within
    the character budget, and persist the result.
 4. Build narrow claims only from the compact evidence ledger and run
-   `citations --op verify`.
-5. Deliver claims you have checked for meaning and whose citations pass
+   `citations --op verify`. A claim that compares magnitudes, including a ratio
+   you compute, carries `baseline`: the comparator and version, and whether it is
+   the direct predecessor or the comparator the primary source itself uses.
+5. Before delivery, check coverage. Search saved full texts for reference lists,
+   compared model or product names, and contemporaneous work the authors name.
+   A companion or directly compared report that a primary source names (the
+   verifier's `coverage_leads` lists such names) is fetched or listed as a named
+   gap, and so is a baseline that is not the predecessor the vendor compares
+   against.
+6. Deliver claims you have checked for meaning and whose citations pass
    verification. Research and verify again only when a resolvable gap could
    materially change the conclusion.
 
-Use `{"url":"...","maxChars":12000}` as both the default and the maximum
-`web_fetch` size for ordinary research evidence on this path, and never refetch
-the same normalized URL with a larger `maxChars` after compaction. When a tool
-result spills, make at most two distinct, narrowly targeted `tool_result`
+Fetch ordinary research evidence with `{"url":"...","maxChars":12000}`. When a
+truncated primary source may hold decision-changing evidence further on, such as
+result tables, appendices, or its reference list, continue it with the `offset`
+the result reports instead of a larger `maxChars` or a shell download, and log
+each window as a continuation row. Log a binary or navigation-only result as
+`no_content` and switch to an HTML or text version of the same document. When a
+tool result spills, make at most two distinct, narrowly targeted `tool_result`
 searches against its valid persisted result ref, never repeat a query, then save
 the exact quotes and move on.
 

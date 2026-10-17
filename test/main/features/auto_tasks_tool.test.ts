@@ -106,11 +106,18 @@ describe('auto_tasks shared tool', () => {
     expect(cleared).toMatchObject({ schedule: draft.schedule, content: draft.content, enabled: false, project_id: pid });
   });
 
-  it('reports a saved automation for the host click-through, and nothing on delete', async () => {
+  it('reports a saved automation for the host click-through, and a delete only as a withdrawal', async () => {
     // The retired `<auto-task>` container had the bus stage this offer; the tool
     // is the only writer now, so it reports the save (2026-09-13, review P3-2).
-    const saved: string[] = [];
-    const tool = createTool({ userId: uid, cid: 'cid-auto-nav', onSaved: (id) => saved.push(id) });
+    // A delete never counts as a save; it is reported separately so the host can
+    // drop a link staged earlier in the same turn (2026-10-10 duplicate-chip fix).
+    const saved: unknown[] = [];
+    const deletedIds: string[] = [];
+    const tool = createTool({
+      userId: uid, cid: 'cid-auto-nav',
+      onSaved: (id, title) => saved.push([id, title]),
+      onDeleted: (id) => deletedIds.push(id),
+    });
     const created = await run(tool, {
       action: 'create',
       title: 'Nightly digest',
@@ -118,11 +125,39 @@ describe('auto_tasks shared tool', () => {
       schedule: { type: 'daily', hour: 22, minute: 0 },
     });
     expect(created.ok).toBe(true);
-    expect(saved).toEqual([created.taskId]);
+    expect(saved).toEqual([[created.taskId, 'Nightly digest']]);
+    expect((await run(tool, { action: 'update', task_id: created.taskId, title: 'Updated digest' })).ok).toBe(true);
+    expect(saved).toEqual([[created.taskId, 'Nightly digest'], [created.taskId, 'Updated digest']]);
+    const before = saved.slice();
+    await run(tool, { action: 'get', task_id: created.taskId });
+    expect((await run(tool, { action: 'update', task_id: 'missing', title: 'Rejected' })).isError).toBe(true);
 
+    expect(deletedIds).toEqual([]);
+
+    expect((await run(tool, { action: 'delete', task_id: 'missing' })).isError).toBe(true);
+    expect(deletedIds).toEqual([]);
     const deleted = await run(tool, { action: 'delete', task_id: created.taskId });
     expect(deleted.ok).toBe(true);
-    expect(saved).toEqual([created.taskId]);
+    expect(saved).toEqual(before);
+    expect(deletedIds).toEqual([created.taskId]);
+  });
+
+  it('keeps scoped and global automation creation independent across rejection, edit and deletion', async () => {
+    const scoped = createTool({ userId: uid, projectId: pid });
+    const created = await run(scoped, { action: 'create', ...draft });
+    expect(created.ok).toBe(true);
+    const unscoped = createTool({ userId: uid });
+    const globalCreate = await run(unscoped, { action: 'create', ...draft });
+    expect(globalCreate.ok).toBe(true);
+    const refused = await run(unscoped, { action: 'create', ...draft, project_id: 'p_missing' });
+    expect(refused.isError).toBe(true);
+    // Reading, editing and deleting are not creations; neither is a rejected input.
+    await run(scoped, { action: 'update', task_id: created.taskId, title: 'Renamed' });
+    await run(scoped, { action: 'delete', task_id: created.taskId });
+    await run(scoped, { action: 'create', content: draft.content });
+
+    expect((await run(scoped, { action: 'get', task_id: created.taskId })).isError).toBe(true);
+    expect((await run(unscoped, { action: 'get', task_id: globalCreate.taskId })).task).toMatchObject({ content: draft.content, schedule: draft.schedule });
   });
 
   it('pages filtered summaries and retrieves complete long content without changing saved schedules', async () => {
@@ -178,6 +213,10 @@ describe('auto_tasks shared tool', () => {
     expect(new Set(received)).toEqual(new Set(saved.filter(task => task.enabled).map(task => task.id)));
     expect(await run(tool, { action: 'list', enabled: false, offset: 37 })).toMatchObject({ tasks: [], total: 37, next_offset: null });
     expect(await run(tool, { action: 'list', offset: 999 })).toMatchObject({ tasks: [], total: 75, next_offset: null });
+    const defaultPage = await run(tool, { action: 'list', offset: 2, enabled: false });
+    for (const limit of [-1, 0, 51, 1000]) {
+      expect(await run(tool, { action: 'list', offset: 2, enabled: false, limit })).toEqual(defaultPage);
+    }
     const detail = await run(tool, { action: 'get', task_id: saved[0].id });
     expect(detail.task.content).toBe(content);
     expect(detail.task).not.toHaveProperty('device_id');
@@ -220,8 +259,8 @@ describe('auto_tasks shared tool', () => {
       { action: 'create', ...draft, userId: 'foreign' },
       { action: 'create', ...draft, schedule: { type: 'daily', hour: 24, minute: 0 } },
       { action: 'create', content: draft.content },
-      { action: 'list', limit: 51 },
-      { action: 'list', limit: 0 },
+      { action: 'list', limit: 1.5 },
+      { action: 'list', limit: '20' },
       { action: 'list', offset: -1 },
       { action: 'list', offset: Number.MAX_SAFE_INTEGER + 1 },
       { action: 'list', enabled: 'false' },

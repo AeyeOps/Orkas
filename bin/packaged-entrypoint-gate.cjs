@@ -111,6 +111,7 @@ const PACKAGED_BIN_ENTRYPOINTS = Object.freeze([
 // surfaces themselves. App-owned connector entrypoints load this proxy
 // bootstrap so their fetch can follow the route selected by Electron main.
 const PACKAGED_BIN_HELPERS = Object.freeze([
+  'local-cli-lark-permission-contract.json',
   // Shared automation schema loaded by both the packaged Orkas bridge and
   // the in-process auto_tasks tool.
   'auto-tasks-contract.cjs',
@@ -119,6 +120,9 @@ const PACKAGED_BIN_HELPERS = Object.freeze([
   // Loaded by the retained Google Workspace bundle, never a standalone catalog transport.
   'gmail-mcp-server.cjs',
   'bridge-tool-input.cjs',
+  'skill-esm-loader.cjs',
+  'tool-input-compat.cjs',
+  'browser-tool-contract.cjs',
   'connector-discovery-contract.cjs',
   // Lark CLI shortcut contract required by local-cli-mcp-server.cjs.
   'local-cli-lark.cjs',
@@ -212,6 +216,7 @@ const PACKAGED_BIN_HELPERS = Object.freeze([
 const DORMANT_BIN_FILES = Object.freeze([]);
 
 const BUILD_ONLY_BIN_FILES = Object.freeze([
+  'tool-input-compat.d.cts',
   'builtin-resource-gate.cjs',
   'ensure-runtime.cjs',
   'native-package-gate.cjs',
@@ -241,6 +246,8 @@ const PACKAGED_JS_LOADER_FILES = Object.freeze([
 // proxy-bootstrap.cjs.
 const PACKAGED_MCP_RUNTIME_UNPACK_GLOBS = Object.freeze([
   'node_modules/@modelcontextprotocol/sdk/**/*',
+  'node_modules/@modelcontextprotocol/server/**/*',
+  'node_modules/@modelcontextprotocol/core/**/*',
   'node_modules/ajv/**/*',
   'node_modules/ajv-formats/**/*',
   'node_modules/zod/**/*',
@@ -258,6 +265,10 @@ const PACKAGED_MCP_RUNTIME_UNPACK_GLOBS = Object.freeze([
 ]);
 
 const PACKAGED_MCP_RUNTIME_FILES = Object.freeze([
+  { lockPath: 'node_modules/@modelcontextprotocol/server', packageName: '@modelcontextprotocol/server', entries: ['dist/index.cjs', 'dist/stdio.cjs'] },
+  { lockPath: 'node_modules/@modelcontextprotocol/core', packageName: '@modelcontextprotocol/core', entries: ['dist/index.cjs'] },
+  { lockPath: 'node_modules/@modelcontextprotocol/server/node_modules/zod', packageName: 'zod', entries: ['index.cjs', 'v4/index.cjs'] },
+  { lockPath: 'node_modules/@modelcontextprotocol/core/node_modules/zod', packageName: 'zod', entries: ['index.cjs', 'v4/index.cjs'] },
   {
     lockPath: 'node_modules/@modelcontextprotocol/sdk',
     packageName: '@modelcontextprotocol/sdk',
@@ -516,6 +527,28 @@ function verifyRuntimeConsumerReferences(projectRoot) {
   }
 }
 
+// Development and beforePack share the executable bridge dependency check.
+// These packages are pure JS; the same lock/version contract serves all targets.
+function verifyBridgeSdkRuntime(projectRoot) {
+  const packageLock = readJson('package-lock.json', path.join(projectRoot, 'package-lock.json'));
+  const bridgePackages = PACKAGED_MCP_RUNTIME_FILES.filter(spec =>
+    spec.lockPath.startsWith('node_modules/@modelcontextprotocol/server')
+    || spec.lockPath.startsWith('node_modules/@modelcontextprotocol/core')
+    || spec.packageName === 'zod-to-json-schema');
+  for (const spec of bridgePackages) {
+    const installed = readJson(`${spec.lockPath} package.json`, path.join(projectRoot, spec.lockPath, 'package.json'));
+    if (installed.version !== packageLockPathVersion(packageLock, spec.lockPath)) {
+      throw new Error(`[packaged-entrypoint-gate] bridge dependency ${spec.lockPath} does not match package-lock.json`);
+    }
+  }
+  const fromProject = Module.createRequire(path.join(projectRoot, 'package.json'));
+  if (typeof fromProject('@modelcontextprotocol/server').McpServer !== 'function'
+    || typeof fromProject('@modelcontextprotocol/server/stdio').serveStdio !== 'function'
+    || typeof fromProject('zod-to-json-schema').zodToJsonSchema !== 'function') {
+    throw new Error('[packaged-entrypoint-gate] bridge dependency exports are unavailable');
+  }
+}
+
 function verifySourceEntrypointContract(projectRoot) {
   projectRoot = path.resolve(projectRoot);
   const expected = [
@@ -527,7 +560,14 @@ function verifySourceEntrypointContract(projectRoot) {
   assertExactFiles('source bin directory', sourceBinFiles(projectRoot), expected);
 
   for (const name of expected) {
-    assertCommonJsSyntax(`source bin/${name}`, path.join(projectRoot, 'bin', name));
+    // Type declarations are build inputs, never executable CommonJS payloads.
+    if (BUILD_ONLY_BIN_FILES.includes(name) && name.endsWith('.d.cts')) {
+      requiredFile(`source bin/${name}`, path.join(projectRoot, 'bin', name));
+    } else if (name.endsWith('.json')) {
+      readJson(`source bin/${name}`, path.join(projectRoot, 'bin', name));
+    } else {
+      assertCommonJsSyntax(`source bin/${name}`, path.join(projectRoot, 'bin', name));
+    }
   }
 
   const packageJson = readJson('package.json', path.join(projectRoot, 'package.json'));
@@ -675,7 +715,8 @@ function verifyPackagedEntrypointPayload(pcRoot, options = {}) {
   for (const name of PACKAGED_BIN_HELPERS) {
     const file = path.join(binRoot, name);
     requiredFile(`runtime helper bin/${name}`, file);
-    assertCommonJsSyntax(`runtime helper bin/${name}`, file);
+    if (name.endsWith('.json')) readJson(`runtime helper bin/${name}`, file);
+    else assertCommonJsSyntax(`runtime helper bin/${name}`, file);
     verified.push(`helper:bin/${name}`);
   }
 
@@ -748,4 +789,5 @@ module.exports = {
   verifyPackagedConnectorRuntime,
   verifyPackagedEntrypointPayload,
   verifySourceEntrypointContract,
+  verifyBridgeSdkRuntime,
 };

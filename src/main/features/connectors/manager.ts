@@ -1583,7 +1583,7 @@ function _oauthConnectErrorCode(err: unknown): string {
  *  that lifecycle from the click request and sends the real terminal result back as a push event.
  *
  *  A flow that receives no callback before its OAuth state expires is abandonment, not a product
- *  failure, so `flow_timeout` deliberately produces no terminal failure event or user alert. */
+ *  failure. Its UI-only cancellation clears busy feedback without a failure metric or alert. */
 export function beginOAuthConnect(
   uid: string,
   catalogId: string,
@@ -1638,6 +1638,10 @@ export function beginOAuthConnect(
     const code = _oauthConnectErrorCode(err);
     if (code === 'flow_timeout') {
       log.info('connector authorization expired without callback', { catalog_id: catalogId });
+      broadcastOAuthConnectOutcome({
+        attempt_id: attemptId, catalog_id: catalogId, result: 'cancelled', code,
+        duration_ms: Math.max(0, Date.now() - startedAt),
+      });
       return;
     }
     const cancelled = code === 'user_cancelled' || code === 'superseded';
@@ -1849,6 +1853,8 @@ export async function authorizeCustomInstance(
     return _connectAndCacheTools(uid, updated, undefined, runtimeEpoch);
   } catch (error) {
     _assertRuntimeEpoch(runtimeEpoch);
+    // Expiry ends the current attempt without invalidating an existing authorization.
+    if (_oauthConnectErrorCode(error) === 'flow_timeout') throw error;
     const reason = String((error as Error | null)?.message || '');
     const safeMessage = /^(DCR registration failed: HTTP [0-9]{3}|token endpoint HTTP [0-9]{3}|provider does not support client metadata or DCR registration)$/.test(reason)
       ? reason : 'OAuth authorization failed; reconnect to try again';
@@ -1879,6 +1885,11 @@ export function beginCustomOAuthConnect(uid: string, id: string): OAuthConnectSt
   }).catch((error) => {
     if (runtimeEpoch !== _runtimeEpoch) return;
     const code = _oauthConnectErrorCode(error);
+    if (code === 'flow_timeout') {
+      broadcastOAuthConnectOutcome({ attempt_id: attemptId, catalog_id: id,
+        result: 'cancelled', code, duration_ms: Math.max(0, Date.now() - startedAt) });
+      return;
+    }
     broadcastOAuthConnectOutcome({ attempt_id: attemptId, catalog_id: id,
       result: code === 'user_cancelled' || code === 'superseded' ? 'cancelled' : 'failure',
       duration_ms: Date.now() - startedAt, code,

@@ -2,6 +2,56 @@ import { describe, it, expect } from 'vitest';
 import { buildClaudeArgs, mapClaudeEvent, extractClaudeUsage } from '../../../../src/main/features/local_agents/backends/claude';
 
 describe('local_agents/backends/claude › mapClaudeEvent', () => {
+  it('keeps interleaved subagent reports in their tool process without corrupting the main stream', () => {
+    const state = { sawTextStreamEvent: false, toolNamesByCallId: new Map<string, string>() };
+    const records = [
+      { type: 'stream_event', parent_tool_use_id: null, event: { type: 'message_start', message: { id: 'main' } } },
+      { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Main ' } } },
+      { type: 'stream_event', parent_tool_use_id: 'agent-a', event: { type: 'message_start', message: { id: 'child-a' } } },
+      { type: 'stream_event', parent_tool_use_id: 'agent-a', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Child report' } } },
+      { type: 'assistant', parent_tool_use_id: 'agent-a', message: { id: 'child-a', content: [
+        { type: 'text', text: 'Child report' },
+        { type: 'tool_use', id: 'child-read', name: 'Read', input: { file_path: 'fixture.png' } },
+      ] } },
+      { type: 'assistant', parent_tool_use_id: 'agent-b', message: { id: 'child-b', content: [{ type: 'text', text: 'Other report' }] } },
+      // A replay must not duplicate a child's report, even after another child spoke.
+      { type: 'assistant', parent_tool_use_id: 'agent-a', message: { id: 'child-a', content: [{ type: 'text', text: 'Child report' }] } },
+      { type: 'user', parent_tool_use_id: 'agent-a', message: { content: [{ type: 'tool_result', tool_use_id: 'child-read', content: [
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aW1hZ2U=' } },
+      ] }] } },
+      { type: 'stream_event', parent_tool_use_id: null, event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'answer' } } },
+      { type: 'assistant', message: { id: 'main', content: [{ type: 'text', text: 'Main answer' }] } },
+    ];
+    const events = records.flatMap(record => {
+      const parsed = mapClaudeEvent(record, undefined, state);
+      return parsed?.events || (parsed?.event ? [parsed.event] : []);
+    });
+    expect(events.filter(event => event.type === 'text-delta')).toEqual([
+      { type: 'text-delta', text: 'Main ', itemId: 'main' },
+      { type: 'text-delta', text: 'answer', itemId: 'main' },
+    ]);
+    expect(events.filter(event => event.type === 'status')).toEqual([
+      { type: 'status', status: 'tool-progress', tool: 'Agent', callId: 'agent-a', message: 'Child report' },
+      { type: 'status', status: 'tool-progress', tool: 'Agent', callId: 'agent-b', message: 'Other report' },
+    ]);
+    expect(events.filter(event => event.type === 'tool-event')).toEqual([
+      { type: 'tool-event', tool: 'Read', callId: 'child-read', phase: 'use', input: { file_path: 'fixture.png' } },
+      { type: 'tool-event', tool: 'tool_result', callId: 'child-read', phase: 'result', output: '' },
+    ]);
+    expect(events.some(event => event.type === 'media-output')).toBe(false);
+  });
+
+  it('isolates full-record child fallbacks without interpreting text or nested look-alike fields', () => {
+    const state = { sawTextStreamEvent: false };
+    const parse = (record: any) => mapClaudeEvent(record, undefined, state)?.event;
+    expect(parse({ type: 'assistant', parent_tool_use_id: 'child', message: { id: 'shared', content: [{ type: 'thinking', thinking: 'Child reasoning' }] } }))
+      .toMatchObject({ type: 'thinking' });
+    expect(parse({ type: 'assistant', parent_tool_use_id: 'child', message: { id: 'shared', content: [{ type: 'text', text: 'Report' }] } }))
+      .toMatchObject({ type: 'status', callId: 'child', message: 'Report' });
+    expect(parse({ type: 'assistant', message: { id: 'shared', parent_tool_use_id: 'not-an-envelope-field', content: [{ type: 'text', text: 'Report' }] } }))
+      .toEqual({ type: 'text-delta', text: 'Report', itemId: 'shared' });
+  });
+
   it('captures session id AND emits status:running on system/init (parity with multica)', () => {
     const r = mapClaudeEvent({ type: 'system', subtype: 'init', session_id: 'sess-1', cwd: '/x' }, undefined);
     expect(r?.captureSession).toBe(true);
@@ -685,7 +735,7 @@ describe('local_agents/backends/claude › Orkas permissions', () => {
     const args = buildClaudeArgs({});
     expect(args).not.toContain('--permission-mode');
     expect(args).not.toContain('--dangerously-skip-permissions');
-    expect(args).toContain('--include-hook-events');
+    expect(args).not.toContain('--include-hook-events');
     expect(args.slice(args.indexOf('--permission-prompt-tool'), args.indexOf('--permission-prompt-tool') + 2)).toEqual(['--permission-prompt-tool', 'stdio']);
     expect(args).not.toContain('--model');
   });
@@ -701,9 +751,15 @@ describe('local_agents/backends/claude › Orkas permissions', () => {
   });
 
   it('applies explicit per-Agent model and effort overrides', () => {
-    const args = buildClaudeArgs({ modelOverride: 'opus', thinkingLevel: 'high' });
+    const args = buildClaudeArgs({ modelOverride: 'opus', thinkingLevel: 'high', cliFlags: ['--effort'] });
     expect(args.slice(args.indexOf('--model'), args.indexOf('--model') + 4)).toEqual([
       '--model', 'opus', '--effort', 'high',
     ]);
+  });
+
+  it('adds optional hook events only when the selected binary advertises them', () => {
+    expect(buildClaudeArgs({ cliFlags: ['--include-hook-events'] })).toContain('--include-hook-events');
+    expect(buildClaudeArgs({ cliFlags: ['--effort'] })).not.toContain('--include-hook-events');
+    expect(buildClaudeArgs({ thinkingLevel: 'high', cliFlags: [] })).not.toContain('--effort');
   });
 });

@@ -15,6 +15,8 @@ interface RetryOptions {
 }
 
 export interface FetchRetryOptions extends RetryOptions {
+  /** Per-call transport; shares the same retry, abort and response-body deadline. */
+  fetch?: FetchImplementation;
   /** Per-attempt wall-clock timeout. Omitted by default so large downloads can opt in deliberately. */
   timeoutMs?: number;
   timeoutMessage?: string;
@@ -29,12 +31,22 @@ export function setFetchImplementation(impl: FetchImplementation | null): void {
 
 export class RetriableHttpStatusError extends Error {
   status: number;
+  retryAfterMs?: number;
 
-  constructor(status: number, label = 'request') {
+  constructor(status: number, label = 'request', retryAfter?: string | null) {
     super(`${label} http ${status}`);
     this.name = 'RetriableHttpStatusError';
     this.status = status;
+    if (retryAfter) {
+      const seconds = Number(retryAfter);
+      const wait = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
+      if (Number.isFinite(wait) && wait >= 0) this.retryAfterMs = Math.ceil(wait);
+    }
   }
+}
+
+export class RequestTimeoutError extends Error {
+  constructor(message: string) { super(message); this.name = 'RequestTimeoutError'; }
 }
 
 export function isRetriableHttpStatus(status: number): boolean {
@@ -78,6 +90,7 @@ export async function retryAsync<T>(
       return await fn();
     } catch (err) {
       lastErr = err;
+      if (opts.signal?.aborted) throw abortReason(opts.signal);
       if (attempt >= retries || !isRetriable(err)) throw err;
       const nextDelay = delaysMs[Math.min(attempt, delaysMs.length - 1)] ?? 0;
       log.warn('request failed; retrying', {
@@ -149,22 +162,25 @@ export async function fetchAndReadWithRetry<T>(
   readBody: (response: Response, signal?: AbortSignal) => Promise<T>,
   opts: FetchRetryOptions = {},
 ): Promise<{ response: Response; body: T }> {
+  const parent = init?.signal && opts.signal ? AbortSignal.any([init.signal, opts.signal])
+    : init?.signal ?? opts.signal;
   return retryAsync(label, async () => {
     const timeoutMessage = opts.timeoutMessage || `${label} timed out after ${opts.timeoutMs}ms`;
-    const composed = composeTimeoutSignal(init?.signal ?? undefined, opts.timeoutMs, timeoutMessage);
+    const composed = composeTimeoutSignal(parent ?? undefined, opts.timeoutMs, timeoutMessage);
     try {
-      const res = await (fetchImplementation || fetch)(input, { ...init, signal: composed.signal });
+      const res = await (opts.fetch || fetchImplementation || fetch)(input, { ...init, signal: composed.signal });
       if (isRetriableHttpStatus(res.status)) {
-        throw new RetriableHttpStatusError(res.status, label);
+        throw new RetriableHttpStatusError(res.status, label, res.headers.get('retry-after'));
       }
       return { response: res, body: await readBody(res, composed.signal) };
     } catch (err) {
-      if (composed.timedOut()) throw new Error(timeoutMessage);
+      if (composed.timedOut()) throw new RequestTimeoutError(timeoutMessage);
       throw err;
     } finally {
       composed.cleanup();
     }
   }, {
+    signal: parent ?? undefined,
     retries: opts.retries,
     delaysMs: opts.delaysMs,
     isRetriable: opts.isRetriable,

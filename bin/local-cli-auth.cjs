@@ -8,6 +8,36 @@ const { spawn, spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const path = require('node:path');
 const permissions = require('./local-cli-permissions.cjs');
+const larkPermissionContract = require('./local-cli-lark-permission-contract.json');
+
+function larkScopeRequirements(env) {
+  const domains = JSON.parse(env.ORKAS_LOCAL_CLI_ALLOWED_DOMAINS_JSON || '[]');
+  return domains.map(domain => {
+    const requirement = larkPermissionContract.domains[domain];
+    if (!requirement) throw new Error('unsupported local CLI permission domain');
+    return requirement;
+  });
+}
+
+function larkRequiredScopes(env) {
+  return [...new Set(larkScopeRequirements(env).flatMap(({ all, any }) =>
+    [...all, ...any.map(group => group[0])]))].sort();
+}
+
+// Only declared API alternatives count as equivalent. Shortcut preflight
+// scopes remain exact requirements; prefixes cannot establish equivalence.
+function larkScopeEvidence(env, granted) {
+  const requirements = larkScopeRequirements(env);
+  const exact = new Set(requirements.flatMap(({ all }) => all));
+  const groups = requirements.flatMap(({ any }) => any);
+  const actual = new Set(granted);
+  const evidence = new Set(granted);
+  for (const scope of new Set(groups.map(group => group[0]))) {
+    if (!exact.has(scope) && groups.filter(group => group[0] === scope)
+      .every(group => group.some(alternative => actual.has(alternative)))) evidence.add(scope);
+  }
+  return [...evidence];
+}
 
 const MANIFESTS = Object.freeze({
   wecom: Object.freeze({
@@ -35,6 +65,7 @@ const MANIFESTS = Object.freeze({
       [
         'auth', 'login', '--profile', env.ORKAS_LOCAL_CLI_PROFILE,
         '--domain', JSON.parse(env.ORKAS_LOCAL_CLI_ALLOWED_DOMAINS_JSON).join(','),
+        '--scope', larkRequiredScopes(env).join(' '),
       ],
     ],
     verify: (env) => [
@@ -98,14 +129,19 @@ function run(node, npxCli, packageSpec, args, env, allowExisting = false, offlin
     });
     let outputForwarded = false;
     let stdout = '';
+    let stderr = '';
     let overflow = false;
+    const captureLimit = captureStdout === 'tee' ? 512 * 1024 : 64 * 1024;
     for (const [source, target] of [[child.stdout, process.stdout], [child.stderr, process.stderr]]) {
+      if (captureStdout && source === child.stderr) source.on('data', chunk => {
+        if (stderr.length + chunk.length <= 64 * 1024) stderr += chunk.toString();
+      });
       if (captureStdout && source === child.stdout) {
         source.on('data', chunk => {
-          if (!overflow && stdout.length + chunk.length <= 64 * 1024) stdout += chunk.toString();
+          if (!overflow && stdout.length + chunk.length <= captureLimit) stdout += chunk.toString();
           else { overflow = true; stdout = ''; }
         });
-        continue;
+        if (captureStdout !== 'tee') continue;
       }
       source.on('data', () => { outputForwarded = true; });
       source.pipe(target, { end: false });
@@ -121,7 +157,7 @@ function run(node, npxCli, packageSpec, args, env, allowExisting = false, offlin
       process.removeListener('SIGINT', forward);
       if (code === 0 || allowExisting) resolve(captureStdout && !overflow ? stdout : undefined);
       else reject(Object.assign(new Error(`official CLI exited with ${code ?? signal ?? 'unknown'}`), {
-        outputForwarded,
+        outputForwarded, ...(captureStdout && !overflow ? { stdout, stderr } : {}),
       }));
     });
   });
@@ -142,7 +178,7 @@ function commandSucceeds(node, npxCli, manifest, args, env, runner = spawnSync) 
   return !result.error && result.status === 0;
 }
 
-function larkUserScopes(node, npxCli, manifest, env, runner = spawnSync) {
+function larkUserScopes(node, npxCli, manifest, env, runner = spawnSync, requireReport = true) {
   const verify = manifest.verify(env);
   const result = runner(
     node,
@@ -160,21 +196,23 @@ function larkUserScopes(node, npxCli, manifest, env, runner = spawnSync) {
   try {
     const status = JSON.parse(String(result.stdout || ''));
     const user = status?.identities?.user;
-    const scopes = typeof user?.scope === 'string' ? user.scope.split(/\s+/)
+    const reported = typeof user?.scope === 'string' || Array.isArray(user?.scope);
+    const scopes = typeof user?.scope === 'string' ? user.scope.split(/\s+/).filter(Boolean)
       : Array.isArray(user?.scope) ? user.scope : [];
     return user?.available === true && user?.verified === true
-      ? scopes.filter(permissions.isScopeName) : null;
+      ? reported && scopes.every(permissions.isScopeName) ? scopes : requireReport ? null : [] : null;
   } catch {
     return null;
   }
 }
 
 function larkAuthorizationReady(node, npxCli, manifest, env, runner = spawnSync, requiredScopes = []) {
-  const scopes = larkUserScopes(node, npxCli, manifest, env, runner);
+  const scopes = larkUserScopes(node, npxCli, manifest, env, runner, requiredScopes.length > 0);
   return scopes !== null && requiredScopes.every((scope) => scopes.includes(scope));
 }
 
 function checkLarkPermissions(node, npxCli, manifest, env, runner = spawnSync) {
+  if (manifest.package !== larkPermissionContract.package) return false;
   const pending = permissions.readPermissionRequest(env);
   let scopeReported = false;
   const scopes = larkUserScopes(node, npxCli, manifest, env, (...args) => {
@@ -188,7 +226,26 @@ function checkLarkPermissions(node, npxCli, manifest, env, runner = spawnSync) {
     return result;
   });
   if (scopes === null || !scopeReported) return false;
-  permissions.recordUserScopeCheck(env, scopes, pending, ['im:message.send_as_user']);
+  permissions.recordUserScopeCheck(env, larkScopeEvidence(env, scopes), pending, larkRequiredScopes(env));
+  // A stored token can retain its scope list after app permissions are revoked.
+  // Check app eligibility independently; this endpoint exposes user scopes only.
+  const current = permissions.readPermissionRequest(env);
+  try {
+    const result = runner(node, [npxCli, '--offline', '-y', manifest.package,
+      'auth', 'scopes', '--profile', env.ORKAS_LOCAL_CLI_PROFILE, '--json'], {
+      cwd: env.ORKAS_LOCAL_CLI_WORK_DIR, env, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024, windowsHide: true,
+    });
+    if (!result.error && result.status === 0) {
+      try {
+        const report = JSON.parse(String(result.stdout || ''));
+        const enabled = report.userScopes === null && report.count === 0 ? [] : report.userScopes;
+        if (report.tokenType === 'user' && Array.isArray(enabled)
+          && enabled.every(permissions.isScopeName)) {
+          permissions.recordLarkAppScopeCheck(env, current, larkScopeEvidence(env, enabled), larkRequiredScopes(env));
+        }
+      } catch { /* An unavailable app report preserves existing evidence. */ }
+    }
+  } catch { /* An unavailable app query cannot invalidate a verified user grant. */ }
   return true;
 }
 
@@ -213,6 +270,23 @@ function wecomAuthorizationReady(node, npxCli, manifest, env, runner = spawnSync
   } catch {
     return false;
   }
+}
+
+function checkWecomPermissions(node, npxCli, manifest, env, runner = spawnSync) {
+  const pending = permissions.readPermissionRequest(env);
+  let result;
+  const verified = wecomAuthorizationReady(node, npxCli, manifest, env, (...args) => {
+    result = runner(...args);
+    return result;
+  });
+  // A permission denial on identity discovery is connector-level evidence.
+  // Identity success alone cannot clear a historical business-permission gap.
+  const denial = result && permissions.structuredPermissionFailure(result, 'wecom');
+  if (denial) {
+    denial.provider_error.identity_denied = true;
+    permissions.rememberPermissionRequest(denial, env);
+  } else if (verified) permissions.recordWecomIdentityCheck(env, pending);
+  return verified;
 }
 
 function dingtalkAuthorizationReady(node, npxCli, manifest, env, runner = spawnSync) {
@@ -244,7 +318,9 @@ async function authorizeSingleStep(node, npxCli, manifest, env, authorizationRea
     || (() => authorizationReady(node, npxCli, manifest, env));
 
   const pending = permissions.readPermissionRequest(env);
-  if (!pending && ready()) return;
+  const permissionRecovery = pending && (pending.scopes.length || pending.pat_scopes?.length
+    || pending.admin_required || pending.connector_level || pending.plan_missing || pending.identity_denied);
+  if (!permissionRecovery && ready()) return;
   let loginError = null;
   try {
     await execute(manifest.login(env)[0]);
@@ -255,105 +331,143 @@ async function authorizeSingleStep(node, npxCli, manifest, env, authorizationRea
   if (ready()) {
     // Identity verification cannot attest to resource or business permissions.
     // Preserve the advisory request and the existing usable connection.
-    if (pending) throw new Error('requested permissions could not be verified');
+    if (pending?.identity_denied && !pending.connector_level && !pending.scopes.length && !pending.pat_scopes?.length) {
+      permissions.recordWecomIdentityCheck(env, pending);
+    } else if (permissionRecovery) throw new Error('requested permissions could not be verified');
     return;
   }
   if (loginError) throw loginError;
   throw new Error('official CLI authorization did not produce a verified identity');
 }
 
-// DWS login verifies identity only. PAT grants are additive and must acknowledge
-// the requested scopes; a successful old login cannot resolve business denial.
+function dingtalkPermissionPlan(output) {
+  try {
+    const receipt = JSON.parse(output);
+    const data = receipt?.data || receipt?.result;
+    if (receipt?.success !== true || typeof data?.allGranted !== 'boolean') return null;
+    const pending = data.pendingScopes === undefined ? [] : data.pendingScopes;
+    const skipped = data.skippedScopes === undefined ? [] : data.skippedScopes;
+    if (![pending, skipped].every(scopes => Array.isArray(scopes) && scopes.every(permissions.isScopeName))) return null;
+    return { complete: data.allGranted && !pending.length && !skipped.length,
+      missing: [...new Set([...pending, ...skipped])] };
+  } catch { return null; }
+}
+
+function dingtalkPlanArgs(manifest) {
+  return ['pat', 'chmod', '--domains', manifest.domains.join(','), '--grant-type', 'permanent', '--dry-run', '--format', 'json'];
+}
+
+function checkDingtalkPermissions(node, npxCli, manifest, env, runner = spawnSync) {
+  const pending = permissions.readPermissionRequest(env);
+  const result = runner(node, [npxCli, '--offline', '-y', manifest.package, ...dingtalkPlanArgs(manifest)], {
+    cwd: env.ORKAS_LOCAL_CLI_WORK_DIR, env, encoding: 'utf8', timeout: 60_000, maxBuffer: 64 * 1024, windowsHide: true,
+  });
+  if (result.error || result.status !== 0) return false;
+  const plan = dingtalkPermissionPlan(String(result.stdout || ''));
+  if (!plan) return false;
+  permissions.recordDingtalkPermissionCheck(env, pending, plan, manifest.domains);
+  return true;
+}
+
+// Identity and PAT grants are separate. Use the pinned domain batch route for
+// complete initial access; never treat repeating OAuth login as a PAT receipt.
 async function authorizeDingtalk(node, npxCli, manifest, env, dependencies = {}) {
   const execute = dependencies.execute
     || ((args, capture = false) => run(node, npxCli, manifest.package, args, env, false, true, capture));
   const ready = dependencies.authorizationReady
     || (() => dingtalkAuthorizationReady(node, npxCli, manifest, env));
   const pending = permissions.readPermissionRequest(env);
-  if (!pending) return authorizeSingleStep(node, npxCli, manifest, env, dingtalkAuthorizationReady, dependencies);
-  const loginNeeded = !ready();
-  if (loginNeeded) await execute(manifest.login(env)[0]);
+  // Always enter official authorization when explicitly requested, including
+  // cached administrator restrictions. There is no Orkas pre-authorization gate.
+  await execute(manifest.login(env)[0]);
   if (!ready()) throw new Error('official CLI authorization did not produce a verified identity');
-  const scopes = pending.pat_scopes || [];
-  // Recheck known PAT scopes after administrator changes; a cached policy denial
-  // must not permanently prevent a user-initiated recovery attempt.
-  if (pending.admin_required && !scopes.length) throw new Error('organization administrator approval is required');
-  if (scopes.length) {
-    const grantArgs = ['pat', 'chmod', ...scopes, '--grant-type', 'permanent', '--yes'];
-    // Table mode lets the official CLI own consent/polling. DWS may return only
-    // {ok:true} after consent; repeat the same additive grant in JSON mode to
-    // obtain granted/already-granted scope evidence, never a business replay.
-    await execute([...grantArgs, '--format', 'table']);
-    const output = await execute([...grantArgs, '--format', 'json'], true);
-    let receipt;
-    try { receipt = JSON.parse(output); } catch { /* no verified grant receipt */ }
-    const data = receipt?.data || receipt?.result;
-    const granted = [...(Array.isArray(data?.grantedScopes) ? data.grantedScopes : []),
-      ...(Array.isArray(data?.alreadyGrantedScopes) ? data.alreadyGrantedScopes : [])];
-    if (receipt?.success === true) permissions.recordPatScopeGrant(env, pending, granted);
-    if (receipt?.success !== true || !scopes.every(scope => granted.includes(scope))) {
-      throw new Error('requested permissions are still unavailable');
-    }
-  }
-  // DWS 1.0.61 declares --scopes but does not read it in auth login. Do not
-  // silently claim an OAuth scope or an unknown resource denial was repaired.
-  if (pending.scopes.length || pending.unresolved_access || !scopes.length) {
-    if (!scopes.length && !loginNeeded) await execute(manifest.login(env)[0]);
+  const scopes = pending?.pat_scopes || [];
+  const grantArgs = ['pat', 'chmod', ...scopes, '--domains', manifest.domains.join(','), '--grant-type', 'permanent', '--yes'];
+  let grantError;
+  let output;
+  try {
+    await execute([...grantArgs, '--format', 'table'], 'tee');
+    output = await execute([...grantArgs, '--format', 'json'], true);
+  } catch (error) { grantError = error; }
+  let receipt;
+  try { receipt = JSON.parse(output); } catch { /* no verified receipt */ }
+  const denial = permissions.structuredPermissionFailure({ status: 1,
+    stdout: grantError?.stdout || output || '', stderr: grantError?.stderr || '' }, 'dingtalk');
+  if (denial) permissions.rememberPermissionRequest(denial, env);
+  if (grantError && !denial) throw grantError;
+  const data = receipt?.data || receipt?.result;
+  const granted = [...(Array.isArray(data?.grantedScopes) ? data.grantedScopes : []),
+    ...(Array.isArray(data?.alreadyGrantedScopes) ? data.alreadyGrantedScopes : [])].filter(permissions.isScopeName);
+  if (pending && receipt?.success === true) permissions.recordPatScopeGrant(env, pending, granted);
+  const expected = permissions.readPermissionRequest(env);
+  let planOutput;
+  try { planOutput = await execute(dingtalkPlanArgs(manifest), true); }
+  catch { /* A failed read-only check cannot erase known evidence. */ }
+  const plan = dingtalkPermissionPlan(planOutput);
+  if (plan) permissions.recordDingtalkPermissionCheck(env, expected, plan, manifest.domains);
+  // Confirmed permission denial can leave a usable partial identity. A cancel,
+  // network failure or other error remains a failed authorization attempt.
+  if (pending && (pending.scopes.length || (pending.unresolved_access && pending.connector_level))) {
     throw new Error('requested permissions could not be verified');
   }
-  permissions.clearPermissionRequest(env, pending);
+  if (pending && !plan?.complete && (receipt?.success !== true || !scopes.every(scope => granted.includes(scope)))) {
+    throw new Error('requested permissions are still unavailable');
+  }
 }
 
 async function authorizeLark(node, npxCli, manifest, env, dependencies = {}) {
+  if (manifest.package && manifest.package !== larkPermissionContract.package) {
+    throw new Error('local CLI permission contract pin mismatch');
+  }
   const execute = dependencies.execute
-    || ((args) => run(node, npxCli, manifest.package, args, env));
+    || ((args) => run(node, npxCli, manifest.package, args, env, false, true, 'tee'));
   const profileConfigured = dependencies.profileConfigured
-    || (() => commandSucceeds(
-      node,
-      npxCli,
-      manifest,
-      ['config', 'show', '--profile', env.ORKAS_LOCAL_CLI_PROFILE],
-      env,
-    ));
+    || (() => commandSucceeds(node, npxCli, manifest,
+      ['config', 'show', '--profile', env.ORKAS_LOCAL_CLI_PROFILE], env));
   const authorizationReady = dependencies.authorizationReady
-    || ((scopes = []) => larkAuthorizationReady(node, npxCli, manifest, env, spawnSync, scopes));
-  const pendingPermissions = permissions.readPermissionRequest(env);
+    || (() => larkAuthorizationReady(node, npxCli, manifest, env));
   const authorizationScopes = dependencies.authorizationScopes
     || (() => larkUserScopes(node, npxCli, manifest, env));
+  const pending = permissions.readPermissionRequest(env);
   const ready = authorizationReady();
-  if (ready && !pendingPermissions) return;
   const commands = manifest.login(env);
+  let identityBeforeLogin = ready;
   if (!ready && !profileConfigured()) {
     await execute(commands[0]);
-    if (!pendingPermissions && authorizationReady()) return;
+    identityBeforeLogin = authorizationReady();
   }
-  if (pendingPermissions) {
-    const existingScopes = authorizationScopes();
-    if (ready && !existingScopes) throw new Error('current user permissions could not be verified');
-    const requestedScopes = [...new Set([...(existingScopes || []), ...pendingPermissions.scopes])].sort();
-    // An explicit authorization attempt preserves existing grants. Access
-    // advisories are independent of the verified user-consent result.
-    await execute(pendingPermissions.scopes.length
-      ? ['auth', 'login', '--profile', env.ORKAS_LOCAL_CLI_PROFILE, '--scope', requestedScopes.join(' ')]
-      : [...commands[1], ...(requestedScopes.length ? ['--scope', requestedScopes.join(' ')] : [])]);
-    if (!authorizationReady(requestedScopes)) {
-      throw new Error('requested permissions are still unavailable');
+  // Connect/Reauthorize is an explicit full request, even for a valid old
+  // identity. Page-entry checks never enter this interactive driver.
+  const existing = identityBeforeLogin ? authorizationScopes() : [];
+  if (identityBeforeLogin && !existing) throw new Error('current user permissions could not be verified');
+  const requested = [...new Set([...larkRequiredScopes(env), ...(existing || []), ...(pending?.scopes || [])])].sort();
+  const args = [...commands[1]];
+  const scopeIndex = args.indexOf('--scope');
+  if (scopeIndex >= 0) args[scopeIndex + 1] = requested.join(' ');
+  else args.push('--scope', requested.join(' '));
+  args.push('--json');
+  let output;
+  let loginError;
+  try { output = await execute(args); }
+  catch (error) { loginError = error; output = error.stdout; }
+  const completed = String(output || '').split('\n').some(line => {
+    try {
+      const receipt = JSON.parse(line);
+      return receipt.event === 'authorization_complete' && Array.isArray(receipt.requested)
+        && receipt.requested.every(permissions.isScopeName) && requested.every(scope => receipt.requested.includes(scope))
+        && Array.isArray(receipt.granted) && receipt.granted.every(permissions.isScopeName);
     }
-    // Verification establishes these user scopes, not bot/resource access.
-    // Keep unrelated advisories and any denial newer than this attempt.
-    permissions.recordUserScopeCheck(env, requestedScopes, pendingPermissions, []);
-    return;
+    catch { return false; }
+  });
+  if (!authorizationReady()) {
+    if (loginError) throw loginError;
+    throw new Error('official CLI authorization did not produce a verified user identity');
   }
-
-  let loginError = null;
-  try {
-    await execute(commands[1]);
-  } catch (error) {
-    loginError = error;
-  }
-  if (authorizationReady()) return;
-  if (loginError) throw loginError;
-  throw new Error('official CLI authorization did not produce a verified user identity');
+  // A cancelled recovery with an old valid token is not a new authorization.
+  // The pinned CLI emits authorization_complete even for nonzero partial grants.
+  if (loginError && !completed) throw loginError;
+  const granted = authorizationScopes();
+  if (granted) permissions.recordUserScopeCheck(env, larkScopeEvidence(env, granted), pending, requested);
 }
 
 function verifyRegistryIntegrity(node, npxCli, manifest, env, runner = spawnSync) {
@@ -440,7 +554,10 @@ async function main() {
 
   assertIntegrityMarker(manifest, process.env);
   if (process.env.ORKAS_LOCAL_CLI_CHECK_PERMISSIONS_ONLY === '1') {
-    if (provider === 'lark' && !checkLarkPermissions(node, npxCli, manifest, process.env)) {
+    const verified = provider === 'lark' ? checkLarkPermissions(node, npxCli, manifest, process.env)
+      : provider === 'dingtalk' ? checkDingtalkPermissions(node, npxCli, manifest, process.env)
+        : provider === 'wecom' ? checkWecomPermissions(node, npxCli, manifest, process.env) : true;
+    if (!verified) {
       throw new Error('local CLI permission verification unavailable');
     }
     return;
@@ -485,6 +602,11 @@ module.exports = {
   larkAuthorizationReady,
   larkUserScopes,
   checkLarkPermissions,
+  checkDingtalkPermissions,
+  checkWecomPermissions,
+  dingtalkPermissionPlan,
+  larkRequiredScopes,
+  larkScopeEvidence,
   main,
   run,
   verifyRegistryIntegrity,

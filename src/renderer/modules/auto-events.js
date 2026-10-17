@@ -45,6 +45,12 @@ function _autoEventsOpenSubscription() {
           Promise.resolve(loadConversations())
             .catch(() => _autoEventsLog.warn('reload after fire failed'));
         }
+        // Main started this run, so no renderer send is observing it. Attach
+        // the run observer like a project auto-advance does, so the sidebar
+        // row shows it running without the user opening it first.
+        if (inner.cid && typeof _observeConversationRunFromPlanAction === 'function') {
+          _observeConversationRunFromPlanAction(inner.cid, { attachExisting: true, allowWithController: true });
+        }
       } else if (inner.type !== 'fire_failed') {
         return;
       }

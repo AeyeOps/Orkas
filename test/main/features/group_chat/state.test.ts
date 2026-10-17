@@ -117,7 +117,7 @@ describe('group_chat state › active recipient provenance', () => {
     expect((await s.readState(TEST_UID, TEST_CID)).active_recipients).toBeUndefined();
     await s.clearOrchestrationForCancellation(TEST_UID, TEST_CID);
     const receipt = await s.beginAgentHandoff(TEST_UID, TEST_CID, {
-      ownerAgentId: 'agent-b', interactive: true, userGoal: 'review', handoffMessage: 'review',
+      ownerAgentId: 'agent-b', claimFloor: true, userGoal: 'review', handoffMessage: 'review',
     });
     expect((await s.readState(TEST_UID, TEST_CID)).active_recipients).toBeUndefined();
     await s.rollbackAgentHandoff(TEST_UID, TEST_CID, receipt);
@@ -172,7 +172,7 @@ describe('group_chat state › scheduled Agent hand-off admission', () => {
     const admission = await s.beginAgentHandoff(TEST_UID, TEST_CID, {
       ownerAgentId: 'agent-new',
       ownerAgentName: 'NewAgent',
-      interactive: true,
+      claimFloor: true,
       userGoal: 'new goal',
       handoffMessage: 'new task',
       resumeInstruction: 'finish new goal',
@@ -199,10 +199,10 @@ describe('group_chat state › scheduled Agent hand-off admission', () => {
 
   it('rejects stale automatic selection after the user chooses Commander and protects a newer same-Agent handoff', async () => {
     const s = await import('../../../../src/main/features/group_chat/state');
-    const origin = (await s.readState(TEST_UID, TEST_CID)).active_recipient_revision || 0;
+    const origin = (await s.readState(TEST_UID, TEST_CID)).active_recipient_choice_revision || 0;
     await s.setActiveRecipient(TEST_UID, TEST_CID, 'commander', 'user_selection');
-    const request = { ownerAgentId: 'agent-a', interactive: true, userGoal: 'review', handoffMessage: 'review' };
-    const stale = await s.beginAgentHandoff(TEST_UID, TEST_CID, { ...request, expectedFloorRevision: origin });
+    const request = { ownerAgentId: 'agent-a', claimFloor: true, userGoal: 'review', handoffMessage: 'review' };
+    const stale = await s.beginAgentHandoff(TEST_UID, TEST_CID, { ...request, expectedChoiceRevision: origin });
     expect(stale.floorApplied).toBe(false);
     expect((await s.readState(TEST_UID, TEST_CID)).active_recipient).toBeUndefined();
     const old = await s.beginAgentHandoff(TEST_UID, TEST_CID, request);
@@ -217,12 +217,86 @@ describe('group_chat state › scheduled Agent hand-off admission', () => {
     expect(current.active_recipient_handoff_id).toBe(newer.token);
   });
 
+  it('admits a formal hand-off without consulting Agent interaction metadata', async () => {
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const receipt = await state.beginAgentHandoff(TEST_UID, TEST_CID, {
+      ownerAgentId: 'agent-a', claimFloor: true, expectedChoiceRevision: 0,
+      userGoal: 'goal', handoffMessage: 'task',
+    });
+    expect(receipt.floorApplied).toBe(true);
+    expect(await state.readState(TEST_UID, TEST_CID)).toMatchObject({
+      active_recipient: 'agent-a', active_recipient_source: 'commander_handoff',
+      active_recipient_handoff_id: receipt.token, active_recipient_choice_revision: 0,
+    });
+    await state.rollbackAgentHandoff(TEST_UID, TEST_CID, receipt);
+    expect((await state.readState(TEST_UID, TEST_CID)).active_recipient).toBeUndefined();
+  });
+
+  it('binds an automatically selected Agent to its waiting task without stealing another selection', async () => {
+    const state = await import('../../../../src/main/features/group_chat/state');
+    await state.beginAgentHandoff(TEST_UID, TEST_CID, {
+      ownerAgentId: 'agent-a', claimFloor: true, userGoal: 'goal', handoffMessage: 'task',
+    });
+    const origin = (await state.readState(TEST_UID, TEST_CID)).active_recipient_choice_revision;
+    expect(await state.claimFloorForWaitingTask(TEST_UID, TEST_CID, 'agent-a', 'task-a', origin)).toBe(true);
+    expect((await state.readState(TEST_UID, TEST_CID)).active_recipient_handoff_id).toBe(state.waitingFloorBinding('task-a'));
+    expect(await state.releaseWaitingFloor(TEST_UID, TEST_CID, 'agent-a', 'task-b')).toBe(false);
+    expect(await state.releaseWaitingFloor(TEST_UID, TEST_CID, 'agent-a', 'task-a')).toBe(true);
+    expect((await state.readState(TEST_UID, TEST_CID)).active_recipient).toBeUndefined();
+  });
+
+  it('does not let a late input form undo a newer explicit return to Commander', async () => {
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const origin = (await state.readState(TEST_UID, TEST_CID)).active_recipient_choice_revision || 0;
+    await state.setActiveRecipient(TEST_UID, TEST_CID, 'commander', 'user_selection');
+    expect(await state.claimFloorForWaitingTask(TEST_UID, TEST_CID, 'agent-a', 'task-a', origin)).toBe(false);
+    expect((await state.readState(TEST_UID, TEST_CID)).active_recipient).toBeUndefined();
+  });
+
+  it('a stale cancellation cannot consume a newer continuation for the same Agent', async () => {
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const old = await state.beginAgentHandoff(TEST_UID, TEST_CID, {
+      ownerAgentId: 'agent-a', claimFloor: true, userGoal: 'old goal',
+      handoffMessage: 'old task', resumeInstruction: 'finish old goal',
+    });
+    const oldRevision = (await state.readState(TEST_UID, TEST_CID)).active_recipient_revision;
+    await state.setActiveRecipient(TEST_UID, TEST_CID, 'commander', 'user_selection');
+    const current = await state.beginAgentHandoff(TEST_UID, TEST_CID, {
+      ownerAgentId: 'agent-a', claimFloor: true, userGoal: 'new goal',
+      handoffMessage: 'new task', resumeInstruction: 'finish new goal',
+    });
+    expect(await state.takeOrchestrationLedgerForAgent(TEST_UID, TEST_CID, 'agent-a', old.token)).toBeNull();
+    expect(await state.releaseWaitingFloor(TEST_UID, TEST_CID, 'agent-a', 'old-task', oldRevision, old.token)).toBe(false);
+    expect(await state.readState(TEST_UID, TEST_CID)).toMatchObject({
+      active_recipient: 'agent-a', orchestration_ledger: { id: current.token, resume_instruction: 'finish new goal' },
+    });
+  });
+
+  it('reads legacy floor generations conservatively and persists user choices separately from automatic changes', async () => {
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const paths = await import('../../../../src/main/paths');
+    const file = paths.groupChatStateFile(TEST_UID, TEST_CID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ version: 1, status: 'idle', active_recipient_revision: 4 }));
+    expect((await state.readState(TEST_UID, TEST_CID)).active_recipient_choice_revision).toBe(4);
+    await state.beginAgentHandoff(TEST_UID, TEST_CID, {
+      ownerAgentId: 'agent-a', claimFloor: true, expectedChoiceRevision: 4,
+      userGoal: 'goal', handoffMessage: 'task',
+    });
+    expect(JSON.parse(fs.readFileSync(file, 'utf8'))).toMatchObject({
+      active_recipient_revision: 5, active_recipient_choice_revision: 4,
+    });
+    await state.setActiveRecipient(TEST_UID, TEST_CID, 'commander', 'user_selection');
+    expect((await state.readState(TEST_UID, TEST_CID)).active_recipient_choice_revision).toBe(5);
+    expect(await state.claimFloorForWaitingTask(TEST_UID, TEST_CID, 'agent-a', 'late-task', 4)).toBe(false);
+  });
+
   it('rollback never overwrites a newer user floor or orchestration ledger', async () => {
     const s = await import('../../../../src/main/features/group_chat/state');
     const admission = await s.beginAgentHandoff(TEST_UID, TEST_CID, {
       ownerAgentId: 'agent-a',
       ownerAgentName: 'AgentA',
-      interactive: true,
+      claimFloor: true,
       userGoal: 'goal a',
       handoffMessage: 'task a',
       resumeInstruction: 'resume a',

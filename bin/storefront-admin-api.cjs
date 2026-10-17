@@ -208,7 +208,7 @@ async function request(config, route) {
   let body;
   try {
     const text = await readBody(response);
-    body = JSON.parse(text);
+    body = route.identity ? require('./local-api-auth.cjs').parseMerchantIdentityJson(text, ['id']) : JSON.parse(text);
   } catch { fail('storefront_upstream_error', 'Storefront API returned invalid or oversized JSON'); }
   if ((!object(body) && !Array.isArray(body)) || body.error || body.errors
       || (body.code !== undefined && !['', '0'].includes(String(body.code))
@@ -242,7 +242,7 @@ async function request(config, route) {
 
 async function identity(config) {
   const key = config.provider === 'shopline' ? 'data' : undefined;
-  const { data } = await request(config, { path: config.provider === 'bigcommerce' ? '/v2/store' : config.provider === 'shopline' ? '/merchants/shop.json' : '/shop', key });
+  const { data } = await request(config, { path: config.provider === 'bigcommerce' ? '/v2/store' : config.provider === 'shopline' ? '/merchants/shop.json' : '/shop', key, identity: true });
   const shop = key ? data[key] : data;
   if (!['string', 'number'].includes(typeof shop.id) || !String(shop.id) || shop.id === 0) fail('storefront_invalid_response', 'Storefront identity is missing');
   const binding = bindingOf(config.provider, config.metadata);

@@ -264,7 +264,7 @@ describe("AgentRunner — parallel tool execution (G4)", () => {
     const tool = defineTool({
       name: "shell_like",
       description: "fixture",
-      inputSchema: { type: "object", properties: {} },
+      inputSchema: { type: "object", properties: { id: { type: "string" }, ro: { type: "boolean" } } },
       executionMode: "parallel",
       parallelWhen: (input) => input.ro === true,
       async execute(input) {
@@ -303,7 +303,7 @@ describe("AgentRunner — parallel tool execution (G4)", () => {
     registry.registerFactory("mock", () => provider);
     const runner = new AgentRunner({
       config: createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } }), providers: registry,
-      tools: [{ ...bashTool, executionMode: "parallel", async execute(input, ctx) {
+      tools: [{ ...bashTool, inputSchema: { type: "object", properties: { id: { type: "number" } } }, executionMode: "parallel", async execute(input, ctx) {
         started.push(Number(input.id));
         return new Promise(resolve => ctx.signal!.addEventListener("abort", () => resolve({ content: "cancelled", isError: true }), { once: true }));
       } }],

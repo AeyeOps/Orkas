@@ -1,5 +1,8 @@
 import { expect, test } from './fixtures/orkas';
 
+// These journeys test local dialog behavior; keep account boot independent of
+// the deliberately unreachable default endpoint and its retry timers.
+
 test.describe('shared dialog behavior', () => {
   test.describe('async actions', () => {
 
@@ -507,7 +510,7 @@ test('global requests show their source task across navigation, locales and narr
 });
 
 const permissionDialogTest = test;
-permissionDialogTest('unknown shell approval shows decision facts before the bounded preview in a narrow window', async ({ orkas: app }, testInfo) => {
+permissionDialogTest('unknown shell approval survives background clicks and shows decision facts in a narrow window', async ({ orkas: app }, testInfo) => {
   const page = app.page!;
   await page.setViewportSize({ width: 760, height: 600 });
   await page.evaluate(() => (window as any).setLang('zh'));
@@ -528,6 +531,19 @@ permissionDialogTest('unknown shell approval shows decision facts before the bou
   await expect(dialog).toContainText('D:\\project with spaces');
   await expect(dialog.locator('[data-id="allow_run"]')).toHaveCount(0);
   await expect(dialog.locator('[data-id="allow_once"]')).toBeInViewport();
+  // Background clicks must leave the approval pending and its actions usable.
+  // Exercise native pointer events, including a second click while the mode
+  // picker is open, so document-level handlers are part of the regression.
+  const overlay = page.locator('.modal-overlay', { has: dialog });
+  await overlay.click({ position: { x: 5, y: 5 } });
+  await expect(dialog).toBeVisible();
+  await dialog.locator('.bash-permission-mode-trigger').click();
+  await expect(overlay.locator('.bash-permission-mode-menu')).toBeVisible();
+  await overlay.dblclick({ position: { x: 5, y: 5 } });
+  await expect(overlay.locator('.bash-permission-mode-menu')).toBeHidden();
+  await expect(dialog).toBeVisible();
+  await expect(dialog.locator('[data-act="cancel"]')).toBeEnabled();
+  await expect(dialog.locator('[data-id="allow_once"]')).toBeEnabled();
   const preview = dialog.locator('.bash-permission-details');
   await expect(preview).not.toHaveAttribute('open');
   await expect(preview.locator('pre')).toBeHidden();

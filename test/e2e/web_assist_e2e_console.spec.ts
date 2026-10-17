@@ -87,8 +87,10 @@ test('task browser reads a console report and submits the accepted field value',
       expect.soft(observed.text).toContain(text);
     }
     expect.soft(observed.elements.some((entry: any) => entry.role === 'treeitem' && entry.label === 'blog')).toBe(true);
-    expect.soft(observed.text).not.toContain('private-');
-    expect.soft(JSON.stringify(observed)).not.toContain('private-value');
+    expect.soft(observed.text).toContain('code-private-value');
+    for (const excluded of ['hidden-private-text', 'nested-private-text', 'password-private-value', 'draft-private-value', 'editor-private-value']) {
+      expect.soft(JSON.stringify(observed)).not.toContain(excluded);
+    }
     const fill = async (text: string, label = 'Inspect address') => {
       observed = await call({ operation: 'observe' });
       const entry = observed.elements.find((entry: any) => entry.label === label);
@@ -104,9 +106,6 @@ test('task browser reads a console report and submits the accepted field value',
     expect(await fill('must-not-change', 'Readonly field')).toMatchObject({ ok: false, code: 'element_readonly' });
     expect(await fill('must-not-claim-success', 'Rejected field')).toMatchObject({ ok: false, code: 'fill_rejected' });
     expect(submissions).toEqual(['https://orkas.ai/blog/cloud-sync/', '日本語 & second', '']);
-    // The same explicit origin grant as the user's download approval; the model
-    // only clicks the link and queries receipts through its existing tabs tool.
-    expect(await orkas.invoke('webAssist.allowDownloadOrigin', { conversation_id: cid, origin })).toMatchObject({ ok: true });
     observed = await call({ operation: 'observe' });
     const download = observed.elements.find((entry: any) => entry.label === 'Download report');
     expect(await call({ operation: 'act', page_id: observed.page_id, element_ref: download.ref, page_action: 'click' })).toMatchObject({ ok: true });

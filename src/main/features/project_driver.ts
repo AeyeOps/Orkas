@@ -32,6 +32,8 @@ import {
 } from '../paths';
 import { readJson, writeJson } from '../storage';
 import { createLogger } from '../logger';
+import { getDeviceId } from './machine_device_id';
+import { getCurrentDevice as getDeviceFingerprint } from '../util/device';
 import type { ProjectTask } from './project_tasks';
 
 const log = createLogger('project-driver');
@@ -50,6 +52,17 @@ export const STUCK_LEASE_TTL_MS = 30 * 60 * 1000;
 export interface DriverConfig {
   enabled: boolean;
   max_advances_per_day: number;
+  /** Stable installation identity; synced with the opt-in, never inferred from the name. */
+  device_id?: string;
+  device_name?: string;
+}
+
+export function getCurrentDevice(): { id: string; name: string } {
+  return { id: getDeviceId(), name: getDeviceFingerprint().name };
+}
+
+export function runsOnCurrentDevice(cfg: DriverConfig): boolean {
+  return cfg.enabled && cfg.device_id === getDeviceId();
 }
 
 export interface DriverState {
@@ -68,7 +81,7 @@ export interface DriverState {
   lease_task_id?: string;
 }
 
-export type AdvanceReason = 'disabled' | 'running' | 'cooldown' | 'daily_cap' | 'no_actionable_task';
+export type AdvanceReason = 'disabled' | 'other_device' | 'running' | 'cooldown' | 'daily_cap' | 'no_actionable_task';
 export type AdvanceDecision =
   | { advance: false; reason: AdvanceReason }
   | { advance: true; task: ProjectTask };
@@ -101,10 +114,18 @@ export async function readConfig(uid: string, pid: string): Promise<DriverConfig
   const f = _configFile(uid, pid);
   if (!fs.existsSync(f)) return { enabled: false, max_advances_per_day: DEFAULT_MAX_ADVANCES_PER_DAY };
   try {
-    const raw = await readJson(f) as { enabled?: unknown; max_advances_per_day?: unknown };
+    const raw = await readJson(f) as {
+      enabled?: unknown; max_advances_per_day?: unknown; device_id?: unknown; device_name?: unknown;
+    };
+    const deviceId = typeof raw?.device_id === 'string' ? raw.device_id.trim() : '';
+    const deviceName = typeof raw?.device_name === 'string' ? raw.device_name.trim() : '';
     return {
-      enabled: raw?.enabled === true,
+      // Legacy opt-ins have no owner. Keep them paused on every installation
+      // until an explicit enable records one; never claim them during a read.
+      enabled: raw?.enabled === true && !!deviceId,
       max_advances_per_day: _clampMaxPerDay(raw?.max_advances_per_day),
+      ...(deviceId ? { device_id: deviceId } : {}),
+      ...(deviceName ? { device_name: deviceName } : {}),
     };
   } catch (err) {
     log.warn(`read config uid=${uid} pid=${pid}: ${(err as Error).message}`);
@@ -112,14 +133,25 @@ export async function readConfig(uid: string, pid: string): Promise<DriverConfig
   }
 }
 
-export async function writeConfig(uid: string, pid: string, patch: Partial<DriverConfig>): Promise<DriverConfig> {
+export async function writeConfig(
+  uid: string, pid: string, patch: Partial<Pick<DriverConfig, 'enabled' | 'max_advances_per_day'>>,
+): Promise<DriverConfig> {
   const cur = await readConfig(uid, pid);
+  // An explicit enable always belongs to the device performing that action.
+  // Cap-only edits preserve the owner; any device may disable the shared opt-in.
+  const device = patch.enabled === true ? getCurrentDevice() : null;
   const next: DriverConfig = {
+    ...cur,
     enabled: typeof patch.enabled === 'boolean' ? patch.enabled : cur.enabled,
     max_advances_per_day: patch.max_advances_per_day !== undefined
       ? _clampMaxPerDay(patch.max_advances_per_day)
       : cur.max_advances_per_day,
+    ...(device ? { device_id: device.id, device_name: device.name } : {}),
   };
+  if (!next.enabled) {
+    delete next.device_id;
+    delete next.device_name;
+  }
   const f = _configFile(uid, pid);
   fs.mkdirSync(path.dirname(f), { recursive: true });
   await writeJson(f, next);

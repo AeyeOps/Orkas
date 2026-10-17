@@ -80,6 +80,94 @@ afterEach(async () => {
 });
 
 describe('global recycle bin', () => {
+  it.each([false, true])('archives and restores metadata and drafts without a transcript (project=%s)', async project => {
+    const paths = await import('../../../src/main/paths');
+    const recycle = await import('../../../src/main/features/recycle_bin');
+    const cid = 'unsent-task', pid = 'draft-project';
+    const root = path.join(paths.userCloudRoot(UID), ...(project ? ['projects', pid] : []));
+    const group = path.join(root, 'chats', cid);
+    const draftDir = path.join(root, 'chat_attachments', cid);
+    const draft = path.join(draftDir, 'folder', 'draft.txt');
+    const index = path.join(root, 'chats', '_index.json');
+    const row = { conversation_id: cid, kind: 'normal', title: 'Unsent draft', session_id: `gconv-${cid}`,
+      created_at: '2020-01-01', updated_at: '2020-01-01', ...(project ? { project_id: pid } : {}) };
+    await fsp.mkdir(group, { recursive: true });
+    await fsp.mkdir(path.dirname(draft), { recursive: true });
+    await fsp.writeFile(path.join(group, 'meta.json'), JSON.stringify(row));
+    await fsp.writeFile(index, JSON.stringify([row]));
+    await fsp.writeFile(draft, 'Unsent attachment');
+    if (project) await fsp.writeFile(paths.projectMetaFile(UID, pid), JSON.stringify({ project_id: pid, name: 'Draft project' }));
+    const batch = project ? await recycle.createAppRecycleBatchForConversations(UID, [cid])
+      : await recycle.createAppRecycleBatchForConversation(UID, cid);
+    expect(batch?.items).toHaveLength(2);
+    expect(batch?.display_items).toEqual([expect.objectContaining({ category: 'conversation', id: cid, title: 'Unsent draft' })]);
+    await fsp.rm(group, { recursive: true });
+    await fsp.rm(draftDir, { recursive: true });
+    await fsp.writeFile(index, '[]');
+    const restored = await recycle.restoreRecycleBatch(UID, batch!.id);
+    expect(restored.restored_paths).toHaveLength(2);
+    expect(restored.reactivated_paths).toHaveLength(1);
+    expect(restored.failed_paths).toEqual([]);
+    expect(await fsp.readFile(draft, 'utf8')).toBe('Unsent attachment');
+    const [restoredRow] = JSON.parse(await fsp.readFile(index, 'utf8'));
+    expect(restoredRow).toMatchObject({ conversation_id: cid, title: row.title, created_at: row.created_at });
+    expect(restoredRow.project_id || null).toBe(project ? pid : null);
+    expect(fs.existsSync(path.join(root, 'chats', `${cid}.jsonl`))).toBe(false);
+  });
+
+  it('rejects a transcript that disappears after inventory instead of treating it as an unsent task', async () => {
+    const paths = await import('../../../src/main/paths');
+    const file = path.join(paths.userChatsDir(UID), 'existing-task.jsonl');
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    await fsp.writeFile(file, 'Existing history');
+    const actual = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+    vi.doMock('node:fs/promises', () => ({ ...actual, copyFile: vi.fn(async (source, destination, flags) => {
+      if (String(source) === file) throw Object.assign(new Error('simulated disappearing file'), { code: 'ENOENT' });
+      return actual.copyFile(source, destination, flags);
+    }) }));
+    vi.resetModules();
+    try {
+      const recycle = await import('../../../src/main/features/recycle_bin');
+      await expect(recycle.createAppRecycleBatchForConversation(UID, 'existing-task')).rejects.toThrow('recycle_archive_failed');
+      expect(await recycle.listRecycleBatches(UID)).toEqual([]);
+      expect(await fsp.readFile(file, 'utf8')).toBe('Existing history');
+    } finally { vi.doUnmock('node:fs/promises'); vi.resetModules(); }
+  });
+  it('keeps drafts when neither a transcript nor recoverable task metadata exists', async () => {
+    const paths = await import('../../../src/main/paths');
+    const recycle = await import('../../../src/main/features/recycle_bin');
+    const draft = path.join(paths.chatAttachmentDir(UID, 'incomplete-task'), 'draft.txt');
+    await fsp.mkdir(path.dirname(draft), { recursive: true });
+    await fsp.writeFile(draft, 'Keep the draft');
+    await expect(recycle.createAppRecycleBatchForConversation(UID, 'incomplete-task')).rejects.toThrow('recycle_archive_failed');
+    expect(await recycle.listRecycleBatches(UID)).toEqual([]);
+    expect(await fsp.readFile(draft, 'utf8')).toBe('Keep the draft');
+  });
+  it('permanently deletes only the selected archive while preserving live data and other accounts', async () => {
+    const paths = await import('../../../src/main/paths');
+    const recycle = await import('../../../src/main/features/recycle_bin');
+    const relPath = 'cloud/contexts/note.txt';
+    const seed = async (uid: string, text: string) => {
+      const source = path.join(paths.userCloudRoot(uid), 'contexts', 'note.txt');
+      await fsp.mkdir(path.dirname(source), { recursive: true });
+      await fsp.writeFile(source, text);
+      const batch = await recycle.createAppRecycleBatchForCloudEntry(uid, relPath, 'context');
+      if (!batch) throw new Error('archive creation failed');
+      return { source, batch };
+    };
+    const selected = await seed(UID, 'selected original');
+    const retained = await seed(UID, 'current live content');
+    const other = await seed('other-account', 'other account content');
+
+    expect(await recycle.deleteRecycleBatch(UID, selected.batch.id)).toEqual({ deleted: true });
+    expect(fs.existsSync(path.join(paths.userRecycleDir(UID), selected.batch.id))).toBe(false);
+    expect((await recycle.listRecycleBatches(UID)).map(batch => batch.id)).toEqual([retained.batch.id]);
+    expect(await fsp.readFile(selected.source, 'utf8')).toBe('current live content');
+    expect((await recycle.listRecycleBatches('other-account')).map(batch => batch.id)).toEqual([other.batch.id]);
+    expect(await fsp.readFile(other.source, 'utf8')).toBe('other account content');
+    expect(await recycle.deleteRecycleBatch(UID, selected.batch.id)).toEqual({ deleted: false });
+  });
+
   it.each(['app-file', 'app-directory', 'sync-file'] as const)(
     'rejects an ancestor symlink before a %s archive can import outside data',
     async (entry) => {

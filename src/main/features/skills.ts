@@ -1249,7 +1249,7 @@ export async function updateCustomSkill(
   // category: explicit update wins, otherwise carry over persisted value.
   const newCategory = Object.prototype.hasOwnProperty.call(updates, 'category')
     ? String(updates.category || '')
-    : ((meta.category as string) || '');
+    : _resolveSkillCategory(meta, readSkillOrkasMetaSync(d));
 
   const sidecar = readSkillOrkasMetaSync(d);
   const proposedSidecar = _stripSkillSidecarDescriptions(mergeSkillOrkasMeta(sidecar, {
@@ -1397,7 +1397,7 @@ interface ImportPathPolicyOptions {
 }
 
 function _realPathForImportPolicy(value: string): string {
-  try { return fs.realpathSync(value); }
+  try { return fs.realpathSync.native(value); }
   catch { return value; }
 }
 
@@ -1754,6 +1754,7 @@ async function _installSourceSkillRoots(
     continueOnError?: boolean;
     rejectExisting?: boolean;
     requireSkillMd?: boolean;
+    beforeCopy?: () => void;
   } = {},
 ): Promise<ImportResult> {
   const reserved = new Set<string>();
@@ -1822,6 +1823,7 @@ async function _installSourceSkillRoots(
           continue;
         }
       }
+      opts.beforeCopy?.();
       const rootFiles = _dropSourceMetaFiles(_filesForSourceSkillRoot(sourceRoot, files, sourceRoots));
       _copyImportedSkillFilesPreservingSource(staged, rootFiles, effectiveName);
       writeSkillOrkasMetaFullSync(staged, _sourceSkillInstallMeta(sourceRoot, sourceSkillMd));
@@ -1851,6 +1853,7 @@ async function _installSourceSkillRoots(
         continue;
       }
 
+      opts.beforeCopy?.();
       created = _createCustomSkillSync(effectiveName, effectiveDesc);
       if (!created) throw new Error(t('skills.errors.create_failed'));
       fs.cpSync(staged, customSkillDir(created.id), { recursive: true });
@@ -2110,7 +2113,7 @@ export async function createFromDir(
  * the model to serialize unchanged files. This stricter package entry point
  * requires at least one SKILL.md, rejects existing ids instead of suffixing
  * duplicates, and lets valid siblings survive an independently rejected one. */
-export async function importSkillPackageFromPath(sourcePath: string): Promise<ImportResult> {
+async function _withSkillPackage<T extends ImportResult>(sourcePath: string, visit: (root: string, archiveStamp?: string) => Promise<T>): Promise<T | ImportResult> {
   const trimmed = String(sourcePath || '').trim();
   if (!trimmed || !path.isAbsolute(trimmed)) {
     return { ok: false, error: t('skills.errors.path_not_absolute') };
@@ -2119,7 +2122,8 @@ export async function importSkillPackageFromPath(sourcePath: string): Promise<Im
   let realSource: string;
   let st: fs.Stats;
   try {
-    realSource = fs.realpathSync(trimmed);
+    // Match promises.realpath during discovery, including Windows short names.
+    realSource = fs.realpathSync.native(trimmed);
     st = fs.statSync(realSource);
   } catch {
     return { ok: false, error: t('skills.errors.dir_inaccessible') };
@@ -2140,13 +2144,8 @@ export async function importSkillPackageFromPath(sourcePath: string): Promise<Im
     return { ok: false, error: t('skills.errors.import_refused', { reason: black.reason || '' }) };
   }
 
-  const importOptions = {
-    continueOnError: true,
-    rejectExisting: true,
-    requireSkillMd: true,
-  } as const;
   if (st.isDirectory()) {
-    return createFromDir(null, null, realSource, importOptions);
+    return visit(realSource);
   }
   if (!st.isFile() || path.extname(realSource).toLowerCase() !== '.zip') {
     return { ok: false, error: t('skills.errors.path_not_package') };
@@ -2163,14 +2162,15 @@ export async function importSkillPackageFromPath(sourcePath: string): Promise<Im
 
   let extractDir = '';
   try {
-    const zip: AdmZip = parseMarketplaceBundle(fs.readFileSync(realSource));
+    const archiveBytes = fs.readFileSync(realSource);
+    const zip: AdmZip = parseMarketplaceBundle(archiveBytes);
     const unsafeEntry = inspectMarketplaceBundle(zip)
       .some(({ entry, relPath }) => !entry.isDirectory && !relPath);
     if (unsafeEntry) return { ok: false, error: t('skills.errors.archive_unsafe') };
 
     extractDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-skill-package-'));
     extractBundleSafely(zip, extractDir);
-    return await createFromDir(null, null, extractDir, importOptions);
+    return await visit(fs.realpathSync.native(extractDir), crypto.createHash('sha256').update(archiveBytes).digest('hex'));
   } catch (err) {
     log.warn('skill package archive import failed', {
       source_type: 'zip',
@@ -2181,6 +2181,169 @@ export async function importSkillPackageFromPath(sourcePath: string): Promise<Im
     if (extractDir) {
       try { fs.rmSync(extractDir, { recursive: true, force: true }); } catch { /* temp cleanup */ }
     }
+  }
+}
+
+export interface SkillPackageCandidate {
+  key: string;
+  name: string;
+  description: string;
+  file_count: number;
+  bytes: number;
+  duplicate: boolean;
+  installed: boolean;
+  issue?: string;
+}
+
+export interface SkillPackageResult extends ImportResult {
+  preview?: { fingerprint: string; candidates: SkillPackageCandidate[]; unsupported: string[] };
+  nextOffset?: number | null;
+}
+
+/** Native package limits apply to individual Skills, not the entire source.
+ * Discovery inspects bounded metadata, and install commits at most ten roots.
+ * The editable-draft importer keeps its separate 200-file contract. */
+export const SKILL_PACKAGE_BATCH_SIZE = 10;
+const SKILL_PACKAGE_MAX_FILES = 1_000;
+const SKILL_PACKAGE_SCAN_ENTRIES = 50_000;
+
+async function _scanNativeSkillPackage(root: string, archiveStamp?: string, signal?: AbortSignal) {
+  type File = { src: string; rel: string; size: number; stamp: string };
+  const files: File[] = [];
+  const stamps: string[] = [];
+  const unsupported = new Set<string>();
+  let visited = 0;
+  const walk = async (dir: string, depth: number): Promise<void> => {
+    if (depth > 32) throw new Error('Skill discovery exceeds the directory depth limit (32).');
+    if (await fsp.realpath(dir) !== dir) throw new Error('The source changed during discovery.');
+    const handle = await fsp.opendir(dir);
+    for await (const entry of handle) {
+      if (signal?.aborted) throw new Error('Skill import cancelled.');
+      if (++visited > SKILL_PACKAGE_SCAN_ENTRIES) throw new Error('Skill discovery exceeds 50,000 entries. Select a narrower source directory.');
+      if (IMPORT_FILTER_NAMES.has(entry.name) || entry.name === '.trash' || _isGeneratedSkillSidecarName(entry.name)) continue;
+      const src = path.join(dir, entry.name);
+      if (entry.isSymbolicLink()) { unsupported.add('symbolic_links'); continue; }
+      if (['hooks', 'commands', 'agents'].includes(entry.name) && entry.isDirectory()) unsupported.add(entry.name);
+      if (entry.name === '.mcp.json') unsupported.add('connectors');
+      if (entry.isDirectory()) await walk(src, depth + 1);
+      else if (entry.isFile()) {
+        const st = await fsp.lstat(src);
+        if (!st.isFile()) throw new Error('The source changed during discovery. Scan it again.');
+        const rel = path.relative(root, src).split(path.sep).join('/');
+        files.push({ src, rel, size: st.size, stamp: JSON.stringify([st.size, st.mtimeMs, st.ctimeMs, st.ino]) });
+        // ZIP extraction timestamps/inodes change between calls; its complete
+        // compressed-byte digest is the stable source version instead.
+        stamps.push(JSON.stringify([rel, st.size, ...(archiveStamp ? [] : [st.mtimeMs, st.ctimeMs, st.ino])]));
+      }
+    }
+  };
+  await walk(root, 0);
+  const entryFiles = files.filter(file => path.basename(file.rel).toUpperCase() === 'SKILL.MD');
+  if (entryFiles.length > 1_000) throw new Error('Skill discovery exceeds 1,000 entries.');
+  const discovered = [...new Set(entryFiles.map(file => path.dirname(file.src)))].sort();
+  const nonWrappers = discovered.filter(sourceRoot => {
+    const entry = entryFiles.find(file => file.src === path.join(sourceRoot, 'SKILL.md'));
+    return !entry || entry.size > 64 * 1024 || !_isEmptyWrapperSourceSkillRoot(sourceRoot, discovered);
+  });
+  // A nested SKILL.md can be a parent's reference. Keep the invokable outer
+  // root intact rather than splitting its relative resources into other Skills.
+  const roots = nonWrappers.filter(r => !nonWrappers.some(other => other !== r && r.startsWith(other + path.sep)));
+  if (roots.length > 1_000) throw new Error('Skill discovery exceeds 1,000 Skills. Select a narrower source directory.');
+  const grouped = new Map(roots.map(sourceRoot => [sourceRoot, [] as File[]]));
+  for (const file of files) {
+    for (let parent = path.dirname(file.src);;) {
+      const group = grouped.get(parent);
+      if (group) { group.push({ ...file, rel: path.relative(parent, file.src).split(path.sep).join('/') }); break; }
+      if (parent === root || path.dirname(parent) === parent) break;
+      parent = path.dirname(parent);
+    }
+  }
+  const entries = roots.map(sourceRoot => {
+    const rootFiles = grouped.get(sourceRoot)!;
+    const bytes = rootFiles.reduce((n, file) => n + file.size, 0);
+    const entry = rootFiles.find(file => file.rel === 'SKILL.md');
+    const name = entry && entry.size <= 64 * 1024 ? _skillNameFromSourceSkillMd(entry.src, sourceRoot) : path.basename(sourceRoot);
+    const issue = rootFiles.length > SKILL_PACKAGE_MAX_FILES ? 'file_limit'
+      : bytes > IMPORT_MAX_BYTES ? 'byte_limit'
+      : !entry || entry.size > 64 * 1024 ? 'entry_limit' : undefined;
+    return { sourceRoot, files: rootFiles, candidate: {
+      key: path.relative(root, sourceRoot).split(path.sep).join('/') || '.', name,
+      description: !issue && entry ? _sourceSkillImportDescription(entry.src, '').slice(0, 300) : '',
+      file_count: rootFiles.length, bytes, duplicate: false,
+      installed: fs.existsSync(customSkillDir(name)) || fs.existsSync(path.join(userMarketplaceSkillsDir(getActiveUserId()), name)),
+      ...(issue ? { issue } : {}),
+    } as SkillPackageCandidate };
+  });
+  const names = new Map<string, number>();
+  for (const { candidate } of entries) names.set(candidate.name, (names.get(candidate.name) || 0) + 1);
+  for (const { candidate } of entries) candidate.duplicate = names.get(candidate.name)! > 1;
+  return { entries, fingerprint: archiveStamp || crypto.createHash('sha256').update(root).update(stamps.sort().join('\n')).digest('hex'), unsupported: [...unsupported].sort() };
+}
+
+export async function importSkillPackageFromPath(sourcePath: string, options: {
+  preview?: boolean;
+  selection?: string[];
+  all?: boolean;
+  offset?: number;
+  expectedFingerprint?: string;
+  signal?: AbortSignal;
+} = {}): Promise<SkillPackageResult> {
+  const uid = getActiveUserId();
+  try {
+    return await _withSkillPackage(sourcePath, async (root, archiveStamp): Promise<SkillPackageResult> => {
+      const scan = await _scanNativeSkillPackage(root, archiveStamp, options.signal);
+      if (getActiveUserId() !== uid || options.signal?.aborted) return { ok: false, error: 'Skill import cancelled or account changed.' };
+      if (!scan.entries.length) return { ok: false, error: t('skills.errors.no_skill_md') };
+      if (options.expectedFingerprint && options.expectedFingerprint !== scan.fingerprint) {
+        return { ok: false, error: 'The source changed after preview. Scan it again before selecting Skills.' };
+      }
+      if (options.preview || (scan.entries.length > 1 && !options.selection && !options.all)) {
+        return { ok: true, preview: { fingerprint: scan.fingerprint, candidates: scan.entries.map(e => e.candidate), unsupported: scan.unsupported } };
+      }
+      const offset = options.offset ?? 0;
+      if (!Number.isSafeInteger(offset) || offset < 0 || (options.selection && (options.all || offset !== 0
+        || !options.selection.length || options.selection.length > SKILL_PACKAGE_BATCH_SIZE
+        || new Set(options.selection).size !== options.selection.length
+        || options.selection.some(key => !scan.entries.some(e => e.candidate.key === key))))) {
+        return { ok: false, error: 'Select 1–10 distinct preview keys, or all with a non-negative offset.' };
+      }
+      const selected = options.selection ? scan.entries.filter(e => options.selection!.includes(e.candidate.key))
+        : scan.entries.slice(offset, offset + SKILL_PACKAGE_BATCH_SIZE);
+      const skills: CustomSkill[] = [];
+      const failures: ImportFailure[] = [];
+      let processed = 0;
+      for (const item of selected) {
+        if (getActiveUserId() !== uid || options.signal?.aborted) {
+          failures.push({ sourceName: item.candidate.name, error: 'Skill import cancelled or account changed.' });
+          break;
+        }
+        if (item.candidate.issue) {
+          failures.push({ sourceName: item.candidate.name, error: `${item.candidate.issue}: each Skill supports at most 1,000 files, 10 MiB, and a 64 KiB SKILL.md.` });
+          processed++;
+          continue;
+        }
+        const result = await _installSourceSkillRoots(null, null, root, item.files, [item.sourceRoot], item.candidate.bytes,
+          { continueOnError: true, rejectExisting: true, requireSkillMd: true, beforeCopy: () => {
+            if (getActiveUserId() !== uid || options.signal?.aborted) throw new Error('Skill import cancelled.');
+            for (const file of item.files) {
+              const st = fs.lstatSync(file.src);
+              if (!st.isFile() || fs.realpathSync.native(file.src) !== file.src
+                || JSON.stringify([st.size, st.mtimeMs, st.ctimeMs, st.ino]) !== file.stamp) {
+                throw new Error('The source changed before copying.');
+              }
+            }
+          } });
+        skills.push(...(result.skills || []));
+        failures.push(...(result.failures || []));
+        processed++;
+        await new Promise<void>(resolve => setImmediate(resolve));
+      }
+      return { ok: skills.length > 0, skills, skill: skills[0], failures,
+        ...(!skills.length ? { error: failures[0]?.error || 'No Skills selected at this offset.' } : {}),
+        nextOffset: options.all && offset + processed < scan.entries.length ? offset + processed : null };
+    });
+  } catch {
+    return { ok: false, error: 'Skill discovery failed or exceeded its bounds. Select a narrower readable directory and scan again.' };
   }
 }
 
@@ -2395,7 +2558,9 @@ interface SkillMetadataApplyResult {
   name?: string;
   written: boolean;
   report?: QualityReport;
-  reason?: WriteSkillFileResult['reason'];
+  /** `not_applied`: the write finished but the Skill does not report the
+   *  requested description, so the edit must not be presented as done. */
+  reason?: WriteSkillFileResult['reason'] | 'not_applied';
 }
 
 export async function applySkillMetadataForEdit(
@@ -2410,18 +2575,47 @@ export async function applySkillMetadataForEdit(
   }
   const mdPath = path.join(skill.dir, 'SKILL.md');
   const current = fs.existsSync(mdPath) ? fs.readFileSync(mdPath, 'utf8') : '';
-  const next = _applyMetadataToSkillMdContent(current, updates, skill.id, skill.source);
+  const has = (key: keyof SkillMetadataUpdate) => Object.prototype.hasOwnProperty.call(updates, key);
+  // A custom Skill keeps one description in SKILL.md and stores a sidecar
+  // pair only when both languages exist. Resolve a one-sided localized edit
+  // against the current pair; otherwise the old SKILL.md description wins on
+  // read and the edit silently has no effect.
+  const localized = skill.source === 'custom' && (has('description_zh') || has('description_en'))
+    ? (() => {
+      const cur = _resolveSkillDescriptions(splitSkillMd(current).meta, readSkillOrkasMetaSync(skill.dir));
+      const lang = descriptionLang(getLanguage());
+      const legacy = has('description') ? _normalizeDisplayDescription(String(updates.description || '')) : '';
+      let zh = has('description_zh') ? _normalizeDisplayDescription(String(updates.description_zh || '')) : cur.description_zh;
+      let en = has('description_en') ? _normalizeDisplayDescription(String(updates.description_en || '')) : cur.description_en;
+      if (legacy && lang === 'zh' && !has('description_zh')) zh = legacy;
+      if (legacy && lang !== 'zh' && !has('description_en')) en = legacy;
+      return { zh, en, primary: lang === 'zh' ? (zh || en) : (en || zh) };
+    })()
+    : null;
+  const mdUpdates: SkillMetadataUpdate = localized
+    ? (() => {
+      const next: SkillMetadataUpdate = { ...updates, description: localized.primary };
+      delete next.description_zh;
+      delete next.description_en;
+      return next;
+    })()
+    : updates;
+  const next = _applyMetadataToSkillMdContent(current, mdUpdates, skill.id, skill.source);
   const rawSidecarPatch = _skillSidecarPatchFromMetadataUpdate(updates);
-  const sidecarPatch = skill.source === 'marketplace'
+  const sidecarPatch = skill.source === 'marketplace' || localized
     ? _stripSkillSidecarDescriptions(rawSidecarPatch)
     : rawSidecarPatch;
   const writesMarkdown = next !== current;
   if (writesMarkdown && skill.source !== 'custom') return { ok: false, skillId, written: false };
-  const wrote = writesMarkdown || _hasSkillSidecarPatch(sidecarPatch);
+  const wrote = writesMarkdown || _hasSkillSidecarPatch(sidecarPatch) || !!localized;
   const currentSidecar = readSkillOrkasMetaSync(skill.dir);
   const proposedSidecar = opts.replaceSidecar && _hasSkillSidecarPatch(sidecarPatch)
     ? _stripSkillSidecarDescriptions(_skillSidecarReplacementFromMetadataUpdate(updates, currentSidecar))
     : mergeSkillOrkasMeta(currentSidecar, sidecarPatch);
+  if (localized) {
+    if (localized.zh && localized.en) proposedSidecar.descriptions = { zh: localized.zh, en: localized.en };
+    else delete proposedSidecar.descriptions;
+  }
   if (wrote && skill.source === 'custom') delete proposedSidecar._import;
   const policyReports = await validateWithOperatorPolicy(uid, { kind: 'files', files: [
     { relpath: 'SKILL.md', content: next }, { relpath: '_meta.json', content: JSON.stringify(proposedSidecar, null, 2) },
@@ -2436,7 +2630,7 @@ export async function applySkillMetadataForEdit(
   if (writesMarkdown && !_writeSkillFileAt(skill.dir, 'SKILL.md', next)) {
     return { ok: false, skillId, written: false, report, reason: 'invalid_path' };
   }
-  if (_hasSkillSidecarPatch(sidecarPatch) || (wrote && currentSidecar._import)) {
+  if (localized || _hasSkillSidecarPatch(sidecarPatch) || (wrote && currentSidecar._import)) {
     writeJsonSync(skillMetaFile(skill.dir), proposedSidecar);
     _invalidateSkillListCache();
     invalidateCoreAgentSkills().catch(() => { /* runner may not be loaded yet */ });
@@ -2447,6 +2641,15 @@ export async function applySkillMetadataForEdit(
   if (skill.source === 'custom') {
     const newId = await _renameSkillByFrontmatterIfNeeded(skillId, opts.isCancelled);
     if (newId && newId !== skillId) resolvedId = newId;
+  }
+  if (localized) {
+    const persisted = await _getCustomSkillForUser(resolvedId, uid);
+    const applied = (!has('description_zh') || persisted?.description_zh === localized.zh)
+      && (!has('description_en') || persisted?.description_en === localized.en);
+    if (!applied) {
+      log.warn('description edit not reflected after write');
+      return { ok: false, skillId: resolvedId, written: wrote, reason: 'not_applied' };
+    }
   }
   const post = await getSkillForEdit(resolvedId);
   log.info(`skill=${skillId}${resolvedId !== skillId ? ` -> ${resolvedId}` : ''} metadata updated`);
@@ -3037,6 +3240,26 @@ export interface SkillContainerResult {
   validation_warnings?: { path: string; report: QualityReport }[];
   /** Total-failure cause when `ok: false`. Already localized via `t()`. */
   error?: string;
+}
+
+const SKILL_READ_REF_TARGET_RE = /^@skill\/([^/\s]*)(\/.*)?$/;
+
+/** Resolve a run-scoped `@skill/<ref>` edit target to the host Skill id.
+ *  The model edits the Skill it read through that ref, so the host id stays
+ *  hidden from discovery results. Plain ids keep their existing behavior. An
+ *  unknown or malformed ref is a failed edit, never a create: the missing-id
+ *  create fallback must not turn a mistyped ref into a duplicate Skill. */
+export function resolveSkillContainerTarget(
+  container: SkillContainerExtracted,
+  bindings: ReadonlyMap<string, { id: string }>,
+): { ok: true; container: SkillContainerExtracted } | { ok: false; error: string } {
+  const raw = (container.skillId || '').trim();
+  const m = SKILL_READ_REF_TARGET_RE.exec(raw);
+  if (!m) return { ok: true, container };
+  const tail = (m[2] || '').replace(/\/+$/, '');
+  const binding = m[1] && (!tail || /^\/SKILL\.md$/i.test(tail)) ? bindings.get(m[1]) : undefined;
+  if (!binding) return { ok: false, error: t('skills.errors.skill_not_found', { id: raw }) };
+  return { ok: true, container: { ...container, skillId: binding.id } };
 }
 
 /** Apply a parsed `<skill>` container from commander. Routes to edit when

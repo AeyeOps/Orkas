@@ -37,6 +37,8 @@
 
   const UI_ICONS = {
     search: '<circle cx="11" cy="11" r="7"></circle><path d="m21 21-4.3-4.3"></path>',
+    camera: '<path d="M14.5 4h-5L7 7H3v13h18V7h-4z"></path><circle cx="12" cy="13" r="4"></circle>',
+    smartphone: '<rect x="6" y="2" width="12" height="20" rx="3"></rect><path d="M10 5h4M11 19h2"></path>',
     // Video-studio fine-tune drawer icons (lucide-style).
     film: '<rect x="3" y="3" width="18" height="18" rx="2"></rect><path d="M7 3v18M17 3v18M3 7.5h4M3 12h18M3 16.5h4M17 7.5h4M17 16.5h4"></path>',
     music: '<path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle>',
@@ -60,9 +62,12 @@
     'book-open': '<path d="M12 7v14"></path><path d="M3 5.5A3.5 3.5 0 0 1 6.5 2H12v19H6.5A3.5 3.5 0 0 1 3 17.5z"></path><path d="M21 5.5A3.5 3.5 0 0 0 17.5 2H12v19h5.5a3.5 3.5 0 0 0 3.5-3.5z"></path>',
     palette: '<path d="M12 22a10 10 0 1 1 10-10 5 5 0 0 1-5 5h-2.4a1.6 1.6 0 0 0-1.3 2.5l.3.4A1.4 1.4 0 0 1 12 22z"></path><circle cx="7.5" cy="10" r="1" fill="currentColor" stroke="none"></circle><circle cx="10" cy="6.8" r="1" fill="currentColor" stroke="none"></circle><circle cx="14" cy="6.8" r="1" fill="currentColor" stroke="none"></circle><circle cx="16.5" cy="10" r="1" fill="currentColor" stroke="none"></circle>',
     download: '<path d="M12 3v12m-5-5 5 5 5-5"></path><path d="M4 15v5h16v-5"></path>',
+    cloud: '<path d="M18 18H6a4 4 0 0 1-.7-7.94A7 7 0 0 1 18.4 8.1 5 5 0 0 1 18 18z"></path>',
     globe: '<circle cx="12" cy="12" r="9"></circle><path d="M3 12h18"></path><path d="M12 3a14 14 0 0 1 0 18"></path><path d="M12 3a14 14 0 0 0 0 18"></path>',
     database: '<ellipse cx="12" cy="5" rx="8" ry="3"></ellipse><path d="M4 5v6c0 1.7 3.6 3 8 3s8-1.3 8-3V5"></path><path d="M4 11v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"></path>',
     'layout-grid': '<rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect>',
+    'chart-spline': '<path d="M3 3v16a2 2 0 0 0 2 2h16"></path><path d="M7 15c6 0 5-8 14-8"></path>',
+    layers: '<path d="m12 3 9 5-9 5-9-5 9-5z"></path><path d="m3 12 9 5 9-5M3 16l9 5 9-5"></path>',
     settings: '<circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3 1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8 1.7 1.7 0 0 0 1.5 1h.1a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"></path>',
     terminal: '<path d="m8 8 4 4-4 4"></path><path d="M14 16h4"></path><rect x="3" y="4" width="18" height="16" rx="3"></rect>',
     x: '<path d="M18 6 6 18M6 6l12 12"></path>',
@@ -181,6 +186,10 @@
     return wrapUiIcon(key, UI_ICONS[key], className);
   }
 
+  function projectIconName(project) {
+    return 'folder';
+  }
+
   function fileKindForName(name, kind) {
     return normalizeFileKind(kind, extOf(name));
   }
@@ -208,6 +217,7 @@
   }
 
   root.uiIconHtml = uiIconHtml;
+  root.projectIconName = projectIconName;
   root.hydrateUiIcons = hydrateUiIcons;
   root.fileKindForName = fileKindForName;
   root.fileKindIconHtml = fileKindIconHtml;

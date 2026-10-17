@@ -2,6 +2,18 @@
  * Free-form error prose is never a credential/account classification signal. */
 export type ProviderCredentialFailure = 'auth' | 'permission' | 'rate_limit' | 'balance';
 
+/** Adapter-owned rejection evidence, distinct from a local payload/transport
+ * exception that happens to carry an HTTP-looking status. */
+export function providerRequestWasRejected(error: unknown): boolean {
+  let current = error;
+  for (let depth = 0; current && typeof current === 'object' && depth < 8; depth++) {
+    const record = current as Record<string, unknown>;
+    if (record.providerRequestRejected === true) return true;
+    current = record.cause ?? record.error;
+  }
+  return false;
+}
+
 const CODE_KINDS: Readonly<Record<string, ProviderCredentialFailure>> = Object.freeze({
   auth_error: 'auth', authentication_error: 'auth', invalid_api_key: 'auth',
   token_invalidated: 'auth', invalid_token: 'auth', unauthorized: 'auth',

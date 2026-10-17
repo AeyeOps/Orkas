@@ -103,6 +103,7 @@ async function typesetMathHtml(html, { cache = true } = {}) {
   if (typeof document === 'undefined' || !document.createElement) return key;
   const host = document.createElement('div');
   host.className = 'math-typeset-buffer';
+  host.dataset.uiLayoutChrome = '';
   host.style.position = 'fixed';
   host.style.left = '-10000px';
   host.style.top = '0';

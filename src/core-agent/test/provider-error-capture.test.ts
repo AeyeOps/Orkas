@@ -1,11 +1,39 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createProviderErrorCapture } from '../src/providers/provider-error-capture.js';
-import { providerErrorFacts } from '../src/shared/provider-error-facts.js';
+import { providerErrorFacts, providerRequestWasRejected } from '../src/shared/provider-error-facts.js';
 import { classifyRetryableError } from '../src/shared/errors.js';
 
 afterEach(() => vi.useRealTimers());
 
 describe('SDK error evidence retention', () => {
+  it('distinguishes actual upstream rejection from a local payload failure', async () => {
+    const capture = createProviderErrorCapture();
+    await capture.wrapFetch(async () => new Response('{"error":{"type":"server_error"}}', {
+      status: 400, headers: { 'content-type': 'application/json' },
+    }))('https://fixture.invalid');
+    expect(providerRequestWasRejected(capture.cause())).toBe(true);
+    const local = Object.assign(new Error('Local payload failure'), { status: 400 });
+    await expect(capture.wrapFetch(async () => { throw local; })('https://fixture.invalid')).rejects.toBe(local);
+    expect(providerRequestWasRejected(capture.cause())).toBe(false);
+  });
+
+  it('preserves an embedded output barrier across HTTP, SSE and legacy SDK errors', async () => {
+    for (const field of ['output', 'choices']) {
+      const payload = { error: { code: 'server_error' }, [field]: [{ type: 'function_call', name: 'write' }] };
+      const capture = createProviderErrorCapture('openai-responses');
+      await capture.wrapFetch(async () => new Response(JSON.stringify(payload), {
+        status: 503, headers: { 'content-type': 'application/json' },
+      }))('https://fixture.invalid');
+      expect(classifyRetryableError(capture.cause())).toBeNull();
+      const failed = { type: 'response.failed', response: { status: 'failed', ...payload } };
+      const response = await capture.wrapFetch(async () => sseResponse('event: response.failed\ndata: ' + JSON.stringify(failed) + '\n\n'))('https://fixture.invalid');
+      await response.text();
+      expect(classifyRetryableError(capture.cause())).toBeNull();
+      const legacy = createProviderErrorCapture();
+      expect(classifyRetryableError(legacy.cause('503 ' + JSON.stringify(payload)))).toBeNull();
+    }
+  });
+
   it('keeps only exact structured rejected indexes and resets between responses', async () => {
     const capture = createProviderErrorCapture();
     for (const param of ['input[9999].status', 'input[1].status.extra', 'messages[1].status', 'input[-1].status']) {
@@ -105,6 +133,55 @@ function sseResponse(text: string, chunkSize = 1): Response {
 }
 
 describe('bounded stream machine facts', () => {
+  it('retains the original body-read failure after unchanged partial bytes without prefetching', async () => {
+    const capture = createProviderErrorCapture('openai-responses');
+    const error = new TypeError('private body failure', { cause: { code: 'UND_ERR_BODY_TIMEOUT' } });
+    const bytes = new TextEncoder().encode(': heartbeat\n\n');
+    const pull = vi.fn(controller => {
+      if (pull.mock.calls.length === 1) controller.enqueue(bytes);
+      else controller.error(error);
+    });
+    const source = new ReadableStream<Uint8Array>({ pull }, { highWaterMark: 0 });
+    const response = await capture.wrapFetch(async () => new Response(source, {
+      headers: { 'content-type': 'text/event-stream' },
+    }))('https://fixture.invalid');
+    expect(pull).not.toHaveBeenCalled();
+    const reader = response.body!.getReader();
+    expect((await reader.read()).value).toBe(bytes);
+    expect(pull).toHaveBeenCalledTimes(1);
+    expect(capture.cause()).toBeUndefined();
+    await expect(reader.read()).rejects.toBe(error);
+    expect(source.locked).toBe(false);
+    expect(capture.cause()).toBe(error);
+    expect(classifyRetryableError(capture.cause())).toBe('timeout');
+    await capture.wrapFetch(async () => new Response('ok'))('https://fixture.invalid');
+    expect(capture.cause()).toBeUndefined();
+  });
+
+  it('does not replace a protocol rejection with a later body failure', async () => {
+    const capture = createProviderErrorCapture('openai-completions');
+    let reads = 0;
+    const response = await capture.wrapFetch(async () => new Response(new ReadableStream({
+      pull(controller) {
+        if (++reads === 1) controller.enqueue(new TextEncoder().encode('data: {"error":{"status":400,"code":"invalid_request_error"}}\n\n'));
+        else controller.error(new TypeError('private', { cause: { code: 'ECONNRESET' } }));
+      },
+    }, { highWaterMark: 0 }), { headers: { 'content-type': 'text/event-stream' } }))('https://fixture.invalid');
+    await expect(response.text()).rejects.toThrow('private');
+    expect(providerErrorFacts(capture.cause(), false)).toEqual({ status: 400, codes: ['invalid_request_error'] });
+    expect(classifyRetryableError(capture.cause())).toBeNull();
+  });
+
+  it('cannot attach a previous stream read failure to a newer request', async () => {
+    const capture = createProviderErrorCapture('openai-responses');
+    const previous = await capture.wrapFetch(async () => new Response(new ReadableStream({
+      pull(controller) { controller.error(new TypeError('private', { cause: { code: 'ECONNRESET' } })); },
+    }, { highWaterMark: 0 }), { headers: { 'content-type': 'text/event-stream' } }))('https://fixture.invalid');
+    await capture.wrapFetch(async () => new Response('ok'))('https://fixture.invalid');
+    await expect(previous.text()).rejects.toThrow('private');
+    expect(capture.cause()).toBeUndefined();
+  });
+
   it.each(['\n', '\r\n', '\r'])('preserves split UTF-8 bytes and multiline error frames with %j delimiters', async newline => {
     const capture = createProviderErrorCapture('openai-responses');
     const text = [': heartbeat', '', 'event: response.output_text.delta',
@@ -190,6 +267,7 @@ describe('bounded stream machine facts', () => {
     expect(await pending).toEqual({ done: true, value: undefined });
     expect(cancel).toHaveBeenCalledExactlyOnceWith('abort');
     expect(source.locked).toBe(false);
+    expect(capture.cause()).toBeUndefined();
   });
 
   it('isolates late streams from the next request and leaves other protocols untouched', async () => {

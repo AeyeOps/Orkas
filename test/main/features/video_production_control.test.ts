@@ -13,6 +13,7 @@ import {
   videoProductionControlSummary,
   beginVideoProductionGeneration,
   finishVideoProductionGeneration,
+  releaseVideoProductionGeneration,
   readVideoProductionControlState,
   readVideoProductionPlanIdentity,
   validateVideoProductionPlanApproval,
@@ -298,6 +299,55 @@ describe('VideoStudio project production control', () => {
     expect((await beginVideoProductionGeneration(args)).status).toBe('started');
     await expect(beginVideoProductionGeneration(args))
       .rejects.toThrow(/E_VIDEO_PRODUCTION_GENERATION_UNCERTAIN/);
+  });
+
+  it('lets the same paid confirmation retry an attempt that never dispatched, but not one that did', async () => {
+    await approveVideoProductionPlan({ statePath, planPath, turnId: 'turn-b' });
+    await approveVideoProductionGeneration({ statePath, planPath, turnId: 'turn-c' });
+    const args = {
+      statePath,
+      planPath,
+      segmentId: 'shot-1',
+      kind: 'video' as const,
+      outputPath: path.join(root, 'shot-1.mp4'),
+      request: request(),
+    };
+    const first = await beginVideoProductionGeneration(args);
+    if (first.status !== 'started') throw new Error('expected started transaction');
+    const releaseArgs = {
+      statePath,
+      planPath,
+      transactionId: first.transaction.transaction_id,
+      segmentId: 'shot-1',
+      kind: 'video' as const,
+      errorCode: 'PROVIDER_API_ERROR',
+    };
+
+    // The reference upload failed before any provider request left.
+    expect(await releaseVideoProductionGeneration(releaseArgs))
+      .toMatchObject({ status: 'released', error_code: 'PROVIDER_API_ERROR' });
+    const released = await readVideoProductionControlState(statePath, planPath);
+    expect(released.transactions['video:shot-1']).toBeUndefined();
+    expect(released.transaction_history.map((transaction) => transaction.status)).toEqual(['released']);
+    await expect(releaseVideoProductionGeneration(releaseArgs))
+      .rejects.toThrow(/E_VIDEO_PRODUCTION_GENERATION_TRANSACTION_STALE/);
+
+    const retry = await beginVideoProductionGeneration(args);
+    if (retry.status !== 'started') throw new Error('expected the retry to start');
+    expect(retry.transaction.approval_id).toBe(first.transaction.approval_id);
+
+    // Once a request was sent, a failure still needs a new paid confirmation.
+    await finishVideoProductionGeneration({
+      statePath,
+      planPath,
+      transactionId: retry.transaction.transaction_id,
+      segmentId: 'shot-1',
+      kind: 'video',
+      ok: false,
+      errorCode: 'PROVIDER_API_ERROR',
+    });
+    await expect(beginVideoProductionGeneration(args))
+      .rejects.toThrow(/E_VIDEO_PRODUCTION_GENERATION_REAPPROVAL_REQUIRED/);
   });
 
   it('requires a new path after reapproving an uncertain provider attempt', async () => {

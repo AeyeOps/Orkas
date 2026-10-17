@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { writeFileSync } from 'node:fs';
 import { test } from './fixtures/web-app-eval';
-import { expect } from './fixtures/orkas';
+import { openSidebarEntry, expect } from './fixtures/orkas';
 import { recoveredPreviewWindows } from './fixtures/preview-recovery';
 
 for (const errorKind of ['pageerror', 'console'] as const) {
@@ -48,7 +48,7 @@ for (const errorKind of ['pageerror', 'console'] as const) {
     // Independent final UI behavior is still exercised, not inferred from the log.
     const saved = await orkas.invoke<{ok:boolean;id:string}>('savedApps.saveFromPath', {path:entry,title:'Recovered app'});
     expect(saved.ok).toBe(true);
-    await orkas.page.locator('#apps-btn').click();
+    await openSidebarEntry(orkas.page, '#apps-btn');
     const panel = await orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${saved.id}"]`).click());
     const frame = panel.locator('.saved-app-viewer-frame').contentFrame();
     await frame.getByRole('textbox', {name:'Name'}).fill('Independent test');

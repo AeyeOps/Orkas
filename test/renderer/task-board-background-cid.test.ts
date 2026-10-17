@@ -49,12 +49,15 @@ function extractFunction(source: string, name: string): string {
 type BoardContext = {
   _taskBoardTasks: Map<string, Map<string, { status: string }>>;
   renders: string[];
+  deliveries: Array<[string, unknown]>;
+  visibilityChecks: string[];
 };
 
 /** Drive the real `_taskBoardOnEvent` with `visibleCid` on screen. */
 function applyEvents(
   visibleCid: string,
   events: Array<[string, unknown]>,
+  throughBus = false,
 ): BoardContext {
   const ctx: Record<string, unknown> = {
     _taskBoardTasks: new Map(),
@@ -63,17 +66,39 @@ function applyEvents(
     _TASK_BOARD_TERMINAL: new Set(['done', 'stopped', 'failed', 'cancelled']),
     currentCid: visibleCid,
     renders: [] as string[],
+    deliveries: [] as Array<[string, unknown]>,
+    visibilityChecks: [] as string[],
+    _lastGroupWorkEventAt: new Map(),
+    _conversationHistoryLoad: null,
+    _offViewLiveDisplayDirty: new Set(),
+    _isSnapshottedProcess: () => false,
+    _deferHistoryLoadProcess: () => false,
+    _refreshVisibleConversationDisplay: () => {},
+  };
+  ctx._isConversationDisplayVisible = (cid: string) => {
+    (ctx.visibilityChecks as string[]).push(cid);
+    return cid === visibleCid;
   };
   ctx._taskBoardRender = (cid: string) => { (ctx.renders as string[]).push(cid); };
   vm.createContext(ctx);
-  const src = [
+  let src = [
     extractFunction(boardSource, '_taskBoardMapFor'),
     extractFunction(boardSource, '_taskBoardLiveRows'),
     extractFunction(boardSource, '_taskBoardBatchAfterCreate'),
     extractFunction(boardSource, '_taskBoardOnEvent'),
   ].join('\n');
+  if (throughBus) {
+    const start = conversationSource.indexOf('function _handleGroupBusEvent');
+    if (start < 0) throw new Error('missing _handleGroupBusEvent');
+    const end = conversationSource.indexOf('\nfunction ', start + 1);
+    src += '\n' + extractFunction(conversationSource, '_taskBoardEventBypassesViewGuard');
+    src += '\n' + conversationSource.slice(start, end > 0 ? end : undefined);
+    src += `\nwindow = { TaskBoard: { onEvent(cid, event) {
+      deliveries.push([cid, event]); _taskBoardOnEvent(cid, event);
+    } } };`;
+  }
   vm.runInContext(
-    `${src}\nfor (const [cid, ev] of ${JSON.stringify(events)}) _taskBoardOnEvent(cid, ev);`,
+    `${src}\nfor (const [cid, ev] of ${JSON.stringify(events)}) ${throughBus ? '_handleGroupBusEvent(cid, null, ev)' : '_taskBoardOnEvent(cid, ev)'};`,
     ctx,
   );
   return ctx as unknown as BoardContext;
@@ -122,26 +147,23 @@ describe('task board › a background conversation still settles', () => {
 });
 
 describe('task board › events are settled above the cross-cid view guard', () => {
-  // An ordering invariant inside a DOM-coupled function, so it is pinned on
-  // the source: putting the board branch back below `cid !== currentCid`
-  // silently restores the stuck-running row and nothing else would fail.
-  const body = (() => {
-    const start = conversationSource.indexOf('function _handleGroupBusEvent');
-    if (start < 0) throw new Error('missing _handleGroupBusEvent');
-    const end = conversationSource.indexOf('\nfunction ', start + 1);
-    return conversationSource.slice(start, end > 0 ? end : undefined);
-  })();
-  const guard = body.indexOf('if (cid !== currentCid) return;');
-
-  it('handles task_created / task_state before the guard runs', () => {
-    const bypass = body.indexOf('_taskBoardEventBypassesViewGuard(evData)');
-    expect(bypass).toBeGreaterThan(-1);
-    expect(guard).toBeGreaterThan(-1);
-    expect(bypass).toBeLessThan(guard);
+  it('delivers background creation and settlement once without consulting view eligibility', () => {
+    const ctx = applyEvents('visible-cid', [['bg-cid', RUNNING], ['bg-cid', DONE]], true);
+    expect(ctx._taskBoardTasks.get('bg-cid')?.get('t1')?.status).toBe('done');
+    expect(ctx.deliveries.map(([cid, event]) => [cid, (event as { type: string }).type]))
+      .toEqual([['bg-cid', 'task_created'], ['bg-cid', 'task_state']]);
+    expect(ctx.visibilityChecks).toEqual([]);
+    expect(ctx.renders).toEqual([]);
   });
 
-  it('leaves no second board delivery below the guard', () => {
-    expect(body.indexOf('TaskBoard.onEvent', guard)).toBe(-1);
+  it('keeps background process events behind view eligibility without redelivering board events', () => {
+    const ctx = applyEvents('visible-cid', [
+      ['bg-cid', RUNNING], ['bg-cid', DONE],
+      ['bg-cid', { type: 'process', display_seq: 1 }],
+    ], true);
+    expect(ctx.deliveries).toHaveLength(2);
+    expect(ctx.visibilityChecks).toEqual(['bg-cid']);
+    expect(ctx.renders).toEqual([]);
   });
 
   it('routes exactly the two board event types past the guard', () => {

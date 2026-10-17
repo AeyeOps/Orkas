@@ -1,13 +1,6 @@
 import { existsSync, readFileSync } from 'node:fs';
-import { expect, OrkasTestApp, test as base } from './fixtures/orkas';
+import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
-// Attachment input exercises local storage rather than GPU composition.
-const test = base.extend({
-  orkas: async ({}, use, testInfo) => {
-    const app = new OrkasTestApp(testInfo, { softwareRendering: true });
-    try { await app.launch(); await use(app); } finally { await app.dispose(); }
-  },
-});
 
 for (const scope of ['global', 'project'] as const) {
   test(`adds pasted and dropped files to a ${scope} todo and preserves their bytes on Save`, async ({ orkas }, info) => {
@@ -17,12 +10,10 @@ for (const scope of ['global', 'project'] as const) {
     const projectId = project?.project.project_id || '';
     if (projectId) {
       await page.evaluate(async (pid) => { await (window as any).setView('project', pid); }, projectId);
-      const todoTab = page.locator('[data-project-tab="todo"]');
-      await expect(todoTab).toHaveAttribute('data-bound', '1');
-      await todoTab.click();
+      await page.locator('[data-project-tab="todo"]').click();
       await page.locator('#project-todo-add-btn').click();
     } else {
-      await page.locator('#todos-btn').click();
+      await openSidebarEntry(page, '#todos-btn');
       await page.locator('#todos-add-btn').click();
     }
     const input = page.locator('#project-todo-input');
@@ -75,7 +66,7 @@ for (const scope of ['global', 'project'] as const) {
 
 test('keeps ordinary text paste native and discards pasted draft attachments on Cancel', async ({ orkas }) => {
   const page = orkas.page!;
-  await page.locator('#todos-btn').click();
+  await openSidebarEntry(page, '#todos-btn');
   await page.locator('#todos-add-btn').click();
   const input = page.locator('#project-todo-input');
   const textHandled = await input.evaluate((element) => {

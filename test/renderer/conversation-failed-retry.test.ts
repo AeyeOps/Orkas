@@ -262,7 +262,6 @@ describe('conversation busy-path send with a deduped retry', () => {
       _convLog: { warn: (text: string) => { warnings.push(text); }, info: noop, error: noop, debug: noop },
       _renderOrClaimPersistedUserMessage: (cid: string, msg: unknown) => { rendered.push(msg); return true; },
       _chatModelTelemetryContext: () => ({}),
-      _normalizeCommanderTemplateAttribution: () => ({}),
       window: { TaskBoard: { resync: noop } },
     };
     const context = new Proxy(target, {

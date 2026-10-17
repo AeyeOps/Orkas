@@ -1,3 +1,4 @@
+import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -218,6 +219,40 @@ export function sensitivePathReasons(
     return ['sensitive_path'];
   }
   return [];
+}
+
+export interface LocationOnlyRead {
+  /** Folder shown to the user: the directory read itself, else the file's parent. */
+  folder: string;
+  /** Real paths, so a link inside the folder cannot carry a grant elsewhere. */
+  realPath: string;
+  realFolder: string;
+}
+
+function realpathOr(candidate: string): string {
+  try { return fs.realpathSync.native(candidate); }
+  catch { return candidate; }
+}
+
+/** A read that is sensitive only because it lies in a broad personal location
+ * (Desktop, Documents, Downloads, Library app folders): neither the path nor
+ * what it resolves to matches an intrinsic secret pattern. Such a read may be
+ * covered by a read-only grant for its folder; anything else stays per-read. */
+export function locationOnlyRead(
+  absPath: string,
+  options: { trustedRoots?: readonly string[] } = {},
+): LocationOnlyRead | undefined {
+  const trustedRoots = options.trustedRoots ?? [];
+  const intrinsicReasons = (candidate: string) => sensitivePathReasons(candidate, 'read', { trustedRoots: [...trustedRoots, candidate] });
+  const lexical = path.resolve(absPath);
+  if (!sensitivePathReasons(lexical, 'read', { trustedRoots }).length || intrinsicReasons(lexical).length) return undefined;
+  const realPath = realpathOr(lexical);
+  if (realPath !== lexical && intrinsicReasons(realPath).length) return undefined;
+  let isDirectory = false;
+  try { isDirectory = fs.statSync(realPath).isDirectory(); }
+  catch { /* a missing path is read as a file in its parent */ }
+  const folder = isDirectory ? lexical : path.dirname(lexical);
+  return { folder, realPath, realFolder: isDirectory ? realPath : realpathOr(folder) };
 }
 
 export function classifyConfiguredBashCommand(

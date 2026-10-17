@@ -11,7 +11,7 @@ const i18nSource = fs.readFileSync(
   path.join(rendererRoot, 'modules', 'i18n.js'),
   'utf8',
 );
-const LANGS = ['en', 'zh', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it', 'ar', 'hi', 'id', 'th', 'tr', 'vi', 'zh-tw', 'pt-pt', 'es-419'] as const;
+const LANGS = MAIN_LOCALES.map((locale) => locale.code);
 
 type Deferred<T> = {
   promise: Promise<T>;

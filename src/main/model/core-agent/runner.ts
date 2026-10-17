@@ -26,7 +26,6 @@ import * as path from 'node:path';
 
 import {
   pickChatEntryGroup,
-  bumpEntryLastUsed,
   hasConfiguredModel,
   getConfiguredModelCooldown,
   getConfiguredModelOAuthExpiredMessage,
@@ -55,7 +54,7 @@ import {
   formatForSystemPrompt as formatMemoryForSystemPrompt,
   type MemoryScope,
 } from '../../features/memory';
-import { addEntryWithMaintenance, replaceEntryWithMaintenance } from '../../features/memory-maintenance';
+import { addMemoryEntry, replaceMemoryEntry, removeMemoryEntry } from '../../features/memory-writes';
 import {
   formatProjectContextPolicyForSystemPrompt,
   formatProjectInstructionsForSystemPrompt,
@@ -367,7 +366,10 @@ export interface BuildRunnerParams {
   /** Turn owner resource-display filter for the `publish_outputs` tool. */
   onOutputsPublished?: (absPaths: string[]) => string[] | Promise<string[]>;
   /** A saved automation, so the host can offer the user a route to it. */
-  onAutoTaskSaved?: (taskId: string) => void;
+  onAutoTaskSaved?: (taskId: string, title: string) => void;
+  onTodoTaskSaved?: (taskId: string, projectId: string, content: string) => void;
+  onAutoTaskDeleted?: (taskId: string) => void;
+  onTodoTaskDeleted?: (taskId: string, projectId: string) => void;
   /** Caller-supplied predicate consumed by write-style tools' uniquify
    *  logic. See `model/client.ts` `ChatOptions.hasProducedPath`. */
   hasProducedPath?: (absPath: string) => boolean;
@@ -696,9 +698,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       : tier === 'project' ? { project: projectScopeId }
       : tier === 'shared' ? 'memory' : 'user';
     const memoryHandler: MemoryToolHandler = {
-      add: (tier, content, signal) => addEntryWithMaintenance(uid, toScope(tier), content, { signal }),
-      replace: (tier, oldText, content, signal) => replaceEntryWithMaintenance(uid, toScope(tier), oldText, content, { signal }),
-      remove: (tier, oldText) => removeEntry(uid, toScope(tier), oldText),
+      add: (tier, content, signal) => addMemoryEntry(uid, toScope(tier), content, { signal }),
+      replace: (tier, oldText, content, signal) => replaceMemoryEntry(uid, toScope(tier), oldText, content, { signal }),
+      remove: (tier, oldText) => removeMemoryEntry(uid, toScope(tier), oldText),
       list: (tier) => listEntries(uid, toScope(tier)),
     };
     const { createCrossSessionMemoryTool } = await import('../../../core-agent/src/tools/memory-tool');
@@ -728,6 +730,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
       cid: params.cid,
       projectId: params.projectId || (isGroupAgent ? null : undefined),
       ...(params.onAutoTaskSaved ? { onSaved: params.onAutoTaskSaved } : {}),
+      ...(params.onAutoTaskDeleted ? { onDeleted: params.onAutoTaskDeleted } : {}),
     }));
   }
 
@@ -741,7 +744,8 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     const cid = params.cid || '';
     const { createProjectTasksHandler: createBoundHandler } = await import('../../features/project_tasks_tool_handler');
     const createProjectTasksHandler = (pid: string) => createBoundHandler(uid, pid, cid, agentDisplayNameById,
-      { actorId: isCommander ? 'commander' : memoryAgentScope }, { sourceProjectId: params.projectId || '' });
+      { actorId: isCommander ? 'commander' : memoryAgentScope }, { sourceProjectId: params.projectId || '' },
+      params.onTodoTaskSaved, params.onTodoTaskDeleted);
     const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
     if (params.projectId || isGroupAgent) {
       injectedTools.push(createProjectTasksTool(createProjectTasksHandler(params.projectId || ''), {
@@ -871,7 +875,16 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     ...(toolResultsDir ? [toolResultsDir] : []),
   ];
 
+  // Schema-only lock from local state: no publication lookup per runner build,
+  // and an unresolved binding leaves the turn usable. create_artifact itself
+  // re-resolves the binding and fails closed.
+  let lockedAppType: 'local'|'web'|undefined;
+  if (uid && params.cid) {
+    try { lockedAppType = await (await import('../../features/saved_apps')).boundAppType(uid, params.cid); }
+    catch (error) { log.warn('app editing binding unavailable for tool schema', { error: logErrorSummary(error) }); }
+  }
   const localTools = createLocalTools({
+    ...(lockedAppType?{lockedAppType}:{}),
     ...(uid ? { userId: uid } : {}),
     ...(params.cid ? { cid: params.cid } : {}),
     ...(params.turnId ? { turnId: params.turnId } : {}),
@@ -1567,12 +1580,19 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
     // Build a rotating provider covering the whole primary group. Even
     // when there's only one candidate, the wrapper is cheap (just one
     // pass-through) and keeps the code path uniform.
+    // The candidate that owned the latest visible outcome decides whether the
+    // observed latency belongs to the monitored official model.
+    let answeredProviderId: string | undefined;
+    const onCandidateChosen = (info: { profileId: string; providerId: string; modelId: string }) => {
+      answeredProviderId = info.providerId;
+      params.onCandidateChosen?.(info);
+    };
     const rotating = await buildRotatingProvider(
       mod,
       providerId,
       group,
       params.onNativeSearchInjected,
-      params.onCandidateChosen,
+      onCandidateChosen,
       params.onCandidatesObserved,
       params.providerFirstEventTimeoutMs,
       uid || undefined,
@@ -1836,6 +1856,7 @@ async function buildRotatingProvider(
       cooldownId: choice.profileId,
       providerId: candProviderId,
       modelId: candModelId,
+      contextWindow: candidateModel?.contextWindow,
       maxInputImages,
       ...(candProviderId === 'custom' && userId && choice.customConfig
         ? { imageSupport: customModelImageSupport({ userId, profileId: choice.profileId,
@@ -1889,12 +1910,6 @@ async function buildRotatingProvider(
         }
       : {}),
     onSuccess: (profileId, candidate) => {
-      const winner = group.find((choice) => (
-        choice.profileId === profileId
-        && choice.provider === candidate.providerId
-        && choice.model === candidate.modelId
-      ));
-      if (winner) bumpEntryLastUsed(winner.entryId);
       clearCooldown(candidate.cooldownId || profileId);
     },
     ...(onCandidateChosen ? { onCandidateChosen } : {}),
@@ -2000,31 +2015,48 @@ export async function completeSkillCreationCorrection(input: {
   return text;
 }
 
-/** A feature-owned memory transformation, using the same auth/candidate and
- * rotating-provider construction as task runs. No Agent session, tools,
- * repository instructions, skills, or other memory scopes enter this call. */
-export async function completeMemoryConsolidation(uid: string, message: string, signal: AbortSignal): Promise<string> {
+/** One tools-free dispatch-planning request (D29): split a user-orchestrated
+ * group-chat message into dependent tasks. It uses only the user's primary
+ * model candidate with no retries: a planning failure falls back to the
+ * Commander, so it must never silently move a bring-your-own-key user onto
+ * another provider. No session, history replay, tools, or skills enter it. */
+export async function completeDispatchPlan(input: {
+  userId: string;
+  cid: string;
+  turnId: string;
+  message: string;
+  signal: AbortSignal;
+}): Promise<string> {
   const { getActiveUserId } = await import('../../features/users');
-  if (signal.aborted || getActiveUserId() !== uid) throw new Error('memory maintenance cancelled');
-  const group = await pickChatEntryGroup();
-  if (signal.aborted || getActiveUserId() !== uid || !group.length) throw new Error('memory model unavailable');
+  const check = () => {
+    if (input.signal.aborted || getActiveUserId() !== input.userId) {
+      throw new Error('Dispatch planning cancelled');
+    }
+  };
+  check();
+  if (!input.message || input.message.length > 64_000) throw new Error('Dispatch planning input limit');
+  const group = (await pickChatEntryGroup()).slice(0, 1);
+  check();
+  if (!group.length) throw new Error('Dispatch planning model unavailable');
   const mod = await ca();
   const primary = group[0];
-  const provider = await buildRotatingProvider(mod, primary.provider, group, undefined, undefined, undefined, 45_000, uid);
-  if (signal.aborted || getActiveUserId() !== uid) throw new Error('memory maintenance cancelled');
+  const provider = await buildRotatingProvider(mod, primary.provider, group,
+    undefined, undefined, undefined, 20_000, input.userId,
+    { networkRetryAttempts: 0, normalEmptyRetryAttempts: 0 }, undefined, input.cid);
+  check();
   const result = await provider.complete({
     model: primary.model,
-    messages: [{ role: 'user', content: [{ type: 'text', text: message }] }],
-    tools: [],
-    maxTokens: 4096,
-    reasoning: 'off',
-    signal,
+    messages: [{ role: 'user', content: [{ type: 'text', text: input.message }] }],
+    tools: [], maxTokens: 2048, reasoning: 'off', signal: input.signal,
+    requestMetadata: { creditContext: {
+      conversationId: input.cid, turnId: input.turnId,
+    } },
   });
-  if (signal.aborted || getActiveUserId() !== uid || result.stopReason === 'max_tokens'
-    || result.content.some(item => item.type === 'tool_use')) {
-    throw new Error('memory maintenance incomplete');
+  check();
+  if (result.stopReason !== 'end_turn' || result.content.some(part => part.type !== 'text')) {
+    throw new Error('Dispatch planning incomplete');
   }
-  return result.content.filter(item => item.type === 'text').map(item => (item as { text: string }).text).join('').trim();
+  return result.content.map(part => (part as { text: string }).text).join('').trim();
 }
 
 /** Check if metacognition feature is enabled.

@@ -69,8 +69,11 @@ function fakeRuntime(options: {
   interactionWarnings?: string[];
   loadFailure?: boolean;
   extraRequests?: string[];
+  /** Returned only when the evidence script carries the design audit. */
+  design?: Record<string, unknown>;
 } = {}): {
   deps: HtmlPreviewRuntimeDeps;
+  evidenceScripts: string[];
   windows: Array<{ options: Record<string, any>; destroyed: boolean }>;
   requestDecisions: Array<{ url: string; cancel: boolean }>;
   permissionDecisions: {
@@ -98,6 +101,7 @@ function fakeRuntime(options: {
   const loadedEntryUrls: string[] = [];
   const bridgeAvailableAtLoad: boolean[] = [];
   const interactionExecutions: string[] = [];
+  const evidenceScripts: string[] = [];
   const protocolHandlers = new Map<string, (request: Request) => Response | Promise<Response>>();
   const registeredProtocolHandlers: Array<(request: Request) => Response | Promise<Response>> = [];
   let requestHandler: ((details: { url: string }, callback: (decision: { cancel: boolean }) => void) => void) | undefined;
@@ -169,14 +173,15 @@ function fakeRuntime(options: {
             const width = Number(windowOptions.width);
             const isEmbed = width === ARTIFACT_FRAME.smokeWidth
               && Number(windowOptions.height) === ARTIFACT_FRAME.maxHeight;
-            return script.startsWith('(async')
-              ? true
-              : { ...pageEvidence(
+            if (script.startsWith('(async')) return true;
+            evidenceScripts.push(script);
+            return { ...pageEvidence(
                 width,
                 width <= 480 ? options.mobileOverflow ?? 0 : 0,
                 isEmbed ? options.embedUnreachablePx ?? 0 : 0,
                 isEmbed ? options.embedScrollHeight ?? 900 : 900,
-              ), ...(options.ineffectiveTransforms ? { ineffectiveTransforms: options.ineffectiveTransforms } : {}) };
+              ), ...(options.ineffectiveTransforms ? { ineffectiveTransforms: options.ineffectiveTransforms } : {}),
+              ...(options.design && script.includes('designEvidence') ? { design: options.design } : {}) };
           }
         },
         capturePage: async () => ({
@@ -262,6 +267,7 @@ function fakeRuntime(options: {
   };
   return {
     deps,
+    evidenceScripts,
     windows,
     requestDecisions,
     permissionDecisions,
@@ -709,6 +715,97 @@ describe('responsive HTML preview renderer', () => {
     expect(interactiveRuntime.loadedEntryUrls.every((url) => (
       !fs.existsSync(path.dirname(fileURLToPath(url)))
     ))).toBe(true);
+  });
+});
+
+describe('design audit', () => {
+  const desktop = [{ name: 'desktop' as const, width: 1440, height: 900 }];
+  const clean = {
+    fontSizes: [32, 16, 14, 13, 12, 11, 10.5, 10],
+    colorTokenCount: 8,
+    nonTokenColorCount: 0,
+    nonTokenColors: [],
+    textOverlaps: [],
+    lowContrastCount: 0,
+    lowContrastText: [],
+  };
+  // The shape a UIDesigner revision drifted into: one-off sizes, colors typed
+  // in place of tokens, copy laid over copy, and muted text too faint to read.
+  const drifted = {
+    fontSizes: [32, 25, 20, 17, 16, 14, 13, 12, 11],
+    colorTokenCount: 8,
+    nonTokenColorCount: 2,
+    nonTokenColors: ['#4945c0 (a.e-tag)', '#fff8e1 (#notice)'],
+    textOverlaps: [{ selector: 'h2#goal-title', other: 'p.micro', width: 40, height: 12 }],
+    lowContrastCount: 3,
+    lowContrastText: [{
+      selector: 'span.muted', ratio: 3.69, required: 4.5, color: '#7e8597', background: '#ffffff', fontSize: 11,
+    }],
+  };
+
+  it('measures every viewport by default and reports drift as warnings, not blockers', async () => {
+    const runtime = fakeRuntime({ design: drifted });
+    const result = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      desktop,
+      runtime.deps,
+      { interactions: false },
+    );
+
+    expect(runtime.evidenceScripts).toHaveLength(1);
+    expect(runtime.evidenceScripts[0]).toContain('designEvidence');
+    expect(result.evidence.ok).toBe(true);
+    expect(result.evidence.blockers).toEqual([]);
+    expect(result.evidence.viewports[0].design).toEqual(drifted);
+    expect(result.evidence.warnings).toEqual([
+      'desktop: 9 distinct font sizes on visible text (32, 25, 20, 17, 16, 14, 13, 12, 11px); a type scale needs 8 or fewer',
+      'desktop: 2 hard-coded color(s) match no color variable: #4945c0 (a.e-tag), #fff8e1 (#notice)',
+      'desktop: 1 text overlap(s): h2#goal-title × p.micro',
+      'desktop: 3 text element(s) below WCAG AA contrast: span.muted 3.69:1 < 4.5:1',
+    ]);
+  });
+
+  it('stays quiet within the scale, names untokened pages, and survives a failed measurement', async () => {
+    const quiet = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'), desktop, fakeRuntime({ design: clean }).deps, { interactions: false },
+    );
+    expect(quiet.evidence.warnings).toEqual([]);
+
+    const untokened = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      desktop,
+      fakeRuntime({
+        design: { ...clean, colorTokenCount: 0, nonTokenColorCount: 1, nonTokenColors: ['#123456 (p.rogue)'] },
+      }).deps,
+      { interactions: false },
+    );
+    expect(untokened.evidence.warnings).toEqual([
+      'desktop: no color variables; 1 hard-coded color(s): #123456 (p.rogue)',
+    ]);
+
+    const failed = await renderResponsiveHtmlPreview(
+      path.join(root, 'index.html'),
+      desktop,
+      fakeRuntime({ design: { ...clean, fontSizes: [], error: 'canvas unavailable' } }).deps,
+      { interactions: false },
+    );
+    expect(failed.evidence.ok).toBe(true);
+    expect(failed.evidence.warnings).toEqual(['desktop: design audit did not run: canvas unavailable']);
+  });
+
+  it('leaves design out of the chat-artifact smoke, which judges operability only', async () => {
+    const runtime = fakeRuntime({
+      controlsExercised: 1,
+      stateChangesObserved: 1,
+      embedScrollHeight: ARTIFACT_FRAME.maxHeight - 40,
+      design: drifted,
+    });
+    const result = await renderInteractiveHtmlSmoke(path.join(root, 'index.html'), runtime.deps);
+
+    expect(runtime.evidenceScripts).toHaveLength(3);
+    expect(runtime.evidenceScripts.some((script) => script.includes('designEvidence'))).toBe(false);
+    expect(result.evidence.viewports.every((view) => view.design === undefined)).toBe(true);
+    expect(result.evidence.warnings).toEqual([]);
   });
 });
 

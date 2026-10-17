@@ -64,6 +64,16 @@ describe('conversations.delete recycle transaction', () => {
     const recycleBin = await import('../../../src/main/features/recycle_bin');
     const conv = await chats.createConversation(TEST_UID, { title: 'Delete during stop' });
     const cid = conv.conversation_id;
+    // A stale Settings page cannot preview or mutate the newly active account.
+    for (const action of ['preview', 'page', 'remove']) {
+      const result = await invoke(`conversations.cleanup.${action}`, {
+        expectedUserId: 'previous-account', days: 90, protectedIds: [], token: 'stale', offset: 0, cid,
+      });
+      expect(result).toMatchObject({ ok: false, error: 'cleanup_account_changed' });
+    }
+    expect(await chats.getConversationMetadata(TEST_UID, cid)).not.toBeNull();
+    expect(await recycleBin.listRecycleBatches(TEST_UID)).toEqual([]);
+
     const chatFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
     const groupDir = paths.groupChatDir(TEST_UID, cid);
     const stateFile = path.join(groupDir, 'state.json');

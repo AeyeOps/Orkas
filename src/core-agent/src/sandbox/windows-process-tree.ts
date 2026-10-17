@@ -35,6 +35,7 @@ $ErrorActionPreference = 'Stop'
 $owned = @{}
 $ordered = [Collections.Generic.List[object]]::new()
 $result = 1
+$rootTerminated = $false
 try {
   $root = [Diagnostics.Process]::GetProcessById($targetProcessId)
   $null = $root.Handle
@@ -46,7 +47,15 @@ try {
 
   # Stop the root immediately, before WMI startup can delay cancellation.
   # Its held handle keeps the parent identity valid for orphan discovery.
-  if (-not $root.HasExited) { $root.Kill() }
+  if (-not $root.HasExited) {
+    try {
+      $root.Kill()
+      $rootTerminated = $true
+    } catch {
+      # A natural exit between HasExited and Kill is not our termination.
+      if (-not $root.HasExited) { throw }
+    }
+  }
   if (-not $root.WaitForExit(500)) { throw 'termination_incomplete' }
   $rows = @(Read-ProcessSnapshot)
   for ($pass = 0; $pass -lt 4; $pass++) {
@@ -103,6 +112,12 @@ try {
   $result = 1
 } finally {
   foreach ($entry in $owned.Values) { $entry.Process.Dispose() }
+}
+if ($result -eq 0 -and $rootTerminated) {
+  # Private helper evidence, never command output. Publish only after the
+  # pinned root's Kill/WaitForExit and the complete descendant sweep succeed.
+  [Console]::Out.WriteLine('root-terminated')
+  [Console]::Out.Flush()
 }
 exit $result
 `;

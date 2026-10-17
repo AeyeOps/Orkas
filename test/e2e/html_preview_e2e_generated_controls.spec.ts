@@ -2,6 +2,107 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { test } from './fixtures/web-app-eval';
 import { expect } from './fixtures/orkas';
+import type { HtmlPreviewDesignEvidence } from '../../src/main/features/html_preview';
+
+for (const broken of [false, true]) {
+  test(`fills an editor before download and retains empty-payload rejection (${broken ? 'broken' : 'working'})`, async ({ sdkOrkas: orkas }, info) => {
+    const entry = orkas.createWorkspaceFile('editor/index.html', `<!doctype html>
+      <style>button:focus-visible,textarea:focus-visible{outline:2px solid blue}</style>
+      <label>Draft<textarea id="draft"></textarea></label><button id="download">Download</button>
+      <script>
+        let edits=0;
+        const draft=document.getElementById('draft');
+        draft.addEventListener('input',()=>edits++);
+        document.getElementById('download').onclick=()=>{
+          const a=document.createElement('a');
+          a.download='draft-'+edits+'.txt';
+          a.href=URL.createObjectURL(new Blob([${broken ? "''" : 'draft.value'}],{type:'text/plain'}));
+          a.click();
+        };
+      </script>`);
+    for (const artifact of [false, true]) {
+      const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+        const preview = (process as any).mainModule.require(args.modulePath);
+        return (await (args.artifact ? preview.renderInteractiveHtmlSmoke(args.entry)
+          : preview.renderResponsiveHtmlPreview(args.entry, [{name:'desktop',width:1280,height:800}]))).evidence;
+      }, {entry,artifact,modulePath:path.resolve(__dirname,'../../src/main/features/html_preview.ts')});
+      writeFileSync(info.outputPath(`editor-${artifact}.json`), JSON.stringify({...evidence,entryPath:undefined},null,2));
+      expect(evidence.interactions.downloads).toHaveLength(1);
+      expect(evidence.interactions.downloads[0]).toMatchObject({filename:'draft-1.txt',mimeType:'text/plain'});
+      expect(evidence.interactions.downloads[0].totalBytes > 0).toBe(!broken);
+      expect(evidence.ok).toBe(!broken);
+      expect(evidence.blockers).toEqual(broken
+        ? ['1 observed download(s) lacked a filename, MIME type, or non-empty payload'] : []);
+    }
+  });
+}
+
+test('fills newly revealed fields before their action without editing earlier fields twice', async ({ sdkOrkas: orkas }, info) => {
+  const entry = orkas.createWorkspaceFile('revealed-editor/index.html', `<!doctype html>
+    <style>button:focus-visible,input:focus-visible{outline:2px solid blue}</style>
+    <input id="title" aria-label="Title"><button id="open">Open editor</button><div id="editor"></div>
+    <script>
+      let edits=0;
+      document.getElementById('title').addEventListener('input',()=>edits++);
+      document.getElementById('open').onclick=()=>{
+        document.getElementById('editor').innerHTML='<input id="body" aria-label="Body"><button id="save">Save</button>';
+        document.getElementById('save').onclick=()=>{
+          const a=document.createElement('a');
+          a.download='saved-'+edits+'.txt';
+          a.href=URL.createObjectURL(new Blob([document.getElementById('body').value],{type:'text/plain'}));
+          a.click();
+        };
+      };
+    </script>`);
+  const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+    const { renderResponsiveHtmlPreview } = (process as any).mainModule.require(args.modulePath);
+    return (await renderResponsiveHtmlPreview(args.entry,[{name:'desktop',width:1280,height:800}])).evidence;
+  }, {entry,modulePath:path.resolve(__dirname,'../../src/main/features/html_preview.ts')});
+  writeFileSync(info.outputPath('revealed-editor.json'),JSON.stringify({...evidence,entryPath:undefined},null,2));
+  expect(evidence.interactions.downloads).toHaveLength(1);
+  expect(evidence.interactions.downloads[0]).toMatchObject({filename:'saved-1.txt',mimeType:'text/plain'});
+  expect(evidence.interactions.downloads[0].totalBytes).toBeGreaterThan(0);
+  expect(evidence.interactions.stateControlsExercised).toBe(2);
+  expect(evidence.blockers).toEqual([]);
+  expect(evidence.ok).toBe(true);
+});
+
+test('reports low contrast for equivalent legacy and CSS Color 4 paints', async ({ sdkOrkas: orkas }) => {
+  const entry = orkas.createWorkspaceFile('color-audit/index.html', `<!doctype html>
+    <style>body{background:white;font:16px sans-serif}button{color:black}
+    #legacy{color:#ccc}#srgb{color:color(srgb 0.8 0.8 0.8)}#lch{color:oklch(0.9 0 0)}</style>
+    <button>Focusable</button><p id="legacy">Light text</p><p id="srgb">Equivalent light text</p>
+    <p id="lch">Light neutral text</p>`);
+  const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+    const { renderResponsiveHtmlPreview } = (process as any).mainModule.require(args.modulePath);
+    return (await renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }], {},
+      { interactions: false })).evidence;
+  }, { entry, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+  const design = evidence.viewports[0].design as HtmlPreviewDesignEvidence;
+  expect(design.lowContrastText.map(item => item.selector).sort()).toEqual(['#lch', '#legacy', '#srgb']);
+  const legacy = design.lowContrastText.find(item => item.selector === '#legacy');
+  const equivalent = design.lowContrastText.find(item => item.selector === '#srgb');
+  expect(equivalent).toMatchObject({ color: legacy!.color, background: legacy!.background, ratio: legacy!.ratio });
+  expect(design.lowContrastText.some(item => item.selector === 'button')).toBe(false);
+  expect(evidence.ok).toBe(true);
+});
+
+test('retains measured findings and marks a large document audit as partial', async ({ sdkOrkas: orkas }) => {
+  const entry = orkas.createWorkspaceFile('bounded-audit/index.html', `<!doctype html>
+    <style>body{background:white;font:16px sans-serif}p{color:#ccc}</style>
+    <button>Focusable</button><p id="early">Known light text</p>${'<i hidden></i>'.repeat(6000)}
+    <p id="late">Light text after the scan boundary</p>`);
+  const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+    const { renderResponsiveHtmlPreview } = (process as any).mainModule.require(args.modulePath);
+    return (await renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }], {},
+      { interactions: false })).evidence;
+  }, { entry, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+  const design = evidence.viewports[0].design as HtmlPreviewDesignEvidence & { incomplete?: string[] };
+  expect(design.lowContrastText.map(item => item.selector)).toContain('#early');
+  expect(design.incomplete).toContain('element_limit');
+  expect(design.error).toBeUndefined();
+  expect(evidence.ok).toBe(true);
+});
 
 test('discovers post-submit controls and identifies an ineffective generated flip', async ({ sdkOrkas: orkas }, info) => {
   const source = readFileSync(path.join(__dirname, 'fixtures/app-template-flashcards/list-inline-defect.html'), 'utf8');

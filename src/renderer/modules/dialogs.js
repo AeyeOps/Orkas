@@ -103,13 +103,22 @@ function _uiTrapDialogTab(overlay, e) {
   return false;
 }
 
-function _uiRestoreDialogFocus(previousFocus) {
+function _uiRestoreDialogFocus(previousFocus, options) {
   if (
     previousFocus
     && typeof previousFocus.focus === 'function'
     && document.body.contains(previousFocus)
   ) {
-    previousFocus.focus();
+    previousFocus.focus(options);
+    // Resource-card actions are revealed by :focus-within. Re-enter the
+    // focusable card before restoring an action that is hidden at rest.
+    if (document.activeElement !== previousFocus && !previousFocus.disabled && !previousFocus.hidden) {
+      const parent = previousFocus.parentElement?.closest('[tabindex]');
+      if (parent && parent.tabIndex >= 0) {
+        parent.focus(options);
+        previousFocus.focus(options);
+      }
+    }
   }
 }
 

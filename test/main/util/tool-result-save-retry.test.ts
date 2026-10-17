@@ -12,6 +12,7 @@ import { isRetryableError } from '../../../src/core-agent/src/shared/errors';
 import type { AgentTool, ToolResult } from '../../../src/core-agent/src/tools/base';
 import type { CompletionResult } from '../../../src/core-agent/src/providers/base';
 import type { AgentRunEvent } from '../../../src/core-agent/src/agent/types';
+import { expectTestLog } from '../../helpers/test-log-analysis';
 
 let root: string;
 beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-result-retry-')); });
@@ -161,6 +162,9 @@ async function collect(runner: AgentRunner, signal?: AbortSignal) {
 
 describe('result storage failure through the runner', () => {
   it.each([false, true])('stops queued work, preserves executed facts and protocol across reload (parallel=%s)', async parallel => {
+    // Asserted below: done.meta.error is TOOL_RESULT_PERSISTENCE_FAILED and the
+    // ledger records `first` as failed. Only the parallel executor logs it.
+    if (parallel) expectTestLog({ level: 'warn', source: 'console', message: /^\[agent-runner\] Tool first failed \(permanent\); details withheld$/ });
     vi.stubEnv('ORKAS_MAX_TOOL_CONCURRENCY', '2');
     const store = path.join(root, 'results');
     const sessionFile = path.join(root, 'session.jsonl');

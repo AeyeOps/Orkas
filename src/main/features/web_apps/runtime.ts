@@ -5,17 +5,24 @@ import * as path from 'node:path';
 import type { AppUsageScope } from '../connectors/action_confirm';
 import { Mutex } from 'async-mutex';
 import { METHODS, SDK_VERSION, UNSUPPORTED, describeMethod, manifestSchema, type AppManifest, type Method, MAX_PAYLOAD_BYTES } from './catalog';
-import { writeJson, writeBytesAtomic, isAtomicWriteTempPath } from '../../storage';
+import { writeBytesAtomic, isAtomicWriteTempPath } from '../../storage';
 import { webAppDataFile, webAppSandboxRoot, userLocalRoot, userCloudRoot, userRoot, WS_ROOT } from '../../paths';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { MAX_TEXT_FILE_BYTES } from '../../util/file-size-limits';
+import { LocalAppData } from './data';
+import {createLogger} from '../../logger';
+import { logErrorSummary } from '../../util/log-redact';
+import { commonMethod, type AppType, type DataDefinition } from './data-contract';
 import { RequestHistory } from './request-history';
+import { requireLocalAppType } from './commercial-entry';
 
 export class AppError extends Error {
   constructor(readonly code: string) { super(code); }
 }
 export interface Bundle {
+  browserOnly?: boolean;
   kind?: 'saved' | 'artifact';
+  appType?: AppType;
   key: string;
   title: string;
   entry: string;
@@ -30,7 +37,14 @@ export interface AppTool {
   inputSchema: object;
   execute(args: Record<string, unknown>, signal: AbortSignal): Promise<unknown>;
 }
+export interface AppDataOwner {
+  readonly closed?:boolean;
+  open():Promise<LocalAppData>;
+  call(method:string,args:unknown,signal?:AbortSignal):Promise<unknown>;
+  close():Promise<void>;
+}
 export interface HostAdapters {
+  dataOwner?(uid:string,key:string,file:string,definition:DataDefinition):AppDataOwner;
   storageChanged?(uid: string, relPath: string): void;
   activeUser(): string;
   language(): string;
@@ -56,7 +70,46 @@ interface Instance {
 const id = () => crypto.randomBytes(16).toString('hex');
 const MAX_FILE_BYTES = MAX_TEXT_FILE_BYTES;
 const STORE_BYTES = MAX_TEXT_FILE_BYTES;
+/** Serialized bytes of parsed stores kept for open apps; larger stores are
+ * re-read per call. */
+const STORE_CACHE_BYTES = 32 * 1024 * 1024;
+interface ParsedStore { signature: string; owner: string; bytes: number; entries: Record<string, unknown> }
+/** Identity plus both change times: a synced copy arrives by rename (new
+ * inode) and an in-place rewrite always moves ctime, even when mtime is set. */
+const storeSignature = (st: { dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number }) =>
+  `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}`;
 const error = (code: string): never => { throw new AppError(code); };
+const callLog = createLogger('web-app-runtime');
+const CALL_FAILURE_WINDOW_MS = 60_000;
+const CALL_FAILURE_MAX_KEYS = 64;
+const callFailures = new Map<string, { at: number; suppressed: number }>();
+/** One warning per catalog method + code per minute, with the suppressed
+ *  count carried forward. Unexpected non-AppError causes keep only a redacted
+ *  summary; app arguments, results, paths, and identities are never logged. */
+function logCallFailure(method: string, code: string, cause: unknown): void {
+  try {
+    const key = `${method}\0${code}`, now = Date.now();
+    const seen = callFailures.get(key);
+    if (seen && now - seen.at < CALL_FAILURE_WINDOW_MS) { seen.suppressed++; return; }
+    if (!seen && callFailures.size >= CALL_FAILURE_MAX_KEYS) {
+      for (const [old, entry] of callFailures) if (now - entry.at >= CALL_FAILURE_WINDOW_MS) callFailures.delete(old);
+      if (callFailures.size >= CALL_FAILURE_MAX_KEYS) return;
+    }
+    callFailures.set(key, { at: now, suppressed: 0 });
+    callLog.warn('web app call failed', { method, code, suppressed_count: seen?.suppressed || 0,
+      ...(cause instanceof AppError ? {} : { error: logErrorSummary(cause) }) });
+  } catch { /* Diagnostics are best effort. */ }
+}
+const liveRuntimes=new Set<WeakRef<WebAppRuntime>>();
+const heldAppData=new Set<string>();
+export function holdAppData(uid:string,key:string){const identity=JSON.stringify([uid,key]);if(heldAppData.has(identity))throw new AppError('E_BUSY');heldAppData.add(identity);return ()=>heldAppData.delete(identity);}
+export async function closeAppData(uid:string,key:string){
+  for(const ref of [...liveRuntimes]){const runtime=ref.deref();if(!runtime){liveRuntimes.delete(ref);continue;}runtime.closeSource(uid,key);await runtime.drainData();}
+}
+/** A formal migration must be transferable even when its page stays closed. */
+export async function checkpointAppData(uid:string,key:string,file:string,definition:DataDefinition){
+  for(const ref of [...liveRuntimes]){const runtime=ref.deref();if(!runtime){liveRuntimes.delete(ref);continue;}if(await runtime.checkpointData(uid,key,file,definition))return;}
+}
 async function readFileBytes(file: fs.FileHandle, check: () => void): Promise<Buffer> {
   // Allocate for this file, not the admission ceiling; read in chunks so
   // cancellation still interrupts large snapshots. Short reads are not EOF.
@@ -77,58 +130,161 @@ async function readFileBytes(file: fs.FileHandle, check: () => void): Promise<Bu
     }
   }
 }
+/** Whether serialized JSON nests at most `max` objects/arrays deep. Strings
+ * are skipped whole (the input is JSON.stringify output, so quotes and escapes
+ * are well formed); scanning only structure keeps long text values cheap. */
+function jsonDepthWithin(json: string, max: number): boolean {
+  const structure = /["{}[\]]/g;
+  let depth = 0;
+  for (let m = structure.exec(json); m; m = structure.exec(json)) {
+    const c = m[0];
+    if (c === '"') {
+      // The closing quote is the next one not escaped by an odd backslash run.
+      let end = m.index;
+      for (;;) {
+        end = json.indexOf('"', end + 1);
+        if (end < 0) return true;
+        let slashes = 0;
+        while (json.charCodeAt(end - 1 - slashes) === 92) slashes++;
+        if (slashes % 2 === 0) break;
+      }
+      structure.lastIndex = end + 1;
+    } else if (c === '{' || c === '[') { if (++depth > max) return false; }
+    else depth--;
+  }
+  return true;
+}
 export function boundedJson(value: unknown, max = MAX_PAYLOAD_BYTES): string {
   let json: string;
   try { json = JSON.stringify(value); } catch { return error('E_INPUT'); }
   if (typeof json !== 'string' || Buffer.byteLength(json) > max) return error('E_LIMIT');
   // Bound nested JSON work before Zod or service adapters traverse it.
-  let depth = 0;
-  let quoted = false;
-  let escaped = false;
-  for (let i = 0; i < json.length; i++) {
-    const c = json[i];
-    if (quoted) { if (escaped) escaped = false; else if (c === '\\') escaped = true; else if (c === '"') quoted = false; }
-    else if (c === '"') quoted = true;
-    else if (c === '{' || c === '[') { if (++depth > 32) return error('E_LIMIT'); }
-    else if (c === '}' || c === ']') depth--;
-  }
+  if (!jsonDepthWithin(json, 32)) return error('E_LIMIT');
   return json;
 }
 
 /** Instances and grants are memory-only and bound to the trusted host renderer. */
 export class WebAppRuntime {
+  private dataConnections=new Map<string,LocalAppData>();
+  private dataOwners=new Map<string,AppDataOwner>();
+  private dataOpening=new Map<string,Promise<LocalAppData>>();
+  private dataClosures=new Set<Promise<void>>();
+  async drainData(){await Promise.allSettled([...this.dataOpening.values()]);await Promise.allSettled([...this.dataClosures]);}
+  private dataFile(s:Instance){return this.preview ? path.join(this.preview.storageRoot,'data.sqlite') : path.join(webAppSandboxRoot(s.uid,s.bundle.key,'local'),'data.sqlite');}
+  private async dataCall(s:Instance,method:string,args:unknown,signal:AbortSignal){
+    if(heldAppData.has(JSON.stringify([s.uid,s.bundle.key])))return error('E_BUSY');
+    if(!s.manifest.data)return error('E_NOT_DECLARED');
+    const file=this.dataFile(s);let connection=this.dataConnections.get(file);
+    if(this.dataOwners.get(file)?.closed){this.releaseData(file);connection=undefined;}
+    // A worker stopped by a call timeout or crash never recovers; release it so this call reopens.
+    if(connection?.dead){createLogger('web-app-data').warn('data worker stopped, reopening');this.releaseData(file);connection=undefined;}
+    if(!connection){
+      if(!this.dataOpening.has(file)&&this.dataConnections.size+this.dataOpening.size>=4)return error('E_BUSY');
+      const boundary=this.preview?.storageRoot ?? userLocalRoot(s.uid);
+      if(!isPathAllowed(file,[boundary]))return error('E_FILE');
+      if(!this.dataOpening.has(file))this.dataOpening.set(file,(async()=>{
+        const owner=this.preview?null:this.host.dataOwner?.(s.uid,s.bundle.key,file,s.manifest.data);
+        const opened=owner?await owner.open():new LocalAppData(file,boundary,s.manifest.data);
+        const inUse = [...this.instances.values()].some(other => other.manifest.data
+          && this.dataFile(other) === file && !other.controller.signal.aborted
+          && other.uid === this.host.activeUser());
+        if(!inUse){await (owner?owner.close():opened.close());throw new AppError('E_CLOSED');}
+        this.dataConnections.set(file,opened);if(owner)this.dataOwners.set(file,owner);return opened;
+      })().finally(()=>this.dataOpening.delete(file)));
+      connection=await this.dataOpening.get(file);
+    }
+    if(s.controller.signal.aborted||s.uid!==this.host.activeUser())return error('E_CLOSED');
+    try{return await (this.dataOwners.get(file)?.call(method,args,signal)??connection.call(method,args));}catch(e){throw new AppError((e as any)?.code?.startsWith('E_')?(e as any).code:'E_DATA');}
+  }
+  /** Drop the cached connection for `file`; its close (and checkpoint) finishes in the background. */
+  private releaseData(file:string){
+    const connection=this.dataConnections.get(file);this.dataConnections.delete(file);
+    const owner=this.dataOwners.get(file);this.dataOwners.delete(file);
+    if(connection){const closing=(owner?owner.close():connection.close()).catch(e=>{createLogger('web-app-data').warn('data checkpoint unavailable',{error_code:(e as any).code||'E_DATA'});}).finally(()=>this.dataClosures.delete(closing));this.dataClosures.add(closing);}
+  }
+
   private instances = new Map<string, Instance>();
   private stores = new Map<string, { mutex: Mutex; users: number }>();
-  constructor(private host: HostAdapters, private preview?: { storageRoot: string }) {}
+  /** Parsed storage files of open apps, least recently used first. */
+  private parsedStores = new Map<string, ParsedStore>();
+  private parsedBytes = 0;
+  constructor(private host: HostAdapters, private preview?: { storageRoot: string }) {liveRuntimes.add(new WeakRef(this));}
+  closeSource(uid:string,key:string){for(const s of [...this.instances.values()])if(s.uid===uid&&s.bundle.key===key)this.close(uid,s.owner,s.token);}
+
+  private static storeOwner(s: Instance): string { return `${s.uid}\0${s.bundle.key}`; }
+  private ownerOpen(owner: string): boolean {
+    for (const s of this.instances.values()) if (WebAppRuntime.storeOwner(s) === owner) return true;
+    return false;
+  }
+  private dropStore(file: string): void {
+    const old = this.parsedStores.get(file);
+    if (!old) return;
+    this.parsedStores.delete(file);
+    this.parsedBytes -= old.bytes;
+  }
+  private keepStore(file: string, store: ParsedStore): void {
+    this.dropStore(file);
+    if (store.bytes > STORE_CACHE_BYTES || !this.ownerOpen(store.owner)) return;
+    this.parsedStores.set(file, store);
+    this.parsedBytes += store.bytes;
+    for (const oldest of this.parsedStores.keys()) {
+      if (this.parsedBytes <= STORE_CACHE_BYTES) break;
+      this.dropStore(oldest);
+    }
+  }
 
   private available(capability: string | null | undefined): boolean {
-    if (this.preview && capability && capability !== 'storage' && capability !== 'appFiles') return false;
+    if (this.preview && capability && capability !== 'storage' && capability !== 'appFiles' && capability !== 'data') return false;
     return capability !== 'ai' || this.host.modelAvailable();
   }
 
+  async checkpointData(uid:string,key:string,file:string,definition:DataDefinition){
+    if(this.preview||!this.host.dataOwner)return false;
+    const owner=this.host.dataOwner(uid,key,file,definition);try{await owner.open();}finally{await owner.close();}return true;
+  }
   open(uid: string, owner: number, bundle: Bundle) {
+    requireLocalAppType(bundle.appType);
     if (uid !== this.host.activeUser()) return error('E_CLOSED');
+    if(heldAppData.has(JSON.stringify([uid,bundle.key])))return error('E_BUSY');
     const parsed = manifestSchema.safeParse(bundle.manifest);
-    if (!parsed.success) return error('E_MANIFEST');
+    if (!parsed.success || (bundle.appType === 'web' && parsed.data.capabilities.some(c=>c!=='data'))) return error('E_MANIFEST');
     const token = id();
-    const instance: Instance = { token, host: `app-${id()}`, uid, owner, bundle, manifest: parsed.data,
+    const host = bundle.browserOnly
+      ? 'a-' + crypto.createHash('sha256').update(JSON.stringify([uid, bundle.key])).digest('hex').slice(0, 20)
+      : `app-${id()}`;
+    if ([...this.instances.values()].some(s => s.host === host && (s.uid !== uid || s.bundle.key !== bundle.key))) return error('E_BUNDLE');
+    const instance: Instance = { token, host, uid, owner, bundle: {...bundle,appType:bundle.appType??'local'}, manifest: structuredClone(parsed.data),
       controller: new AbortController(), handles: new Map(), requests: new Map(),
       seen: new RequestHistory() };
     this.instances.set(token, instance);
-    return { token, entry: bundle.entry, url: `chat-app://${instance.host}/${bundle.entry.split('/').map(encodeURIComponent).join('/')}`, sdkVersion: SDK_VERSION };
+    return { token, entry: bundle.entry, url: `chat-app://${instance.host}/${bundle.entry.split('/').map(encodeURIComponent).join('/')}`, ...(bundle.browserOnly ? { browserOnly: true } : { sdkVersion: SDK_VERSION }) };
   }
   private current(uid: string, owner: number, token: string): Instance {
     const s = this.instances.get(token);
     if (!s || s.uid !== uid || s.owner !== owner || uid !== this.host.activeUser() || s.controller.signal.aborted) return error('E_CLOSED');
+    requireLocalAppType(s.bundle.appType);
     if (s.bundle.valid?.() === false) {
       this.close(uid, owner, token); return error('E_CLOSED');
     }
     return s;
   }
+  /** The existing artifact bridge is available only in its local task context. */
+  canSubmitArtifact(uid: string, owner: number, token: string): boolean {
+    try {
+      const s = this.current(uid, owner, token);
+      return !this.preview && s.bundle.kind === 'artifact' && s.bundle.appType === 'local';
+    } catch { return false; }
+  }
   close(uid: string, owner: number, token: string): void {
     const s = this.instances.get(token);
     if (!s || s.uid !== uid || s.owner !== owner) return;
     this.instances.delete(token);
+    const dataFile=s.manifest.data?this.dataFile(s):null;
+    if(dataFile&&![...this.instances.values()].some(other=>other.manifest.data&&this.dataFile(other)===dataFile))this.releaseData(dataFile);
+    const app = WebAppRuntime.storeOwner(s);
+    if (!this.ownerOpen(app)) {
+      for (const [file, store] of this.parsedStores) if (store.owner === app) this.dropStore(file);
+    }
     s.controller.abort();
     for (const c of s.requests.values()) c.abort();
     this.host.closed?.(s.uid, { id: s.token, owner: s.owner });
@@ -163,9 +319,10 @@ export class WebAppRuntime {
   }
   cancel(uid: string, owner: number, token: string, requestId: string) {
     const s = this.current(uid, owner, token);
+    if (s.bundle.browserOnly) return error('E_UNAVAILABLE');
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(requestId)) return error('E_INPUT');
     // Tombstones also stop a cancellation arriving before its invoke.
-    s.seen.add(requestId);
+    if (!s.seen.add(requestId)) return error('E_LIMIT');
     s.requests.get(requestId)?.abort();
   }
   resource(host: string, rel: string, origin: string | null) {
@@ -182,15 +339,28 @@ export class WebAppRuntime {
   async call(uid: string, owner: number, token: string, requestId: string, method: string, raw: unknown,
     progress: (event: unknown) => void = () => {}) {
     const s = this.current(uid, owner, token);
+    try { return await this.dispatch(s, requestId, method, raw, progress); }
+    catch (cause) {
+      const code = cause instanceof AppError ? cause.code : 'E_FAILED';
+      if (code !== 'E_CANCELLED' && code !== 'E_CLOSED') {
+        logCallFailure(Object.hasOwn(METHODS, method) ? method : 'unknown', code, cause);
+      }
+      throw cause;
+    }
+  }
+  private async dispatch(s: Instance, requestId: string, method: string, raw: unknown,
+    progress: (event: unknown) => void) {
+    if (s.bundle.browserOnly) return error('E_UNAVAILABLE');
     if (!/^[a-zA-Z0-9_-]{1,64}$/.test(requestId)) return error('E_INPUT');
     if (s.seen.has(requestId)) return error('E_DUPLICATE');
     if (!Object.hasOwn(METHODS, method)) return error('E_METHOD');
-    boundedJson(raw);
+    if(s.bundle.appType==='web'&&!commonMethod(method))return error('E_UNAVAILABLE');
+    boundedJson(raw,method.startsWith('data.')?1024*1024:MAX_PAYLOAD_BYTES);
     const def = METHODS[method as Method];
     const parsed = def.input.safeParse(raw);
     if (!parsed.success) return error('E_INPUT');
     if (!this.available(def.capability) || (this.preview && method === 'tools.call')) return error('E_UNAVAILABLE');
-    s.seen.add(requestId);
+    if (!s.seen.add(requestId)) return error('E_LIMIT');
     const controller = new AbortController();
     s.requests.set(requestId, controller);
     const signal = controller.signal;
@@ -201,7 +371,7 @@ export class WebAppRuntime {
         this.check(s, signal); boundedJson(event, 64 * 1024); progress(event);
       });
       if (method !== 'permissions.revoke') this.check(s, signal);
-      boundedJson(value);
+      boundedJson(value,method.startsWith('data.')?2*1024*1024:MAX_PAYLOAD_BYTES);
       return value;
     } catch (cause) {
       // Owning services may reject with Error/AbortError rather than AppError.
@@ -227,25 +397,48 @@ export class WebAppRuntime {
         try { if ((await fs.lstat(segment)).isSymbolicLink()) return error('E_FILE'); }
         catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
       }
+      const owner = WebAppRuntime.storeOwner(s);
+      // Cached entries are shared with later calls: read them, never mutate.
       let entries: Record<string, unknown> = Object.create(null);
       try {
-        if ((await fs.stat(file)).size > STORE_BYTES) return error('E_LIMIT');
-        const data = await fs.readFile(file);
-        if (data.length > STORE_BYTES) return error('E_LIMIT');
-        const saved = JSON.parse(data.toString('utf8'));
-        if (saved.version !== 1 || !saved.entries || Array.isArray(saved.entries) || typeof saved.entries !== 'object') return error('E_STORAGE');
-        entries = Object.assign(Object.create(null), saved.entries);
-      } catch (err) { if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err; }
+        const st = await fs.stat(file);
+        if (st.size > STORE_BYTES) return error('E_LIMIT');
+        const signature = storeSignature(st);
+        const cached = this.parsedStores.get(file);
+        if (cached?.signature === signature) {
+          entries = cached.entries;
+          this.keepStore(file, cached);
+        } else {
+          const data = await fs.readFile(file);
+          if (data.length > STORE_BYTES) return error('E_LIMIT');
+          const saved = JSON.parse(data.toString('utf8'));
+          if (saved.version !== 1 || !saved.entries || Array.isArray(saved.entries) || typeof saved.entries !== 'object') return error('E_STORAGE');
+          entries = Object.assign(Object.create(null), saved.entries);
+          this.keepStore(file, { signature, owner, bytes: data.length, entries });
+        }
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+        this.dropStore(file);
+      }
       this.check(s, signal);
       if (action === 'storage.get') return { value: Object.hasOwn(entries, input.key) ? entries[input.key] : null };
       if (action === 'storage.keys') return { keys: Object.keys(entries).sort() };
-      if (action === 'storage.set') entries[input.key] = input.value;
-      else delete entries[input.key];
-      const saved = { version: 1, entries };
-      boundedJson(saved, STORE_BYTES);
-      if (Buffer.byteLength(JSON.stringify(saved, null, 2)) > STORE_BYTES) return error('E_LIMIT');
-      await writeJson(file, saved, { shouldCommit: () => { this.check(s, signal); return true; } });
+      const next: Record<string, unknown> = Object.assign(Object.create(null), entries);
+      if (action === 'storage.set') next[input.key] = input.value;
+      else delete next[input.key];
+      // One serialization: the written bytes are what the size and depth
+      // limits check (the indented form is never smaller than the compact one).
+      let json: string;
+      try { json = JSON.stringify({ version: 1, entries: next }, null, 2); } catch { return error('E_INPUT'); }
+      const bytes = Buffer.from(json);
+      if (bytes.length > STORE_BYTES || !jsonDepthWithin(json, 32)) return error('E_LIMIT');
+      await writeBytesAtomic(file, bytes, { shouldCommit: () => { this.check(s, signal); return true; } });
       this.check(s, signal);
+      // Only sync also writes cloud files, and it could land between this
+      // write and a stat; those are re-read on their next call instead.
+      const written = this.preview || input.scope !== 'cloud' ? await fs.stat(file).catch(() => null) : null;
+      if (written) this.keepStore(file, { signature: storeSignature(written), owner, bytes: bytes.length, entries: next });
+      else this.dropStore(file);
       this.changed(s, input.scope, file);
       return action === 'storage.set' ? { saved: true } : { removed: true };
     }); } finally { if (--lock.users === 0) this.stores.delete(file); }
@@ -327,12 +520,13 @@ export class WebAppRuntime {
     }); } finally { if (--lock.users === 0) this.stores.delete(root); }
   }
   private async execute(s: Instance, method: Method, a: any, signal: AbortSignal, progress: (event: unknown) => void): Promise<any> {
+    if (method.startsWith('data.')) return this.dataCall(s,method,a,signal);
     if (method.startsWith('appFiles.')) return this.appFiles(s, method, a, signal);
     if (method.startsWith('storage.')) return this.store(s, method, a, signal);
     switch (method) {
       case 'host.getContext': return { language: this.host.language(), sdkVersion: SDK_VERSION, ...(this.preview ? { mode: 'preview' } : {}) };
-      case 'capabilities.describe': return describeMethod(a.method) || error('E_METHOD');
-      case 'capabilities.list': return { sdkVersion: SDK_VERSION, methods: Object.keys(METHODS).map(name => {
+      case 'capabilities.describe': return (s.bundle.appType!=='web'||commonMethod(a.method)) && describeMethod(a.method) || error('E_METHOD');
+      case 'capabilities.list': return { sdkVersion: SDK_VERSION, methods: Object.keys(METHODS).filter(name=>s.bundle.appType!=='web'||commonMethod(name)).map(name => {
         const def = METHODS[name as Method];
         return { name, capability: def.capability, supported: true,
           available: this.available(def.capability) && !(this.preview && name === 'tools.call'),

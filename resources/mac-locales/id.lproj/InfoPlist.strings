@@ -1,1 +1,3 @@
-"NSMicrophoneUsageDescription" = "Orkas menggunakan mikrofon untuk input suara.";
+"NSMicrophoneUsageDescription" = "Orkas menggunakan mikrofon untuk input suara dan situs yang Anda izinkan.";
+"NSCameraUsageDescription" = "Orkas mengizinkan situs menggunakan kamera dengan izin Anda.";
+"NSBluetoothAlwaysUsageDescription" = "Orkas menggunakan Bluetooth untuk memastikan ponsel dengan kunci sandi Anda berada di dekat Anda.";

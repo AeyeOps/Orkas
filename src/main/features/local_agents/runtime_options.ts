@@ -7,9 +7,13 @@
  * "use the CLI default"; this module does not mutate global CLI settings.
  */
 
+import * as fs from 'node:fs';
+
 import { createLogger } from '../../logger.js';
 import { logErrorSummary } from '../../util/log-redact.js';
 import { killProcessTree, LineSplitter, spawnCli, stripAnsi } from './backends/base.js';
+import { CLAUDE_BARE_MIN_VERSION, cliVersionAtLeast } from './version.js';
+import { codexNativeModelMinimum, compatibleCodexModels, compatibleCodexDefault } from './compatibility.js';
 import {
   localCliPermissionPolicies,
   type LocalCliEntry,
@@ -93,6 +97,65 @@ export interface LocalCliRuntimeOptions {
 type CaptureResult = { ok: boolean; stdout: string; stderr: string };
 type CachedOptions = { expiresAt: number; value: LocalCliRuntimeOptions };
 const cache = new Map<string, CachedOptions>();
+const helpCache = new Map<string, { identity: string; value: CaptureResult }>();
+const helpInFlight = new Map<string, Promise<CaptureResult>>();
+
+function optionsCacheKey(entry: LocalCliEntry, cwd: string): string {
+  return `${entry.type}\u0000${entry.path || ''}\u0000${entry.fullVersion || entry.version || ''}\u0000${cwd}`;
+}
+
+/** Help text, and so the flag set, changes only with the binary. Same identity
+ * as dispatch resolution: path, version, mtime and size. */
+async function helpIdentity(entry: LocalCliEntry): Promise<string> {
+  let stat = '';
+  try {
+    const st = await fs.promises.stat(entry.path || '');
+    stat = `${st.mtimeMs}\u0000${st.size}`;
+  } catch { /* path and version still identify the binary */ }
+  return `${entry.path || ''}\u0000${entry.fullVersion || entry.version || ''}\u0000${stat}`;
+}
+
+/** Dispatch probes flags before every CLI task, so a result is kept for the
+ * binary's lifetime rather than a TTL or a workspace. A failed probe is never
+ * kept: the next caller retries it instead of replaying the failure. */
+async function cliHelp(entry: LocalCliEntry, cwd: string, force = false, args: readonly string[] = ['--help']): Promise<CaptureResult> {
+  const key = `${entry.type}\u0000${JSON.stringify(args)}`;
+  const identity = await helpIdentity(entry);
+  const flightKey = `${key}\u0000${identity}`;
+  const pending = helpInFlight.get(flightKey);
+  if (pending) return pending;
+  const cached = helpCache.get(key);
+  if (!force && cached?.identity === identity) return cached.value;
+  const probe = captureCli(entry, [...args], cwd);
+  helpInFlight.set(flightKey, probe);
+  try {
+    const value = await probe;
+    if (value.ok) helpCache.set(key, { identity, value });
+    return value;
+  } finally { helpInFlight.delete(flightKey); }
+}
+
+/** Parse documented option syntax, not free-form task/model text. Capability
+ * discovery supplements version boundaries and covers vendor backports. */
+export function parseCliHelpFlags(text: string): string[] {
+  const entries = text.split(/\r?\n/).flatMap(line => {
+    const body = line.trimStart();
+    // Parse documented option/usage syntax. Flags mentioned only in prose or
+    // in another option's description do not establish this command's support.
+    const syntax = /^Usage:/i.test(body) ? body
+      : /^(?:-[A-Za-z],?\s+)?--[a-z]/.test(body) ? body.split(/\s{2,}/, 1)[0] : '';
+    return syntax.match(/--[a-z][a-z0-9-]*(?=[\s,=<]|$)/g) || [];
+  });
+  return [...new Set(entries)];
+}
+function supportedFlags(help: CaptureResult): string[] {
+  return help.ok ? parseCliHelpFlags(help.stdout + '\n' + help.stderr) : [];
+}
+
+export async function getLocalCliSupportedFlags(entry: LocalCliEntry, cwd: string, args: readonly string[] = ['--help']): Promise<string[]> {
+  if (!entry.available || !entry.path) return [];
+  return supportedFlags(await cliHelp(entry, cwd, false, args));
+}
 
 function safeToken(value: unknown): string {
   if (typeof value !== 'string') return '';
@@ -267,17 +330,20 @@ export function parseBannerJson(raw: string): unknown {
   return null;
 }
 
-export function mapCodexModelList(result: unknown): Pick<LocalCliRuntimeOptions,
+export function mapCodexModelList(result: unknown, config?: unknown): Pick<LocalCliRuntimeOptions,
   'models' | 'default_model' | 'default_thinking_level' | 'thinking_levels'
 > {
   const root = result && typeof result === 'object' ? result as any : {};
+  const effective = config && typeof config === 'object' ? (config as any).config : undefined;
+  const configuredModel = safeToken(effective?.model);
+  const configUnavailable = config === null;
   const rows = Array.isArray(root.data) ? root.data : (Array.isArray(root.models) ? root.models : []);
   const models = uniqueCodexModelsByLabel(uniqueModels(rows.map((row: any) => {
     const id = safeToken(row?.id ?? row?.model);
     return {
       id,
       label: safeLabel(row?.displayName ?? row?.name, id),
-      is_default: row?.isDefault === true,
+      is_default: !configUnavailable && (configuredModel ? id === configuredModel : row?.isDefault === true),
       default_thinking_level: safeToken(row?.defaultReasoningEffort),
       thinking_levels: uniqueThinking(Array.isArray(row?.supportedReasoningEfforts)
         ? row.supportedReasoningEfforts : []),
@@ -287,8 +353,8 @@ export function mapCodexModelList(result: unknown): Pick<LocalCliRuntimeOptions,
   const thinkingLevels = uniqueThinking(models.flatMap(model => model.thinking_levels || []));
   return {
     models,
-    default_model: selected?.id || null,
-    default_thinking_level: selected?.default_thinking_level || null,
+    default_model: configuredModel || selected?.id || null,
+    default_thinking_level: safeToken(effective?.model_reasoning_effort) || selected?.default_thinking_level || null,
     thinking_levels: thinkingLevels,
   };
 }
@@ -435,22 +501,32 @@ async function claudeModelList(entry: LocalCliEntry, cwd: string): Promise<unkno
   });
 }
 
-async function codexModelList(entry: LocalCliEntry, cwd: string): Promise<unknown> {
+async function codexModelList(entry: LocalCliEntry, cwd: string, customArgs: readonly string[]): Promise<unknown> {
   if (!entry.path) return null;
   return new Promise<unknown>((resolve) => {
-    const child = spawnCli(entry.path!, ['app-server', '--listen', 'stdio://'], cwd);
+    const child = spawnCli(entry.path!, ['app-server', '--listen', 'stdio://', ...customArgs], cwd);
     const splitter = new LineSplitter();
     let settled = false;
     let stdoutBytes = 0;
+    let timer: NodeJS.Timeout | undefined;
+    let models: unknown;
+    let config: unknown;
+    let account: unknown;
+    let modelsSettled = false;
+    let configSettled = false;
+    let accountRequested = false;
+    let accountSettled = false;
     const finish = (value: unknown, closed = false) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       if (!closed) killProcessTree(child, 'SIGTERM');
       resolve(value);
     };
     const send = (message: object) => {
-      if (!settled && child.stdin.writable) child.stdin.write(`${JSON.stringify(message)}\n`);
+      if (!settled && child.stdin.writable) {
+        try { child.stdin.write(`${JSON.stringify(message)}\n`); } catch { finish(null); }
+      }
     };
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', chunk => {
@@ -465,12 +541,37 @@ async function codexModelList(entry: LocalCliEntry, cwd: string): Promise<unknow
             jsonrpc: '2.0', id: 2, method: 'model/list',
             params: { limit: MAX_MODELS, includeHidden: false },
           });
+          // model/list.isDefault is the catalog recommendation. config/read
+          // reports the actual inherited default for this invocation's cwd.
+          send({ jsonrpc: '2.0', id: 3, method: 'config/read', params: { cwd, includeLayers: false } });
+        } else if (message?.id === 1 && message.error) {
+          finish(null);
         } else if (message?.id === 2) {
-          finish(message.error ? null : message.result);
+          models = message.error ? null : message.result;
+          modelsSettled = true;
+        } else if (message?.id === 3) {
+          config = message.error ? null : message.result;
+          configSettled = true;
+        } else if (message?.id === 4) {
+          account = message.error ? null : message.result;
+          accountSettled = true;
+        }
+        if (modelsSettled && configSettled) {
+          const effective = (config as any)?.config;
+          const rows = Array.isArray((models as any)?.data) ? (models as any).data : [];
+          const version = entry.fullVersion || entry.version || undefined;
+          const needsAccount = (!effective?.model_provider || effective.model_provider === 'openai')
+            && [effective?.model, ...rows.map((row: any) => row?.model || row?.id)]
+              .some(model => codexNativeModelMinimum(model, version));
+          if (needsAccount && !accountRequested) {
+            accountRequested = true;
+            send({ jsonrpc: '2.0', id: 4, method: 'account/read', params: { refreshToken: false } });
+          } else if (!accountRequested || accountSettled) finish({ models, config, account });
         }
       });
     });
     child.on('error', () => finish(null));
+    child.stdin.on('error', () => finish(null));
     child.on('close', () => finish(null, true));
     send({
       jsonrpc: '2.0', id: 1, method: 'initialize',
@@ -479,7 +580,7 @@ async function codexModelList(entry: LocalCliEntry, cwd: string): Promise<unknow
         capabilities: { experimentalApi: true },
       },
     });
-    const timer = setTimeout(() => finish(null), DISCOVERY_TIMEOUT_MS);
+    timer = setTimeout(() => finish(modelsSettled ? { models, config, account } : null), DISCOVERY_TIMEOUT_MS);
     if (typeof timer.unref === 'function') timer.unref();
   });
 }
@@ -509,14 +610,17 @@ function baseOptions(cli: LocalCliType): LocalCliRuntimeOptions {
   };
 }
 
-async function discover(entry: LocalCliEntry, cwd: string): Promise<LocalCliRuntimeOptions> {
+async function discover(entry: LocalCliEntry, cwd: string, force: boolean, customArgs: readonly string[]): Promise<LocalCliRuntimeOptions> {
   const out = baseOptions(entry.type);
   if (!entry.available || !entry.path) return out;
   if (entry.type === 'claude') {
-    const [help, advertised] = await Promise.all([
-      captureCli(entry, ['--help'], cwd),
-      claudeModelList(entry, cwd).then(mapClaudeModelList),
-    ]);
+    const help = await cliHelp(entry, cwd, force);
+    const flags = supportedFlags(help);
+    // Never fall back to a non-bare probe on an older CLI: that would run
+    // user hooks/plugins just to populate a settings picker.
+    const canProbe = flags.includes('--bare')
+      && cliVersionAtLeast(entry.fullVersion || entry.version, CLAUDE_BARE_MIN_VERSION);
+    const advertised = mapClaudeModelList(canProbe ? await claudeModelList(entry, cwd) : null);
     out.status = help.ok ? 'ready' : 'partial';
     out.models = advertised.models.length
       ? advertised.models
@@ -526,16 +630,28 @@ async function discover(entry: LocalCliEntry, cwd: string): Promise<LocalCliRunt
     out.thinking_levels = advertised.thinking_levels.length
       ? advertised.thinking_levels
       : uniqueThinking(CLAUDE_FALLBACK_EFFORTS);
-    out.can_select_model = help.ok && /--model\b/.test(help.stdout + help.stderr);
-    out.can_select_thinking = help.ok && /--effort\b/.test(help.stdout + help.stderr);
+    out.can_select_model = flags.includes('--model');
+    out.can_select_thinking = flags.includes('--effort');
     out.allow_custom_model = out.can_select_model;
     out.allow_custom_thinking = out.can_select_thinking;
     return out;
   }
   if (entry.type === 'codex') {
-    const mapped = mapCodexModelList(await codexModelList(entry, cwd));
+    const probe = await codexModelList(entry, cwd, customArgs) as { models?: any; config?: any; account?: any } | null;
+    if (probe?.account?.account?.type === 'chatgpt') {
+      const version = entry.fullVersion || entry.version || undefined;
+      const rows = Array.isArray(probe.models?.data) ? probe.models.data : [];
+      probe.models = { ...probe.models, data: compatibleCodexModels(rows, version) };
+      if (codexNativeModelMinimum(probe.config?.config?.model, version)) {
+        const fallback = compatibleCodexDefault(rows, version);
+        probe.config = { ...probe.config, config: { ...probe.config.config,
+          model: fallback?.model || fallback?.id || null,
+          model_reasoning_effort: fallback?.defaultReasoningEffort || null } };
+      }
+    }
+    const mapped = mapCodexModelList(probe?.models, probe?.config ?? null);
     Object.assign(out, mapped);
-    out.status = mapped.models.length ? 'ready' : 'partial';
+    out.status = mapped.models.length && probe?.config ? 'ready' : 'partial';
     out.thinking_kind = 'effort';
     out.can_select_model = true;
     out.can_select_thinking = true;
@@ -554,8 +670,8 @@ async function discover(entry: LocalCliEntry, cwd: string): Promise<LocalCliRunt
     out.status = status.ok || list.ok || help.ok ? (status.ok && list.ok && help.ok ? 'ready' : 'partial') : 'unavailable';
     out.thinking_kind = 'thinking';
     out.thinking_levels = uniqueThinking(['off', 'minimal', 'low', 'medium', 'high', 'xhigh']);
-    out.can_select_model = help.ok && /--model\b/.test(help.stdout + help.stderr);
-    out.can_select_thinking = help.ok && /--thinking\b/.test(help.stdout + help.stderr);
+    out.can_select_model = supportedFlags(help).includes('--model');
+    out.can_select_thinking = supportedFlags(help).includes('--thinking');
     out.allow_custom_model = out.can_select_model;
     out.allow_custom_thinking = out.can_select_thinking;
     return out;
@@ -568,8 +684,8 @@ async function discover(entry: LocalCliEntry, cwd: string): Promise<LocalCliRunt
     out.models = parseOpenCodeModels(models.stdout);
     out.status = models.ok || help.ok ? (models.ok && help.ok ? 'ready' : 'partial') : 'unavailable';
     out.thinking_kind = 'variant';
-    out.can_select_model = help.ok && /--model\b/.test(help.stdout + help.stderr);
-    out.can_select_thinking = help.ok && /--variant\b/.test(help.stdout + help.stderr);
+    out.can_select_model = supportedFlags(help).includes('--model');
+    out.can_select_thinking = supportedFlags(help).includes('--variant');
     out.allow_custom_model = out.can_select_model;
     out.allow_custom_thinking = out.can_select_thinking;
     return out;
@@ -587,13 +703,13 @@ async function discover(entry: LocalCliEntry, cwd: string): Promise<LocalCliRunt
 export async function getLocalCliRuntimeOptions(
   entry: LocalCliEntry,
   cwd: string,
-  { force = false }: { force?: boolean } = {},
+  { force = false, customArgs = [] }: { force?: boolean; customArgs?: readonly string[] } = {},
 ): Promise<LocalCliRuntimeOptions> {
-  const key = `${entry.type}\u0000${entry.path || ''}\u0000${entry.version || ''}\u0000${cwd}`;
+  const key = `${optionsCacheKey(entry, cwd)}\u0000${JSON.stringify(customArgs)}`;
   const cached = cache.get(key);
   if (!force && cached && cached.expiresAt > Date.now()) return cached.value;
   try {
-    const value = await discover(entry, cwd);
+    const value = await discover(entry, cwd, force, customArgs);
     cache.set(key, { expiresAt: Date.now() + CACHE_TTL_MS, value });
     return value;
   } catch (err) {

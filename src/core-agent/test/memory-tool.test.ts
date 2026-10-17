@@ -22,6 +22,20 @@ function mockHandler(): MemoryToolHandler {
 
 const dummyCtx = { state: {}, signal: new AbortController().signal };
 
+/** One admission rule owns what memory may hold on every variant; removed
+ *  per-case exclusions must not reappear beside it. */
+function expectAdmissionRule(description: string): void {
+  expect(description).toContain('Entries load into every later conversation in scope');
+  expect(description).toContain('Before replying, even unasked');
+  expect(description).toContain('save only compact facts');
+  expect(description).toContain('leave specs, plans and progress in their files, tasks or library, at most as a pointer');
+  expect(description).toContain('Update or remove stale entries');
+  expect(description).toContain('Decide by meaning, not trigger words');
+  for (const retired of ['Do not store current-task progress', 'Use todo_tasks for task progress', 'exclude task progress and temporary state']) {
+    expect(description).not.toContain(retired);
+  }
+}
+
 describe('createCrossSessionMemoryTool', () => {
   it('publishes measured state effects without leaking host evidence in the receipt', async () => {
     const handler = mockHandler();
@@ -54,13 +68,10 @@ describe('createCrossSessionMemoryTool', () => {
       const def = toToolDefinition(createCrossSessionMemoryTool(mockHandler()));
       const properties = def.inputSchema.properties as Record<string, Record<string, unknown>>;
       expect(def.description).toContain('Manage durable agent, shared, or user memory');
-      expect(def.description).toContain('Call this tool before replying whenever');
-      expect(def.description).toContain('establishes, corrects, or invalidates');
-      expect(def.description).toContain('stable, reusable information');
-      expect(def.description).toContain('should affect future conversations');
-      expect(def.description).toContain('even without an explicit save request');
-      expect(def.description).toContain('Decide from meaning, never trigger words');
-      expect(def.description).toContain('Do not store current-task progress');
+      expectAdmissionRule(def.description);
+      // Length is advice on the content field, never a schema limit.
+      expect(properties.content.description).toContain('one self-contained fact, ideally under 200 characters');
+      expect(properties.content.maxLength).toBeUndefined();
       expect(estimateTextTokens(def.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
       expect(properties.target.description).toContain('Defaults to agent');
       expect(properties.target.description).toContain('shared: rare cross-project facts');
@@ -251,10 +262,8 @@ describe('cross_session_memory › error handling', () => {
 describe('cross_session_memory › project tier', () => {
   it('adds project selection semantics only when includeProjectTier', () => {
     const withProject = createCrossSessionMemoryTool(mockHandler(), { includeProjectTier: true });
-    expect(withProject.description).toContain('Call this tool before replying whenever');
-    expect(withProject.description).toContain('even without an explicit save request');
-    expect(withProject.description).toContain('Decide from meaning, never trigger words');
-    expect(withProject.description).toContain('Use todo_tasks for task progress');
+    expect(withProject.description).toContain('Manage durable agent, project, shared, or user memory');
+    expectAdmissionRule(withProject.description);
     expect(estimateTextTokens(withProject.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
     expect((withProject.inputSchema as any).properties.target.enum).toEqual(['agent', 'project', 'shared', 'user']);
     expect((withProject.inputSchema as any).properties.target.description)
@@ -278,6 +287,7 @@ describe('cross_session_memory › project tier', () => {
     const tool = createCrossSessionMemoryTool(handler, { includeProjectTier: true, projectTierReadOnly: true });
 
     expect(tool.description).toContain('Project memory is read-only in this session; Commander can change it.');
+    expectAdmissionRule(tool.description);
     expect(estimateTextTokens(tool.description)).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
 
     // The relevant target parameter tells this actor it cannot write project memory.

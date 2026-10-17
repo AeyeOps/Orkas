@@ -275,7 +275,8 @@ describe('group_chat app_nav registry', () => {
     expect(findAppNavSurface('not-a-surface')).toBeNull();
     const schemaDescription = appNavSurfaceDescription();
     expect(estimateTextTokens(schemaDescription)).toBeLessThanOrEqual(SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS);
-    for (const surface of APP_NAV_SURFACES) expect(schemaDescription).toContain(surface.id);
+    expect(schemaDescription).toContain('All support open');
+    for (const surface of APP_NAV_SURFACES.filter(item => item.actions.length > 1)) expect(schemaDescription).toContain(surface.id);
   });
 
   it('carries app_nav_requests through the renderer legacy conversion', () => {

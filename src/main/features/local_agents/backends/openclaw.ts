@@ -193,7 +193,7 @@ export const openclawBackend: LocalBackend = {
 };
 
 export function buildOpenclawArgs(opts: Pick<BackendRunOptions,
-  'resumeSessionId' | 'customArgs' | 'prompt' | 'timeoutMs' | 'modelOverride' | 'thinkingLevel'
+  'resumeSessionId' | 'customArgs' | 'prompt' | 'timeoutMs' | 'modelOverride' | 'thinkingLevel' | 'cliFlags'
 >, sessionId: string): string[] {
   // Per `openclaw agent --help` (2026.4.11):
   //   --local      run embedded agent (no gateway daemon needed)
@@ -206,7 +206,8 @@ export function buildOpenclawArgs(opts: Pick<BackendRunOptions,
   if (opts.modelOverride) args.push('--model', opts.modelOverride);
   if (opts.thinkingLevel) args.push('--thinking', opts.thinkingLevel);
   if (opts.customArgs && opts.customArgs.length) args.push(...opts.customArgs);
-  if (!hasOpenclawTimeoutArg(opts.customArgs)) {
+  if (!hasOpenclawTimeoutArg(opts.customArgs)
+    && (opts.cliFlags === undefined || opts.cliFlags.includes('--timeout'))) {
     args.push('--timeout', String(Math.max(1, Math.ceil(opts.timeoutMs / 1000))));
   }
   args.push('--message', opts.prompt);

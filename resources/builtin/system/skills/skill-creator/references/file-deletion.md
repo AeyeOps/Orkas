@@ -1,5 +1,11 @@
 # Deleting a file from a Skill
 
+## Removing a whole Skill
+
+Removing, disabling, or uninstalling a whole Skill is not a file deletion and has no protocol here. The user does it: in **Skills**, the card's **⋯** menu offers **Disable** and **Delete**; a Skill installed from **Marketplace** is uninstalled there with **Uninstall**. Give that path and stop.
+
+## Files inside a Skill
+
 Delete only files inside the current Skill directory. Never simulate deletion with an empty `<<<skill-file>>>` block.
 
 ## Confirmation flow

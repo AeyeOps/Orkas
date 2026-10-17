@@ -9,12 +9,19 @@ export function createProjectTasksHandler(
   uid: string, pid: string, cid: string, agentDisplayNameById: ReadonlyMap<string, string>,
   execution: BacklogRunIdentity = {},
   files: { sourceProjectId?: string; workingDir?: string } = {},
+  onSaved?: (taskId: string, projectId: string, content: string) => void,
+  // A successful delete withdraws any offer staged for that task this turn.
+  onDeleted?: (taskId: string, projectId: string) => void,
 ): ProjectTasksToolHandler {
   const toView = (task: projectTasks.ProjectTask) => ({
     ...projectTasks.taskView(task),
     ...(backlogExecutionSnapshot(uid, pid, cid, execution).get(task.id)
       || { is_running: null, is_current_run: false }),
   });
+  const savedView = (task: projectTasks.ProjectTask) => {
+    try { onSaved?.(task.id, pid, task.content); } catch { /* A navigation offer cannot fail a saved operation. */ }
+    return toView(task);
+  };
   // Same normalization as the group-chat dispatch-target resolver
   // (bus.ts::resolveDispatchTarget): lowercase + strip whitespace, name
   // first, raw bound agent_id as fallback. Populating `owner_agent_id`
@@ -71,18 +78,20 @@ export function createProjectTasksHandler(
     delete: async (taskId) => {
       if (getActiveUserId() !== uid) return { ok: false, error: 'account_changed' };
       const result = await projectTasks.deleteTask(uid, pid, taskId);
-      return result.ok ? { ok: true, task_id: taskId, deleted: true } : result;
+      if (!result.ok) return result;
+      try { onDeleted?.(taskId, pid); } catch { /* withdrawing an offer never fails the delete */ }
+      return { ok: true, task_id: taskId, deleted: true };
     },
     addAttachment: async (taskId, sourcePath) => {
       const { addTaskAttachmentFromPath } = await import('./project_task_attachment_tool');
       const result = await addTaskAttachmentFromPath(uid, pid, cid, taskId, sourcePath, files);
-      return result.ok ? { ok: true, task: toView(result.task) } : result;
+      return result.ok ? { ok: true, task: savedView(result.task) } : result;
     },
     list: async (query = {}) => {
       const tasks = await projectTasks.listTasks(uid, pid);
       const executions = backlogExecutionSnapshot(uid, pid, cid, execution);
       const summaries = tasks.filter((task) => query.status === undefined || task.status === query.status).map((task) => {
-        const { result_ref: _resultRef, ...summary } = projectTasks.taskView(task);
+        const summary = projectTasks.taskView(task);
         return { ...summary, ...(executions.get(task.id) || { is_running: null, is_current_run: false }) };
       });
       return {
@@ -110,11 +119,16 @@ export function createProjectTasksHandler(
         ...ownerFields,
         created_by: 'agent',
       });
-      return r.ok
-        ? { ok: true, task: toView(r.task), alreadyExists: r.alreadyExists }
-        : { ok: false, error: (r as { error: string }).error };
+      if (!r.ok) return { ok: false, error: (r as { error: string }).error };
+      // Reused global to-dos retain their original conversation association.
+      let task = r.task;
+      if (!task.origin_cid && cid && !pid) {
+        await projectTasks.recordTaskExecution(uid, pid, task.id, cid);
+        task = (await projectTasks.getTask(uid, pid, task.id)) || task;
+      }
+      return { ok: true, task: savedView(task), alreadyExists: r.alreadyExists };
     },
-    update: async (taskId: string, patch: projectTasks.TaskContentInput & { status?: projectTasks.TaskStatus; owner?: string; result_ref?: string }) => {
+    update: async (taskId: string, patch: projectTasks.TaskContentInput & { status?: projectTasks.TaskStatus; owner?: string }) => {
       let ownerPatch: { owner_agent?: string; owner_agent_id?: string } = {};
       if (patch.owner !== undefined) {
         if (patch.owner.trim()) {
@@ -132,21 +146,19 @@ export function createProjectTasksHandler(
         ...(patch.detail !== undefined ? { detail: patch.detail } : {}),
         ...(patch.status !== undefined ? { status: patch.status } : {}),
         ...ownerPatch,
-        ...(patch.result_ref !== undefined ? { result_ref: patch.result_ref } : {}),
       });
-      return r.ok === true ? { ok: true, task: toView(r.task) } : {
+      return r.ok === true ? { ok: true, task: savedView(r.task) } : {
         ok: false,
         error: r.error === 'content_required_for_update'
           ? 'This task uses content; title/detail updates are not supported. The content field requires the complete replacement.'
           : r.error,
       };
     },
-    complete: async (taskId: string, resultRef?: string) => {
+    complete: async (taskId: string) => {
       const r = await projectTasks.updateTask(uid, pid, taskId, {
         status: 'done',
-        ...(resultRef ? { result_ref: resultRef } : {}),
       });
-      return r.ok ? { ok: true, task: toView(r.task) } : { ok: false, error: (r as { error: string }).error };
+      return r.ok ? { ok: true, task: savedView(r.task) } : { ok: false, error: (r as { error: string }).error };
     },
   };
 }

@@ -22,6 +22,8 @@ import { isIP } from 'node:net';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { t } from '../../i18n.js';
+import { CLI_TASK_HELP_ARGS, adaptCliRuntimeOverrides, unsupportedCliOverride } from './compatibility.js';
 import { createLogger } from '../../logger.js';
 import { AGENT_EXECUTION_MAX_MS, AGENT_EXECUTION_IDLE_MS, AgentActivityClock, type AgentTimeoutKind } from '../../util/agent-execution-budget.js';
 import { chatMediaCidUrl } from '../../util/chat-media-url.js';
@@ -44,6 +46,7 @@ import { codexBackend } from './backends/codex.js';
 import { openclawBackend } from './backends/openclaw.js';
 import { opencodeBackend } from './backends/opencode.js';
 import { hermesBackend } from './backends/hermes.js';
+import { getLocalCliSupportedFlags } from './runtime_options.js';
 import {
   type LocalActiveRunIngress,
   type LocalBackend,
@@ -607,7 +610,9 @@ export function buildBridgeSystemPrompt(capabilities: readonly BridgeCapability[
   }
   if (granted.has('memory.agent')) {
     sentences.push(
-      'It provides cross_session_memory; writable scopes are bound by the host, while user/shared global memory is read-only.',
+      'It provides cross_session_memory; writable scopes are bound by the host, while user/shared global memory is read-only. '
+      + "Orkas memory takes precedence over this CLI's native memory: save durable facts with cross_session_memory, "
+      + 'and when native memory conflicts with Orkas memory or project context, follow Orkas.',
     );
   }
   if (granted.has('connectors')) {
@@ -1119,7 +1124,13 @@ export interface RunCliAgentOpts {
   /** Active native-turn ingress lifecycle. The runner forwards backend
    * readiness and guarantees a final clear even when a backend throws. */
   onActiveRunIngress?: (ingress: LocalActiveRunIngress | null) => void;
+  /** Conversation-owned persistence for non-secret native question replies. */
+  saveUserInput?: (text: string, inputId: string) => Promise<void>;
   onOutputsPublished?: (paths: string[]) => string[];
+  onAutoTaskSaved?: (taskId: string, title: string) => void;
+  onTodoTaskSaved?: (taskId: string, projectId: string, content: string) => void;
+  onAutoTaskDeleted?: (taskId: string) => void;
+  onTodoTaskDeleted?: (taskId: string, projectId: string) => void;
 }
 
 export interface RunCliAgentResult {
@@ -1127,7 +1138,7 @@ export interface RunCliAgentResult {
   status: 'completed' | 'failed' | 'cancelled' | 'timeout' | 'missing_cli';
   output?: string;
   error?: string;
-  cliError?: LocalCliEntry['error'];
+  cliError?: LocalCliEntry['error'] | 'model_unsupported' | 'parameter_unsupported';
   cliPath?: string;
   cliVersion?: string;
   commanderHandoff?: CommanderHandoffRequest;
@@ -1298,6 +1309,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   const handle = await persist.start(opts.uid, {
     agentId: opts.agentId,
     cid: opts.cid,
+    currentMessageId: opts.currentMessageId,
     cli: opts.cli,
     cliPath: entry.path,
     prompt: opts.prompt,
@@ -1349,6 +1361,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     usage?: unknown;
     failureKind?: string;
     retrySafe?: boolean;
+    bootstrapTimeout?: boolean;
+    cliError?: RunCliAgentResult['cliError'];
   } | null = null;
   // CLI dispatch session id. The per-session spill dir is anchored on this
   // so sweep / read paths can find the file again.
@@ -1369,6 +1383,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   let inspectResumeAttempt = !!(opts.resumeSessionId && opts.resumeFallbackPrompt);
   let resumeRejected = false;
   let resumeAttemptExecuted = false;
+  let taskExecutionObserved = false;
   // The recovery digest emits this while clearing the interrupted session's
   // live work; it is what separates a consumed turn from a quiet one.
   let sawBackgroundStopped = false;
@@ -1382,6 +1397,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   let holdTerminalForResumeCheck = !!opts.resumeSessionId;
   const holdTerminalForCandidateFallback = true;
   let resendAttempted = false;
+  let bootstrapRecoveryAttempted = false;
   let deferredDone: LocalEvent | null = null;
   const setTerminal = (e: LocalEvent) => {
     terminal = {
@@ -1395,6 +1411,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       usage: e.usage,
       failureKind: typeof e.failureKind === 'string' ? e.failureKind : undefined,
       retrySafe: e.retrySafe === true,
+      bootstrapTimeout: e.bootstrapTimeout === true,
+      cliError: e.cliError === 'model_unsupported' || e.cliError === 'parameter_unsupported' ? e.cliError : undefined,
     };
   };
   const materializeMediaItem = (
@@ -1829,6 +1847,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   };
   const onEvent = (rawEvent: LocalEvent) => {
     if (rawEvent.type === 'media-output') {
+      taskExecutionObserved = true;
       if (inspectResumeAttempt) resumeAttemptExecuted = true;
       commitMediaOutput(rawEvent);
       return;
@@ -1855,17 +1874,18 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         resumeRejected = true;
       }
       if (e.type === 'done' && resumeRejected) e.resumeRejected = true;
-      if (
-        e.type === 'text-delta'
-        || e.type === 'async-message'
-        || e.type === 'tool-event'
-        || e.type === 'media-output'
-        || e.type === 'file-change'
-        || e.type === 'permission-request'
-        || (e.type === 'status' && e.status === 'running')
-      ) {
-        resumeAttemptExecuted = true;
-      }
+    }
+    if (
+      e.type === 'text-delta'
+      || e.type === 'async-message'
+      || e.type === 'tool-event'
+      || e.type === 'media-output'
+      || e.type === 'file-change'
+      || e.type === 'permission-request'
+      || (e.type === 'status' && e.status === 'running')
+    ) {
+      taskExecutionObserved = true;
+      if (inspectResumeAttempt) resumeAttemptExecuted = true;
     }
     if (e.type === 'status' && e.status === 'background-stopped') sawBackgroundStopped = true;
     if (e.type === 'status' && typeof e.status === 'string' && e.status.startsWith('background-')) {
@@ -1937,6 +1957,10 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         workingDir: opts.cwd,
         signal: opts.signal,
         onOutputsPublished: opts.onOutputsPublished,
+        onAutoTaskSaved: opts.onAutoTaskSaved,
+        onTodoTaskSaved: opts.onTodoTaskSaved,
+        onAutoTaskDeleted: opts.onAutoTaskDeleted,
+        onTodoTaskDeleted: opts.onTodoTaskDeleted,
         runId: handle.runId,
         configDir: handle.dir,
         sandboxEnv: buildSkillSandboxEnv(opts.uid, opts.agentId),
@@ -1961,12 +1985,40 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     }
   }
 
+  // A shared read-only probe may serve another caller. Stop waiting promptly
+  // on this task's cancellation/deadline without cancelling their bounded probe.
+  const taskFlags = (helpArgs: readonly string[]): Promise<string[] | undefined> => new Promise(resolve => {
+    let settled = false;
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (flags?: string[]) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      opts.signal.removeEventListener('abort', abort);
+      resolve(flags);
+    };
+    const abort = () => finish();
+    opts.signal.addEventListener('abort', abort, { once: true });
+    if (opts.signal.aborted) { finish(); return; }
+    timer = setTimeout(() => finish(), Math.max(1, deadlineAt - Date.now()));
+    timer.unref?.();
+    void getLocalCliSupportedFlags(entry, opts.cwd, helpArgs).then(finish, () => finish([]));
+  });
   const runBackendAttempt = async (attempt: {
     prompt: string;
     resumeSessionId?: string;
     reuseSessionInstructions?: boolean;
   }) => {
     try {
+      const helpArgs = CLI_TASK_HELP_ARGS[opts.cli];
+      const cliFlags = helpArgs && !opts.signal.aborted && Date.now() < deadlineAt
+        ? await taskFlags(helpArgs) : undefined;
+      // Discovery is bounded asynchronous I/O. Recheck cancellation and the
+      // inherited deadline afterwards, before a task process can execute.
+      if (opts.signal.aborted) {
+        onEvent({ type: 'done', status: 'cancelled', durationMs: Date.now() - executionStartedAt });
+        return;
+      }
       if (Date.now() >= deadlineAt) {
         onEvent({
           type: 'done', status: 'timeout', timeoutKind: 'wall',
@@ -1975,16 +2027,24 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
         });
         return;
       }
+      const unsupported = unsupportedCliOverride(opts.cli, { ...opts, cliFlags });
+      if (unsupported) {
+        onEvent({ type: 'done', status: 'failed', cliError: 'parameter_unsupported',
+          failureKind: 'cli_compatibility', retrySafe: false,
+          error: t('cli_agent.parameter_unsupported', { cli: opts.cli, parameter: unsupported }) });
+        return;
+      }
       await backend.run({
         binPath: entry.path,
+        cliVersion: entry.fullVersion || entry.version || undefined,
+        ...(cliFlags ? { cliFlags } : {}),
         prompt: attempt.prompt,
         systemPrompt: opts.systemPrompt,
         resumeFallbackPrompt: opts.resumeFallbackPrompt,
         reuseSessionInstructions: attempt.reuseSessionInstructions,
         cwd: opts.cwd,
         customArgs: opts.customArgs,
-        modelOverride: opts.modelOverride,
-        thinkingLevel: opts.thinkingLevel,
+        ...adaptCliRuntimeOverrides(opts.cli, { ...opts, cliFlags }),
         permissionPolicy,
         requestPermission: request => activityClock.waitForUser(() => cliPermissions.requestPermission({
           uid: opts.uid,
@@ -2016,6 +2076,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
           conversationTitle: opts.conversationTitle,
           cli: opts.cli,
           request,
+          saveAnswer: opts.saveUserInput,
           onWaiting: elapsedMs => onEvent({
             type: 'status',
             status: 'waiting-input',
@@ -2131,15 +2192,52 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       });
     }
 
+    // A bootstrap timeout is not evidence of a bad binary. Restart Codex once
+    // using the same installation and the existing bounded
+    // recovery payload for a fresh thread. Never replay an uncertain submission
+    // or replace a native session with a delta-only user message.
+    if (
+      opts.cli === 'codex'
+      && terminal?.status === 'failed'
+      && terminal.failureKind === 'cli_protocol'
+      && terminal.bootstrapTimeout === true
+      && terminal.retrySafe === true
+      && !taskExecutionObserved
+      && !opts.signal.aborted
+      && Date.now() < deadlineAt
+      && (!opts.resumeSessionId || !!opts.resumeFallbackPrompt)
+    ) {
+      bootstrapRecoveryAttempted = true;
+      log.warn('Codex bootstrap timed out; restarting once', runLogContext);
+      commitEvent({ type: 'status', status: 'retrying', reason: 'cli-bootstrap-timeout', attempt: 1, maxRetries: 1 });
+      inspectResumeAttempt = false;
+      holdTerminalForResumeCheck = false;
+      deferredDone = null;
+      terminal = null;
+      resumeRejected = false;
+      resumeAttemptExecuted = false;
+      sawBackgroundStopped = false;
+      await runBackendAttempt({
+        prompt: opts.resumeSessionId ? opts.resumeFallbackPrompt! : opts.prompt,
+        reuseSessionInstructions: false,
+      });
+      if (!terminal) {
+        onEvent({ type: 'done', status: 'failed', error: 'backend exited without terminal event' });
+      }
+    }
+
     // Reuse the already-probed CLI inventory when protocol setup or process
     // startup fails. The backend must explicitly prove replay is safe;
     // a task that may already have changed files or called tools is never
     // replayed silently under another binary.
     while (
-      terminal?.status === 'failed'
+      !bootstrapRecoveryAttempted
+      && terminal?.status === 'failed'
+      && !(opts.cli === 'codex' && terminal.bootstrapTimeout)
       && terminal.retrySafe === true
       && (terminal.failureKind === 'cli_protocol' || terminal.failureKind === 'cli_spawn')
       && !opts.signal.aborted
+      && !taskExecutionObserved
       && streamedOutput.length === 0
       && toolStartedAtByCallId.size === 0
     ) {
@@ -2230,6 +2328,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
     status: terminal.status,
     output: finalOutput,
     error: terminal.error,
+    ...(terminal.cliError ? { cliError: terminal.cliError } : {}),
     ...(entry.path ? { cliPath: entry.path } : {}),
     ...(entry.version ? { cliVersion: entry.fullVersion || entry.version } : {}),
     ...(terminal.timeoutPhase ? { timeoutPhase: terminal.timeoutPhase } : {}),

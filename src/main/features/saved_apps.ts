@@ -5,7 +5,7 @@
  * and is purged when the conversation is deleted. The artifact card's `⋯` →
  * "Save" copies the bundle into a new persistent pool here:
  *   `<uid>/cloud/saved_apps/<appId>/{entry.html, ...siblings, __orkas-meta.json}`
- * Cloud-synced; conversation-independent; never auto-purged (only the user's
+ * Device-local and conversation-independent; never auto-purged (only the user's
  * explicit delete from the My Apps tab removes one). The files are served
  * read-only inside the app via `chat-app://saved/<appId>/...`; the explicit
  * external-open IPC still uses `shell.openPath` for callers that want the OS
@@ -23,14 +23,18 @@ import * as fsp from 'node:fs/promises';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 
-import { userSavedAppsDir, savedAppDir } from '../paths';
+import { userSavedAppsDir, savedAppDir, userAppEditsDir,webAppSandboxRoot,userLocalRoot,userAppDeletesDir, userCloudRoot } from '../paths';
+import { metadataAppType, normalizeAppType, type AppType } from './web_apps/data-contract';
+import { commercialWebAppFailure, requireLocalAppType, storedAppType, isCommercialWebAppFailure } from './web_apps/commercial-entry';
 import * as chatArtifacts from './chat_artifacts';
 import * as chats from './chats';
+import { conversationLayout } from '../util/project-layout';
 import * as chatAttachments from './chat_attachments';
 import { t } from '../i18n';
 import { createLogger } from '../logger';
-import { logErrorRef, logPathRef, maskId } from '../util/log-redact';
+import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { isPathAllowed } from '../util/path-sandbox';
+import { renameWithRetrySync, writeTextAtomicSync } from '../storage';
 
 const log = createLogger('saved_apps');
 
@@ -57,10 +61,13 @@ const BUNDLE_EXCLUDED_DIRS: ReadonlySet<string> = new Set([
 ]);
 const SOURCE_BUNDLE_NAME = 'app-source.md';
 
-export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string };
+export type Result<T = {}> = ({ ok: true } & T) | { ok: false; error: string; code?: string; feature?: string; message?: string };
 type ResolveCode = 'bad_input' | 'forbidden' | 'not_found';
 
 export interface SavedAppMeta {
+  browserStorage?: 'isolated-v1';
+  appType?: AppType;
+  description?: string;
   title: string;
   sourceCid: string;
   sourceArtifactId: string;
@@ -69,6 +76,8 @@ export interface SavedAppMeta {
 }
 
 export interface SavedAppListItem {
+  appType?: AppType;
+  description?: string;
   id: string;
   title: string;
   savedAt: string;
@@ -111,7 +120,37 @@ function sanitiseTitle(t: unknown): string {
 }
 
 function writeMeta(dir: string, meta: SavedAppMeta): void {
-  fs.writeFileSync(path.join(dir, META_FILENAME), Buffer.from(JSON.stringify(meta, null, 2), 'utf8'));
+  writeTextAtomicSync(path.join(dir, META_FILENAME), JSON.stringify(meta, null, 2));
+}
+
+// `<appId>.tmp-<8 hex>` staging folders (save copies and delete staging) are
+// never apps. Ones registered here belong to an operation in this process;
+// any other match is an interrupted leftover and is swept from the list path.
+const STAGING_DIR_RE = /^[A-Za-z0-9_-]{1,64}\.tmp-[a-f0-9]{8}$/;
+const activeStagingDirs = new Set<string>();
+function stagingDir(destDir: string): string {
+  const dir = `${destDir}.tmp-${crypto.randomBytes(4).toString('hex')}`;
+  activeStagingDirs.add(dir);
+  return dir;
+}
+function sweepStagingDirs(root: string, names: readonly string[], retained?: ReadonlySet<string>): void {
+  for (const name of names) {
+    if (!STAGING_DIR_RE.test(name)) continue;
+    const dir = path.join(root, name);
+    if (activeStagingDirs.has(dir) || retained?.has(dir)) continue;
+    try { const st = fs.lstatSync(dir); if (!st.isDirectory() || st.isSymbolicLink() || storedAppType(dir) === 'web') continue; }
+    catch { continue; }
+    activeStagingDirs.add(dir);
+    void fsp.rm(dir, { recursive: true, force: true })
+      .catch((error) => log.warn('saved app staging sweep deferred', { error: logErrorSummary(error) }))
+      .finally(() => activeStagingDirs.delete(dir));
+  }
+}
+/** Stable caller-visible failure: known `app_*` codes pass through, anything
+ *  else (errno text, absolute paths) collapses to `fallback`. */
+function failureCode(err: unknown, fallback: string): string {
+  const message = (err as Error)?.message;
+  return typeof message === 'string' && /^app_[a-z_]+$/.test(message) ? message : fallback;
 }
 
 function isRealSavedAppDirectory(dir: string): boolean {
@@ -130,24 +169,19 @@ function readMeta(dir: string): Partial<SavedAppMeta> {
   return JSON.parse(fs.readFileSync(metaPath, 'utf8')) || {};
 }
 
-function savedAppRelPath(appId: string, rel = ''): string {
-  return ['cloud/saved_apps', appId, rel].filter(Boolean).join('/');
+/** The absence of this additive marker preserves legacy browser storage. */
+export function hasIsolatedBrowserStorage(uid: string, appId: string): boolean {
+  try {
+    const dir = savedAppDir(uid, safeAppId(appId));
+    return isRealSavedAppDirectory(dir) && readMeta(dir).browserStorage === 'isolated-v1';
+  } catch { return false; }
 }
 
-function notifySavedAppDirty(appId: string, rel = ''): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('saved_apps', savedAppRelPath(appId, rel));
-  } catch { /* features/sync stripped */ }
-}
-
-function notifySavedAppDeleted(appId: string, rel: string): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDeleted?: (relPath: string) => Promise<void> | void };
-    void sync?.markDeleted?.(savedAppRelPath(appId, rel));
-  } catch { /* features/sync stripped */ }
+/** Persisted metadata owns type; legacy local apps have no type marker. */
+export async function resolveSavedAppType(uid: string, appId: string): Promise<AppType> {
+  const id = safeAppId(appId), dir = savedAppDir(uid, id);
+  if (!isRealSavedAppDirectory(dir)) throw new Error('app not found');
+  return storedAppType(dir) ?? 'local';
 }
 
 function isInsideAnyRoot(candidate: string, roots: string[]): boolean {
@@ -183,6 +217,38 @@ async function inferTitleFromHtml(entryPath: string, rootDir: string): Promise<s
     if (clean) return sanitiseTitle(clean);
   } catch { /* fallback */ }
   return sanitiseTitle(path.basename(rootDir));
+}
+
+function sanitiseDescription(value: unknown): string {
+  return typeof value === 'string' ? value.replace(/\s+/g, ' ').trim().slice(0, 240) : '';
+}
+
+/** Read optional display copy once on save; gallery reads never scan app sources. */
+async function readHtmlDescription(entryPath: string): Promise<string> {
+  let file: fsp.FileHandle | undefined;
+  try {
+    file = await fsp.open(entryPath, 'r');
+    const buffer = Buffer.alloc(64 * 1024);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    const html = buffer.toString('utf8', 0, bytesRead)
+      .replace(/<!--[\s\S]*?(?:-->|$)|<(script|style)\b[^>]*>[\s\S]*?(?:<\/\1\s*>|$)/gi, '');
+    for (const tag of html.matchAll(/<meta\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi)) {
+      const attrs: Record<string, string> = {};
+      for (const attr of tag[0].matchAll(/([^\s=<>/]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/g)) {
+        attrs[attr[1].toLowerCase()] = attr[2] ?? attr[3] ?? attr[4];
+      }
+      if (attrs.name?.toLowerCase() !== 'description') continue;
+      const decoded = (attrs.content || '').replace(/&(#x[\da-f]+|#\d+|amp|lt|gt|quot|apos|nbsp);/gi, (entity, key: string) => {
+        const named: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
+        if (key[0] !== '#') return named[key.toLowerCase()] ?? entity;
+        const point = key[1].toLowerCase() === 'x' ? parseInt(key.slice(2), 16) : Number(key.slice(1));
+        return point > 0 && point <= 0x10ffff && !(point >= 0xd800 && point <= 0xdfff) ? String.fromCodePoint(point) : entity;
+      });
+      return sanitiseDescription(decoded);
+    }
+  } catch { /* Optional metadata must not prevent saving an app. */ }
+  finally { await file?.close().catch(() => {}); }
+  return '';
 }
 
 function isHtmlEntryName(name: string): boolean {
@@ -334,6 +400,14 @@ async function inspectBundle(targetPath: string, opts: BundleInspectOptions): Pr
   if (opts.fenceRoots?.length && !isInsideAnyRoot(rootDir, opts.fenceRoots)) {
     return { ok: true, canSave: false, reason: 'bundle is outside allowed workspace' };
   }
+  // A sandbox root can contain unrelated user files; it is never an implicit app bundle.
+  const realRoot = await fsp.realpath(rootDir);
+  for (const root of opts.fenceRoots || []) {
+    const realFence = await fsp.realpath(root).catch(() => path.resolve(root));
+    if (path.relative(realFence, realRoot) === '') {
+      return { ok: true, canSave: false, reason: 'app_bundle_root' };
+    }
+  }
   const entry = found.entry;
   const entryAbs = path.join(rootDir, entry);
   let entryStat: fs.Stats;
@@ -386,26 +460,101 @@ function mintAppId(userId: string): { appId: string; destDir: string } {
 
 // ── Public API ───────────────────────────────────────────────────────────
 
+function localDatabase(uid:string,appId:string){const key=crypto.createHash('sha256').update(JSON.stringify(['saved',appId])).digest('hex');return {key,file:path.join(webAppSandboxRoot(uid,key,'local'),'data.sqlite')};}
+async function appDefinition(dir:string){try{const {manifestSchema}=await import('./web_apps/catalog');const file=path.join(dir,'orkas-app.json');if((await fsp.stat(file)).size>65536)throw new Error('app_edit_data_migration');const definition=manifestSchema.parse(JSON.parse(await fsp.readFile(file,'utf8'))).data;if(!definition)throw new Error('app_edit_data_migration');return definition;}catch{throw new Error('app_edit_data_migration');}}
+/** Author-only recovery facts; records never enter model context. */
+export async function appDataImpact(uid:string,cid:string,artifactId:string):Promise<Result<{records:number;version:number;fingerprint:string;tables:Array<{name:string;fields:string[];count:number}>}>>{
+  try { requireLocalAppType(await boundAppType(uid, cid)); requireLocalAppType(await resolveArtifactAppType(uid, cid, artifactId)); }
+  catch (error) { return isCommercialWebAppFailure(error) ? commercialWebAppFailure() : { ok: false, error: 'app_edit_target_missing' }; }
+  const context=readEditContext(uid,cid),artifact=chatArtifacts.resolveArtifactDir(uid,cid,artifactId);if(!context||!artifact.ok)return {ok:false,error:'app_edit_target_missing'};
+  let release:(()=>void)|undefined;
+  try{const dir=savedAppDir(uid,context.appId);if(fingerprintApp(dir)!==context.fingerprint)throw new Error('app_edit_conflict');const {key,file}=localDatabase(uid,context.appId);const runtime=await import('./web_apps/runtime');release=runtime.holdAppData(uid,key);await runtime.closeAppData(uid,key);const {LocalAppData}=await import('./web_apps/data');const database=new LocalAppData(file,userLocalRoot(uid),await appDefinition(dir));try{const info:any=await database.call('internal.inspect',{});return {ok:true,records:info.records,version:info.version,fingerprint:context.fingerprint,tables:info.tables};}finally{await database.close();}}
+  catch{return {ok:false,error:'app_edit_conflict'};}finally{release?.();}
+}
+/** Consistent private SQLite export, create-only at the user-selected destination. */
+async function removeAppDataBackup(file: string): Promise<void> {
+  for (const suffix of ['', '-wal', '-shm']) {
+    try { await fsp.rm(file + suffix, { force: true }); }
+    catch (error) { log.warn('edited app data backup cleanup deferred', { error: logErrorSummary(error) }); }
+  }
+}
+
+export async function exportAppData(uid:string,cid:string,artifactId:string,destination:string):Promise<Result>{
+  try { requireLocalAppType(await boundAppType(uid, cid)); requireLocalAppType(await resolveArtifactAppType(uid, cid, artifactId)); }
+  catch (error) { return isCommercialWebAppFailure(error) ? commercialWebAppFailure() : { ok: false, error: 'app_edit_target_missing' }; }
+  const context=readEditContext(uid,cid);if(!context||!chatArtifacts.resolveArtifactDir(uid,cid,artifactId).ok)return {ok:false,error:'app_edit_target_missing'};
+  let release:(()=>void)|undefined,temporary='';
+  try{const {key,file}=localDatabase(uid,context.appId),runtime=await import('./web_apps/runtime');release=runtime.holdAppData(uid,key);await runtime.closeAppData(uid,key);temporary=file+'.backup-'+crypto.randomBytes(8).toString('hex');const {LocalAppData}=await import('./web_apps/data');const database=new LocalAppData(file,userLocalRoot(uid),await appDefinition(savedAppDir(uid,context.appId)));try{await database.call('internal.backup',{file:temporary});}finally{await database.close();}const users=await import('./users');if(users.getActiveUserId()!==uid)throw new Error('app_edit_conflict');await fsp.copyFile(temporary,destination,fs.constants.COPYFILE_EXCL);return {ok:true};}
+  catch{return {ok:false,error:'app_edit_data_export_failed'};}
+  finally {
+    try { if (temporary) await removeAppDataBackup(temporary); }
+    finally { release?.(); }
+  }
+}
+
 /** Copy a chat artifact bundle into a new `saved_apps/<appId>/`. */
-export async function saveFromArtifact(userId: string, cid: string, artifactId: string): Promise<Result<{ id: string; title: string }>> {
+const activeEditSaves = new Map<string, number>();
+const deferredEditCleanup = new Set<string>();
+
+export async function saveFromArtifact(userId: string, cid: string, artifactId: string, mode: 'new' | 'update' = 'new', recovery?:{clearVersion:number;clearFingerprint:string}): Promise<Result<{ id: string; title: string }>> {
+  try {
+    requireLocalAppType(await boundAppType(userId, cid));
+    requireLocalAppType(await resolveArtifactAppType(userId, cid, artifactId));
+  } catch (error) {
+    return isCommercialWebAppFailure(error) ? commercialWebAppFailure() : { ok: false, error: 'app_edit_target_missing' };
+  }
+  const key = JSON.stringify([userId, cid]);
+  activeEditSaves.set(key, (activeEditSaves.get(key) || 0) + 1);
+  try { return await saveArtifact(userId, cid, artifactId, mode, recovery); }
+  finally {
+    const remaining = activeEditSaves.get(key)! - 1;
+    if (remaining) activeEditSaves.set(key, remaining);
+    else {
+      activeEditSaves.delete(key);
+      if (deferredEditCleanup.delete(key)) await cleanupEditSnapshots(userId);
+    }
+  }
+}
+
+async function saveArtifact(userId: string, cid: string, artifactId: string, mode: 'new' | 'update', recovery?:{clearVersion:number;clearFingerprint:string}): Promise<Result<{ id: string; title: string }>> {
+  recoverEditedSaves(userId);
   const resolved = chatArtifacts.resolveArtifactDir(userId, cid, artifactId);
   if (!resolved.ok) return { ok: false, error: (resolved as { error?: string }).error || 'artifact not found' };
   const srcDir = (resolved as { dirPath: string }).dirPath;
 
   const srcMeta = chatArtifacts.readArtifactMeta(userId, cid, artifactId);
   const title = sanitiseTitle(srcMeta?.title);
+  const context = readEditContext(userId, cid);
+  // Only an untyped artifact consults the task binding, which must resolve or
+  // fail. An update must also keep the original app's trusted type: the
+  // untyped case inherits it, so only a typed artifact needs the comparison.
+  let appType: AppType;
+  try {
+    appType = await resolveArtifactAppType(userId, cid, artifactId, srcMeta);
+    if (mode === 'update' && context && srcMeta?.appType) {
+      const original = (await getEditTarget(userId, cid))?.appType;
+      if (original && original !== appType) return { ok: false, error: 'app_type_mismatch' };
+    }
+  } catch (err) {
+    log.warn('saveFromArtifact edit binding unavailable', { error: logErrorSummary(err) });
+    return { ok: false, error: 'app_edit_target_missing' };
+  }
+  if (mode === 'update' && !context) return { ok: false, error: 'app_edit_target_missing' };
 
   let appId = '';
   let destDir = '';
   try {
-    const minted = mintAppId(userId);
+    const minted = mode === 'update' && context
+      ? { appId: context.appId, destDir: savedAppDir(userId, context.appId) }
+      : mintAppId(userId);
     appId = minted.appId;
     destDir = minted.destDir;
   } catch (err) {
     return { ok: false, error: (err as Error).message };
   }
 
-  const tmpDir = `${destDir}.tmp-${crypto.randomBytes(4).toString('hex')}`;
+  const tmpDir = stagingDir(destDir);
+  let release:(()=>void)|undefined,dataFile='',candidate='';
   try {
     // Copy everything except the source `__orkas-meta.json` (we write a fresh
     // one stamped with the source provenance).
@@ -413,10 +562,28 @@ export async function saveFromArtifact(userId: string, cid: string, artifactId: 
       recursive: true,
       filter: (src) => path.basename(src) !== META_FILENAME,
     });
+    // Binary placeholders in the editing attachment are not replacement bytes.
+    // Omitted binary resources survive; explicit artifact files take precedence.
+    if (context) {
+      const snapshot = path.join(editContextDir(userId, cid), 'snapshot');
+      for (const rel of listAppFilesRel(snapshot)) {
+        if (rel === META_FILENAME || TEXT_LIKE_EXTS.has(path.extname(rel).toLowerCase())) continue;
+        const target = path.join(tmpDir, rel);
+        if (!fs.existsSync(target)) {
+          const source = path.join(snapshot, rel);
+          if (!isPathAllowed(source, [snapshot])) throw new Error('app_edit_snapshot_invalid');
+          await fsp.mkdir(path.dirname(target), { recursive: true });
+          await fsp.copyFile(source, target);
+        }
+      }
+    }
     if (!fs.existsSync(path.join(tmpDir, 'index.html'))) {
       throw new Error('source artifact is missing index.html');
     }
     const meta: SavedAppMeta = {
+      ...(mode === 'new' || hasIsolatedBrowserStorage(userId, appId) ? { browserStorage: 'isolated-v1' as const } : {}),
+      appType,
+      description: await readHtmlDescription(path.join(tmpDir, 'index.html')),
       title,
       sourceCid: typeof cid === 'string' ? cid : '',
       sourceArtifactId: typeof artifactId === 'string' ? artifactId : '',
@@ -424,25 +591,70 @@ export async function saveFromArtifact(userId: string, cid: string, artifactId: 
     };
     await fsp.writeFile(path.join(tmpDir, META_FILENAME), JSON.stringify(meta, null, 2));
     await fsp.mkdir(path.dirname(destDir), { recursive: true });
-    await fsp.rename(tmpDir, destDir);
+    if (mode === 'update' && context) {
+      const local=localDatabase(userId,appId);dataFile=local.file;
+      if(fs.existsSync(dataFile)){
+        const runtime=await import('./web_apps/runtime');release=runtime.holdAppData(userId,local.key);await runtime.closeAppData(userId,local.key);
+        const {LocalAppData}=await import('./web_apps/data');candidate=dataFile+'.backup-'+crypto.randomBytes(8).toString('hex');
+        const oldDefinition=await appDefinition(destDir),definition=await appDefinition(tmpDir);
+        const original=new LocalAppData(dataFile,userLocalRoot(userId),oldDefinition);
+        try{const info:any=await original.call('internal.inspect',{});if(recovery&&(recovery.clearVersion!==info.version||recovery.clearFingerprint!==context.fingerprint))throw new Error('app_edit_conflict');await original.call('internal.backup',{file:candidate});}finally{await original.close();}
+        if(recovery){const staged=new LocalAppData(candidate,userLocalRoot(userId),oldDefinition);try{await staged.call('internal.reset',{version:recovery.clearVersion});}finally{await staged.close();}}
+        const database=new LocalAppData(candidate,userLocalRoot(userId),definition,200*1024*1024,true);
+        try{await database.call('internal.check',{});}catch{throw new Error('app_edit_data_migration');}finally{await database.close();}
+      }
+      // No await between the comparison and swap: other main-process actions
+      // cannot silently overwrite a newer save, rename or deletion.
+      if((await import('./users')).getActiveUserId()!==userId)throw new Error('app_edit_conflict');
+      if (!isRealSavedAppDirectory(destDir)) throw new Error('app_edit_target_missing');
+      if (fingerprintApp(destDir) !== context.fingerprint) throw new Error('app_edit_conflict');
+      const backup = `${tmpDir}.previous`;
+      const journal = {version:1,appId,temporary:path.basename(tmpDir),before:context.fingerprint,after:fingerprintApp(tmpDir),...(candidate?{dataCandidate:path.basename(candidate)}:{})};
+      const journalPath=path.join(editContextDir(userId,cid),'save-journal.json');
+      const journalFd=fs.openSync(journalPath,'w',0o600);
+      try { fs.writeFileSync(journalFd,JSON.stringify(journal));fs.fsyncSync(journalFd); } finally {fs.closeSync(journalFd);}
+      fs.renameSync(destDir, backup);
+      try {
+        fs.renameSync(tmpDir, destDir);
+        if(candidate){fs.renameSync(dataFile,dataFile+'.previous');try{fs.renameSync(candidate,dataFile);}catch(error){fs.renameSync(dataFile+'.previous',dataFile);throw error;}}
+      } catch (err) { if(fs.existsSync(destDir))fs.rmSync(destDir,{recursive:true,force:true});fs.renameSync(backup, destDir);throw err; }
+      try {
+        refreshEditSnapshot(userId,cid,context,destDir);
+        fs.rmSync(backup, { recursive: true, force: true });
+        if(candidate)fs.rmSync(dataFile+'.previous',{force:true});
+        fs.rmSync(journalPath,{force:true});
+        if(candidate){const {key}=localDatabase(userId,appId);await (await import('./web_apps/runtime')).checkpointAppData(userId,key,dataFile,await appDefinition(destDir));}
+      } catch (err) {
+        // The save boundary already completed. Cleanup/presentation cannot
+        // turn it into a failed save or remove the newly written application.
+        log.warn('edited app post-save cleanup deferred', { error: logErrorSummary(err) });
+      }
+    } else await fsp.rename(tmpDir, destDir);
   } catch (err) {
     try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    try { await fsp.rm(destDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    if (mode !== 'update') {
+      try { await fsp.rm(destDir, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
     log.warn('saveFromArtifact failed', {
       user_id: maskId(userId),
       conversation_id: maskId(cid),
       artifact_id: maskId(artifactId),
-      error: logErrorRef(err),
+      error: logErrorSummary(err),
     });
-    return { ok: false, error: `failed to save app: ${(err as Error).message}` };
+    return { ok: false, error: failureCode(err, 'app_save_failed') };
+  }
+  finally {
+    activeStagingDirs.delete(tmpDir);
+    try { if (candidate) await removeAppDataBackup(candidate); }
+    finally { release?.(); }
   }
   log.info('saveFromArtifact completed', {
     user_id: maskId(userId),
     app_id: maskId(appId),
     conversation_id: maskId(cid),
     artifact_id: maskId(artifactId),
+    save_mode: mode,
   });
-  notifySavedAppDirty(appId);
   return { ok: true, id: appId, title };
 }
 
@@ -452,11 +664,26 @@ export async function saveFromPath(
   targetPath: string,
   opts: BundleInspectOptions & { title?: unknown; sourceCid?: unknown } = {},
 ): Promise<Result<{ id: string; title: string; rootDir: string; entry: string; fileCount: number; totalBytes: number }>> {
+  try {
+    if (typeof opts.sourceCid === 'string' && opts.sourceCid) requireLocalAppType(await boundAppType(userId, opts.sourceCid));
+    requireLocalAppType(await managedPathAppType(userId, targetPath));
+    requireLocalAppType(storedAppType(path.dirname(targetPath)));
+  } catch (error) {
+    return isCommercialWebAppFailure(error) ? commercialWebAppFailure() : { ok: false, error: 'app_edit_target_missing' };
+  }
   const inspected = await inspectBundle(targetPath, opts);
   if (!inspected.ok) return { ok: false, error: (inspected as { ok: false; error: string }).error };
   if (!inspected.canSave) return { ok: false, error: (inspected as { ok: true; canSave: false; reason: string }).reason };
+  try { requireLocalAppType(storedAppType(inspected.rootDir)); }
+  catch (error) { return isCommercialWebAppFailure(error) ? commercialWebAppFailure() : { ok: false, error: 'app_edit_target_missing' }; }
 
   const title = sanitiseTitle(opts.title || inspected.title);
+  const sourceCid=typeof opts.sourceCid==='string'?opts.sourceCid:'';
+  const assistance=sourceCid?(await chats.getConversationMetadata(userId,sourceCid))?.assistance:undefined;
+  let editType:AppType|undefined;
+  try{editType=sourceCid?(await getEditTarget(userId,sourceCid))?.appType:undefined;}
+  catch(err){log.warn('saveFromPath edit binding unavailable',{error:logErrorSummary(err)});return {ok:false,error:'app_edit_target_missing'};}
+  const appType:AppType=editType??(assistance?.kind==='app_creation'?assistance.appType??'local':'local');
   let appId = '';
   let destDir = '';
   try {
@@ -467,12 +694,21 @@ export async function saveFromPath(
     return { ok: false, error: (err as Error).message };
   }
 
-  const tmpDir = `${destDir}.tmp-${crypto.randomBytes(4).toString('hex')}`;
+  const tmpDir = stagingDir(destDir);
   try {
     await fsp.mkdir(tmpDir, { recursive: true });
     const copied = await copyBundleFiles(inspected.rootDir, tmpDir, inspected.files!);
     if (!fs.existsSync(path.join(tmpDir, inspected.entry))) throw new Error('bundle is missing its HTML entry');
+    if(appType==='web'){
+      const {manifestSchema}=await import('./web_apps/catalog');const file=path.join(tmpDir,'orkas-app.json');
+      const manifest=manifestSchema.parse(fs.existsSync(file)?JSON.parse(await fsp.readFile(file,'utf8')):{sdkVersion:1,capabilities:[]});
+      if(manifest.capabilities.some(capability=>capability!=='data')||(manifest.capabilities.includes('data')&&!manifest.data))throw new Error('app_web_interfaces_required');
+      await fsp.writeFile(file,JSON.stringify({...manifest,minimumClient:'1.9.0'}));
+    }
     const meta: SavedAppMeta = {
+      browserStorage: 'isolated-v1',
+      appType,
+      description: await readHtmlDescription(path.join(tmpDir, inspected.entry)),
       title,
       sourceCid: typeof opts.sourceCid === 'string' ? opts.sourceCid : '',
       sourceArtifactId: '',
@@ -490,7 +726,6 @@ export async function saveFromPath(
       file_count: copied.fileCount,
       total_bytes: copied.totalBytes,
     });
-    notifySavedAppDirty(appId);
     return { ok: true, id: appId, title, rootDir: inspected.rootDir, entry: inspected.entry, ...copied };
   } catch (err) {
     try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
@@ -498,18 +733,23 @@ export async function saveFromPath(
     log.warn('saveFromPath failed', {
       user_id: maskId(userId),
       target: logPathRef(targetPath),
-      error: logErrorRef(err),
+      error: logErrorSummary(err),
     });
-    return { ok: false, error: `failed to save app: ${(err as Error).message}` };
+    return { ok: false, error: failureCode(err, 'app_save_failed') };
   }
+  finally { activeStagingDirs.delete(tmpDir); }
 }
 
 /** List the user's saved apps, newest save first. */
 export function listSavedApps(userId: string): SavedAppListItem[] {
+  const retained = recoverEditedSaves(userId);
+  void recoverInterruptedDeletes(userId);
+  void cleanupEditSnapshots(userId, true);
   const root = userSavedAppsDir(userId);
   let names: string[];
   try { names = fs.readdirSync(root); }
   catch { return []; } // pool dir not created yet
+  sweepStagingDirs(root, names, retained);
   const items: SavedAppListItem[] = [];
   for (const name of names) {
     if (name.startsWith('.')) continue;
@@ -523,10 +763,12 @@ export function listSavedApps(userId: string): SavedAppListItem[] {
       log.warn('listSavedApps bad meta skipped', {
         user_id: maskId(userId),
         app_id: maskId(appId),
-        error: logErrorRef(err),
+        error: logErrorSummary(err),
       });
     }
     items.push({
+      appType: metadataAppType(meta.appType),
+      description: sanitiseDescription(meta.description),
       id: appId,
       title: typeof meta.title === 'string' && meta.title.trim() ? meta.title : DEFAULT_TITLE,
       savedAt: typeof meta.savedAt === 'string' ? meta.savedAt : '',
@@ -547,6 +789,16 @@ export function listSavedApps(userId: string): SavedAppListItem[] {
     });
     return byTitle || a.id.localeCompare(b.id);
   });
+  return items;
+}
+
+/** Listing never contacts an account or publication service. */
+export async function listResolvedSavedApps(uid: string): Promise<SavedAppListItem[]> {
+  const items = listSavedApps(uid);
+  for (const item of items) {
+    try { item.appType = storedAppType(savedAppDir(uid, item.id)) ?? 'local'; }
+    catch { item.appType = undefined; }
+  }
   return items;
 }
 
@@ -589,7 +841,7 @@ export function resolveSavedAppFilePath(
   userId: string,
   appId: string,
   relPath: string,
-): { ok: true; absPath: string; mime: string; entry: string } | { ok: false; code: ResolveCode; error: string } {
+): { ok: true; absPath: string; mime: string; entry: string; appType: AppType } | { ok: false; code: ResolveCode; error: string } {
   let safeId: string;
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, code: 'bad_input', error: (err as Error).message }; }
@@ -598,8 +850,10 @@ export function resolveSavedAppFilePath(
     return { ok: false, code: 'not_found', error: 'not found' };
   }
   let entry = 'index.html';
+  let appType: AppType = 'local';
   try {
     const meta = readMeta(root);
+    appType = normalizeAppType(meta.appType);
     entry = normaliseEntryRel(meta.entry);
   } catch { /* old apps or corrupt meta fall back to index.html */ }
 
@@ -630,11 +884,12 @@ export function resolveSavedAppFilePath(
   try { st = fs.statSync(abs); }
   catch { return { ok: false, code: 'not_found', error: 'not found' }; }
   if (!st.isFile()) return { ok: false, code: 'not_found', error: 'not a file' };
-  return { ok: true, absPath: abs, mime: savedAppMimeFor(rel), entry };
+  return { ok: true, absPath: abs, mime: savedAppMimeFor(rel), entry, appType };
 }
 
 /** Rename a saved app (rewrites `__orkas-meta.json`). */
 export function renameSavedApp(userId: string, appId: string, title: unknown): Result<{ title: string }> {
+  recoverEditedSaves(userId);
   let safeId: string;
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
@@ -643,20 +898,28 @@ export function renameSavedApp(userId: string, appId: string, title: unknown): R
   if (!isRealSavedAppDirectory(dir)) return { ok: false, error: 'app not found' };
   let meta: SavedAppMeta;
   try { meta = readMeta(dir) as SavedAppMeta; }
-  catch (err) { return { ok: false, error: `app not found: ${(err as Error).message}` }; }
+  catch { return { ok: false, error: 'app not found' }; }
   meta.title = sanitiseTitle(title);
   try { writeMeta(dir, meta); }
-  catch (err) { return { ok: false, error: `failed to rename: ${(err as Error).message}` }; }
+  catch (err) {
+    log.warn('renameSavedApp failed', { user_id: maskId(userId), app_id: maskId(safeId), error: logErrorSummary(err) });
+    return { ok: false, error: 'app_rename_failed' };
+  }
   log.info('renameSavedApp completed', { user_id: maskId(userId), app_id: maskId(safeId) });
-  notifySavedAppDirty(safeId, META_FILENAME);
   return { ok: true, title: meta.title };
 }
 
 /** Delete a saved app (`rm -rf saved_apps/<appId>/`). */
-export function deleteSavedApp(userId: string, appId: string): Result {
+export async function deleteSavedApp(userId: string, appId: string): Promise<Result> {
+  recoverEditedSaves(userId);
   let safeId: string;
   try { safeId = safeAppId(appId); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
+  await deleteRecoveries.get(userId);
+  return deleteLocalSavedApp(userId, safeId);
+}
+
+async function deleteLocalSavedApp(userId: string, safeId: string): Promise<Result> {
   const dir = savedAppDir(userId, safeId);
   let exists = false;
   try {
@@ -665,15 +928,122 @@ export function deleteSavedApp(userId: string, appId: string): Result {
     if (!st.isDirectory() || st.isSymbolicLink()) return { ok: false, error: 'app not found' };
   } catch { /* idempotent missing delete */ }
   const deleted = exists ? listAppFilesRel(dir) : [];
+  // The app folder moves aside atomically first and returns if its data cannot
+  // be removed, so a failed delete leaves the app listed and sync untouched.
+  // A durable intent recorded before anything moves lets a stopped delete finish.
+  const staged = exists ? stagingDir(dir) : '', intent = deleteIntentPath(userId, safeId);
+  activeDeleteIntents.add(intent);
   try {
-    if (exists) fs.rmSync(dir, { recursive: true, force: true });
-  } catch (err) {
-    log.warn('deleteSavedApp failed', { user_id: maskId(userId), app_id: maskId(safeId), error: logErrorRef(err) });
-    return { ok: false, error: `failed to delete: ${(err as Error).message}` };
-  }
-  log.info('deleteSavedApp completed', { user_id: maskId(userId), app_id: maskId(safeId) });
-  for (const rel of deleted) notifySavedAppDeleted(safeId, rel);
-  return { ok: true };
+    let release:(()=>void)|undefined,key='',cloudFiles:string[]=[];
+    try {
+      key=appDataKey(safeId);
+      const runtime=await import('./web_apps/runtime');release=runtime.holdAppData(userId,key);
+      await runtime.closeAppData(userId,key);
+      cloudFiles=listAppDataCloudFiles(userId,key);
+      writeDeleteIntent(userId,{version:1,appId:safeId,files:deleted,cloudFiles});
+      if (exists) renameWithRetrySync(dir, staged);
+      try { await removeAppData(userId,key); }
+      catch (err) { if (exists) renameWithRetrySync(staged, dir); throw err; }
+    } catch (err) {
+      log.warn('deleteSavedApp failed', { user_id: maskId(userId), app_id: maskId(safeId), error: logErrorSummary(err) });
+      // A restored (or never moved) app voids the intent; a missing one keeps it for recovery.
+      if (!exists || isRealSavedAppDirectory(dir)) clearDeleteIntent(intent);
+      activeStagingDirs.delete(staged);
+      release?.();
+      return { ok: false, error: 'app_delete_failed' };
+    }
+    release?.();
+    // Committed: the app and its data are gone. Cleanup or sync notification
+    // failures cannot turn this into a failed delete; leftovers are swept later.
+    if (staged) {
+      try { await fsp.rm(staged, { recursive: true, force: true }); }
+      catch (err) { log.warn('deleteSavedApp staging cleanup deferred', { error: logErrorSummary(err) }); }
+      finally { activeStagingDirs.delete(staged); }
+    }
+    log.info('deleteSavedApp completed', { user_id: maskId(userId), app_id: maskId(safeId) });
+    clearDeleteIntent(intent);
+    return { ok: true };
+  } finally { activeDeleteIntents.delete(intent); }
+}
+
+const appDataKey = (appId: string) => crypto.createHash('sha256').update(JSON.stringify(['saved', appId])).digest('hex');
+function listAppDataCloudFiles(uid: string, key: string): string[] {
+  const local=webAppSandboxRoot(uid,key,'local'),cloud=webAppSandboxRoot(uid,key,'cloud');
+  for(const root of [local,cloud])if(fs.existsSync(root)&&fs.lstatSync(root).isSymbolicLink())throw new Error('app data unavailable');
+  return fs.existsSync(cloud)?listAppFilesRel(cloud):[];
+}
+async function removeAppData(uid: string, key: string): Promise<void> {
+  await fsp.rm(webAppSandboxRoot(uid,key,'local'),{recursive:true,force:true});
+  await fsp.rm(webAppSandboxRoot(uid,key,'cloud'),{recursive:true,force:true});
+}
+
+// ── Interrupted delete recovery ──────────────────────────────────────────
+// Only a recorded intent proves the user deleted an app. Data without a local
+// app folder may belong to an app still arriving through personal sync, so it
+// is never removed on its own. Intents live in the machine-private domain.
+interface DeleteIntent { version: 1; appId: string; files: string[]; cloudFiles: string[] }
+const activeDeleteIntents = new Set<string>();
+const deleteRecoveries = new Map<string, Promise<void>>();
+const DELETE_INTENT_RE = /^([A-Za-z0-9_-]{1,64})\.json$/;
+const deleteIntentPath = (uid: string, appId: string) => path.join(userAppDeletesDir(uid), `${appId}.json`);
+function writeDeleteIntent(uid: string, intent: DeleteIntent): void {
+  const file = deleteIntentPath(uid, intent.appId);
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  // A torn write is harmless: it can only precede the app-folder move, and a
+  // present app folder voids the intent without reading it.
+  const fd = fs.openSync(file, 'w', 0o600);
+  try { fs.writeFileSync(fd, JSON.stringify(intent)); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+}
+function clearDeleteIntent(file: string): void {
+  try { fs.rmSync(file, { force: true }); }
+  catch (err) { log.warn('saved app delete intent cleanup deferred', { error: logErrorSummary(err) }); }
+}
+function isIntentRel(rel: unknown): rel is string {
+  return typeof rel === 'string' && rel.length > 0 && rel.length <= 1024 && !/[\\\0]/.test(rel)
+    && rel.split('/').every(seg => !!seg && seg !== '.' && seg !== '..');
+}
+function readDeleteIntent(file: string, appId: string): DeleteIntent {
+  if (!fs.lstatSync(file).isFile()) throw new Error('invalid delete intent');
+  const intent = JSON.parse(fs.readFileSync(file, 'utf8'));
+  if (intent?.version !== 1 || intent.appId !== appId || !Array.isArray(intent.files) || !Array.isArray(intent.cloudFiles)
+    || !intent.files.every(isIntentRel) || !intent.cloudFiles.every(isIntentRel)) throw new Error('invalid delete intent');
+  return intent;
+}
+function recoverInterruptedDeletes(uid: string): Promise<void> {
+  const running = deleteRecoveries.get(uid);
+  if (running) return running;
+  let appIds: string[];
+  try { appIds = fs.readdirSync(userAppDeletesDir(uid)).map(name => DELETE_INTENT_RE.exec(name)?.[1]).filter((id): id is string => !!id); }
+  catch { return Promise.resolve(); } // no intents recorded
+  if (!appIds.length) return Promise.resolve();
+  const work = (async () => { for (const appId of appIds) await recoverDelete(uid, appId); })()
+    .finally(() => deleteRecoveries.delete(uid));
+  deleteRecoveries.set(uid, work);
+  return work;
+}
+async function recoverDelete(uid: string, appId: string): Promise<void> {
+  const file = deleteIntentPath(uid, appId);
+  if (activeDeleteIntents.has(file)) return;
+  try {
+    // A present app folder means the delete never committed or was rolled back.
+    if (fs.existsSync(savedAppDir(uid, appId)) || isSymlink(savedAppDir(uid, appId))) {
+      clearDeleteIntent(file);
+      log.info('saved app delete intent voided', { app_id: maskId(appId) });
+      return;
+    }
+    // Tombstones go to the active account's personal sync; another account waits for its own session.
+    const users = await import('./users');
+    if (users.getActiveUserId() !== uid) return;
+    const intent = readDeleteIntent(file, appId), key = appDataKey(appId);
+    const runtime = await import('./web_apps/runtime'), release = runtime.holdAppData(uid, key);
+    try { await runtime.closeAppData(uid, key); listAppDataCloudFiles(uid, key); await removeAppData(uid, key); }
+    finally { release(); }
+    clearDeleteIntent(file);
+    log.info('saved app delete recovery completed', { app_id: maskId(appId), files: intent.files.length, data_files: intent.cloudFiles.length });
+  } catch (error) { log.warn('saved app delete recovery deferred', { app_id: maskId(appId), error: logErrorSummary(error) }); }
+}
+function isSymlink(target: string): boolean {
+  try { return fs.lstatSync(target).isSymbolicLink(); } catch { return false; }
 }
 
 // ── "Edit in a new conversation" ─────────────────────────────────────────
@@ -694,6 +1064,180 @@ function listAppFilesRel(dir: string): string[] {
   walk('');
   out.sort((a, b) => a.localeCompare(b));
   return out;
+}
+
+interface EditContext { appType?: AppType; version: 1; appId: string; title: string; fingerprint: string }
+
+function refreshEditSnapshot(uid: string,cid: string,context: EditContext,source: string) {
+  const root=editContextDir(uid,cid),snapshot=path.join(root,'snapshot'),next=path.join(root,'snapshot-next'),previous=path.join(root,'snapshot-previous');
+  fs.rmSync(next,{recursive:true,force:true});fs.cpSync(source,next,{recursive:true,dereference:false});
+  fs.rmSync(previous,{recursive:true,force:true});
+  if(fs.existsSync(snapshot))fs.renameSync(snapshot,previous);
+  try {fs.renameSync(next,snapshot);} catch(error) {if(fs.existsSync(previous))fs.renameSync(previous,snapshot);throw error;}
+  context.fingerprint=fingerprintApp(source);
+  fs.writeFileSync(path.join(root,'context.json'),JSON.stringify(context));
+  fs.rmSync(previous,{recursive:true,force:true});
+}
+
+function recoverEditedSaves(uid: string) {
+  const retained = new Set<string>();
+  const edits=userAppEditsDir(uid);
+  if(!fs.existsSync(edits))return retained;
+  for(const cid of fs.readdirSync(edits)) {
+    if(!/^[A-Za-z0-9_-]{1,128}$/.test(cid))continue;
+    const root=editContextDir(uid,cid),journalPath=path.join(root,'save-journal.json');
+    if(!fs.existsSync(journalPath)||fs.lstatSync(root).isSymbolicLink()||fs.lstatSync(journalPath).isSymbolicLink())continue;
+    try {
+      const journal=JSON.parse(fs.readFileSync(journalPath,'utf8'));
+      const appId=safeAppId(journal.appId);
+      if(journal.version!==1||!new RegExp('^'+appId+'\\.tmp-[a-f0-9]{8}$').test(journal.temporary)
+        || !/^[a-f0-9]{64}$/.test(journal.before)||!/^[a-f0-9]{64}$/.test(journal.after))throw new Error('invalid edit save journal');
+      const destination=savedAppDir(uid,appId),temporary=path.join(userSavedAppsDir(uid),journal.temporary),backup=temporary+'.previous';
+      const existingContext = readEditContext(uid, cid);
+      if (existingContext?.appType === 'web' || [destination, temporary, backup, path.join(root, 'snapshot')]
+        .some(dir => isRealSavedAppDirectory(dir) && storedAppType(dir) === 'web')) {
+        retained.add(temporary); retained.add(backup); continue;
+      }
+      if(journal.dataCandidate){
+        if(!/^data\.sqlite\.backup-[a-f0-9]{16}$/.test(journal.dataCandidate))throw new Error('invalid data save journal');
+        const {file}=localDatabase(uid,appId),candidate=path.join(path.dirname(file),journal.dataCandidate);
+        if(fs.existsSync(candidate)){
+          if(isRealSavedAppDirectory(backup)){if(fs.existsSync(destination))fs.rmSync(destination,{recursive:true,force:true});fs.renameSync(backup,destination);}
+          if(fs.existsSync(file+'.previous')){fs.rmSync(file,{force:true});fs.renameSync(file+'.previous',file);}
+          for(const suffix of ['', '-wal','-shm'])fs.rmSync(candidate+suffix,{force:true});
+        }else if(fs.existsSync(file+'.previous'))fs.rmSync(file+'.previous',{force:true});
+      }
+      if(!fs.existsSync(destination)&&isRealSavedAppDirectory(backup)&&fingerprintApp(backup)===journal.before)fs.renameSync(backup,destination);
+      if(isRealSavedAppDirectory(destination)&&fingerprintApp(destination)===journal.after){
+        const context=readEditContext(uid,cid);if(context&&context.appId===appId)refreshEditSnapshot(uid,cid,context,destination);
+      }
+      fs.rmSync(temporary,{recursive:true,force:true});fs.rmSync(backup,{recursive:true,force:true});fs.rmSync(journalPath,{force:true});
+      log.info('edited app save recovery completed');
+    } catch(error) {log.warn('edited app save recovery deferred',{error:logErrorSummary(error)});}
+  }
+  return retained;
+}
+const editCleanupRunning = new Map<string, Promise<void>>();
+const editCleanupLast = new Map<string, number>();
+
+/** Snapshot ownership follows the edit conversation, including recycle recovery. */
+export function cleanupEditSnapshots(uid: string, background = false, cid?: string): Promise<void> {
+  const running = editCleanupRunning.get(uid);
+  if (running) return background ? running : running.then(() => cleanupEditSnapshots(uid, false, cid));
+  if (background && Date.now() - (editCleanupLast.get(uid) || 0) < 60_000) return Promise.resolve();
+  editCleanupLast.set(uid, Date.now());
+  const run = (async () => {
+    const root = userAppEditsDir(uid);
+    try {
+      if ((await fsp.lstat(root)).isSymbolicLink()) throw new Error('unsafe edit root');
+      // Capture candidates before ownership so a concurrently created edit is never swept.
+      const candidates = (await fsp.readdir(root, { withFileTypes: true })).filter(entry => !cid || entry.name === cid);
+      if (!candidates.length) return;
+      const recycle = await import('./recycle_bin');
+      await recycle.withEditSnapshotRetention(uid, async () => {
+        const retained = await chats.retainedConversationIdsForEditCleanup(uid);
+        for (const cid of await recycle.retainedEditConversationIds(uid)) retained.add(cid);
+        for (const entry of candidates) {
+          if (!entry.isDirectory() || !/^[A-Za-z0-9_-]{1,128}$/.test(entry.name) || retained.has(entry.name)) continue;
+          const dir = editContextDir(uid, entry.name);
+          if (readEditContext(uid, entry.name)?.appType === 'web'
+            || storedAppType(path.join(dir, 'snapshot')) === 'web') continue;
+          const activeKey = JSON.stringify([uid, entry.name]);
+          if (activeEditSaves.has(activeKey)) { deferredEditCleanup.add(activeKey); continue; }
+          try { await fsp.lstat(path.join(dir, 'save-journal.json')); continue; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+          await fsp.rm(dir, { recursive: true, force: true });
+        }
+      });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') log.warn('edit snapshot cleanup deferred', { error: logErrorSummary(error) });
+    }
+  })().finally(() => { editCleanupRunning.delete(uid); });
+  editCleanupRunning.set(uid, run);
+  return run;
+}
+
+function editContextDir(userId: string, cid: string): string {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(cid)) throw new Error('invalid cid');
+  return path.join(userAppEditsDir(userId), cid);
+}
+function fingerprintApp(dir: string): string {
+  const digest = crypto.createHash('sha256');
+  for (const rel of listAppFilesRel(dir)) {
+    const target = path.join(dir, rel);
+    if (!isPathAllowed(target, [dir])) throw new Error('app_edit_snapshot_invalid');
+    digest.update(JSON.stringify(rel)).update('\0').update(fs.readFileSync(target)).update('\0');
+  }
+  return digest.digest('hex');
+}
+function readEditContext(userId: string, cid: string): EditContext | null {
+  try {
+    const data = JSON.parse(fs.readFileSync(path.join(editContextDir(userId, cid), 'context.json'), 'utf8'));
+    if (data.version !== 1 || !/^[a-f0-9]{64}$/.test(data.fingerprint)) return null;
+    safeAppId(data.appId);
+    if (Object.hasOwn(data, 'appType') && !metadataAppType(data.appType)) return null;
+    return {...data, appType: metadataAppType(data.appType)};
+  } catch { return null; }
+}
+export async function getEditTarget(userId: string, cid: string): Promise<{ appId: string; title: string; appType: AppType } | null> {
+  const context = readEditContext(userId, cid);
+  if (!context && fs.existsSync(editContextDir(userId, cid))) throw Object.assign(new Error(t('web_apps.error_E_CLOSED')), { code: 'app_edit_context_unavailable' });
+  if (!context) return null;
+  const dir = savedAppDir(userId, context.appId);
+  const persisted = isRealSavedAppDirectory(dir) ? storedAppType(dir) : undefined;
+  const appType = context.appType === 'web' || persisted === 'web' ? 'web' : context.appType ?? persisted ?? 'local';
+  return { appId: context.appId, title: context.title, appType };
+}
+
+/** Read the structured task/edit binding without any publication lookup. */
+export async function boundAppType(userId: string, cid: string): Promise<AppType | undefined> {
+  const target = await getEditTarget(userId, cid); if (target) return target.appType;
+  const conversation = await chats.getConversationMetadata(userId, cid);
+  // The sidebar's normalizing reader is deliberately tolerant. Its recovery
+  // record cannot grant a local capability when that binding is unreadable.
+  const file = conversationLayout(userId, cid, conversation?.project_id).metaFile;
+  let stat: fs.Stats | undefined;
+  try { stat = fs.lstatSync(file); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  if (stat) {
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 64 * 1024) throw new Error('Application task binding unavailable');
+    const raw = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Application task binding unavailable');
+    if (raw.assistance?.kind === 'app_creation') {
+      const value = raw.assistance.appType;
+      const stored = metadataAppType(value);
+      if (value !== undefined && !stored) throw new Error('Application task binding unavailable');
+      if (stored === 'web') return 'web';
+    }
+  }
+  const assistance = conversation?.assistance;
+  return assistance?.kind === 'app_creation' ? assistance.appType ?? 'local' : undefined;
+}
+
+/** The one fallback order for an artifact on every surface (label, runtime,
+ *  save, share): stored metadata, then the structured task binding, then
+ *  local. A damaged binding throws so each caller can fail closed. */
+export async function resolveArtifactAppType(userId:string,cid:string,artifactId:string,meta=chatArtifacts.readArtifactMeta(userId,cid,artifactId)):Promise<AppType>{
+  const resolved = chatArtifacts.resolveArtifactDir(userId, cid, artifactId);
+  if (!resolved.ok) throw new Error('artifact not found');
+  const bound = await boundAppType(userId, cid);
+  if (bound === 'web') return bound;
+  return storedAppType(resolved.dirPath) ?? bound ?? 'local';
+}
+
+/** Resolve only canonical managed pools; HTML content and manifest capabilities
+ * never decide whether an app is commercial. No directory inventory is needed. */
+export async function managedPathAppType(userId: string, file: string): Promise<AppType | undefined> {
+  const relative = path.relative(userCloudRoot(userId), path.resolve(file));
+  if (path.isAbsolute(relative) || relative.split(path.sep).includes('..')) return undefined;
+  const segments = relative.split(path.sep);
+  if (segments[0] === 'saved_apps' && segments[1]) return resolveSavedAppType(userId, segments[1]);
+  const start = segments[0] === 'chat_artifacts' ? 1
+    : segments[0] === 'projects' && segments[2] === 'chat_artifacts' ? 3 : -1;
+  if (start < 0 || !segments[start] || !segments[start + 1]) return undefined;
+  const resolved = chatArtifacts.resolveArtifactDir(userId, segments[start], segments[start + 1]);
+  if (!resolved.ok || !isPathAllowed(file, [resolved.dirPath])) throw new Error('Invalid app source');
+  return resolveArtifactAppType(userId, segments[start], segments[start + 1]);
 }
 
 /** Build the single-`.md` source bundle handed to the editing conversation as
@@ -732,6 +1276,27 @@ function buildSourceBundle(dir: string, title: string): string {
   return lines.join('\n');
 }
 
+/** Best-effort removal of a half-built edit conversation; failures are logged
+ *  redacted so the caller still reports the original edit failure. */
+async function rollbackEditConversation(
+  userId: string,
+  appId: string,
+  editingDir: string,
+  conv: { conversation_id: string; project_id?: string | null },
+): Promise<void> {
+  try { await fsp.rm(editingDir, { recursive: true, force: true }); }
+  catch (err) { log.warn('openForEditing rollback context cleanup failed', { error: logErrorSummary(err) }); }
+  try { await chats.deleteConversation(userId, conv.conversation_id, conv.project_id || null); }
+  catch (err) {
+    log.warn('openForEditing rollback deleteConversation failed', {
+      user_id: maskId(userId),
+      app_id: maskId(appId),
+      conversation_id: maskId(conv.conversation_id),
+      error: logErrorSummary(err),
+    });
+  }
+}
+
 /**
  * Open a saved app for editing: create a fresh normal conversation, drop the
  * app's source in as a single `app-source.md` attachment, and return the conv
@@ -751,14 +1316,21 @@ export async function openForEditing(
   const dir = savedAppDir(userId, safeId);
   if (!isRealSavedAppDirectory(dir)) return { ok: false, error: 'app not found' };
   let title = DEFAULT_TITLE;
+  let appType: AppType = 'local';
   try {
     const m = readMeta(dir);
     if (m && typeof m.title === 'string' && m.title.trim()) title = m.title;
   } catch { /* fallback */ }
+  try { appType = await resolveSavedAppType(userId, safeId); }
+  catch (error) {
+    log.warn('saved app type recovery unavailable', { error: logErrorSummary(error) });
+    return { ok: false, error: t('web_apps.error_E_FAILED') };
+  }
+  if (appType === 'web') return commercialWebAppFailure();
   const resolvedEntry = resolveSavedAppIndex(userId, safeId);
   if (!resolvedEntry.ok) return { ok: false, error: 'app is missing its HTML entry' };
 
-  const bundle = buildSourceBundle(dir, title);
+  const originalFingerprint = fingerprintApp(dir);
 
   let conv: Awaited<ReturnType<typeof chats.createConversation>>;
   try {
@@ -770,23 +1342,31 @@ export async function openForEditing(
     log.warn('openForEditing createConversation failed', {
       user_id: maskId(userId),
       app_id: maskId(safeId),
-      error: logErrorRef(err),
+      error: logErrorSummary(err),
     });
-    return { ok: false, error: `failed to create a conversation: ${(err as Error).message}` };
+    return { ok: false, error: 'app_edit_open_failed' };
   }
 
+  const editingDir = editContextDir(userId, conv.conversation_id);
+  let bundle: string;
+  try {
+    const snapshot = path.join(editingDir, 'snapshot');
+    await fsp.cp(dir, snapshot, { recursive: true, dereference: false });
+    if (fingerprintApp(snapshot) !== originalFingerprint || fingerprintApp(dir) !== originalFingerprint) {
+      throw new Error('app_edit_conflict');
+    }
+    const context: EditContext = { version: 1, appId: safeId, title, appType, fingerprint: originalFingerprint };
+    await fsp.writeFile(path.join(editingDir, 'context.json'), JSON.stringify(context));
+    bundle = buildSourceBundle(snapshot, title);
+  } catch (err) {
+    log.warn('openForEditing snapshot failed', { error: logErrorSummary(err) });
+    await rollbackEditConversation(userId, safeId, editingDir, conv);
+    return { ok: false, error: 'app_edit_snapshot_failed' };
+  }
   const up = await chatAttachments.uploadAttachment(userId, conv.conversation_id, SOURCE_BUNDLE_NAME, Buffer.from(bundle, 'utf8'));
   if (!up.ok) {
     // Roll back the conversation we just created so no empty conv is orphaned.
-    try { await chats.deleteConversation(userId, conv.conversation_id, conv.project_id || null); }
-    catch (err) {
-      log.warn('openForEditing rollback deleteConversation failed', {
-        user_id: maskId(userId),
-        app_id: maskId(safeId),
-        conversation_id: maskId(conv.conversation_id),
-        error: logErrorRef(err),
-      });
-    }
+    await rollbackEditConversation(userId, safeId, editingDir, conv);
     return { ok: false, error: (up as { error?: string }).error || 'failed to attach the app source' };
   }
   const sourceFileName = ((up as { info?: { name?: string } }).info?.name) || SOURCE_BUNDLE_NAME;

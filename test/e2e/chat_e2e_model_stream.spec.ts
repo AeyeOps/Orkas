@@ -187,7 +187,8 @@ test.describe('real chat pipeline with a local model', () => {
       )))).toEqual(['text', 'tool:call-e2e-commentary-1', 'text', 'tool:call-e2e-commentary-2']);
     };
 
-    await expect.poll(() => modelOrkas.commentaryStage).toBe(1);
+    // Cold history/model startup shares the real Electron process on low-tier hosts.
+    await expect.poll(() => modelOrkas.commentaryStage, { timeout: 30_000 }).toBe(1);
     await assertProse(1);
     await expect(tool(1)).toHaveCount(1);
     await openOperations();
@@ -521,6 +522,11 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(retry).toBeVisible({ timeout: 30_000 });
     const requestsBeforeUserRetry = modelOrkas.modelRequests.length;
     expect(requestsBeforeUserRetry).toBeGreaterThan(1);
+    // The selected negative mode deliberately returns500 for each attempt.
+    // Match those exact responses; all other HTTP failures remain rejected.
+    for (let index = 0; index < requestsBeforeUserRetry; index++) {
+      modelOrkas.expectApiFailure('POST', '/api/v1/chat/completions', 500);
+    }
 
     modelOrkas.setModelMode('success');
     await retry.locator('xpath=ancestor::*[contains(@class, "chat-message")]').hover();
@@ -548,6 +554,7 @@ test.describe('real chat pipeline with a local model', () => {
 
   test('turns provider authentication failures into private actionable guidance', async ({ modelOrkas }) => {
     modelOrkas.setModelMode('auth-error');
+    modelOrkas.expectApiFailure('POST', '/api/v1/chat/completions', 401);
     const page = await sendNewChat(modelOrkas, 'E2E show a safe credential failure.');
     const retry = page.locator('#chat-history .bubble-retry-btn').last();
     await expect(retry).toBeVisible({ timeout: 30_000 });
@@ -559,6 +566,7 @@ test.describe('real chat pipeline with a local model', () => {
     await expect(failedBubble).not.toContainText('invalid_api_key');
     await expect(failedBubble).not.toContainText('sk-e2e-private-secret');
     await expect(failedBubble).not.toContainText('req_e2e_auth_failure');
+    expect(modelOrkas.modelRequests).toHaveLength(1);
   });
 
   test('treats a truncated partial model stream as failed and keeps retry recoverable', async ({ modelOrkas }) => {
@@ -609,7 +617,7 @@ test.describe('real chat pipeline with a local model', () => {
   test('board-queues a second message while streaming and runs it in order', async ({ modelOrkas }) => {
     modelOrkas.setModelMode('slow');
     const page = await sendNewChat(modelOrkas, 'E2E first slow queued turn.');
-    await expect.poll(() => modelOrkas.modelRequests.length).toBeGreaterThan(0);
+    await expect.poll(() => modelOrkas.modelRequests.length, { timeout: 30_000 }).toBeGreaterThan(0);
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
 
     await page.locator('#chat-input').fill('E2E second queued turn.');

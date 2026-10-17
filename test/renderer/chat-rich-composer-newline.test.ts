@@ -85,3 +85,76 @@ describe('composer document preserves the authored text', () => {
     expect(m.offset(doc, m.position(doc, Number.MAX_SAFE_INTEGER))).toBe(text.length);
   });
 });
+
+// Run the production ownership boundary with real editor documents/history.
+// Only the view mount is replaced; no browser layout is needed for this state.
+function projectComposer() {
+  const context = vm.createContext({ currentUserId: 'first',
+    Event: class { constructor(public type: string) {} },
+    _findChatComposerTokens: () => [],
+  });
+  vm.runInContext(readFileSync(path.join(__dirname, '../../src/renderer/vendor/prosemirror/prosemirror.min.js'), 'utf8'), context);
+  vm.runInContext(readFileSync(path.join(__dirname, '../../src/renderer/modules/composer-input.js'), 'utf8'), context);
+  const api = vm.runInContext(`(() => {
+    const input = { id: 'project-chat-input', matches: () => true, dispatchEvent() {} };
+    const api = { editor: input, owner: null, revision: 0, epoch: 0, stamp: {}, anchors: new Set(),
+      plugins: [OrkasEditor.history()], autoGrow() {}, view: {
+        composing: false, state: OrkasEditor.EditorState.create({schema: _composerSchema}),
+        updateState(state) { this.state = state; },
+      } };
+    _composerInputs.set(input.id, api);
+    return {
+      bind: owner => composerBindOwner(input, owner),
+      text: () => composerText(input),
+      edit: text => { api.view.state = api.view.state.apply(api.view.state.tr
+        .replaceWith(0, api.view.state.doc.content.size, _composerDocument(text, input.id).content));
+        api.revision++; api.stamp = {}; },
+      snapshot: () => composerSnapshot(input),
+      discard: (owner, snapshot) => composerDiscardStoredDraft(input, owner, snapshot),
+      undo: () => OrkasEditor.undo(api.view.state, tr => { api.view.state = api.view.state.apply(tr); }),
+    };
+  })()`, context);
+  return { ...api, account: (id: string) => { context.currentUserId = id; } };
+}
+
+describe('project composer draft isolation', () => {
+  it('restores each project’s unsent text, preserves refreshes and fences undo after navigation', () => {
+    const p = projectComposer();
+    p.bind('A'); p.edit('中文 A\nunsent');
+    const submitted = p.snapshot();
+    p.bind('B');
+    expect(p.text()).toBe('');
+    expect(p.undo()).toBe(false);
+    expect(submitted.matches()).toBe(false);
+    p.edit('B draft'); p.bind('B');
+    expect(p.text()).toBe('B draft');
+    p.bind(null); p.bind('A');
+    expect(p.text()).toBe('中文 A\nunsent');
+    expect(p.undo()).toBe(false);
+    p.bind('B');
+    expect(p.text()).toBe('B draft');
+    p.edit(''); p.bind('A'); p.bind('B');
+    expect(p.text()).toBe('');
+  });
+
+  it('does not expose a previous account’s drafts even when the project id is the same', () => {
+    const p = projectComposer();
+    p.bind('A'); p.edit('first account'); p.bind('B'); p.edit('other first draft');
+    p.account('second'); p.bind('B');
+    expect(p.text()).toBe('');
+    p.bind('A');
+    expect(p.text()).toBe('');
+  });
+
+  it.each([false, true])('a delayed successful send consumes only its saved revision (edited=%s)', edited => {
+    const p = projectComposer();
+    p.bind('A'); p.edit('submitted');
+    const submitted = p.snapshot();
+    if (edited) { p.edit('different'); p.edit('submitted'); }
+    p.bind('B'); p.edit('B survives');
+    p.discard('A', submitted);
+    expect(p.text()).toBe('B survives');
+    p.bind('A');
+    expect(p.text()).toBe(edited ? 'submitted' : '');
+  });
+});

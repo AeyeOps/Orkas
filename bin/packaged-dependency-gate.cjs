@@ -286,7 +286,7 @@ function verifyDirectDependencies(sourcePackage, lock, records) {
   }
 }
 
-function verifyResolvedGraph(sourcePackage, rootManifest, records) {
+function verifyResolvedGraph(sourcePackage, rootManifest, records, allowUnreachable = false) {
   const overrides = sourcePackage.overrides || {};
   const reachable = new Set();
   const queue = [{ root: '', name: sourcePackage.name, version: sourcePackage.version, manifest: rootManifest }];
@@ -314,10 +314,52 @@ function verifyResolvedGraph(sourcePackage, rootManifest, records) {
     .filter((record) => !reachable.has(record.root))
     .map((record) => `${record.root} (${record.name}@${record.version})`)
     .sort();
-  if (unexpected.length > 0) {
+  if (!allowUnreachable && unexpected.length > 0) {
     fail(`unreachable package(s) in app.asar: ${unexpected.join(', ')}`);
   }
-  return { edgeCount, overrideEdgeCount };
+  return { edgeCount, overrideEdgeCount, reachable: [...reachable] };
+}
+
+// Packaging-only source/cache checks reuse the final archive's resolution and
+// version rules. Unrelated dev and other-platform optional packages may exist
+// in the lock or build tree, but cannot satisfy a missing production edge.
+function verifySourceDependencyGraph(sourcePackage, lock, platform, arch) {
+  validateRootContract(sourcePackage, sourcePackage, lock);
+  if (!sameJson(lock.packages[''].devDependencies, sourcePackage.devDependencies)) {
+    fail('package-lock.json root devDependencies differs from source package.json');
+  }
+  const records = new Map();
+  for (const [root, manifest] of Object.entries(lock.packages)) {
+    if (!root || !listMatchesTarget(manifest.os, platform) || !listMatchesTarget(manifest.cpu, arch)) continue;
+    records.set(root, { root, name: manifest.name || packageNameFromLockPath(root), version: manifest.version, manifest });
+  }
+  verifyDirectDependencies(sourcePackage, lock, records);
+  return { ...verifyResolvedGraph(sourcePackage, sourcePackage, records, true), records };
+}
+
+function verifyInstalledProductionDependencies(pcRoot, platform, arch) {
+  const source = readJson('package.json', path.join(pcRoot, 'package.json'));
+  const lock = readJson('package-lock.json', path.join(pcRoot, 'package-lock.json'));
+  const locked = verifySourceDependencyGraph(source, lock, platform, arch);
+  const records = new Map();
+  // Follow the locked production closure, including nested packages. Never
+  // require() dependency code or load a target native binding on the build host.
+  for (const root of locked.reachable) {
+    const expected = locked.records.get(root);
+    const file = path.join(pcRoot, root, 'package.json');
+    // npm may legitimately omit optional packages. The resolved graph below
+    // still rejects every missing required edge, including nested fallbacks.
+    if (!fs.existsSync(file)) continue;
+    const manifest = readJson(`${root}/package.json`, file);
+    if (manifest.name !== expected.name || manifest.version !== expected.version) {
+      fail(`installed ${root} name/version does not match package-lock.json`);
+    }
+    for (const key of ['dependencies', 'optionalDependencies', 'peerDependencies', 'peerDependenciesMeta']) {
+      if (!sameJson(manifest[key] || {}, expected.manifest[key] || {})) fail(`installed ${root} ${key} differs from package-lock.json`);
+    }
+    records.set(root, { ...expected, manifest });
+  }
+  return verifyResolvedGraph(source, source, records, true);
 }
 
 function nodeRuntimeClosure(records, rootNames, includeOptional) {
@@ -475,4 +517,6 @@ module.exports = {
   packageRootFromManifestPath,
   verifyPackagedDependencyGraph,
   verifyNodeRuntimeBuildConfig,
+  verifySourceDependencyGraph,
+  verifyInstalledProductionDependencies,
 };

@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { expect, test, type OrkasTestApp } from './fixtures/orkas';
+import { openSidebarEntry, expect, test, type OrkasTestApp } from './fixtures/orkas';
 
 const AUTH_URL = 'https://login.dingtalk.com/oauth2/device/verify.htm?user_code=DING-42';
 
@@ -223,7 +223,7 @@ test(`${scenario.id} ${scenario.format} failure reaches the connection alert wit
   try {
     const page = orkas.page!;
     await page.evaluate(async () => { await (window as any).setLang('zh'); });
-    await page.locator('#connectors-btn').click();
+    await openSidebarEntry(page, '#connectors-btn');
     await page.locator('#connectors-search-input').fill(scenario.id);
     const card = page.locator(`.connector-card[data-id="${scenario.id}"]`);
     await card.locator('[data-act="connect"]').click();

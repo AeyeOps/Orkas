@@ -17,7 +17,9 @@ let _searchTab = 'all';             // 'all' | 'chat' | 'agent' | 'skill' | 'con
 let _searchResults = [];
 let _searchActiveIdx = -1;
 let _searchLastQuery = '';
-let _searchChatIndexComplete = true;
+// Only a first full build announces incomplete history. Catch-up after that
+// (an unverified index waiting for its idle repair) stays quiet.
+let _searchChatIndexBuilding = false;
 let _searchLoading = false;
 const _SEARCH_FAILURE_DEDUPE_MS = 60 * 1000;
 const _SEARCH_FAILURE_MAX_KEYS = 16;
@@ -134,7 +136,7 @@ function openGlobalSearch(entryPoint = 'unknown') {
     _searchResults = [];
     _searchActiveIdx = -1;
     _searchLastQuery = '';
-    _searchChatIndexComplete = true;
+    _searchChatIndexBuilding = false;
     _searchSeq++;    // invalidate any in-flight query from a previous session
     _setSearchTab('all');           // reset to default tab each open
     _setSearchTabsVisible(false);   // hide tabs while empty/history state is shown
@@ -199,8 +201,8 @@ async function _refreshSearchIndexStatus(seq, query, pending) {
     const response = await apiFetch('/api/search/status');
     const data = await response.json();
     if (seq !== _searchSeq || !pending.active || !data.ok) return;
-    _searchChatIndexComplete = data.chat_index_complete !== false;
-    if (!_searchChatIndexComplete) {
+    _searchChatIndexBuilding = data.chat_index_building === true;
+    if (_searchChatIndexBuilding) {
       if (query) {
         if (query !== _searchLastQuery) {
           _searchResults = [];
@@ -235,7 +237,7 @@ async function _runSearchNow(queryArg) {
     _searchVisibleResults = [];
     _searchActiveIdx = -1;
     _searchLastQuery = '';
-    _searchChatIndexComplete = true;
+    _searchChatIndexBuilding = false;
     _setSearchTabsVisible(false);
     _renderSearchEmptyState();
     void _refreshSearchIndexStatus(_searchSeq, '', { active: true });
@@ -274,7 +276,7 @@ async function _runSearchNow(queryArg) {
         code: _searchDegradationErrorCode(data.degradation_code),
       }, 'search_degraded');
     }
-    _searchChatIndexComplete = data.chat_index_complete !== false;
+    _searchChatIndexBuilding = data.chat_index_building === true;
     _searchResults = data.results || [];
     _searchLastQuery = query;
     _setSearchTabsVisible(true);
@@ -346,7 +348,7 @@ function _renderSearchEmptyState() {
         ${history.map((q) => `<button class="search-history-item" data-history-q="${escapeHtml(q)}">${escapeHtml(q)}</button>`).join('')}
       </div>`
     : '';
-  const notice = !_searchChatIndexComplete
+  const notice = _searchChatIndexBuilding
     ? `<div class="search-section-label is-status" role="status">${escapeHtml(t('search.history_indexing'))}</div>` : '';
   body.innerHTML = notice + (historyHtml || (notice ? '' : `<div class="search-empty">${escapeHtml(t('search.empty_hint'))}</div>`));
   body.querySelectorAll('[data-history-q]').forEach((btn) => {
@@ -462,7 +464,7 @@ function _renderSearchResults(query) {
   const body = document.getElementById('search-body');
   if (!body) return;
   body.classList.remove('is-start-state');
-  const indexing = !_searchChatIndexComplete && (_searchTab === 'all' || _searchTab === 'chat');
+  const indexing = _searchChatIndexBuilding && (_searchTab === 'all' || _searchTab === 'chat');
   const notice = indexing
     ? `<div class="search-section-label is-status" role="status">${escapeHtml(t('search.history_indexing'))}</div>`
     : '';
@@ -603,6 +605,8 @@ async function _gotoSearchResult(r) {
     // Open the agent detail view in read mode. Edit mode is intentionally
     // NOT auto-toggled — the user is looking up "this agent", not editing.
     setTimeout(async () => {
+      const loader = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
+      if (typeof loader === 'function') await loader('agents');
       if (typeof openAgentDetail === 'function') {
         await openAgentDetail(r.id, { returnTarget: agentReturnTarget });
       }

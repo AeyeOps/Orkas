@@ -20,6 +20,7 @@ const h = vi.hoisted(() => ({
   lastRunStreamParams: null as null | Record<string, unknown>,
   runStreamCalls: 0,
   sessionStoreCalls: [] as string[],
+  providerId: 'mock-provider',
   logEntries: [] as Array<{ level: string; message: string; data?: Record<string, unknown> }>,
 }));
 
@@ -55,7 +56,7 @@ vi.mock('../../../../src/main/model/core-agent/runner', () => ({
     resolvedSystemPrompt: 'sys',
     entryId: 'e1',
     profileId: 'p1',
-    providerId: 'mock-provider',
+    providerId: h.providerId,
     modelId: 'mock-model',
     toolDefs: [],
     skillDisplayNameById: new Map(),
@@ -113,6 +114,7 @@ beforeEach(() => {
   h.sessionStoreCalls = [];
   h.lastRunStreamParams = null;
   h.logEntries = [];
+  h.providerId = 'mock-provider';
 });
 afterEach(() => {
   vi.clearAllTimers();
@@ -147,6 +149,7 @@ async function drain(opts: Record<string, unknown>): Promise<{ events: DrainedEv
 }
 
 describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
+
   it('does not charge the provider usage again when the enclosing run finishes', async () => {
     const meter = await import('../../../../src/main/util/conversation-cost-meter');
     const cid = 'client-budget-count-once';

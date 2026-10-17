@@ -9,6 +9,50 @@ const node = process.env.ORKAS_TEST_NODE || process.execPath;
 const quote = (text: string) => `'${text.replace(/'/g, "''")}'`;
 const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
+it.runIf(process.platform === "win32").each(["before-check", "before-kill"])(
+  "does not claim a root that exits independently after helper readiness: %s", async (timing) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-natural-exit-"));
+    const release = path.join(dir, "release");
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let root: ChildProcess | undefined;
+    try {
+      const code = "const fs=require('fs');console.log('ready');"
+        + "setInterval(()=>{if(fs.existsSync('release'))process.exit(7)},5);"
+        + "setTimeout(()=>process.exit(99),10000)";
+      root = spawn(node, ["-e", code], { cwd: dir, windowsHide: true });
+      await new Promise<void>((resolve, reject) => {
+        root!.once("error", reject);
+        root!.stdout!.once("data", () => resolve());
+      });
+      let attributed = 0;
+      const naturalExit = `[IO.File]::WriteAllText(${quote(release)}, 'release'); `
+        + "if (-not $root.WaitForExit(2000)) { throw 'fixture_exit_missing' }; ";
+      await new Promise<void>(resolve => killProcessTree(root!, "SIGTERM", {
+        spawnFn: ((file: string, args: string[], options: any) => {
+          const rewritten = [...args];
+          const index = rewritten.indexOf("-EncodedCommand") + 1;
+          let script = Buffer.from(rewritten[index], "base64").toString("utf16le");
+          script = timing === "before-check"
+            ? script.replace("# Stop the root immediately", naturalExit + "\n# Stop the root immediately")
+            : script.replace("$root.Kill()", naturalExit + "$root.Kill()");
+          rewritten[index] = Buffer.from(script, "utf16le").toString("base64");
+          return spawn(file, rewritten, options);
+        }) as typeof spawn,
+        onRootTerminated: () => { attributed++; },
+        onComplete: resolve,
+      }));
+      await vi.waitFor(() => expect(root!.exitCode).toBe(7));
+      expect(attributed).toBe(0);
+      expect(warning.mock.calls).toEqual([]);
+      expect(() => process.kill(root!.pid!, 0)).toThrow();
+    } finally {
+      warning.mockRestore();
+      if (root?.exitCode == null && root?.signalCode == null) root?.kill();
+      await fs.rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+  }, 10_000,
+);
+
 it.runIf(process.platform === "win32")("cleans up eight simultaneous deadlines without an incomplete-tree fallback", async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-concurrent-cleanup-"));
   const warnings = vi.spyOn(console, "warn");

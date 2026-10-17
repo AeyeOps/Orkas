@@ -28,7 +28,11 @@ export async function exerciseProductInventory(frame: FrameLocator, reopen: () =
   await submit.click();
   await expect(row()).toContainText('21.43');
   passed?.('edited');
-  await expect(row().getByRole('cell').filter({ hasText: /^0$/ })).toBeVisible();
+  const stockColumn = await frame.getByRole('columnheader', { name: /库存/ }).evaluate(el =>
+    Array.from(el.parentElement!.children).indexOf(el));
+  const stockCell = row().getByRole('cell').nth(stockColumn);
+  await expect(stockCell).toBeVisible();
+  await expect.poll(async () => Number((await stockCell.innerText()).replace(/,/g, '').match(/[-+]?\d+(?:\.\d+)?/)?.[0])).toBe(0);
   passed?.('zeroStock');
   frame = await reopen();
   await expect(row()).toContainText('21.43');
@@ -54,8 +58,12 @@ export async function exerciseConverter(frame: FrameLocator, passed?: Checkpoint
   const from = frame.getByRole('combobox', { name: /输入单位|源单位|从/ });
   const to = frame.getByRole('combobox', { name: /输出单位|目标单位|换算为/ });
   const input = frame.getByRole('spinbutton').first();
-  const result = frame.locator('output:visible');
-  const value = async () => Number((await result.innerText()).replace(/,/g, '').match(/[-+]?\d+(?:\.\d+)?/)?.[0]);
+  const labeledResult = frame.getByRole('textbox', { name: /换算结果|输出数值/ });
+  const result = await labeledResult.count() ? labeledResult : frame.locator('output:visible');
+  const value = async () => {
+    const text = await result.evaluate(el => el instanceof HTMLInputElement ? el.value : el.textContent || '');
+    return Number(text.replace(/,/g, '').match(/[-+]?\d+(?:\.\d+)?/)?.[0]);
+  };
   await selectOptionMatching(from, /^千米$|^公里$|^km$/i);
   await selectOptionMatching(to, /^米$|^m$/i);
   await input.fill('2.37');
@@ -91,18 +99,26 @@ export async function exerciseFlashcards(frame: FrameLocator, page: Page, eviden
   const wordInput = frame.getByRole('textbox', { name: /^单词/ });
   const addForm = frame.locator('form').filter({ has: wordInput });
   for (let i = 0; i < 2; i++) {
+    if (!await wordInput.isVisible()) await frame.getByRole('button', { name: /添加(?:新)?单词|新增单词/ }).click();
     await wordInput.fill(words[i]);
     await frame.getByLabel(/^释义/).fill(meanings[i]);
     await frame.getByLabel(/^例句/).fill(`This is ${words[i]}.`);
     await addForm.locator('button[type="submit"], button:not([type]), input[type="submit"]').click();
   }
-  const flip = frame.getByRole('button', { name: /翻转.*卡|翻.*答案|收起答案|显示释义|显示单词|卡片正面|卡片背面/ });
+  const flip = frame.getByRole('button', { name: /翻转.*卡|翻.*答案|收起答案|显示释义|显示单词|卡片正面|卡片背面|单词卡片|答案已显示/ });
   // A card may itself be a button or contain a separate flip button.
   const article = frame.getByRole('article').filter({ has: flip });
   const separateFlip = await article.count() === 1;
   const card = separateFlip ? article : flip;
   await expect(card).toContainText(words[1]);
   passed?.('added');
+  // Some apps open the answer immediately after adding a word. CSS back faces
+  // can have a nonempty layout box while still facing away, so layout visibility
+  // alone cannot identify that starting state; use the flip control's state.
+  if (/答案已显示|收起答案|显示单词|卡片背面/.test(await flip.getAttribute('aria-label') || '')) {
+    await flip.click();
+    await expect(card.getByText(meanings[1], { exact: true })).not.toBeVisible();
+  }
   const before = await card.screenshot({ path: evidencePath('flashcard-front.png') });
   await flip.click();
   await expect(card).toContainText(meanings[1]);
@@ -111,13 +127,22 @@ export async function exerciseFlashcards(frame: FrameLocator, page: Page, eviden
   const after = await card.screenshot({ path: evidencePath('flashcard-back.png') });
   expect(after.equals(before), 'Flip must visibly reveal the answer').toBe(false);
   passed?.('flipped');
-  await (separateFlip ? card : frame).getByRole('button', { name: /我已掌握|^已掌握$|标记.*掌握|^已经掌握$/ }).click();
+  await (separateFlip ? card : frame).getByRole('button', { name: /我已掌握|^(?:[✓✔]\s*)?已掌握$|标记.*掌握|^已经掌握$/ }).click();
   await expect(card).toContainText(words[0]);
   // The template promises mastery and priority, not a particular list layout.
   // Verify the marked word through the app's list or its mastery filter.
   const masteredRow = frame.getByRole('listitem').filter({ hasText: words[1] });
+  // The flashcard itself may be a non-native role=button with the same word.
+  // Deck navigation uses actual buttons, distinct from that flip surface.
+  const deckButton = frame.locator('button').filter({ hasText: words[1] });
+  const hasFilters = await frame.getByRole('combobox', { name: /筛选/ }).count()
+    || await frame.getByRole('group', { name: /筛选/ }).count();
   if (await masteredRow.count()) {
     await expect(masteredRow).toContainText('已掌握');
+  } else if (!hasFilters && await deckButton.count() === 1) {
+    await deckButton.click();
+    await expect(card).toContainText(words[1]);
+    await expect(card).toContainText('已掌握');
   } else {
     await filterCards('mastered');
     await expect(card).toContainText(words[1]);
@@ -127,6 +152,18 @@ export async function exerciseFlashcards(frame: FrameLocator, page: Page, eviden
     await expect(card).not.toContainText(words[1]);
   }
   passed?.('masteryMarked');
+  if (!await masteredRow.count() && !hasFilters && await deckButton.count() === 1) {
+    const again = frame.getByRole('button', { name: /^还不熟$|还不熟悉|未掌握|不认识/ });
+    if (!await again.isEnabled()) await flip.click();
+    await again.click();
+    const nextReview = await card.innerText();
+    await deckButton.click();
+    await expect(card, 'Returning a card to review must clear mastery').not.toContainText('已掌握');
+    expect(nextReview).toContain(words[0]);
+    expect(nextReview).not.toContain(words[1]);
+    passed?.('unmasteredPrioritized');
+    return { added: true, flipped: true, masteryMarked: true, unmasteredPrioritized: true };
+  }
   const again = frame.getByRole('button', { name: /还不熟悉|未掌握|不认识/ });
   if (await again.count()) {
     await again.click();
@@ -166,11 +203,15 @@ export async function exerciseSnake(frame: FrameLocator, page: Page, passed?: Ch
   const board = frame.locator('canvas');
   const pixels = () => board.evaluate((el: HTMLCanvasElement) => el.toDataURL());
   const difficulty = frame.getByRole('combobox', { name: /难度/ });
-  const levels = await difficulty.locator('option').evaluateAll(options => options
+  const difficultyButtons = frame.getByRole('group', { name: /难度/ }).getByRole('button');
+  const selectDifficulty = await difficulty.count() > 0;
+  const levels = selectDifficulty ? await difficulty.locator('option').evaluateAll(options => options
     .filter(option => !(option as HTMLOptionElement).disabled)
-    .map(option => ({ value: (option as HTMLOptionElement).value, label: option.textContent || '' })));
-  expect(levels.length, 'Difficulty must offer multiple levels').toBeGreaterThan(1);
-  await difficulty.selectOption(levels[0].value);
+    .map(option => ({ value: (option as HTMLOptionElement).value, label: option.textContent || '' }))) : [];
+  const levelCount = selectDifficulty ? levels.length : await difficultyButtons.count();
+  expect(levelCount, 'Difficulty must offer multiple levels').toBeGreaterThan(1);
+  if (selectDifficulty) await difficulty.selectOption(levels[0].value);
+  else await difficultyButtons.first().click();
   await frame.getByRole('button', { name: /重新开始/ }).click();
   await expect(frame.getByText(/^最高分(?:\s*\d+)?$/)).toBeVisible();
   for (const direction of ['上', '下', '左', '右']) {
@@ -195,10 +236,17 @@ export async function exerciseSnake(frame: FrameLocator, page: Page, passed?: Ch
   await expect.poll(pixels, { timeout: 3000 }).not.toBe(turned);
   passed?.('keyboard');
   await frame.getByRole('button', { name: /重新开始/ }).click();
-  await expect(frame.getByText(/^(?:当前分数|分数)(?:\s*\d+)?$/).first().locator('..')).toContainText('0');
+  const score = frame.getByText(/^(?:当前分数|当前得分|分数)(?:\s*\d+)?$/).first().locator('..');
+  await expect(score).toContainText('0');
   passed?.('restart');
-  await difficulty.selectOption(levels[levels.length - 1].value);
-  await expect(difficulty.locator('option:checked')).toHaveText(levels[levels.length - 1].label);
+  if (selectDifficulty) {
+    await difficulty.selectOption(levels[levels.length - 1].value);
+    await expect(difficulty.locator('option:checked')).toHaveText(levels[levels.length - 1].label);
+  } else {
+    await difficultyButtons.last().click();
+    await expect(difficultyButtons.last()).toHaveAttribute('aria-pressed', 'true');
+    await expect(difficultyButtons.first()).toHaveAttribute('aria-pressed', 'false');
+  }
   passed?.('difficulty');
   return { movement: true, pause: true, resume: true, keyboard: true, restart: true, difficulty: true,
     limits: 'Eating, collision, high-score persistence and visual design are not scored by this smoke journey.' };

@@ -6,19 +6,21 @@ import { expect, test } from './fixtures/orkas';
 
 // Native executor and real MCP child -> run-local bridge -> real Electron page.
 // Local HTTP receipts and rendered responses prove submission without a model.
-test('native and CLI browsers submit ordinary forms once while protecting sensitive actions and task scope', async ({ orkas }) => {
+test('native and CLI browsers read fields, fill credentials, upload and submit once within task scope', async ({ orkas }) => {
   const submissions: string[] = [];
-  let protectedRequests = 0;
+  const credentialReceipts: string[] = [];
+  const uploadReceipts: Buffer[] = [];
   const server = createServer((req, res) => {
     if (req.method === 'POST') {
-      let body = '';
-      req.setEncoding('utf8');
-      req.on('data', chunk => { body += chunk; });
+      const chunks: Buffer[] = [];
+      req.on('data', chunk => { chunks.push(Buffer.from(chunk)); });
       req.on('end', () => {
-        if (req.url === '/submit') submissions.push(body);
-        else protectedRequests += 1;
+        const body = Buffer.concat(chunks);
+        if (req.url === '/submit') submissions.push(body.toString('utf8'));
+        else if (req.url === '/upload') uploadReceipts.push(body);
+        else credentialReceipts.push(body.toString('utf8'));
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.end(`Received: ${body}`);
+        res.end(req.url === '/submit' ? `Received: ${body.toString('utf8')}` : 'Accepted');
       });
       return;
     }
@@ -30,20 +32,27 @@ test('native and CLI browsers submit ordinary forms once while protecting sensit
       <form id="credentials"><button>Continue</button></form>
       <label>Password<input id="password" type="password" form="credentials" value="fixture-private-value"></label>
       <button id="purchase" type="button">Pay now</button>
-      <label>Attachment<input id="upload" type="file"></label>
+      <input aria-label="Attachment" id="upload" type="file" form="question" style="display:none">
+      <label>Long draft<textarea id="long"></textarea></label>
+      <label>Language<select aria-label="Language"><option value="en">English</option><option value="ja">日本語</option></select></label>
       <script>
         window.protectedActions = 0;
+        document.querySelector('#password').addEventListener('input', event => {
+          if (!(event instanceof InputEvent)) event.target.value = 'fixture-private-value';
+        });
         document.querySelector('#question').addEventListener('submit', async event => {
           event.preventDefault();
+          const file = document.querySelector('#upload').files[0];
+          if (file) await fetch('/upload', { method: 'POST', body: file, signal: AbortSignal.timeout(5000) });
           const response = await fetch('/submit', { method: 'POST', body: document.querySelector('#draft').value, signal: AbortSignal.timeout(5000) });
           document.querySelector('#answer').textContent = await response.text();
         });
         document.querySelector('#credentials').addEventListener('submit', event => {
           event.preventDefault();
           window.protectedActions++;
-          void fetch('/protected', { method: 'POST', body: 'unexpected', signal: AbortSignal.timeout(5000) });
+          void fetch('/protected', { method: 'POST', body: document.querySelector('#password').value, signal: AbortSignal.timeout(5000) });
         });
-        for (const id of ['purchase', 'upload']) document.getElementById(id).addEventListener('click', () => { window.protectedActions++; });
+        for (const id of ['purchase']) document.getElementById(id).addEventListener('click', () => { window.protectedActions++; });
       </script>`);
   });
   await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -65,7 +74,18 @@ test('native and CLI browsers submit ordinary forms once while protecting sensit
     expect(foreign.ok).toBe(true);
     const foreignId = foreign.state.active_tab_id;
     await selectTask(cid);
+    const uploadPath = await orkas.electronApp!.evaluate(async (_electron, args) => {
+      await new Promise<void>(resolve => setImmediate(resolve));
+      const require = (process as any).mainModule.require;
+      const fs = require('node:fs');
+      const dir = require(args.root + '/src/main/util/project-layout.ts').chatAttachmentDirForConversation('account-e2e', args.cid);
+      fs.mkdirSync(dir, { recursive: true });
+      const file = require('node:path').join(dir, 'browser-upload.txt');
+      fs.writeFileSync(file, 'Browser upload\n中文\0exact bytes');
+      return file;
+    }, { root, cid });
     const env = await orkas.electronApp!.evaluate(async ({ BrowserWindow }, args) => {
+      await new Promise<void>(resolve => setImmediate(resolve));
       const require = (process as any).mainModule.require;
       // The production groupChat entry binds its sender before dispatch.
       require(args.root + '/src/main/features/web_assist.ts').bindWebAssistConversation('account-e2e', args.cid, BrowserWindow.getAllWindows()[0].webContents);
@@ -90,6 +110,7 @@ test('native and CLI browsers submit ordinary forms once while protecting sensit
       return { ...data, isError: result.isError === true };
     };
     const nativeCall = async (args: Record<string, unknown>) => orkas.electronApp!.evaluate(async (_electron, input) => {
+      await new Promise<void>(resolve => setImmediate(resolve));
       const result = await (globalThis as any).__nativeBrowserTestTool.execute(input, { state: {} });
       return { ...JSON.parse(result.content), isError: result.isError === true };
     }, args);
@@ -104,74 +125,83 @@ test('native and CLI browsers submit ordinary forms once while protecting sensit
     const field = observed.elements.find((element: any) => element.label === 'Question');
     expect(field).toBeTruthy();
     expect(await call({ operation: 'act', tab_id: tabId, page_id: observed.page_id, element_ref: field.ref, page_action: 'fill', text: 'orkas' })).toMatchObject({ ok: true });
-    expect(await call({ operation: 'act', tab_id: tabId, page_id: observed.page_id, element_ref: field.ref, page_action: 'fill', text: 'Stale mutation' })).toMatchObject({ ok: false, code: 'stale_page', isError: true });
+    expect(await call({ operation: 'act', tab_id: tabId, page_id: observed.page_id, element_ref: field.ref, page_action: 'fill', text: 'Revised draft' })).toMatchObject({ ok: true });
+    expect(await call({ operation: 'read_value', tab_id: tabId, page_id: observed.page_id, element_ref: field.ref })).toMatchObject({ ok: true, value: 'Revised draft' });
+    expect(await call({ operation: 'act', tab_id: tabId, page_id: observed.page_id, element_ref: field.ref, page_action: 'fill', text: 'orkas' })).toMatchObject({ ok: true });
     const readPageState = () => orkas.electronApp!.evaluate(async ({ webContents }, url) => {
       const page = webContents.getAllWebContents().find(contents => contents.getURL() === url)!;
       return page.executeJavaScript(`({ answer: document.querySelector('#answer').textContent, password: document.querySelector('#password').value, protectedActions: window.protectedActions })`);
     }, origin + '/current');
     let expectedSubmissions = 0;
     for (const [lane, submitCall] of [['CLI', call], ['native', nativeCall]] as const) {
-      await test.step(`${lane}: ordinary submission, duplicate rejection, sensitive handoff and recovery`, async () => {
-        observed = await submitCall({ operation: 'observe', tab_id: tabId });
+      await test.step(`${lane}: exact readback, sensitive fill without echo, upload and submission`, async () => {
+        const observe = () => submitCall({ operation: 'observe', tab_id: tabId });
+        const control = (snapshot: any, label: string) => {
+          const entry = snapshot.elements.find((element: any) => element.label === label);
+          expect(entry, label).toBeTruthy();
+          return { tab_id: tabId, page_id: snapshot.page_id, element_ref: entry.ref };
+        };
+        observed = await observe();
         expect(JSON.stringify(observed)).not.toContain('fixture-private-value');
-        const send = observed.elements.find((element: any) => element.label === '发送');
-        expect(send).toMatchObject({ input_type: 'submit', requires_user_action: false });
-        const click = { operation: 'act', tab_id: tabId, page_id: observed.page_id, element_ref: send.ref, page_action: 'click' };
+        expect(await submitCall({ operation: 'read_value', ...control(observed, 'Question') })).toMatchObject({ ok: true, value: 'orkas', untrusted_content: true });
+        const longValue = ('  中文🙂\tJapanese\n\n').repeat(800) + '  tail\n';
+        expect(await submitCall({ operation: 'act', ...control(observed, 'Long draft'), page_action: 'fill', text: longValue })).toMatchObject({ ok: true });
+        observed = await observe();
+        let actual = '', offset = 0;
+        for (;;) {
+          const chunk = await submitCall({ operation: 'read_value', ...control(observed, 'Long draft'), text_offset: offset });
+          expect(chunk).toMatchObject({ ok: true, value_total: longValue.length, untrusted_content: true });
+          actual += chunk.value;
+          if (chunk.value_next_offset === null) break;
+          offset = chunk.value_next_offset;
+        }
+        expect(actual).toBe(longValue);
+        expect(await submitCall({ operation: 'act', ...control(observed, 'Language'), page_action: 'select', text: 'ja' })).toMatchObject({ ok: true });
+        observed = await observe();
+        expect(await submitCall({ operation: 'read_value', ...control(observed, 'Language') })).toMatchObject({ ok: true, value: 'ja', selected_options: ['日本語'] });
 
-        // An externally associated field changes after observation; button refs
-        // and labels stay valid, so execution must recheck its actual form.
+        const secret = `fixture-secret-${lane}`;
+        const filled = await submitCall({ operation: 'act', ...control(observed, 'Password'), page_action: 'fill', text: secret });
+        expect(filled).toMatchObject({ ok: true });
+        expect(JSON.stringify(filled)).not.toContain(secret);
+        observed = await observe();
+        expect(JSON.stringify(observed)).not.toContain(secret);
+        const unreadable = await submitCall({ operation: 'read_value', ...control(observed, 'Password') });
+        expect(unreadable).toMatchObject({ ok: false, code: 'value_not_readable' });
+        expect(JSON.stringify(unreadable)).not.toContain(secret);
+        expect(unreadable).not.toHaveProperty('value_total');
+        expect(await submitCall({ operation: 'act', ...control(observed, 'Continue'), page_action: 'click' })).toMatchObject({ ok: true });
+        await expect.poll(() => credentialReceipts.at(-1)).toBe(secret);
+        observed = await observe();
+        expect(await submitCall({ operation: 'act', ...control(observed, 'Pay now'), page_action: 'click' })).toMatchObject({ ok: true });
+        expect(await readPageState()).toMatchObject({ password: secret, protectedActions: 2 * (expectedSubmissions + 1) });
+        observed = await observe();
+        const upload = await submitCall({ operation: 'act', ...control(observed, 'Attachment'), page_action: 'upload', file_paths: [uploadPath] });
+        expect(upload, JSON.stringify(upload)).toMatchObject({ ok: true, file_count: 1 });
+        expect(JSON.stringify(upload)).not.toContain(uploadPath);
+        expect(uploadReceipts).toHaveLength(expectedSubmissions);
+        observed = await observe();
+        const click = { operation: 'act', ...control(observed, '发送'), page_action: 'click' };
+        // A field becomes sensitive after observation. Submission is authorized;
+        // stale-page replay must still never submit it twice.
         await orkas.electronApp!.evaluate(async ({ webContents }, url) => {
           await webContents.getAllWebContents().find(contents => contents.getURL() === url)!
             .executeJavaScript("document.querySelector('#conditional').type = 'password'");
         }, origin + '/current');
-        expect(await submitCall(click)).toMatchObject({ ok: false, code: 'user_action_required', reason: 'sensitive_form_submission', isError: true });
-        expect(submissions).toHaveLength(expectedSubmissions);
-
-        await orkas.electronApp!.evaluate(async ({ webContents }, url) => {
-          await webContents.getAllWebContents().find(contents => contents.getURL() === url)!
-            .executeJavaScript("document.querySelector('#conditional').type = 'text'");
-        }, origin + '/current');
-        observed = await submitCall({ operation: 'observe', tab_id: tabId });
-        const freshSend = observed.elements.find((element: any) => element.label === '发送');
-        expect(freshSend.requires_user_action).toBe(false);
-        const freshClick = { ...click, page_id: observed.page_id, element_ref: freshSend.ref };
-        expect(await submitCall(freshClick)).toMatchObject({ ok: true, outcome: 'acted', isError: false });
-        expect(await submitCall(freshClick)).toMatchObject({ ok: false, code: 'stale_page', isError: true });
+        expect(await submitCall(click)).toMatchObject({ ok: true, outcome: 'acted', isError: false });
+        expect(await submitCall(click)).toMatchObject({ ok: false, code: 'stale_page', isError: true });
         expectedSubmissions += 1;
         await expect.poll(() => submissions.length).toBe(expectedSubmissions);
         expect(submissions).toEqual(Array(expectedSubmissions).fill('orkas'));
+        await expect.poll(() => uploadReceipts.length).toBe(expectedSubmissions);
+        expect(uploadReceipts.at(-1)).toEqual(Buffer.from('Browser upload\n中文\0exact bytes'));
         expect(await submitCall({ operation: 'wait', tab_id: tabId, wait_condition: 'text', text: 'Received: orkas' })).toMatchObject({ ok: true });
-        observed = await submitCall({ operation: 'observe', tab_id: tabId });
-        expect(observed.text).toContain('Received: orkas');
-
-        // High-impact labels match whole action words, as in web_assist.test.ts.
-        for (const [label, action, reason] of [
-          ['Password', 'fill', 'sensitive_input'],
-          ['Continue', 'click', 'sensitive_form_submission'],
-          ['Pay now', 'click', 'high_impact_action'],
-          ['Attachment', 'click', 'file_upload'],
-        ] as const) {
-          const control = observed.elements.find((element: any) => element.label === label);
-          expect(control, label).toMatchObject({ requires_user_action: true });
-          const handback = submitCall({ operation: 'act', tab_id: tabId, page_id: observed.page_id, element_ref: control.ref, page_action: action, ...(action === 'fill' ? { text: 'must-not-be-written' } : {}) });
-          // A high-impact control is the one handback the user may answer, so
-          // the host asks before it refuses. Denied here: the model is left with
-          // exactly the handback it would have had, and nothing ran.
-          if (reason === 'high_impact_action') {
-            const confirmation = orkas.page!.locator('.bash-permission-dialog');
-            await expect(confirmation).toBeVisible();
-            await confirmation.locator('[data-act="cancel"]').click();
-            await expect(confirmation).toHaveCount(0);
-          }
-          expect(await handback).toMatchObject({ ok: false, code: 'user_action_required', reason, isError: true });
-        }
-        expect(await readPageState()).toEqual({ answer: 'Received: orkas', password: 'fixture-private-value', protectedActions: 0 });
-        expect(protectedRequests).toBe(0);
-        expect(submissions).toHaveLength(expectedSubmissions);
+        expect(await orkas.page!.locator('.bash-permission-dialog').count()).toBe(0);
       });
     }
     for (const input of [
-      { operation: 'observe' }, { operation: 'navigate', navigation: 'goto', url: origin + '/forbidden' },
+      { operation: 'observe' }, { operation: 'read_value', page_id: observed.page_id, element_ref: field.ref },
+      { operation: 'act', page_id: observed.page_id, element_ref: field.ref, page_action: 'upload', file_paths: [uploadPath] }, { operation: 'navigate', navigation: 'goto', url: origin + '/forbidden' },
       { operation: 'act', page_id: observed.page_id, element_ref: field.ref, page_action: 'click' },
       { operation: 'wait' }, { operation: 'retain', retention: 'temporary' }, { operation: 'close' },
     ]) expect(await call({ ...input, tab_id: foreignId })).toMatchObject({ ok: false, code: 'unknown_tab', isError: true });
@@ -190,13 +220,30 @@ test('native and CLI browsers submit ordinary forms once while protecting sensit
     expect(state.tabs.find((tab: any) => tab.address_url === origin + '/forbidden')?.tab_id)
       .not.toBe(foreignId);
     await selectTask(cid);
+    const policies: Array<{ id: string; path: string; retention: string }> = [];
+    for (const [lane, openCall] of [['native', nativeCall], ['CLI', call]] as const) {
+      for (const retention of ['temporary', 'deliverable', 'handoff']) {
+        const path = `/${lane}-${retention}`;
+        const result = await openCall({ operation: 'open', url: origin + path, retention });
+        expect(result).toMatchObject({ ok: true, tab: { retention } });
+        expect(await openCall({ operation: 'wait', tab_id: result.active_tab_id })).toMatchObject({ ok: true });
+        policies.push({ id: result.active_tab_id, path, retention });
+      }
+    }
     await orkas.electronApp!.evaluate((_electron, args) => {
       (process as any).mainModule.require(args.root + '/src/main/features/web_assist_lifecycle.ts').finishBrowserTaskRun('account-e2e', args.cid, 'cli-browser-e2e');
     }, { root, cid });
+    const remaining = (await orkas.invoke<any>('webAssist.state', {})).state.tabs.map((tab: any) => tab.tab_id);
+    for (const policy of policies) expect(remaining.includes(policy.id)).toBe(policy.retention !== 'temporary');
+    expect(remaining).toContain(tabId); // An unmarked model page stays open.
+    expect(remaining).toContain(foreignId); // A user page in another task stays open.
+    const nativePaths = await orkas.electronApp!.evaluate(({ webContents }, base) => webContents.getAllWebContents()
+      .map(contents => contents.getURL()).filter(url => url.startsWith(base)).map(url => new URL(url).pathname), origin);
+    for (const policy of policies) expect(nativePaths.includes(policy.path)).toBe(policy.retention !== 'temporary');
     expect(await call({ operation: 'open', url: origin + '/late' })).toMatchObject({ ok: false, code: 'task_run_ended', isError: true });
     expect(await nativeCall({ operation: 'open', url: origin + '/late' })).toMatchObject({ ok: false, code: 'task_run_ended', isError: true });
     expect(submissions).toEqual(['orkas', 'orkas']);
-    expect(protectedRequests).toBe(0);
+    expect(credentialReceipts).toEqual(['fixture-secret-CLI', 'fixture-secret-native']);
   } finally {
     await client.close();
     await orkas.electronApp!.evaluate(async (_electron, args) => {

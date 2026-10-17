@@ -1,5 +1,6 @@
 import { defineConfig } from 'vitest/config';
 import { cpus } from 'node:os';
+import { TestLogAnalysisReporter } from './test/log-analysis-reporter';
 
 const logicalCpus = cpus().length || 1;
 // Test files exercise real Electron workers, shell helpers, Git, SQLite,
@@ -23,8 +24,10 @@ export default defineConfig({
     // the developer's real `PC/data/`. See ./test/setup-env.ts for the
     // full rationale.
     setupFiles: ['./test/setup-env.ts'],
-    // Default reporter is a per-file dot list — keep CI output compact.
-    reporters: ['default'],
+    // Default reporter is a per-file dot list — keep CI output compact. The
+    // log-analysis reporter adds the attributed log summary and fails a run
+    // whose executed cases lack analysis (Common/docs/test-case-design.md §3.1).
+    reporters: ['default', new TestLogAnalysisReporter()],
     // The desktop suite exercises native modules, file IO, child processes,
     // and sqlite-backed features. Leaving Vitest at the host default can
     // oversubscribe local dev machines and make otherwise healthy tests trip

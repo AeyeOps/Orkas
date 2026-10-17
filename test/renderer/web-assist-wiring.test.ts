@@ -66,6 +66,7 @@ describe('Web Assist renderer wiring', () => {
       activityEl: { hidden: false }, activityListEl: node(),
       window: { orkas: { invoke } }, label: (_key: string, fallback: string) => fallback,
       openChatFileViewer: vi.fn(async () => {}), uiToast: vi.fn(),
+      measureActivityGroups: vi.fn(),
       icon: (name: string) => name, document: { createElement: node }, Date,
     });
     vm.runInContext(webAssistSource.slice(webAssistSource.indexOf('  function refreshActivity(event) {'),
@@ -73,108 +74,17 @@ describe('Web Assist renderer wiring', () => {
     return context;
   }
 
-  function downloadPromptContext(invoke = vi.fn(async () => ({ ok: true }))) {
-    const elements = new Map<string, any>();
-    const element = (selector: string) => {
-      if (!elements.has(selector)) elements.set(selector, { hidden: false, disabled: false, textContent: '' });
-      return elements.get(selector);
-    };
-    const context = vm.createContext({
-      currentState: { tabs: [{ conversation_id: 'a', download_request: { id: 'first', origin: 'https://files.example', filename: '<report>.csv' } }] },
-      panelOpen: true, panelTab: 'browser', activeView: 'conversation', activeCid: 'a', contextEpoch: 0,
-      downloadPromptEl: { hidden: true, querySelector: element, querySelectorAll: () => [element('[data-act="deny-download"]'), element('[data-act="allow-download"]')] },
-      activityBtn: {}, activeDownloadPrompt: null, downloadRevealKey: '', dismissedDownloadRequests: new Set(),
-      window: { orkas: { invoke } }, label: (_key: string, fallback: string) => fallback,
-      setActivityOpen: vi.fn(), syncVisibility: vi.fn(),
-    });
-    context.tabsForConversation = () => context.currentState.tabs.filter((tab: any) => tab.conversation_id === context.activeCid);
-    vm.runInContext(webAssistSource.slice(webAssistSource.indexOf('  function renderDownloadPrompt()'),
-      webAssistSource.indexOf('  function setActivityOpen(')), context);
-    return { context, element, invoke };
-  }
-
-  it('shows consent only in its task browser, remembers dismissal, and asks again for a new attempt', () => {
-    const { context, element, invoke } = downloadPromptContext();
-    context.activeCid = 'other';
-    context.renderDownloadPrompt();
-    expect(context.downloadPromptEl.hidden).toBe(true);
-    context.activeCid = 'a';
-    context.renderDownloadPrompt();
-    expect(context.downloadPromptEl.hidden).toBe(false);
-    expect(element('.web-assist-download-origin').textContent).toBe('https://files.example');
-    expect(element('.web-assist-download-filename').textContent).toBe('<report>.csv');
-    expect(element('.web-assist-download-filename').innerHTML).toBeUndefined();
-    expect(context.setActivityOpen).toHaveBeenCalledWith(false);
-    context.dismissDownloadPrompt();
-    context.renderDownloadPrompt();
-    expect(context.downloadPromptEl.hidden).toBe(true);
-    expect(invoke).not.toHaveBeenCalled();
-    context.currentState.tabs[0].download_request.id = 'retry';
-    context.renderDownloadPrompt();
-    expect(context.downloadPromptEl.hidden).toBe(false);
-    expect(context.dismissedDownloadRequests.size).toBe(0);
-    context.panelTab = 'files';
-    context.renderDownloadPrompt();
-    expect(context.downloadPromptEl.hidden).toBe(true);
-    const openAndSetTab = vi.fn(() => { context.panelOpen = true; context.panelTab = 'browser'; return true; });
-    context.window.ConversationInfo = { openAndSetTab };
-    context.panelOpen = false;
-    context.renderDownloadPrompt();
-    expect(openAndSetTab).not.toHaveBeenCalled();
-    context.contextEpoch++;
-    context.renderDownloadPrompt();
-    expect(openAndSetTab).toHaveBeenCalledExactlyOnceWith('browser', 'a');
-    expect(context.downloadPromptEl.hidden).toBe(false);
-  });
-
-  it('keeps a failed consent local and retryable, grants only the displayed task/site, and never retries the transfer', async () => {
-    const invoke = vi.fn().mockResolvedValueOnce({ ok: false }).mockResolvedValueOnce({ ok: true });
-    const { context, element } = downloadPromptContext(invoke);
-    context.renderDownloadPrompt();
-    await context.allowDownloadPrompt();
-    expect(context.downloadPromptEl.hidden).toBe(false);
-    expect(element('.web-assist-download-error').hidden).toBe(false);
-    expect(element('.web-assist-download-error').textContent).toContain('Try again');
-    expect(element('[data-act="allow-download"]').disabled).toBe(false);
-    await context.allowDownloadPrompt();
-    expect(context.downloadPromptEl.hidden).toBe(true);
-    expect(invoke.mock.calls).toEqual([
-      ['webAssist.allowDownloadOrigin', { conversation_id: 'a', origin: 'https://files.example' }],
-      ['webAssist.allowDownloadOrigin', { conversation_id: 'a', origin: 'https://files.example' }],
-    ]);
-  });
-
-  it('does not dismiss or overwrite another task prompt when an old consent response arrives', async () => {
-    let finish!: (value: unknown) => void;
-    const invoke = vi.fn(() => new Promise(resolve => { finish = resolve; }));
-    const { context, element } = downloadPromptContext(invoke);
-    context.renderDownloadPrompt();
-    const pending = context.allowDownloadPrompt();
-    await context.allowDownloadPrompt();
-    expect(invoke).toHaveBeenCalledTimes(1);
-    context.activeCid = 'b';
-    context.contextEpoch++;
-    context.currentState.tabs.push({ conversation_id: 'b', download_request: { id: 'second', origin: 'https://other.example', filename: 'other.csv' } });
-    context.renderDownloadPrompt();
-    finish({ ok: false });
-    await pending;
-    expect(context.downloadPromptEl.hidden).toBe(false);
-    expect(element('.web-assist-download-origin').textContent).toBe('https://other.example');
-    expect(element('.web-assist-download-error').hidden).toBe(true);
-    expect(element('[data-act="allow-download"]').disabled).toBe(false);
-  });
-
-  it('merges visits and downloads newest first, identifies their meaning, and offers only answerable grants', async () => {
+  it('merges visits and downloads newest first, identifies their meaning, and offers no site grants', async () => {
     const invoke = vi.fn(async (method: string) => {
       if (method === 'webAssist.navigations') return { ok: true, navigations: [
         { at: 2, url: 'https://example.com/linked', from_link: true },
         { at: 5, url: 'https://example.com/<script>', from_link: false },
       ] };
-      return { ok: true, allowed_origins: [], downloads: [
+      return { ok: true, downloads: [
         { at: 0, origin: 'https://a.example', filename: 'saved.csv', state: 'saved' },
-        { at: 1, origin: 'https://b.example', filename: 'ask.csv', state: 'refused', reason: 'needs_origin_grant' },
-        { at: 3, origin: 'https://b.example', filename: 'tool.exe', state: 'refused', reason: 'blocked_type' },
-        { at: 4, origin: 'https://b.example', filename: 'large.csv', state: 'refused', reason: 'task_budget' },
+        { at: 1, origin: 'https://b.example', filename: 'ask.csv', state: 'failed' },
+        { at: 3, origin: 'https://b.example', filename: 'tool.exe', state: 'failed' },
+        { at: 4, origin: 'https://b.example', filename: 'large.csv', state: 'failed' },
       ] };
     });
     const context = activityContext(invoke);
@@ -189,14 +99,10 @@ describe('Web Assist renderer wiring', () => {
     expect(rows[0].children).toHaveLength(3);
     expect(rows[3].children).toHaveLength(3);
     expect(rows[5].children[3].textContent).toBe('saved to attachments');
-    const grants = rows.filter((row: any) => row.children.some((child: any) => child.className === 'web-assist-download-allow'));
+    expect([rows[1], rows[2], rows[4]].map((row: any) => row.children[3].textContent)).toEqual(['failed', 'failed', 'failed']);
     expect(rows[5].children[4].children.map((button: any) => button.textContent)).toEqual(['View file', 'Open in folder']);
     expect(rows.slice(0, 5).flatMap((row: any) => row.children).some((child: any) => child.className === 'web-assist-download-actions')).toBe(false);
-    expect(grants).toHaveLength(1);
-    expect(grants[0].children[2].textContent).toBe('ask.csv');
-    await grants[0].children[4].listeners.click();
-    expect(invoke).toHaveBeenCalledWith('webAssist.allowDownloadOrigin', { conversation_id: 'a', origin: 'https://b.example' });
-    await new Promise(resolve => setImmediate(resolve));
+    expect(rows.slice(0, 5).every((row: any) => row.children.length <= 4)).toBe(true);
     context.activityEl.hidden = true;
     invoke.mockClear();
     await context.renderActivity();
@@ -388,19 +294,18 @@ describe('Web Assist renderer wiring', () => {
     expect(webAssistSource).toContain("onPushEvent('web-assist:activity', refreshActivity)");
   });
 
-  it('keeps combined records and grants bound to their task across late responses and reopening', async () => {
+  it('keeps combined records bound to their task across late responses and reopening', async () => {
     const pending: Array<{ method: string; cid: string; resolve: (value: unknown) => void }> = [];
     const invoke = vi.fn((method: string, args: any) => new Promise(resolve => pending.push({ method, cid: args.conversation_id, resolve })));
     const context = activityContext(invoke);
     const response = (name: string) => ({ ok: true,
-      downloads: [{ at: 1, filename: name, origin: `https://${name}.example`, state: 'refused', reason: 'needs_origin_grant' }],
-      navigations: [{ at: 0, url: name, from_link: true }], allowed_origins: [],
+      downloads: [{ at: 1, filename: name, origin: `https://${name}.example`, state: 'failed' }],
+      navigations: [{ at: 0, url: name, from_link: true }],
     });
     const resolvePair = (name: string, offset = 0) => pending.splice(offset, 2).forEach(item => item.resolve(response(name)));
     const first = context.renderActivity();
     resolvePair('a');
     await first;
-    const oldButton = context.activityListEl.children[0].children[4];
     const late = context.renderActivity();
     context.activeCid = 'b';
     context.contextEpoch++;
@@ -413,8 +318,6 @@ describe('Web Assist renderer wiring', () => {
     expect(context.activityListEl.children.map((row: any) => row.children[2].textContent)).toEqual(['b', 'b']);
     context.activeCid = 'a';
     context.contextEpoch++;
-    await oldButton.listeners.click();
-    expect(invoke.mock.calls.some(([method]) => method === 'webAssist.allowDownloadOrigin')).toBe(false);
     const older = context.renderActivity();
     const newer = context.renderActivity();
     resolvePair('newest-a', 2);
@@ -430,16 +333,28 @@ describe('Web Assist renderer wiring', () => {
     expect(context.activityListEl.children[0].textContent).toBe('Loading…');
   });
 
-  it('reveals a task used in the background on return without reopening a manually dismissed browser', () => {
+  it.each(['open', 'connector activity'])('reveals current-turn background %s on return without reopening a manually dismissed browser', activity => {
     const openAndSetTab = vi.fn(() => true);
     const context = vm.createContext({
-      activeView: 'conversation', activeCid: 'foreground', revealedTasks: new Set(),
-      tabsForConversation: () => [{ conversation_id: 'background', assistant_controlled: true }].filter(tab => tab.conversation_id === context.activeCid),
-      window: { ConversationInfo: { openAndSetTab } },
+      activeView: 'conversation', activeCid: 'foreground', revealedTasks: new Set(), browserActivityTasks: new Set(),
+      ensureShell: vi.fn(), rememberMainActiveTab: vi.fn(), renderState: vi.fn(),
+      tabsForConversation: () => ['foreground', 'background'].map(conversation_id => ({ conversation_id, assistant_controlled: true }))
+        .filter(tab => tab.conversation_id === context.activeCid),
+      panelOpen: false, panelTab: 'files',
+      window: { OverlayManager: { hasOpenLayers: () => false }, ConversationInfo: { openAndSetTab } },
     });
     vm.runInContext(webAssistSource.slice(webAssistSource.indexOf('  function revealCurrentTask() {'),
-      webAssistSource.indexOf('  function showFromMain(')), context);
+      webAssistSource.indexOf('  function updateContext(')), context);
     context.revealCurrentTask();
+    expect(openAndSetTab).not.toHaveBeenCalled();
+    context.showFromMain(activity === 'open' ? { browser_activity_conversation_id: 'background' }
+      : { conversation_id: 'foreground', tabs: [{ conversation_id: 'background', assistant_controlled: true,
+        assistant_action: 'observing' }] }, activity === 'open' ? 'background' : undefined);
+    if (activity === 'open') {
+      expect(context.ensureShell).not.toHaveBeenCalled();
+      expect(context.renderState).not.toHaveBeenCalled();
+      expect(context.rememberMainActiveTab).not.toHaveBeenCalled();
+    }
     expect(openAndSetTab).not.toHaveBeenCalled();
     context.activeCid = 'background';
     context.revealCurrentTask();
@@ -448,6 +363,42 @@ describe('Web Assist renderer wiring', () => {
     context.revealCurrentTask();
     context.activeView = 'conversation';
     context.revealCurrentTask();
+    expect(openAndSetTab).toHaveBeenCalledOnce();
+    // Starting a later turn must discard pending activity, including for a
+    // background task that has not been revisited yet.
+    context.activeCid = 'foreground';
+    context.beginTaskTurn('background');
+    context.activeCid = 'background';
+    context.revealCurrentTask();
+    expect(openAndSetTab).toHaveBeenCalledOnce();
+  });
+
+  it('keeps retained pages hidden on task return until this turn actually uses its browser', async () => {
+    const state = { conversation_id: 'c1', tabs: [{ conversation_id: 'c1', assistant_controlled: true }] };
+    const openAndSetTab = vi.fn(() => true);
+    const context = vm.createContext({
+      activeView: 'conversation', activeCid: 'c1', contextEpoch: 0, layoutRevision: 0,
+      currentState: state, revealedTasks: new Set(['c1']), browserActivityTasks: new Set(['c1']),
+      panelOpen: false, panelTab: 'files', activityListEl: null,
+      tabsForConversation: () => context.currentState.tabs.filter((tab: any) => tab.conversation_id === context.activeCid),
+      ensureShell() {}, rememberMainActiveTab() {}, ensureDefaultTab() {}, setActivityOpen() {}, setExpanded() {},
+      renderState: (next: any) => { context.currentState = next; }, log: { warn: vi.fn() },
+      window: { orkas: { invoke: vi.fn(async () => ({ ok: true, state })) },
+        OverlayManager: { hasOpenLayers: () => false }, ConversationInfo: { openAndSetTab } },
+    });
+    vm.runInContext(webAssistSource.slice(webAssistSource.indexOf('  function revealCurrentTask() {'),
+      webAssistSource.indexOf('  function setPanelState(')), context);
+    context.beginTaskTurn('c1');
+    context.setContext('settings', '');
+    context.setContext('conversation', 'c1');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(openAndSetTab).not.toHaveBeenCalled();
+    context.showFromMain({ ...state, assistant_action: 'observing' });
+    expect(openAndSetTab).toHaveBeenCalledExactlyOnceWith('browser', 'c1');
+    // A manual close still survives repeated activity and ordinary state reads.
+    context.setContext('conversation', 'c1');
+    context.showFromMain({ ...state, assistant_action: 'acting' });
+    await new Promise(resolve => setImmediate(resolve));
     expect(openAndSetTab).toHaveBeenCalledOnce();
   });
 
@@ -522,27 +473,6 @@ describe('Web Assist renderer wiring', () => {
     expect(focus).toHaveBeenCalledOnce();
   });
 
-  it('treats a rendered dialog as open even when the browser has no page rectangle', () => {
-    // modalIsOpen() answers "is the native page occluded" and is false while
-    // the browser has no page; a dialog above the app still owns Escape then.
-    const start = webAssistSource.indexOf('  function dialogIsOpen() {');
-    const end = webAssistSource.indexOf('  function modalIsOpen() {', start);
-    const overlays: Array<{ hidden: boolean; rects: number }> = [];
-    const context = vm.createContext({
-      document: { querySelectorAll: () => overlays.map((overlay) => ({
-        hidden: overlay.hidden, getClientRects: () => new Array(overlay.rects).fill({}),
-      })) },
-    });
-    vm.runInContext(webAssistSource.slice(start, end), context);
-
-    expect(context.dialogIsOpen()).toBe(false);
-    overlays.push({ hidden: true, rects: 1 });
-    overlays.push({ hidden: false, rects: 0 });
-    expect(context.dialogIsOpen()).toBe(false);
-    overlays.push({ hidden: false, rects: 1 });
-    expect(context.dialogIsOpen()).toBe(true);
-  });
-
   it('creates default tabs only in visible empty task browsers, deduplicates requests, and permits failure recovery', async () => {
     const start = webAssistSource.indexOf('  function ensureDefaultTab() {');
     const end = webAssistSource.indexOf('  async function addTab()', start);
@@ -591,12 +521,13 @@ describe('Web Assist renderer wiring', () => {
     const first = { tab_id: 'first', display_url: 'https://example.com/work', address_url: 'https://example.com/work?x=one&x=two#section' };
     const input = { value: '' };
     const context = vm.createContext({
-      currentState: {}, shell: { classList: { toggle() {} } },
+      window: { OverlayManager: { setBrowserOpen() {} } },
+      currentState: {}, shell: { querySelector: () => null, classList: { toggle() {} } },
       renderTabs() {}, refreshBrowserCount() {}, selectedTab: () => first,
       renderedTabId: '', addressDirty: false, addressInput: input,
       emptyEl: {}, host: {}, backBtn: {}, forwardBtn: {}, reloadBtn: {}, externalBtn: {}, statusEl: {},
       stateErrorText: () => '', assistantStatusText: () => '',
-      renderDownloadPrompt() {}, ensureMainActiveTab() {}, syncVisibility() {},
+      renderPermissionPrompt() {}, ensureMainActiveTab() {}, syncVisibility() {},
     });
     vm.runInContext(webAssistSource.slice(start, end), context);
     context.renderState({});
@@ -647,17 +578,19 @@ describe('Web Assist renderer wiring', () => {
   });
 
   it('reveals the browser once per task turn while retaining manual close/tab choices and task isolation', () => {
-    const start = webAssistSource.indexOf('  function showFromMain(state) {');
+    const start = webAssistSource.indexOf('  function showFromMain(');
     const end = webAssistSource.indexOf('  function setContext(', start);
     const openAndSetTab = vi.fn(() => true);
     const renderState = vi.fn();
     const context = vm.createContext({
       ensureShell() {}, rememberMainActiveTab() {}, renderState,
       activeView: 'conversation', activeCid: 'c1', currentState: null,
-      revealedTasks: new Set(), window: { ConversationInfo: { openAndSetTab } },
+      panelOpen: false, panelTab: 'files',
+      tabsForConversation: () => context.currentState?.tabs || [],
+      revealedTasks: new Set(), browserActivityTasks: new Set(), window: { OverlayManager: { hasOpenLayers: () => false }, ConversationInfo: { openAndSetTab } },
     });
-    vm.runInContext(webAssistSource.slice(start, end), context);
-    const state = { conversation_id: 'c1', active_tab_id: 'tab-1', assistant_action: 'observing' };
+    vm.runInContext(webAssistSource.slice(webAssistSource.indexOf('  function revealCurrentTask() {'), start) + webAssistSource.slice(start, end), context);
+    const state = { conversation_id: 'c1', active_tab_id: 'tab-1', assistant_action: 'observing', tabs: [{ conversation_id: 'c1', tab_id: 'tab-1', assistant_controlled: true }] };
     context.showFromMain(state);
     expect(openAndSetTab).toHaveBeenCalledExactlyOnceWith('browser', 'c1');
     // Closing details or selecting Attachments must survive all subsequent
@@ -716,48 +649,84 @@ describe('Web Assist renderer wiring', () => {
     handlers.get('web-assist:state')!(activity);
     expect(showFromMain).toHaveBeenCalledWith(activity);
     handlers.get('web-assist:show')!(state);
+    expect(showFromMain).toHaveBeenLastCalledWith(state, 'c1');
     expect(showFromMain).toHaveBeenCalledTimes(2);
+    const backgroundActivity = { ...state, tabs: [{ conversation_id: 'background', assistant_action: 'observing' }] };
+    handlers.get('web-assist:state')!(backgroundActivity);
+    expect(showFromMain).toHaveBeenLastCalledWith(backgroundActivity);
+    handlers.get('web-assist:show')!({ ...state, browser_activity_conversation_id: 'background' });
+    expect(showFromMain).toHaveBeenLastCalledWith(expect.objectContaining({ conversation_id: 'c1' }), 'background');
     expect(handlers.has('web-assist:failure')).toBe(false);
   });
 
-  it.each(['close', 'switch', 'decode-failure', 'ready'])('keeps overlay capture safe during %s', async scenario => {
-    let finish!: (value: unknown) => void;
-    let decode!: () => void;
-    const invoke = vi.fn((method: string) => method === 'webAssist.capturePreview'
-      ? new Promise(resolve => { finish = resolve; }) : Promise.resolve({ ok: true }));
-    const appendChild = vi.fn();
-    const context = vm.createContext({
-      pagePreview: null, pagePreviewTabId: '', pagePreviewRequest: 0,
-      contextEpoch: 0, nativeVisible: false,
-      window: { orkas: { invoke } }, host: { appendChild }, log: { warn: vi.fn() },
-      Image: class {
-        setAttribute() {}
-        decode() { return scenario === 'decode-failure' ? Promise.reject(new Error('fixture decode failed'))
-          : new Promise<void>(resolve => { decode = resolve; }); }
+  it('dismisses an emptied task only on model closure events, including while another task is active', () => {
+    const handlers = new Map<string, (state: unknown) => void>();
+    const closeBrowserForTask = vi.fn(() => true);
+    const revealedTasks = new Set(['c1', 'c2']);
+    const renderState = vi.fn();
+    const showFromMain = vi.fn();
+    const start = webAssistSource.indexOf("  window.orkas.onPushEvent('web-assist:state'");
+    const end = webAssistSource.indexOf('  window.WebAssist =', start);
+    vm.runInNewContext(webAssistSource.slice(start, end), {
+      window: {
+        orkas: { onPushEvent: (name: string, handler: (state: unknown) => void) => handlers.set(name, handler) },
+        ConversationInfo: { closeBrowserForTask },
       },
+      showFromMain, renderState, revealedTasks, browserActivityTasks: new Set(['c1', 'c2']), rememberMainActiveTab() {},
     });
-    vm.runInContext(webAssistSource.slice(webAssistSource.indexOf('  function clearPagePreview()'),
+    const state = handlers.get('web-assist:state')!;
+    state({ open: false, tabs: [] });
+    expect(closeBrowserForTask).not.toHaveBeenCalled();
+    state({ model_closed_conversation_id: 'c1', tabs: [{ conversation_id: 'c1' }] });
+    expect(closeBrowserForTask).not.toHaveBeenCalled();
+    state({ open: false, model_closed_conversation_id: 'c1', tabs: [] });
+    expect(closeBrowserForTask).toHaveBeenLastCalledWith('c1');
+    expect(revealedTasks.has('c1')).toBe(false);
+    expect(revealedTasks.has('c2')).toBe(true);
+    closeBrowserForTask.mockClear();
+    const otherTask = {
+      open: true, assistant_action: 'observing', conversation_id: 'c2',
+      model_closed_conversation_id: 'c1', tabs: [{ conversation_id: 'c2' }],
+    };
+    state(otherTask);
+    expect(showFromMain).toHaveBeenLastCalledWith(otherTask);
+    expect(closeBrowserForTask).toHaveBeenCalledExactlyOnceWith('c1');
+    closeBrowserForTask.mockReturnValue(false);
+    state({ open: false, model_closed_conversation_id: 'c2', tabs: [] });
+    expect(revealedTasks.has('c2')).toBe(true);
+  });
+
+  it('hides closed browser chrome immediately without capturing or replacing its page', async () => {
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const context = vm.createContext({ window: { orkas: { invoke }, OverlayManager: { version: () => 4, epoch: () => 1 } }, log: { warn: vi.fn() } });
+    vm.runInContext(webAssistSource.slice(webAssistSource.indexOf('  async function hideNativeView()'),
       webAssistSource.indexOf('  function syncVisibility()')), context);
-    const pending = context.hideNativeView('tab');
-    expect(invoke).not.toHaveBeenCalledWith('webAssist.layout', expect.anything());
-    finish({ preview: 'data:image/jpeg;base64,fixture' });
-    if (scenario !== 'decode-failure') await vi.waitFor(() => expect(decode).toBeTypeOf('function'));
-    if (scenario === 'close') { context.nativeVisible = true; context.pagePreviewRequest++; }
-    if (scenario === 'switch') { context.contextEpoch++; context.clearPagePreview(); }
-    if (scenario !== 'decode-failure') decode();
-    await pending;
-    if (scenario === 'ready') {
-      expect(appendChild).toHaveBeenCalledOnce();
-      expect(invoke).toHaveBeenLastCalledWith('webAssist.layout', { visible: false });
-      expect(appendChild.mock.invocationCallOrder[0]).toBeLessThan(invoke.mock.invocationCallOrder[1]);
-    } else if (scenario === 'decode-failure') {
-      expect(appendChild).not.toHaveBeenCalled();
-      expect(invoke).toHaveBeenLastCalledWith('webAssist.layout', { visible: false });
-      expect(context.log.warn).toHaveBeenCalledWith('browser preview unavailable');
-    } else {
-      expect(appendChild).not.toHaveBeenCalled();
-      expect(invoke).toHaveBeenCalledTimes(1);
-    }
+    await context.hideNativeView();
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('webAssist.layout', { visible: false, overlayRevision: 4, overlayEpoch: 1 });
+  });
+
+  it('waits for native layer synchronization and discards a layout invalidated while waiting', async () => {
+    let acknowledge!: (value: boolean) => void;
+    let frame!: () => Promise<void>;
+    const settled = new Promise<boolean>(resolve => { acknowledge = resolve; });
+    const invoke = vi.fn(async () => ({ ok: true }));
+    const context = vm.createContext({ nativeVisible: true, layoutFrame: 0, layoutRevision: 0,
+      host: { hidden: false, getBoundingClientRect: () => ({ left: 600, top: 100, width: 400, height: 500 }) },
+      window: { requestAnimationFrame: (fn: any) => { frame = fn; return 1; },
+        OverlayManager: { settled: () => settled, version: () => 2, epoch: () => 1 }, orkas: { invoke } },
+      log: { warn: vi.fn() }, renderState: vi.fn(),
+    });
+    vm.runInContext(webAssistSource.slice(webAssistSource.indexOf('  function scheduleLayout()'),
+      webAssistSource.indexOf('  // In-app full screen.')), context);
+    context.scheduleLayout(); const waiting = frame();
+    expect(invoke).not.toHaveBeenCalled();
+    context.nativeVisible = false; context.layoutRevision++;
+    acknowledge(true); await waiting;
+    expect(invoke).not.toHaveBeenCalled();
+    context.nativeVisible = true; context.scheduleLayout(); await frame();
+    expect(invoke).toHaveBeenCalledExactlyOnceWith('webAssist.layout', {
+      x: 600, y: 100, width: 400, height: 500, overlayRevision: 2, overlayEpoch: 1,
+    });
   });
 
   it('settles visibility mutations so the renderer can finish booting and accept input', () => {
@@ -770,8 +739,7 @@ describe('Web Assist renderer wiring', () => {
       set hidden(value) { hidden = value; pending.push(() => context.syncVisibility()); },
     };
     const context = vm.createContext({
-      pagePreviewTabId: '', pagePreviewRequest: 0, activityEl: null, downloadPromptEl: null,
-      clearPagePreview() {},
+      layoutRevision: 0,
       hideNativeView: () => context.window.orkas.invoke('webAssist.layout', { visible: false }),
       shell, selectedTab: () => null, panelOpen: false, panelTab: 'files',
       activeView: 'new-chat', activeCid: '', nativeVisible: false, nativeTabId: '', currentState: null,
@@ -790,8 +758,7 @@ describe('Web Assist renderer wiring', () => {
     const end = webAssistSource.indexOf('  function scheduleLayout()', start);
     let layoutCalls = 0;
     const context = vm.createContext({
-      pagePreviewTabId: '', pagePreviewRequest: 0, activityEl: null, downloadPromptEl: null,
-      clearPagePreview() {},
+      layoutRevision: 0,
       hideNativeView: () => context.window.orkas.invoke('webAssist.layout', { visible: false }),
       shell: { hidden: false },
       selectedTab: () => ({ tab_id: 'new-tab', display_url: 'https://example.com/new' }),
@@ -815,30 +782,6 @@ describe('Web Assist renderer wiring', () => {
     expect(layoutCalls).toBe(1);
   });
 
-  it('hides native content only for overlays that actually overlap its viewport', () => {
-    const start = webAssistSource.indexOf('  function modalIsOpen() {');
-    const end = webAssistSource.indexOf('  function syncVisibility()', start);
-    const rect = { left: 600, top: 100, right: 1000, bottom: 700, width: 400, height: 600 };
-    let matches = [{ hidden: false, getClientRects: () => [rect] }];
-    const querySelectorAll = vi.fn(() => matches);
-    const context = vm.createContext({ document: { querySelectorAll }, host: { getBoundingClientRect: () => rect } });
-    vm.runInContext(webAssistSource.slice(start, end), context);
-
-    expect(context.modalIsOpen()).toBe(true);
-    expect(querySelectorAll).toHaveBeenCalledWith(expect.stringContaining('.panel.resource-detail-overlay'));
-
-    matches = [{ hidden: true, getClientRects: () => [rect] }];
-    expect(context.modalIsOpen()).toBe(false);
-    matches = [{ hidden: false, getClientRects: () => [] }];
-    expect(context.modalIsOpen()).toBe(false);
-    matches = [{ hidden: false, getClientRects: () => [{ ...rect, left: 0, right: 600, width: 600 }] }];
-    expect(context.modalIsOpen()).toBe(false);
-    matches = [{ hidden: false, getClientRects: () => [{ ...rect, bottom: 100, top: 0, height: 100 }] }];
-    expect(context.modalIsOpen()).toBe(false);
-    matches = [{ hidden: false, getClientRects: () => [{ ...rect, left: 599, right: 601, width: 2 }] }];
-    expect(context.modalIsOpen()).toBe(true);
-  });
-
   it('keeps the page visible and schedules its new bounds throughout a resize', () => {
     const start = webAssistSource.indexOf('  function syncVisibility() {');
     const end = webAssistSource.indexOf('  function scheduleLayout()', start);
@@ -847,8 +790,7 @@ describe('Web Assist renderer wiring', () => {
     const invoke = vi.fn(async () => ({ ok: true }));
     const scheduleLayout = vi.fn();
     const context = vm.createContext({
-      pagePreviewTabId: '', pagePreviewRequest: 0, activityEl: null, downloadPromptEl: null,
-      clearPagePreview() {},
+      layoutRevision: 0,
       hideNativeView: () => context.window.orkas.invoke('webAssist.layout', { visible: false }),
       shell: { hidden: false }, selectedTab: () => ({ tab_id: 'tab', display_url: 'https://example.com' }),
       panelOpen: true, panelTab: 'browser', activeView: 'conversation', activeCid: 'c1',
@@ -876,8 +818,7 @@ describe('Web Assist renderer wiring', () => {
     const invoke = vi.fn(async () => ({ ok: true }));
     const scheduleLayout = vi.fn();
     const context = vm.createContext({
-      pagePreviewTabId: '', pagePreviewRequest: 0, activityEl: null, downloadPromptEl: null,
-      clearPagePreview() {},
+      layoutRevision: 0,
       hideNativeView: () => context.window.orkas.invoke('webAssist.layout', { visible: false }),
       shell: { hidden: false },
       selectedTab: () => ({ tab_id: 'tab-1', display_url: 'https://example.com/setup' }),
@@ -890,7 +831,8 @@ describe('Web Assist renderer wiring', () => {
     vm.runInContext(webAssistSource.slice(start, end), context);
     context.syncVisibility();
     context.syncVisibility(); // Repeated page/status events must settle.
-    expect(invoke).toHaveBeenCalledExactlyOnceWith('webAssist.layout', { visible: false });
+    if (scenario.modal) expect(invoke).not.toHaveBeenCalled();
+    else expect(invoke).toHaveBeenCalledExactlyOnceWith('webAssist.layout', { visible: false });
     expect(context.nativeVisible).toBe(false);
     expect(scheduleLayout).not.toHaveBeenCalled();
     expect(context.currentState.open).toBe(true);
@@ -904,7 +846,7 @@ describe('Web Assist renderer wiring', () => {
     expect(context.nativeTabId).toBe('tab-1');
     expect(scheduleLayout).toHaveBeenCalledOnce();
     // Hiding is layout-only: no close, navigation, or loss of browser state.
-    expect(invoke).toHaveBeenCalledTimes(1);
+    expect(invoke).toHaveBeenCalledTimes(scenario.modal ? 0 : 1);
   });
 
   it('loads trusted browser chrome after icons and before connector callers', () => {
@@ -947,7 +889,6 @@ describe('Web Assist renderer wiring', () => {
     expect(userClickBlock).toContain("window.orkas.invoke('auth.openExternal', { url })");
     expect(userClickBlock).not.toContain('WebAssist');
     expect(webAssistSource).toContain("onPushEvent('web-assist:show'");
-    expect(webAssistSource).toContain('function showFromMain(state)');
     expect(webAssistSource).toContain('assistantStatusText(tab)');
   });
 
@@ -987,10 +928,6 @@ describe('Web Assist renderer wiring', () => {
         'web_assist.page_unresponsive',
         'web_assist.download_blocked',
         'web_assist.download_unavailable',
-        'web_assist.download_prompt_title',
-        'web_assist.download_prompt_description',
-        'web_assist.download_not_now',
-        'web_assist.download_permission_failed',
         'chat.process.action_view_file',
         'chat.preview_reveal_title',
         'web_assist.open_failed',

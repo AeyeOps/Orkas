@@ -175,7 +175,7 @@
         value: `project:${project.project_id}`,
         label: project.name || project.project_id,
         hint: t('contexts.transfer.project_library'),
-        iconName: 'folder',
+        iconName: typeof root.projectIconName === 'function' ? root.projectIconName(project) : 'folder',
       })),
     ];
     const initialLibrary = _libraryValue(source);

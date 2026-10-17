@@ -7,9 +7,9 @@ import * as path from 'node:path';
 import {
   nowIso, genUserId, genId12, safeId,
   readJson, readJsonSync, writeJson, writeJsonSync,
-  writeTextAtomicSync, appendJsonl, appendJsonlAtomic,
+  writeTextAtomicSync, writeTextAtomicGuardedSync, appendJsonl, appendJsonlAtomic,
   invalidateLineCount, readJsonl, readJsonlPage, readJsonlPageWithOffsets,
-  readJsonlWindow, __storageTestHooks,
+  readJsonlWindow, readJsonlWindowAtMatch, __storageTestHooks,
 } from '../../src/main/storage';
 
 let tmpDir: string;
@@ -188,6 +188,28 @@ describe('storage › JSON IO', () => {
 });
 
 describe('storage › writeTextAtomicSync', () => {
+  it('does not publish a superseded snapshot and cleans its temporary file', () => {
+    const file = path.join(tmpDir, 'guarded.md');
+    fs.writeFileSync(file, 'newer save');
+    expect(writeTextAtomicGuardedSync(file, 'old candidate', () => false)).toBe(false);
+    expect(fs.readFileSync(file, 'utf8')).toBe('newer save');
+    expect(fs.readdirSync(tmpDir)).toEqual(['guarded.md']);
+    expect(writeTextAtomicGuardedSync(file, 'accepted', () => true)).toBe(true);
+    expect(fs.readFileSync(file, 'utf8')).toBe('accepted');
+  });
+
+  it('rechecks ownership after a Windows-style sharing violation', () => {
+    let current = 'original';
+    let renames = 0;
+    const published = __storageTestHooks.renameWithRetrySyncUsing('temporary', 'target', () => {
+      renames++;
+      current = 'newer save';
+      throw eperm();
+    }, () => current === 'original');
+    expect(published).toBe(false);
+    expect(renames).toBe(1);
+    expect(current).toBe('newer save');
+  });
   it('writes text atomically and removes .tmp', () => {
     const p = path.join(tmpDir, 'text.md');
     writeTextAtomicSync(p, '# hello\n');
@@ -303,6 +325,42 @@ describe('storage › JSONL append/read', () => {
 
     expect(targetPage.records.map((row) => row.i)).toEqual([20, 21, 22, 23, 24, 25, 26, 27, 28, 29]);
     expect(previousPage.records.map((row) => row.i)).toEqual([10, 11, 12, 13, 14, 15, 16, 17, 18, 19]);
+  });
+
+  // A quoted message is located by id. The single pass must land on exactly
+  // the page the index reader returns for that record, across malformed and
+  // blank lines, CRLF endings, records spanning read chunks, a tombstoned
+  // duplicate, page boundaries and an unterminated final record.
+  it('finds the page holding the first live matching record in one pass, identical to its index page', async () => {
+    const p = path.join(tmpDir, 'quoted.jsonl');
+    const pad = '中🙂'.repeat(12_000);
+    const lines: string[] = [];
+    for (let i = 0; i < 37; i++) {
+      lines.push(JSON.stringify({ id: `m${i}`, text: i % 5 === 0 ? pad : `row ${i}` }));
+      if (i === 3) lines.push('{malformed');
+      if (i === 8) lines.push('   ');
+    }
+    lines.splice(12, 0, JSON.stringify({ id: 'm30', deleted_at: '2026-10-01T00:00:00Z' }));
+    const body = lines.join('\r\n');
+    fs.writeFileSync(p, body, 'utf8');
+    // Independent oracle: parsed-record indexes in file order.
+    const parsed = body.split('\n').map((line) => line.trim()).filter(Boolean)
+      .flatMap((line) => { try { return [JSON.parse(line)]; } catch { return []; } });
+    const live = (id: string) => (record: any) => record?.id === id && !record?.deleted_at;
+    for (const limit of [1, 7, 10]) {
+      for (const id of ['m0', 'm9', 'm10', 'm30', 'm36']) {
+        const index = parsed.findIndex(live(id));
+        const start = Math.floor(index / limit) * limit;
+        expect(await readJsonlWindowAtMatch<any>(p, live(id), limit))
+          .toEqual({ ...await readJsonlWindow<any>(p, start, limit), start, index });
+      }
+    }
+    let projected = 0;
+    const page = await readJsonlWindowAtMatch<any>(p, live('m36'), 10, (record) => { projected++; return { id: record.id }; });
+    expect(page!.records.map((record) => record.id)).toEqual(['m29', 'm30', 'm31', 'm32', 'm33', 'm34', 'm35', 'm36']);
+    expect(projected).toBe(8);
+    expect(await readJsonlWindowAtMatch<any>(p, live('missing'), 10)).toBeNull();
+    expect(await readJsonlWindowAtMatch<any>(path.join(tmpDir, 'absent.jsonl'), live('m0'), 10)).toBeNull();
   });
 
   it('continues forward at byte boundaries across large Unicode records and an unterminated tail', async () => {

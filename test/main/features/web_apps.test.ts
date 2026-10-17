@@ -30,10 +30,158 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   runtime.closeOwner(1); runtime.closeOwner(2);
+  await runtime.drainData?.();
   if (prev === undefined) delete process.env.ORKAS_WORKSPACE_ROOT; else process.env.ORKAS_WORKSPACE_ROOT = prev;
   await fs.rm(root, { recursive: true, force: true });
 });
 describe('Web app capability journeys', () => {
+  it('keeps another application instance usable when the first requester closes during shared SQLite startup', async () => {
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let database: import('../../../src/main/features/web_apps/data').LocalAppData;
+    const close = vi.fn(async () => { await database?.close(); });
+    host.dataOwner = (owner, _key, file, definition) => ({
+      async open() {
+        enter(); await gate;
+        const { LocalAppData } = await import('../../../src/main/features/web_apps/data');
+        const { userLocalRoot } = await import('../../../src/main/paths');
+        database = new LocalAppData(file, userLocalRoot(owner), definition);
+        await database.call('data.insert', { table: 'notes', values: { body: 'KEEP' } });
+        return database;
+      },
+      call: (method, args) => database.call(method, args), close,
+    });
+    const definition = { version: 1, tables: [{ id: 'notes', name: 'notes',
+      fields: [{ id: 'body', name: 'body', type: 'string' }],
+      access: { read: ['body'], insert: ['body'], count: true } }] };
+    const b = { ...bundle('shared-startup', ['data']), manifest: { sdkVersion: 1, capabilities: ['data'], data: definition } };
+    const first = runtime.open(uid, 1, b), second = runtime.open(uid, 2, b);
+    const firstResult = call(first.token, 'data.query', { table: 'notes' }).then(value => ({ value }), error => ({ error }));
+    await entered;
+    const secondResult = runtime.call(uid, 2, second.token, 'second-query', 'data.query', { table: 'notes' }).then(value => ({ value }), error => ({ error }));
+    runtime.close(uid, 1, first.token); release();
+    expect(await firstResult).toMatchObject({ error: { code: 'E_CANCELLED' } });
+    expect(await secondResult).toEqual({ value: { records: [{ body: 'KEEP' }] } });
+    expect(close).not.toHaveBeenCalled();
+    expect(await runtime.call(uid, 2, second.token, 'second-count', 'data.count', { table: 'notes' })).toEqual({ count: 1 });
+    runtime.close(uid, 2, second.token); await runtime.drainData();
+    expect(close).toHaveBeenCalledOnce();
+    expect(host.generate).not.toHaveBeenCalled(); expect(host.tools).not.toHaveBeenCalled();
+  });
+
+  it('closes a late SQLite owner once when its last requester departs before startup completes', async () => {
+    let enter!: () => void, release!: () => void;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let database: import('../../../src/main/features/web_apps/data').LocalAppData;
+    const close = vi.fn(async () => { await database?.close(); });
+    host.dataOwner = (owner, _key, file, definition) => ({
+      async open() {
+        enter(); await gate;
+        const { LocalAppData } = await import('../../../src/main/features/web_apps/data');
+        const { userLocalRoot } = await import('../../../src/main/paths');
+        database = new LocalAppData(file, userLocalRoot(owner), definition);
+        await database.call('internal.check', {}); return database;
+      },
+      call: (method, args) => database.call(method, args), close,
+    });
+    const app = runtime.open(uid, 1, { ...bundle('departing-startup', ['data']),
+      manifest: { sdkVersion: 1, capabilities: ['data'], data: { version: 1, tables: [] } } });
+    const pending = call(app.token, 'data.query', { table: 'notes' }).then(value => ({ value }), error => ({ error }));
+    await entered; runtime.close(uid, 1, app.token); release();
+    expect(await pending).toMatchObject({ error: { code: 'E_CANCELLED' } });
+    await runtime.drainData(); expect(close).toHaveBeenCalledOnce();
+    await expect(database.call('internal.check', {})).rejects.toMatchObject({ code: 'E_CLOSED' });
+    expect(host.generate).not.toHaveBeenCalled(); expect(host.tools).not.toHaveBeenCalled();
+  });
+
+  it.each(['direct'] as const)('reopens the application database after a timed-out query stops its worker (%s owner)', async mode => {
+    const { Worker } = await import('node:worker_threads');
+    const definition = { version: 1, tables: [{ id: 'notes', name: 'notes',
+      fields: [{ id: 'body', name: 'body', type: 'string' }],
+      access: { read: ['body'], insert: ['body'], count: true } }] };
+    const b = { ...bundle('stalled-query', ['data']), appType: 'local' as const, manifest: { sdkVersion: 1, capabilities: ['data'], data: definition } };
+    const workers = new Set<unknown>();
+    let stall = false;
+    const post = Worker.prototype.postMessage;
+    const spy = vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function (this: InstanceType<typeof Worker>, message: any, transfer?: any) {
+      workers.add(this);
+      // A query slower than the data.* budget never answers; the timeout stops this worker.
+      if (stall && message?.method === 'data.count') { stall = false; return; }
+      return post.call(this, message, transfer);
+    });
+    try {
+      const a = runtime.open(uid, 1, b);
+      await call(a.token, 'data.insert', { table: 'notes', values: { body: 'KEEP' } });
+      stall = true;
+      await expect(call(a.token, 'data.count', { table: 'notes' })).rejects.toMatchObject({ code: 'E_BUSY' });
+      // The saved row must stay reachable from the open page and from a later instance.
+      expect(await call(a.token, 'data.count', { table: 'notes' })).toEqual({ count: 1 });
+      const second = runtime.open(uid, 2, b);
+      expect(await runtime.call(uid, 2, second.token, 'second-query', 'data.query', { table: 'notes' })).toEqual({ records: [{ body: 'KEEP' }] });
+      expect(workers.size).toBe(2);
+    } finally { spy.mockRestore(); }
+  });
+
+  it('lets a local app describe the method shown in its supplied discovery example', async () => {
+    const { appResource } = await import('../../../src/main/features/web_apps/resources');
+    const app = runtime.open(uid, 1, { ...bundle('cloud-discovery-example', []), appType: 'local' });
+    const supplied = appResource(new Request(new URL('/__orkas/capabilities.json', app.url)), runtime);
+    const document = JSON.parse(supplied!.body!);
+    const example = document.methods.find((method: any) => method.name === 'capabilities.describe').example;
+    expect(await call(app.token, 'capabilities.describe', example)).toMatchObject({ name: example.method });
+    expect(host.generate).not.toHaveBeenCalled();
+    expect(host.tools).not.toHaveBeenCalled();
+  });
+
+  it.each(['local'] as const)('serves the matching %s authoring contract and invalidates it on closure', async appType => {
+    const { appResource } = await import('../../../src/main/features/web_apps/resources');
+    const b = { ...bundle('catalog-' + appType, []), appType };
+    const app = runtime.open(uid, 1, b);
+    const request = new Request(new URL('/__orkas/capabilities.json', app.url));
+    const result = appResource(request, runtime);
+    expect(result?.status).toBe(200);
+    const document = JSON.parse(result!.body!);
+    expect(document.manifest.starter.manifest).toBe(`@skill/web-app-sdk/assets/${appType === 'web' ? 'web' : 'starter'}/orkas-app.json`);
+    expect(document.methods.some((method: any) => method.name === 'ai.generate')).toBe(appType === 'local');
+    runtime.closeOwner(1);
+    expect(appResource(request, runtime)?.status).toBe(403);
+  });
+  it('preserves ordinary SQLite data without requiring a personal sync adapter',async()=>{
+    const definition:any={version:1,tables:[{id:'notes',name:'notes',fields:[{id:'body',name:'body',type:'string'}],access:{read:['body'],insert:['body']}}]};const b=bundle('offline-data',['data']);b.appType='local';b.manifest={sdkVersion:1,capabilities:['data'],data:definition};const app=runtime.open(uid,1,b);await call(app.token,'data.insert',{table:'notes',values:{body:'local only'}});runtime.closeOwner(1);await runtime.drainData();
+    const {webAppSandboxRoot}=await import('../../../src/main/paths');expect(nativeFs.existsSync(path.join(webAppSandboxRoot(uid,b.key,'local'),'data.sqlite'))).toBe(true);expect(nativeFs.existsSync(path.join(webAppSandboxRoot(uid,b.key,'cloud'),'database.snapshot'))).toBe(false);const reopened=runtime.open(uid,1,b);expect(await call(reopened.token,'data.query',{table:'notes'})).toEqual({records:[{body:'local only'}]});
+  });
+  it('runs real common SQLite calls with the same visitor rules and preserves formal records across reopen',async()=>{
+    const definition={version:1,tables:[{id:'messages',name:'messages',fields:[{id:'body',name:'body',type:'string'}],access:{read:['body'],insert:['body'],count:true}}]};
+    const b={...bundle('common',['data']),appType:'local' as const,manifest:{sdkVersion:1,capabilities:['data'],data:definition}};
+    const first=runtime.open(uid,1,b);
+    await call(first.token,'data.insert',{table:'messages',values:{body:'KEEP'}});
+    expect(await call(first.token,'data.query',{table:'messages',fields:['body']})).toEqual({records:[{body:'KEEP'}]});
+    await expect(call(first.token,'data.query',{table:'messages',fields:['private']})).rejects.toMatchObject({code:'E_PERMISSION'});
+    // A generated app may sort by a reserved timestamp without declaring read
+    // authority. Denial must leave the saved row available to a valid query.
+    await expect(call(first.token,'data.query',{table:'messages',fields:['body'],order:{field:'createdAt',direction:'desc'}})).rejects.toMatchObject({code:'E_PERMISSION'});
+    expect(await call(first.token,'data.query',{table:'messages',fields:['body']})).toEqual({records:[{body:'KEEP'}]});
+    runtime.closeOwner(1);await runtime.drainData();runtime=new mod.WebAppRuntime(host);
+    const reopened=runtime.open(uid,1,b);
+    expect(await call(reopened.token,'data.count',{table:'messages'})).toEqual({count:1});
+    const previewRoot=path.join(root,'preview-common');await fs.mkdir(previewRoot);
+    const preview=new mod.WebAppRuntime(host,{storageRoot:previewRoot});const test=preview.open(uid,2,b);
+    expect(await preview.call(uid,2,test.token,'preview-q','data.count',{table:'messages'})).toEqual({count:0});
+    await preview.call(uid,2,test.token,'preview-w','data.insert',{table:'messages',values:{body:'TEST'}});
+    preview.closeOwner(2);await preview.drainData();
+    expect(await call(reopened.token,'data.count',{table:'messages'})).toEqual({count:1});
+  });
+  it('refuses a known web bundle before granting a runtime instance, including after manifest mutation', () => {
+    const b = { ...bundle('cloud', []), appType: 'web' as const };
+    for (const capabilities of [[], ['ai', 'storage']]) {
+      (b.manifest as any).capabilities = capabilities;
+      expect(() => runtime.open(uid, 1, b)).toThrowError(expect.objectContaining({ code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' }));
+    }
+    expect(host.generate).not.toHaveBeenCalled(); expect(host.tools).not.toHaveBeenCalled();
+  });
+
   it('reads complete picked and sandbox files when the filesystem returns short chunks', async () => {
     const source = path.join(root, 'chunked.txt');
     const text = '完整内容 αβ — complete payload';
@@ -186,6 +334,31 @@ describe('Web app capability journeys', () => {
     runtime.closeOwner(1);
     expect(host.closed).toHaveBeenCalledTimes(2);
     expect(host.closed).toHaveBeenLastCalledWith(uid, { id: b.token, owner: 1 });
+  });
+  it('logs one redacted warning per method and code per minute and nothing for cancellation', async () => {
+    const warn = vi.fn();
+    vi.doMock('../../../src/main/logger', async (original) => ({ ...(await original<any>()),
+      createLogger: () => ({ warn, info: vi.fn(), error: vi.fn(), debug: vi.fn() }) }));
+    try {
+      vi.resetModules();
+      const logged = await import('../../../src/main/features/web_apps/runtime');
+      const rt = new logged.WebAppRuntime(host);
+      const a = rt.open(uid, 1, bundle());
+      host.generate = async () => { throw new Error('/Users/test/private provider body'); };
+      for (let i = 0; i < 3; i += 1) {
+        await expect(rt.call(uid, 1, a.token, `fail-${i}`, 'ai.generate', { prompt: 'secret prompt' })).rejects.toThrow();
+      }
+      await expect(rt.call(uid, 1, a.token, 'tool', 'tools.call', { name: 'bash', arguments: {} })).rejects.toMatchObject({ code: 'E_TOOL' });
+      host.generate = async () => { throw new logged.AppError('E_CANCELLED'); };
+      await expect(rt.call(uid, 1, a.token, 'cancelled', 'ai.generate', { prompt: 'x' })).rejects.toMatchObject({ code: 'E_CANCELLED' });
+      const rows = warn.mock.calls.filter(([message]) => message === 'web app call failed');
+      expect(rows).toEqual([
+        ['web app call failed', { method: 'ai.generate', code: 'E_FAILED', suppressed_count: 0, error: expect.objectContaining({ message_hash: expect.any(String) }) }],
+        ['web app call failed', { method: 'tools.call', code: 'E_TOOL', suppressed_count: 0 }],
+      ]);
+      expect(JSON.stringify(warn.mock.calls)).not.toMatch(/alice|secret prompt|provider body/);
+      rt.closeOwner(1);
+    } finally { vi.doUnmock('../../../src/main/logger'); }
   });
   it('delivers streaming progress and usage without an app-specific output default', async () => {
     const a=open(), progress=vi.fn(); host.generate=vi.fn(async(_uid,_args,_signal,out)=>{out({type:'delta',text:'Hi'});return {text:'Hi',usage:{outputTokens:1},stopReason:'end_turn'};});
@@ -430,6 +603,82 @@ it.each(['switch', 'revoke', 'cancel'])('does not publish sandbox bytes after %s
   } finally { spy.mockRestore(); syncBuiltinESMExports(); }
 });
 
+// Storage calls run on the main process, so an unchanged store must not be
+// re-read and re-parsed for every call; any external replacement (a synced
+// copy, an in-place rewrite) must still be seen, and a failed write must not
+// leave a value that never reached the disk.
+describe('app storage reuse', () => {
+  const storeReads = () => {
+    const realRead = nativeFs.promises.readFile.bind(nativeFs.promises);
+    const reads: string[] = [];
+    const spy = vi.spyOn(nativeFs.promises, 'readFile').mockImplementation(async (...args: any[]) => {
+      if (String(args[0]).endsWith('.json')) reads.push(String(args[0]));
+      return (realRead as any)(...args);
+    });
+    syncBuiltinESMExports();
+    return { reads, restore: () => { spy.mockRestore(); syncBuiltinESMExports(); } };
+  };
+
+  it('reads an unchanged store once while the app stays open and writes the same bytes', async () => {
+    const paths = await import('../../../src/main/paths');
+    const key = bundle('reuse').key;
+    const file = paths.webAppDataFile(uid, key);
+    const a = open('reuse', ['storage']);
+    await call(a.token, 'storage.set', { key: 'draft', value: { text: 'first' } });
+    const probe = storeReads();
+    try {
+      for (let i = 0; i < 5; i++) {
+        expect(await call(a.token, 'storage.get', { key: 'draft' })).toEqual({ value: { text: 'first' } });
+      }
+      expect(await call(a.token, 'storage.keys')).toEqual({ keys: ['draft'] });
+      await call(a.token, 'storage.set', { key: 'count', value: 2 });
+      expect(await call(a.token, 'storage.get', { key: 'count' })).toEqual({ value: 2 });
+      expect(probe.reads).toEqual([]);
+      expect(nativeFs.readFileSync(file, 'utf8'))
+        .toBe(JSON.stringify({ version: 1, entries: { draft: { text: 'first' }, count: 2 } }, null, 2));
+
+      // Closing the last instance releases the parsed store.
+      runtime.close(uid, 1, a.token);
+      const again = open('reuse', ['storage']);
+      expect(await call(again.token, 'storage.get', { key: 'count' })).toEqual({ value: 2 });
+      expect(probe.reads).toEqual([file]);
+    } finally { probe.restore(); }
+  });
+
+  it('sees replaced and rewritten stores and keeps the stored value when a write fails', async () => {
+    const paths = await import('../../../src/main/paths');
+    const key = bundle('external').key;
+    const a = open('external', ['storage']);
+    for (const scope of ['local', 'cloud'] as const) {
+      const file = paths.webAppDataFile(uid, key, scope);
+      await call(a.token, 'storage.set', { key: 'draft', value: 'v1', scope });
+      expect(await call(a.token, 'storage.get', { key: 'draft', scope })).toEqual({ value: 'v1' });
+
+      // A synced copy replaces the file through a temp file and rename.
+      const tmp = file + '.sync.tmp';
+      await fs.writeFile(tmp, JSON.stringify({ version: 1, entries: { draft: 'v2' } }));
+      await fs.rename(tmp, file);
+      expect(await call(a.token, 'storage.get', { key: 'draft', scope })).toEqual({ value: 'v2' });
+
+      // An in-place rewrite of the same size is still a different store.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      await fs.writeFile(file, JSON.stringify({ version: 1, entries: { draft: 'v3' } }));
+      expect(await call(a.token, 'storage.get', { key: 'draft', scope })).toEqual({ value: 'v3' });
+
+      // Guarded atomic writes publish with renameSync.
+      const rename = vi.spyOn(nativeFs, 'renameSync').mockImplementationOnce(() => {
+        throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      });
+      syncBuiltinESMExports();
+      try {
+        await expect(call(a.token, 'storage.set', { key: 'draft', value: 'lost', scope })).rejects.toMatchObject({ code: 'ENOSPC' });
+      } finally { rename.mockRestore(); syncBuiltinESMExports(); }
+      expect(await call(a.token, 'storage.get', { key: 'draft', scope })).toEqual({ value: 'v3' });
+      expect(await call(a.token, 'storage.keys', { scope })).toEqual({ keys: ['draft'] });
+    }
+  });
+});
+
 // A working notebook must grow beyond the old demo quotas and stay usable.
 it('persists larger files and JSON, many entries and long-lived request sequences', async () => {
   const app = open('growing-notebook', ['storage', 'appFiles']);
@@ -449,7 +698,7 @@ it('persists larger files and JSON, many entries and long-lived request sequence
   const reopened = open('growing-notebook', ['storage', 'appFiles']);
   expect(await call(reopened.token, 'appFiles.readText', { path: 'large.txt' })).toEqual({ text });
   expect(await call(reopened.token, 'storage.get', { key: 'new' })).toEqual({ value: 'retained' });
-  for (let i = 0; i < 4200; i++) await call(reopened.token, 'host.getContext');
+  for (let i = 0; i < 20000; i++) await call(reopened.token, 'host.getContext');
   expect(await call(reopened.token, 'storage.get', { key: 'new' })).toEqual({ value: 'retained' });
   await expect(runtime.call(uid, 1, reopened.token, 'q' + seq, 'storage.remove', { key: 'new' }))
     .rejects.toMatchObject({ code: 'E_DUPLICATE' });
@@ -465,6 +714,35 @@ it('remembers cancelled and completed SDK ids out of order without rejecting int
     await expect(runtime.call(uid, 1, a.token, id, 'storage.set', { key: 'replay', value: true }))
       .rejects.toMatchObject({ code: 'E_DUPLICATE' });
   expect(await runtime.call(uid, 1, a.token, 'q6', 'storage.keys', {})).toEqual({ keys: ['q1', 'q2', 'q3', 'q5'] });
+});
+
+it.each(['custom', 'sparse', 'documents'])('bounds an identity flood, preserves replay protection, and recovers by reopening (%s)', async shape => {
+  const a = open();
+  let limited = 0;
+  for (let n = 0; n < 100000; n++) {
+    const id = shape === 'custom' ? 'custom_' + n : shape === 'sparse' ? 'q' + (2 * n + 1) : 'd' + n.toString(16).padStart(32, '0') + 'q1';
+    try { runtime.cancel(uid, 1, a.token, id); }
+    catch (error) { expect(error).toMatchObject({ code: 'E_LIMIT' }); limited++; }
+  }
+  expect(limited).toBeGreaterThan(90000);
+  const first = shape === 'custom' ? 'custom_0' : shape === 'sparse' ? 'q1' : 'd' + '0'.repeat(32) + 'q1';
+  await expect(runtime.call(uid, 1, a.token, first, 'storage.set', { key: 'replayed', value: true })).rejects.toMatchObject({ code: 'E_DUPLICATE' });
+  await expect(runtime.call(uid, 1, a.token, 'fresh', 'storage.set', { key: 'replayed', value: true })).rejects.toMatchObject({ code: 'E_LIMIT' });
+  const other = open(); expect(await runtime.call(uid, 1, other.token, 'q1', 'storage.get', { key: 'replayed' })).toEqual({ value: null });
+  runtime.close(uid, 1, a.token);
+  const reopened = open(); expect(await runtime.call(uid, 1, reopened.token, first, 'host.getContext', {})).toMatchObject({ sdkVersion: 1 });
+});
+
+it('still cancels accepted work after the replay history is exhausted', async () => {
+  const a = open(); let started!: () => void;
+  const gate = new Promise<void>(resolve => { started = resolve; });
+  host.generate = async (_uid, _args, signal) => { started(); await new Promise<void>(resolve => signal.addEventListener('abort', () => resolve(), { once: true })); return { text: 'discarded' }; };
+  const work = runtime.call(uid, 1, a.token, 'running', 'ai.generate', { prompt: 'Controlled operation' });
+  const outcome = expect(work).rejects.toMatchObject({ code: 'E_CANCELLED' }); await gate;
+  let saturated = false;
+  for (let i = 0; i < 9000; i++) { try { runtime.cancel(uid, 1, a.token, 'cancel_' + i); } catch { saturated = true; break; } }
+  expect(saturated).toBe(true);
+  runtime.cancel(uid, 1, a.token, 'running'); await outcome;
 });
 
 it('lets the owning service complete long work without an additional SDK deadline', async () => {
@@ -522,6 +800,104 @@ it('keeps acknowledged browser calls alive until result or explicit cancellation
     await outcome;
     expect(parent.postMessage.mock.calls.at(-1)![0].type).toBe('cancel');
   } finally { vi.useRealTimers(); }
+});
+
+async function browserSdkHarness() {
+  const { runInNewContext } = await import('node:vm');
+  const source = await fs.readFile(path.resolve('src/main/features/web_apps/sdk.js'), 'utf8');
+  const listeners: Record<string, (event?: any) => void> = {};
+  const messages: any[] = [];
+  const parent = { postMessage: vi.fn(message => { messages.push(structuredClone(message)); }) };
+  const window: any = { parent, addEventListener: (type: string, fn: any) => { listeners[type] = fn; } };
+  runInNewContext(source, { window, parent, setTimeout, clearTimeout, structuredClone, crypto: (await import('node:crypto')).webcrypto });
+  return { call: window.orkasApp.call, listeners,
+    calls: () => messages.filter(message => message.type === 'call'),
+    result: (id: string, value: unknown) => listeners.message({ source: parent,
+      data: { __orkasApp: 1, id, type: 'result', ok: true, value } }),
+  };
+}
+
+it('discovers the host before first inference so a cold service cannot expire host discovery', async () => {
+  vi.useFakeTimers();
+  try {
+    const sdk = await browserSdkHarness();
+    const input = { prompt: 'Cold inference', maxTokens: 128 };
+    const work = sdk.call('ai.generate', input);
+    input.prompt = 'Changed after the call';
+    let status = 'pending';
+    void work.then(() => { status = 'resolved'; }, () => { status = 'rejected'; });
+    expect(sdk.calls().map(call => call.method)).toEqual(['host.getContext']);
+    sdk.result(sdk.calls()[0].id, { sdkVersion: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sdk.calls().map(call => call.method)).toEqual(['host.getContext', 'ai.generate']);
+    expect(sdk.calls()[1].args).toEqual({ prompt: 'Cold inference', maxTokens: 128 });
+    await vi.advanceTimersByTimeAsync(30 * 60 * 1000);
+    expect(status).toBe('pending');
+    expect(sdk.calls()).toHaveLength(2);
+    sdk.result(sdk.calls()[1].id, { text: 'One completed inference' });
+    expect(await work).toEqual({ text: 'One completed inference' });
+  } finally { vi.useRealTimers(); }
+});
+
+it('shares inference discovery and never dispatches an operation cancelled while waiting', async () => {
+  vi.useFakeTimers();
+  try {
+    const sdk = await browserSdkHarness();
+    const controller = new AbortController();
+    const cancelled = sdk.call('ai.generate', { prompt: 'Cancelled operation' }, { signal: controller.signal });
+    const outcome = expect(cancelled).rejects.toMatchObject({ code: 'E_CANCELLED' });
+    const kept = sdk.call('ai.generate', { prompt: 'Kept operation' });
+    expect(sdk.calls().map(call => call.method)).toEqual(['host.getContext']);
+    controller.abort();
+    await outcome;
+    sdk.result(sdk.calls()[0].id, { sdkVersion: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sdk.calls().map(call => call.method)).toEqual(['host.getContext', 'ai.generate']);
+    expect(sdk.calls()[1].args).toEqual({ prompt: 'Kept operation' });
+    sdk.result(sdk.calls()[1].id, { text: 'Completed' });
+    expect(await kept).toEqual({ text: 'Completed' });
+  } finally { vi.useRealTimers(); }
+});
+
+it('does not start late inference when the document departs just after discovery resolves', async () => {
+  vi.useFakeTimers();
+  try {
+    const sdk = await browserSdkHarness();
+    const work = sdk.call('ai.generate', { prompt: 'Departing document' });
+    const outcome = expect(work).rejects.toMatchObject({ code: 'E_CLOSED' });
+    expect(sdk.calls().map(call => call.method)).toEqual(['host.getContext']);
+    sdk.result(sdk.calls()[0].id, { sdkVersion: 1 });
+    sdk.listeners.pagehide();
+    await outcome;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sdk.calls().map(call => call.method)).toEqual(['host.getContext']);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
+it('keeps missing-host discovery bounded without dispatching inference or retrying it', async () => {
+  vi.useFakeTimers();
+  try {
+    const sdk = await browserSdkHarness();
+    const work = sdk.call('ai.generate', { prompt: 'Unavailable host' });
+    const outcome = expect(work).rejects.toMatchObject({ code: 'E_HOST_UNAVAILABLE' });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await outcome;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(sdk.calls().map(call => call.method)).toEqual(['host.getContext']);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
+it('retains serialization failure and cancellation during input snapshot without contacting the host', async () => {
+  const sdk = await browserSdkHarness();
+  await expect(sdk.call('ai.generate', { prompt: 'Invalid', unsupported: () => {} }))
+    .rejects.toMatchObject({ code: 'E_INPUT' });
+  const controller = new AbortController();
+  const input = { get prompt() { controller.abort(); return 'Must not dispatch'; } };
+  await expect(sdk.call('ai.generate', input, { signal: controller.signal }))
+    .rejects.toMatchObject({ code: 'E_CANCELLED' });
+  expect(sdk.calls()).toEqual([]);
 });
 
 it('can select more than sixteen files and release snapshots independently', async () => {
@@ -631,4 +1007,103 @@ it('shares initial host discovery across concurrent requests and cancels all wor
     expect(parent.postMessage.mock.calls.slice(2).map(([message]) => message)).toEqual(ids.map(id => ({ __orkasApp: 1, type: 'cancel', id })));
     expect(vi.getTimerCount()).toBe(0);
   } finally { vi.useRealTimers(); }
+});
+
+it('matches the shared independent data contract fixtures through the real browser runtime',async()=>{
+  const fixture=JSON.parse(await fs.readFile(path.resolve(__dirname,'../../fixtures/app-data-v1.json'),'utf8'));
+  const b=bundle('conformance',['data']);b.appType='local';b.manifest={sdkVersion:1,capabilities:['data'],data:fixture.definition};const app=runtime.open(uid,1,b);
+  for(const values of fixture.inserts)await call(app.token,'data.insert',{table:'items',values});
+  for(const [method,key] of [['data.query','queries'],['data.aggregate','aggregates']])for(const test of fixture[key])expect(await call(app.token,method,test.args)).toEqual(test.expected);
+  for(const test of fixture.rejections){const result=call(app.token,test.method,test.args);if(test.code)await expect(result).rejects.toMatchObject({code:test.code});else await expect(result).rejects.toBeInstanceOf(Error);}
+  expect(await call(app.token,'data.count',{table:'items'})).toEqual({count:3});
+  expect(await call(app.token,'data.query',fixture.queries[0].args)).toEqual(fixture.queries[0].expected);
+});
+
+it('fails grouped analytics explicitly when more than one hundred groups match',async()=>{
+  const definition={version:1,tables:[{id:'items',name:'items',fields:[{id:'category',name:'category',type:'string'},{id:'n',name:'n',type:'integer'}],access:{read:['category','n'],insert:['category','n'],aggregate:['n']}}]};
+  const b=bundle('group-boundary',['data']);b.appType='local';b.manifest={sdkVersion:1,capabilities:['data'],data:definition};const app=runtime.open(uid,1,b);
+  for(let n=0;n<101;n++)await call(app.token,'data.insert',{table:'items',values:{category:String(n),n}});
+  await expect(call(app.token,'data.aggregate',{table:'items',field:'n',op:'sum',groupBy:'category'})).rejects.toMatchObject({code:'E_LIMIT'});
+});
+
+// Web type contract. The expected common surface is the published v1 product
+// contract (Common/docs/plans/app-publishing.md), not a copy of commonMethod().
+const WEB_COMMON_V1 = ['capabilities.describe', 'capabilities.list', 'data.aggregate', 'data.count', 'data.insert', 'data.insertIf', 'data.query', 'host.getContext'];
+const webBundle = (name: string, data?: any): Bundle => ({ ...bundle(name, data ? ['data'] : []), appType: 'local',
+  manifest: data ? { sdkVersion: 1, capabilities: ['data'], data } : { sdkVersion: 1, capabilities: [] } });
+const notesDefinition = { version: 1, tables: [{ id: 'notes', name: 'notes', fields: [{ id: 'body', name: 'body', type: 'string' }], access: { read: ['body'], insert: ['body'], count: true } }] };
+
+it('refuses web SDK resource acquisition before exposing any runtime URL or token', () => {
+  const b = { ...webBundle('web-resources'), appType: 'web' as const };
+  expect(() => runtime.open(uid, 1, b)).toThrowError(expect.objectContaining({ code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' }));
+  for (const adapter of [host.pick, host.save, host.generate, host.tools]) expect(adapter).not.toHaveBeenCalled();
+});
+
+it('matches the shared stateful data scenarios: retries, relations, read filters, capacity and stable pages', async () => {
+  // Same fixture steps are replayed against the Server SQLite runtime; expected
+  // values come from the published data contract, never from either runtime.
+  const { scenarios } = JSON.parse(await fs.readFile(path.resolve(__dirname, '../../fixtures/app-data-v1.json'), 'utf8'));
+  const b = webBundle('shared-scenarios', scenarios.definition);
+  let app = runtime.open(uid, 1, b);
+  const saved: Record<string, string> = {};
+  const resolve = (value: any): any => Array.isArray(value) ? value.map(resolve)
+    : value && typeof value === 'object' ? (Object.keys(value).join() === '$ref' ? saved[value.$ref] : Object.fromEntries(Object.entries(value).map(([k, v]) => [k, resolve(v)]))) : value;
+  for (const [index, step] of scenarios.steps.entries()) {
+    const label = `step ${index}`;
+    if (step.reopen) { runtime.closeOwner(1); await runtime.drainData(); runtime = new mod.WebAppRuntime(host); app = runtime.open(uid, 1, b); continue; }
+    if (step.paginate) {
+      const pages: any[] = [];
+      for (let offset = 0; ; offset += step.pageSize) {
+        const { records } = await call(app.token, 'data.query', { ...step.paginate, limit: step.pageSize, offset });
+        if (!records.length) break; pages.push(...records);
+      }
+      const { records: whole } = await call(app.token, 'data.query', { ...step.paginate, limit: 100 });
+      expect(pages, label).toEqual(whole);
+      expect(pages.map(r => r.rank), label).toEqual(step.expectedRanks);
+      expect(pages.map(r => r.title).sort(), label).toEqual(step.expectedTitles);
+      continue;
+    }
+    const result = call(app.token, step.method, resolve(step.args));
+    if (step.code) { await expect(result, label).rejects.toMatchObject({ code: step.code }); continue; }
+    const value = await result;
+    if (step.expected) expect(value, label).toEqual(step.expected);
+    if (step.sameIdAs) expect(value, label).toEqual({ id: saved[step.sameIdAs] });
+    if (step.save) saved[step.save] = value.id;
+  }
+});
+
+it('isolates formal data by application and account and closes the previous account immediately', async () => {
+  const first = webBundle('isolated-a', notesDefinition), second = webBundle('isolated-b', notesDefinition);
+  const a = runtime.open(uid, 1, first), b = runtime.open(uid, 1, second);
+  await call(a.token, 'data.insert', { table: 'notes', values: { body: 'A private' } });
+  expect(await call(b.token, 'data.query', { table: 'notes' })).toEqual({ records: [] });
+  uid = 'account-b';
+  await expect(runtime.call('account-a', 1, a.token, 'after-switch', 'data.query', { table: 'notes' })).rejects.toMatchObject({ code: 'E_CLOSED' });
+  await expect(runtime.call('account-a', 1, a.token, 'after-switch-write', 'data.insert', { table: 'notes', values: { body: 'late' } })).rejects.toMatchObject({ code: 'E_CLOSED' });
+  runtime.closeUser('account-a'); await runtime.drainData();
+  const other = runtime.open(uid, 1, first);
+  expect(await call(other.token, 'data.count', { table: 'notes' })).toEqual({ count: 0 });
+  await call(other.token, 'data.insert', { table: 'notes', values: { body: 'B private' } });
+  runtime.closeUser(uid); await runtime.drainData();
+  uid = 'account-a';
+  const back = runtime.open(uid, 1, first);
+  expect(await call(back.token, 'data.query', { table: 'notes' })).toEqual({ records: [{ body: 'A private' }] });
+});
+
+it.each(['local'] as const)('rejects record update and delete from a %s app without changing records', async appType => {
+  const b = { ...webBundle('no-mutation-' + appType, notesDefinition), appType };
+  const app = runtime.open(uid, 1, b);
+  const { id } = await call(app.token, 'data.insert', { table: 'notes', values: { body: 'KEEP' } });
+  for (const [method, args] of [['data.update', { table: 'notes', id, values: { body: 'changed' } }], ['data.delete', { table: 'notes', id }], ['data.deleteMany', { table: 'notes' }]] as const)
+    await expect(call(app.token, method, args), method).rejects.toMatchObject({ code: 'E_METHOD' });
+  expect(await call(app.token, 'data.query', { table: 'notes' })).toEqual({ records: [{ body: 'KEEP' }] });
+});
+
+it('bounds concurrently open application databases and recovers once one closes', async () => {
+  const apps = Array.from({ length: 5 }, (_, n) => { const b = webBundle('bounded-' + n, notesDefinition); return { b, app: runtime.open(uid, 1, b) }; });
+  for (const { app } of apps.slice(0, 4)) expect(await call(app.token, 'data.count', { table: 'notes' })).toEqual({ count: 0 });
+  await expect(call(apps[4].app.token, 'data.insert', { table: 'notes', values: { body: 'refused' } })).rejects.toMatchObject({ code: 'E_BUSY' });
+  runtime.close(uid, 1, apps[0].app.token); await runtime.drainData();
+  await call(apps[4].app.token, 'data.insert', { table: 'notes', values: { body: 'accepted' } });
+  expect(await call(apps[4].app.token, 'data.query', { table: 'notes' })).toEqual({ records: [{ body: 'accepted' }] });
 });

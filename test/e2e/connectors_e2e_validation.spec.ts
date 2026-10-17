@@ -1,7 +1,7 @@
 import { expectComposerText } from './fixtures/composer';
 import { readFileSync, writeFileSync } from 'node:fs';
 
-import { expect, test, type OrkasTestApp } from './fixtures/orkas';
+import { openSidebarEntry, expect, test, type OrkasTestApp } from './fixtures/orkas';
 
 async function connectLocalMcp(modelOrkas: OrkasTestApp) {
   if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
@@ -43,7 +43,7 @@ rl.on('line', (line) => {
 });
 `);
 
-  await page.locator('#connectors-btn').click();
+  await openSidebarEntry(page, '#connectors-btn');
   await expect(page.locator('#panel-connectors')).toHaveClass(/\bactive\b/);
   await page.locator('#connectors-add-custom-btn').click();
   const dialog = page.locator('.connector-custom-dialog');
@@ -65,7 +65,7 @@ rl.on('line', (line) => {
       enabled?: boolean;
       status: { kind: string };
       transport?: { kind: string; summary: string };
-      tools_cache: Array<{ name: string }>;
+      tools_count: number;
     }>;
   }>('connectors.list');
   const instance = listed.instances.find((item) => item.display_name === 'E2E Local MCP');
@@ -74,7 +74,9 @@ rl.on('line', (line) => {
     status: { kind: 'connected' },
     transport: { kind: 'stdio' },
   });
-  expect(instance?.tools_cache.map((tool) => tool.name)).toContain('e2e_echo');
+  // The renderer gets a tool count; the tool itself is proven by the calls below.
+  expect(instance?.tools_count).toBe(1);
+  expect(JSON.stringify(instance)).not.toContain('Returns deterministic E2E text.');
   expect(JSON.stringify(instance)).not.toContain('must-not-reach-renderer');
 
   const card = page.locator(`.connector-card[data-id="${instance?.id}"]`);
@@ -195,7 +197,10 @@ test.describe('connectors', () => {
     await expect(categories.locator('[data-connectors-cat="office"]')).toBeVisible();
   });
 
-  test('shows all remaining merchant forms in ten languages with production-only setup and callback ownership', async ({ appPage, orkas }, testInfo) => {
+  for (const [id, inputs, choices, callback] of [
+    ['magento', 5, 0, false], ['temu-seller', 3, 1, false], ['lazada-seller', 3, 1, true],
+    ['shein-seller', 3, 0, true], ['alibaba-com-seller', 3, 0, true], ['aliexpress-seller', 3, 0, true],
+  ] as const) test(`shows ${id} merchant form in ten languages with production-only setup and callback ownership`, async ({ appPage, orkas }, testInfo) => {
     const logs: string[] = [];
     const child = orkas.electronApp?.process();
     const stdout = (data: Buffer) => logs.push(`[main:stdout] ${String(data).trimEnd()}`);
@@ -203,44 +208,39 @@ test.describe('connectors', () => {
     const renderer = (message: { type(): string; text(): string }) => logs.push(`[renderer:${message.type()}] ${message.text()}`);
     child?.stdout?.on('data', stdout); child?.stderr?.on('data', stderr); appPage.on('console', renderer);
     try {
-      await appPage.locator('#connectors-btn').click();
-      for (const [id, inputs, choices, callback] of [
-        ['magento', 5, 0, false], ['temu-seller', 3, 1, false], ['lazada-seller', 3, 1, true],
-        ['shein-seller', 3, 0, true], ['alibaba-com-seller', 3, 0, true], ['aliexpress-seller', 3, 0, true],
-      ] as const) {
-        await appPage.locator('#connectors-search-input').fill(id);
-        const card = appPage.locator(`.connector-card[data-id="${id}"]`);
-        await expect(card).toBeVisible();
-        await expect(card.locator('svg')).not.toHaveCount(0);
-        await card.screenshot({ path: testInfo.outputPath(`${id}-card.png`) });
-        await card.locator('[data-act="connect"]').click();
-        const setup = appPage.locator('#connectors-connect-modal');
-        await expect(setup).toBeVisible();
-        await expect(setup.locator('input')).toHaveCount(inputs);
-        await expect(setup.locator('select')).toHaveCount(choices);
-        await expect(setup.locator('[data-act="copy-setup-callback"]')).toHaveCount(callback ? 1 : 0);
-        await setup.locator('input[type="password"]').first().fill('merchant-ui-private-canary');
-        let englishInstructions = '';
-        for (const lang of ['en', 'zh', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it']) {
-          await appPage.evaluate(async locale => { await (window as any).setLang(locale); }, lang);
-          const instructions = await setup.locator('.connectors-setup-instructions').innerText();
-          expect(instructions.trim()).not.toBe('');
-          if (lang === 'en') englishInstructions = instructions;
-          else expect(instructions).not.toBe(englishInstructions);
-          await expect(setup.locator('input[type="password"]').first()).toHaveValue('merchant-ui-private-canary');
-          await expect(setup).not.toContainText('connectors.setup.');
-          await expect(setup.locator('option[value="sandbox"]')).toHaveCount(0);
-          if (callback) await expect(setup.locator('input[readonly]')).toHaveValue('https://orkas.ai/api/connectors/oauth/dcr-callback');
-          expect(await setup.evaluate(el => el.scrollWidth <= el.clientWidth + 1), `${id}/${lang}`).toBe(true);
-          if (id === 'temu-seller') await setup.screenshot({ path: testInfo.outputPath(`${id}-${lang}-setup.png`) });
-        }
-        await appPage.evaluate(async () => { await (window as any).setLang('zh'); });
-        await setup.screenshot({ path: testInfo.outputPath(`${id}-setup.png`) });
-        expect(await setup.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
-        // Never submit dummy credentials to a live merchant API.
-        await setup.locator('[data-act="cancel"]').click();
-        await expect(setup).toHaveCount(0);
+      await openSidebarEntry(appPage, '#connectors-btn');
+      await appPage.locator('#connectors-search-input').fill(id);
+      const card = appPage.locator(`.connector-card[data-id="${id}"]`);
+      await expect(card).toBeVisible();
+      await expect(card.locator('svg')).not.toHaveCount(0);
+      await card.screenshot({ path: testInfo.outputPath(`${id}-card.png`) });
+      await card.locator('[data-act="connect"]').click();
+      const setup = appPage.locator('#connectors-connect-modal');
+      await expect(setup).toBeVisible();
+      await expect(setup.locator('input')).toHaveCount(inputs);
+      await expect(setup.locator('select')).toHaveCount(choices);
+      await expect(setup.locator('[data-act="copy-setup-callback"]')).toHaveCount(callback ? 1 : 0);
+      await setup.locator('input[type="password"]').first().fill('merchant-ui-private-canary');
+      let englishInstructions = '';
+      for (const lang of ['en', 'zh', 'ja', 'pt', 'es', 'fr', 'ko', 'de', 'ru', 'it']) {
+        await appPage.evaluate(async locale => { await (window as any).setLang(locale); }, lang);
+        const instructions = await setup.locator('.connectors-setup-instructions').innerText();
+        expect(instructions.trim()).not.toBe('');
+        if (lang === 'en') englishInstructions = instructions;
+        else expect(instructions).not.toBe(englishInstructions);
+        await expect(setup.locator('input[type="password"]').first()).toHaveValue('merchant-ui-private-canary');
+        await expect(setup).not.toContainText('connectors.setup.');
+        await expect(setup.locator('option[value="sandbox"]')).toHaveCount(0);
+        if (callback) await expect(setup.locator('input[readonly]')).toHaveValue('https://orkas.ai/api/connectors/oauth/dcr-callback');
+        expect(await setup.evaluate(el => el.scrollWidth <= el.clientWidth + 1), `${id}/${lang}`).toBe(true);
+        if (id === 'temu-seller') await setup.screenshot({ path: testInfo.outputPath(`${id}-${lang}-setup.png`) });
       }
+      await appPage.evaluate(async () => { await (window as any).setLang('zh'); });
+      await setup.screenshot({ path: testInfo.outputPath(`${id}-setup.png`) });
+      expect(await setup.evaluate(el => el.scrollWidth <= el.clientWidth + 1)).toBe(true);
+      // Never submit dummy credentials to a live merchant API.
+      await setup.locator('[data-act="cancel"]').click();
+      await expect(setup).toHaveCount(0);
     } finally {
       child?.stdout?.off('data', stdout); child?.stderr?.off('data', stderr); appPage.off('console', renderer);
       const logPath = testInfo.outputPath('merchant-runtime.log');
@@ -261,7 +261,7 @@ test.describe('connectors', () => {
     child?.stderr?.on('data', stderr);
     appPage.on('console', renderer);
     try {
-      await appPage.locator('#connectors-btn').click();
+      await openSidebarEntry(appPage, '#connectors-btn');
       for (const id of ['bigcommerce', 'shopline', 'shoplazza']) {
         await appPage.locator('#connectors-search-input').fill(id);
         const card = appPage.locator(`.connector-card[data-id="${id}"]`);
@@ -302,8 +302,8 @@ test.describe('connectors', () => {
     expect(logs.filter(line => line.startsWith('[renderer:error]'))).toEqual([]);
   });
 
-  test('switches ten locales in open connector forms without losing credentials or selected region', async ({ appPage }) => {
-    await appPage.locator('#connectors-btn').click();
+  test('switches ten locales in the merchant connector form without losing credentials or selected region', async ({ appPage }) => {
+    await openSidebarEntry(appPage, '#connectors-btn');
     const shopee = appPage.locator('.connector-card[data-id="shopee"]');
     await shopee.locator('[data-act="connect"]').click();
     const setup = appPage.locator('#connectors-connect-modal');
@@ -332,6 +332,10 @@ test.describe('connectors', () => {
     }
     await setup.locator('[data-act="cancel"]').click();
     await expect(setup).toHaveCount(0);
+  });
+
+  test('switches ten locales in the custom MCP form without losing connection values', async ({ appPage }) => {
+    await openSidebarEntry(appPage, '#connectors-btn');
     await appPage.locator('#connectors-add-custom-btn').click();
     const custom = appPage.locator('.connector-custom-dialog');
     await custom.locator('[data-f="name"]').fill('我的 MCP');
@@ -352,7 +356,7 @@ test.describe('connectors', () => {
     await expect(custom).toHaveCount(0);
   });
 
-  test('connects to a real local MCP server and expires task approval before the next task', async ({ modelOrkas }, testInfo) => {
+  test('keeps local MCP approval details readable and narrow actions usable without approving inspection', async ({ modelOrkas }, testInfo) => {
     const { page, instance, callStatePath, startConnectorChat } = await connectLocalMcp(modelOrkas);
     await startConnectorChat();
 
@@ -396,6 +400,26 @@ test.describe('connectors', () => {
     await actionConfirmation.locator('[data-id="allow_run"]').click();
     await expect(actionConfirmation).toHaveCount(0);
     await page.evaluate(() => (window as any).setLang('en'));
+    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+      hasText: 'E2E connector tool round trip completed.',
+    })).toBeVisible({ timeout: 20_000 });
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toEqual([{ name: 'e2e_echo', arguments: { text: 'roundtrip' } }]);
+  });
+
+  test('connects to a real local MCP server and expires task approval before the next task', async ({ modelOrkas }) => {
+    const { page, instance, callStatePath, startConnectorChat } = await connectLocalMcp(modelOrkas);
+    await startConnectorChat();
+
+    modelOrkas.setConnectorToolScenario(instance.id);
+    await page.locator('#new-chat-input').type('Call the deterministic echo connector.');
+    await page.locator('#new-chat-send-btn').click();
+    // Custom tool claims do not grant read-only trust. Complete the account's
+    // normal approval flow and prove that the local peer sees no early call.
+    const actionConfirmation = page.locator('.bash-permission-dialog');
+    await expect(actionConfirmation).toBeVisible();
+    expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toEqual([]);
+    await actionConfirmation.locator('[data-id="allow_run"]').click();
+    await expect(actionConfirmation).toHaveCount(0);
     await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
       hasText: 'E2E connector tool round trip completed.',
     })).toBeVisible({ timeout: 20_000 });
@@ -479,7 +503,7 @@ test.describe('connectors', () => {
     expect(JSON.parse(readFileSync(callStatePath, 'utf8'))).toEqual([
       { name: 'e2e_echo', arguments: { text: 'roundtrip' } },
     ]);
-    await page.locator('#connectors-btn').click();
+    await openSidebarEntry(page, '#connectors-btn');
     await card.hover();
     await card.locator('.connector-card-menu-btn').click();
     await page.locator('.connector-card-menu-popover [data-act="toggle-enabled"]').click();
@@ -518,7 +542,7 @@ test.describe('connectors', () => {
       .join('\n');
     expect(disabledSystemPrompt).not.toContain(`**${instance.id}**`);
 
-    await page.locator('#connectors-btn').click();
+    await openSidebarEntry(page, '#connectors-btn');
     await card.hover();
     await card.locator('.connector-card-menu-btn').click();
     await page.locator('.connector-card-menu-popover [data-act="toggle-enabled"]').click();
@@ -534,7 +558,7 @@ test.describe('connectors', () => {
   });
 
   test('loads the connector catalog and rejects malformed custom MCP configuration', async ({ appPage }) => {
-    await appPage.locator('#connectors-btn').click();
+    await openSidebarEntry(appPage, '#connectors-btn');
     await expect(appPage.locator('#panel-connectors')).toHaveClass(/\bactive\b/);
     await expect(appPage.locator('#connectors-add-custom-btn')).toBeVisible();
     await expect(

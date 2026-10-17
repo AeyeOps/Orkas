@@ -1,9 +1,9 @@
-import { expect, test } from './fixtures/orkas';
+import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
 
 test('WooCommerce setup accepts a store URL without keys and retains manual fields across locales', async ({ orkas }) => {
   const page = orkas.page!;
-  await page.locator('#connectors-btn').click();
+  await openSidebarEntry(page, '#connectors-btn');
   await page.locator('#connectors-search-input').fill('woocommerce');
   await page.locator('.connector-card[data-id="woocommerce"] [data-act="connect"]').click();
   const dialog = page.locator('#connectors-connect-modal');

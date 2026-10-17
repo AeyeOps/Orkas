@@ -169,13 +169,70 @@ describe('sidebar top-level section collapse', () => {
 
   it('treats corrupt or non-boolean stored values as expanded', () => {
     const storage = { getItem: () => '{bad json', setItem() {} };
-    expect(readCollapsedState(storage)).toEqual({});
+    expect(readCollapsedState(storage)).toEqual({ today: false, projects: false, tasks: false });
 
     const harness = createHarness({ today: 'yes', projects: 'true', tasks: 1 });
     initSidebarSections(harness.document, harness.storage, harness.translate);
 
     expect(harness.todayBody.hidden).toBe(false);
     expect(harness.projectsBody.hidden).toBe(false);
+    expect(harness.tasksBody.hidden).toBe(false);
+  });
+});
+
+describe('sidebar section preferences after the navigation groups were retired', () => {
+  it('ignores and drops collapse values stored for the retired navigation groups', () => {
+    // An upgraded installation still carries the old group keys; they must
+    // neither leak into task-section state nor survive the next write.
+    const harness = createHarness({ operations: false, capabilities: true, projects: true });
+    initSidebarSections(harness.document, harness.storage, harness.translate);
+
+    expect(harness.todayBody.hidden).toBe(false);
+    expect(harness.projectsBody.hidden).toBe(true);
+    expect(harness.tasksBody.hidden).toBe(false);
+
+    harness.tasksToggle.click();
+
+    expect(JSON.parse(harness.values.get(STORAGE_KEY)!)).toEqual({ today: false, projects: true, tasks: true });
+  });
+
+  it.each(['{bad json', 'null', '[]', '{"projects":"true","tasks":0}'])('recovers invalid storage %s to expanded sections and lets the first click collapse', (stored) => {
+    const harness = createHarness();
+    harness.values.set(STORAGE_KEY, stored);
+    initSidebarSections(harness.document, harness.storage, harness.translate);
+    expect(harness.projectsBody.hidden).toBe(false);
+    harness.projectsToggle.click();
+    expect(harness.projectsBody.hidden).toBe(true);
+    expect(JSON.parse(harness.values.get(STORAGE_KEY)!)).toEqual({ today: false, projects: true, tasks: false });
+  });
+
+  it('keeps section toggles usable when local storage is unavailable', () => {
+    const harness = createHarness();
+    const blockedStorage = {
+      getItem() { throw new Error('Storage unavailable'); },
+      setItem() { throw new Error('Storage unavailable'); },
+    };
+    initSidebarSections(harness.document, blockedStorage, harness.translate);
+    expect(harness.todayBody.hidden).toBe(false);
+    harness.todayToggle.click();
+    expect(harness.todayBody.hidden).toBe(true);
+    harness.todayToggle.click();
+    expect(harness.todayBody.hidden).toBe(false);
+  });
+
+  it('refreshes accessible labels after a language change without resetting user choices', () => {
+    const harness = createHarness({ projects: true });
+    let language = 'en';
+    const translate = (key: string, params?: { section?: string }) => language === 'zh'
+      ? ({ 'sidebar.projects': '项目', 'sidebar.conversations': '任务', 'sidebar.today_tasks': '当天任务',
+        'sidebar.section_expand': `展开${params?.section}`, 'sidebar.section_collapse': `收起${params?.section}` } as Record<string, string>)[key] || key
+      : harness.translate(key, params);
+    const controller = initSidebarSections(harness.document, harness.storage, translate);
+    language = 'zh';
+    controller.applyAll();
+    expect(harness.projectsToggle.getAttribute('aria-label')).toBe('展开项目');
+    expect(harness.tasksToggle.getAttribute('aria-label')).toBe('收起任务');
+    expect(harness.projectsBody.hidden).toBe(true);
     expect(harness.tasksBody.hidden).toBe(false);
   });
 });

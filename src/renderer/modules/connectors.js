@@ -12,10 +12,11 @@
 // OAuth flow UX: clicking Connect asks main to open the system browser, then the IPC returns
 // immediately. The custom-scheme callback finishes exchange + provisioning independently and
 // pushes `connectors:oauth-callback` when the user returns and `connectors:oauth-result` when the
-// network work finishes. The card shows launch feedback until window blur, independently of the
+// network work finishes. The card shows launch feedback until the result, independently of the
 // two-second duplicate-click throttle. When the throttle expires the spinner remains but the button
 // becomes clickable, so a browser launch that did not navigate can be retried. A callback starts a
-// second busy phase until exchange + provisioning completes.
+// second busy phase until exchange + provisioning completes. Authorization expiry only clears
+// busy feedback; it does not show an alert or count an abandoned flow as a connection failure.
 
 const _connectorsLog = createLogger('connectors');
 // Older caches can contain CLI connection states imported from another device.
@@ -95,7 +96,7 @@ async function _assistConnectorSetup(entry, button, onReady) {
     const data = await res.json();
     cid = data && data.ok && data.conversation && data.conversation.conversation_id;
     if (!cid) throw new Error('conversation_create_failed');
-    conversations.unshift(data.conversation);
+    _cacheCreatedConversation(data.conversation);
     renderConversationList();
     if (typeof onReady === 'function') onReady();
     setView('conversation', cid, { skipLoad: true });
@@ -160,8 +161,12 @@ function _isConnectCancel(errLike) {
   return msg.includes('superseded') || msg.includes('cancelled') || msg.includes('canceled');
 }
 
+function _isConnectTimeout(errLike) {
+  return _connectorStructuredErrorCode(errLike) === 'e_network_timeout' || _connectorErrorType(errLike) === 'timeout';
+}
+
 function _handleConnectFailure(errLike) {
-  if (_isConnectCancel(errLike)) return;
+  if (_isConnectCancel(errLike) || _isConnectTimeout(errLike)) return;
   uiAlert(_formatConnectError(errLike));
 }
 
@@ -324,7 +329,7 @@ let _connectorSetupDialogOpen = false;
 // mutate the card state.
 const _pendingConnectAttempts = new Map();
 // `catalog_id → { token, attemptId, timeoutId, throttled }` for browser-launch feedback. Feedback
-// remains until blur, launch failure, callback, or result; `throttled` independently blocks another
+// remains until launch failure, callback, or result; `throttled` independently blocks another
 // click for two seconds. Clearing either concern never cancels main-process OAuth/result tracking.
 const _oauthLaunchAttempts = new Map();
 let _oauthLaunchToken = 0;
@@ -837,8 +842,9 @@ window.focusConnectorById = async function focusConnectorById(id) {
 // open_app_view/connectors/configure route arrive here. For an unconfigured
 // catalog connector, continue into the same protected setup form as a card click.
 // Healthy/degraded/custom connectors keep the historical focus-only behavior;
-// a reconnectable error re-enters the guided setup path.
-window.openConnectorSetupById = async function openConnectorSetupById(id) {
+// a reconnectable error re-enters the guided setup path. Explicit form entries
+// count as user connect clicks rather than Commander-opened forms.
+window.openConnectorSetupById = async function openConnectorSetupById(id, entryPoint = 'agent') {
   const targetId = String(id || '').trim();
   if (!targetId) return false;
   await loadConnectors();
@@ -851,7 +857,8 @@ window.openConnectorSetupById = async function openConnectorSetupById(id) {
   await window.focusConnectorById(entry.id);
   // The protected form is owned by the catalog, not by a filtered DOM card.
   // A user opening it must not reopen the guide and revoke Commander control.
-  _runConnect(entry, 'agent').catch(() => uiAlert(t('connectors.errors.connect_failed')));
+  _runConnect(entry, entryPoint === 'form' ? 'form' : 'agent')
+    .catch(() => uiAlert(t('connectors.errors.connect_failed')));
   return true;
 };
 
@@ -1188,8 +1195,10 @@ function _renderCatalogCard(entry, instance) {
   const connected = !!(instance && instance.status && instance.status.kind === 'connected');
   // An interrupted first CLI setup is still available to connect. Its failure is reported for
   // that attempt, rather than persisting as a service outage before it has ever been usable.
+  // `tools_count` is what connectors.list sends; a render cache written by an
+  // older build may still hold the `tools_cache` array.
   const unfinishedLocalCli = e.auth_mode === 'local_cli'
-    && !(instance && (instance.tools_cached_at > 0
+    && !(instance && (instance.tools_cached_at > 0 || instance.tools_count > 0
       || (Array.isArray(instance.tools_cache) && instance.tools_cache.length > 0)));
   const errored = !!(instance && instance.status && instance.status.kind === 'error' && !unfinishedLocalCli);
   // Authorized + cached, but the last connect/refresh failed. Stays in this group (a 30s backend
@@ -1234,7 +1243,6 @@ function _renderCatalogCard(entry, instance) {
     : 0;
   const installPhase = _localCliInstallPhases.get(e.id) || '';
   const installError = _localCliInstallErrors.get(e.id) || null;
-  const permissionNotice = e.auth_mode === 'local_cli' && instance?.reauthorization_required;
   const accessAdvisories = e.auth_mode === 'local_cli' && Array.isArray(instance?.access_advisories)
     ? [...new Set(instance.access_advisories)].filter(kind =>
       ['check_bot_availability', 'check_app_permissions', 'check_resource_access'].includes(kind)) : [];
@@ -1250,7 +1258,7 @@ function _renderCatalogCard(entry, instance) {
 
   // Bottom-row action:
   //   - connecting: retry/callback finalization stays disabled until completion.
-  //   - browser launch: keep the spinner until blur, but disable only during the 2s throttle.
+  //   - browser launch: keep the spinner until the result, but disable during the 2s throttle.
   //   - connected: use in the Commander composer; enable / disable lives in the ⋯ menu
   //   - errored:   disconnect (recover from a stuck error state)
   //   - oauth_pending: disabled unavailable button
@@ -1277,11 +1285,6 @@ function _renderCatalogCard(entry, instance) {
   } else if (connected) {
     const useTitle = escapeHtml(formatChatUseLabel({ kind: 'connector', id: e.id, name: displayName || e.id }));
     action = `<button class="agent-card-use connector-card-use" data-act="use-connector" title="${useTitle}" aria-label="${useTitle}" ${enabledFlag ? '' : 'disabled aria-disabled="true" tabindex="-1"'}>${escapeHtml(t('common.use'))}</button>`;
-    if (e.auth_mode === 'local_cli' && instance.reauthorization_required) {
-      action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.authorize_permissions'))}</button>${action}`;
-    }
-  } else if (e.auth_mode === 'local_cli' && instance && instance.reauthorization_required) {
-    action = `<button class="btn btn-sm btn-primary" data-act="connect">${escapeHtml(t('connectors.action.authorize_permissions'))}</button>`;
   } else if (degraded) {
     // Retry re-runs connect + token refresh (`connectors.refresh`) — NOT OAuth. The grant is fine;
     // what failed was reaching the backend. Offering "连接" here would send the user through a
@@ -1324,7 +1327,6 @@ function _renderCatalogCard(entry, instance) {
       ${menuHtml}
     </div>
     <div class="connector-card-desc muted"></div>
-    ${permissionNotice ? '<div class="connector-card-unverified" data-role="permission-notice"></div>' : ''}
     ${accessAdvisories.length ? '<div class="connector-card-unverified" data-role="access-notice"></div>' : ''}
     <div class="connector-card-foot">${cardBadgesHtml}${action}</div>
   `;
@@ -1333,20 +1335,6 @@ function _renderCatalogCard(entry, instance) {
   if (accessAdvisories.length) {
     card.querySelector('[data-role="access-notice"]').textContent = accessAdvisories
       .map(kind => t('connectors.permissions.' + kind)).join(' ');
-  }
-  if (permissionNotice) {
-    const scopes = Array.isArray(instance.missing_permissions) ? instance.missing_permissions : [];
-    const permissionLabels = {
-      'im:message.send_as_user': 'send_as_user',
-      'chat.message:send': 'send_as_user',
-      'mail:send': 'send_mail',
-    };
-    const labels = [...new Set(scopes.map(scope => Object.hasOwn(permissionLabels, scope)
-      ? t('connectors.permissions.' + permissionLabels[scope]) : scope))];
-    const notice = card.querySelector('[data-role="permission-notice"]');
-    notice.textContent = labels.length
-      ? t('connectors.permissions.missing', { permissions: labels.join(', ') })
-      : t('connectors.permissions.limited');
   }
   if (installError) {
     const el = card.querySelector('.connector-card-error');
@@ -1391,9 +1379,7 @@ function _renderCatalogCard(entry, instance) {
   return card;
 }
 
-// Tiny absolute-positioned popover anchored under the ⋯ button — one disconnect item for now.
-// Closes on outside click / Esc / window scroll. Keeping it inline so we don't pull in a generic
-// menu primitive for one use site; if a second connector-card menu item ever lands, refactor.
+// Card actions close on outside click, Escape or window scroll.
 function _clearConnectorCardMenuState() {
   document.querySelectorAll('.connector-card.is-menu-open').forEach((card) => card.classList.remove('is-menu-open'));
   document.querySelectorAll('.connector-card-menu-btn[aria-expanded="true"]').forEach((btn) => {
@@ -1422,6 +1408,7 @@ function _openCardMenu(anchorBtn, entry, instance) {
     : true;
   const toggleLabel = enabledFlag ? t('component.disable') : t('component.enable');
   pop.innerHTML = `
+    ${entry.auth_mode === 'local_cli' ? `<div class="connector-card-menu-item" data-act="reauthorize">${escapeHtml(t('connectors.action.authorize_permissions'))}</div>` : ''}
     <div class="connector-card-menu-item" data-act="toggle-enabled">${escapeHtml(toggleLabel)}</div>
     <div class="connector-card-menu-item is-danger" data-act="disconnect">${escapeHtml(t('connectors.action.disconnect'))}</div>
   `;
@@ -1455,6 +1442,7 @@ function _openCardMenu(anchorBtn, entry, instance) {
       close();
       const act = item.dataset.act;
       if (act === 'disconnect') _quickDisconnect(entry, instance);
+      else if (act === 'reauthorize') _runConnect(entry);
       else if (act === 'toggle-enabled') _toggleConnectorEnabled(entry, instance, !enabledFlag);
     });
   });
@@ -1728,8 +1716,6 @@ async function _runConnect(entry, entryPoint = 'form') {
       accepted = true;
       _pendingConnectAttempts.set(res.attempt_id, { uiCatalogId: entry.id });
       const launch = _oauthLaunchAttempts.get(entry.id);
-      // The browser can take focus before IPC returns. Do not recreate feedback already cleared by
-      // that blur; only correlate a launch phase that is still visible.
       if (launch && launch.token === launchToken) launch.attemptId = res.attempt_id;
     } else if (res && !res.ok && res.requires_api_key) {
       setView('settings');
@@ -1745,21 +1731,37 @@ async function _runConnect(entry, entryPoint = 'form') {
   } catch (err) {
     _handleConnectFailure(err);
   } finally {
-    if (!accepted) {
-      const launch = _oauthLaunchAttempts.get(entry.id);
-      if (launch && launch.token === launchToken) {
-        clearTimeout(launch.timeoutId);
-        _oauthLaunchAttempts.delete(entry.id);
-        _renderConnectorsGrid();
-      }
-    }
+    if (!accepted) _finishOAuthLaunchFeedback(entry.id, launchToken);
   }
 }
 
-function _clearOAuthLaunchFeedback() {
-  if (!_oauthLaunchAttempts.size) return;
-  for (const launch of _oauthLaunchAttempts.values()) clearTimeout(launch.timeoutId);
-  _oauthLaunchAttempts.clear();
+function _startOAuthLaunchFeedback(uiCatalogId) {
+  const previous = _oauthLaunchAttempts.get(uiCatalogId);
+  if (previous) clearTimeout(previous.timeoutId);
+  const launchToken = ++_oauthLaunchToken;
+  const launchAttempt = {
+    token: launchToken,
+    attemptId: '',
+    timeoutId: null,
+    throttled: true,
+  };
+  _oauthLaunchAttempts.set(uiCatalogId, launchAttempt);
+  launchAttempt.timeoutId = setTimeout(() => {
+    const current = _oauthLaunchAttempts.get(uiCatalogId);
+    if (!current || current.token !== launchToken) return;
+    current.throttled = false;
+    current.timeoutId = null;
+    if (currentView === 'connectors') _renderConnectorsGrid();
+  }, _OAUTH_LAUNCH_THROTTLE_MS);
+  _renderConnectorsGrid();
+  return launchAttempt;
+}
+
+function _finishOAuthLaunchFeedback(uiCatalogId, launchToken) {
+  const launch = _oauthLaunchAttempts.get(uiCatalogId);
+  if (!launch || launch.token !== launchToken) return;
+  clearTimeout(launch.timeoutId);
+  _oauthLaunchAttempts.delete(uiCatalogId);
   if (currentView === 'connectors') _renderConnectorsGrid();
 }
 
@@ -1771,6 +1773,9 @@ function _handleOAuthCallback(info) {
   const pending = _pendingConnectAttempts.get(info.attempt_id);
   const uiCatalogId = (pending && pending.uiCatalogId) || _catalogUiId(info.catalog_id);
   const launch = _oauthLaunchAttempts.get(uiCatalogId);
+  if (launch && launch.attemptId !== info.attempt_id) return;
+  const callbackAttempt = _oauthCallbackAttempts.get(uiCatalogId);
+  if (callbackAttempt && callbackAttempt !== info.attempt_id) return;
   if (launch && launch.attemptId === info.attempt_id) {
     clearTimeout(launch.timeoutId);
     _oauthLaunchAttempts.delete(uiCatalogId);
@@ -1799,9 +1804,10 @@ function _handleOAuthConnectResult(info) {
     _oauthCallbackAttempts.delete(uiCatalogId);
     busyChanged = true;
   }
-  if (busyChanged) _renderConnectorsGrid();
   if (pending) _pendingConnectAttempts.delete(info.attempt_id);
-  _connectorsState.connecting.delete(uiCatalogId);
+  // Explicit retry operations own their separate busy flag and release it in their own finally.
+  if (busyChanged) _renderConnectorsGrid();
+  if (info.code === 'flow_timeout') return;
   const entry = _connectorsState.catalog.find((item) => item && item.id === info.catalog_id) || { id: info.catalog_id };
   if (info.result !== 'success') {
     const errLike = {
@@ -1811,7 +1817,8 @@ function _handleOAuthConnectResult(info) {
     const cancelled = _isConnectCancel(errLike);
     // Failed first CLI setups return to the ordinary Connect card, so report their transport
     // failure here too. Other transports retain the resulting error on their connector card.
-    if (!cancelled && (errLike.code !== 'mcp_connect_failed' || entry.auth_mode === 'local_cli')) {
+    if (!cancelled && !_isConnectTimeout(errLike)
+        && (errLike.code !== 'mcp_connect_failed' || entry.auth_mode === 'local_cli')) {
       uiAlert(_formatConnectError(errLike));
     }
   }
@@ -2054,19 +2061,25 @@ function _openAddCustomDialog() {
 }
 
 async function _authorizeCustom(entry, instance) {
-  _connectorsState.connecting.add(entry.id);
-  _renderConnectorsGrid();
+  const currentLaunch = _oauthLaunchAttempts.get(entry.id);
+  if (_connectorsState.connecting.has(entry.id) || _oauthCallbackAttempts.has(entry.id)
+      || (currentLaunch && currentLaunch.throttled)) return;
+  const startedAt = performance.now();
+  const launch = _startOAuthLaunchFeedback(entry.id);
+  let accepted = false;
   try {
     const res = await window.orkas.invoke('connectors.authorize_custom', { id: instance.id });
     if (res && res.ok && res.started && typeof res.attempt_id === 'string') {
+      accepted = true;
+      launch.attemptId = res.attempt_id;
       _pendingConnectAttempts.set(res.attempt_id, { uiCatalogId: instance.id });
     } else {
-      uiAlert(_formatConnectError(res));
-      _connectorsState.connecting.delete(entry.id);
+      _handleConnectFailure(res || { code: 'empty_response' });
     }
   } catch (err) {
-    uiAlert(_formatConnectError(err));
-    _connectorsState.connecting.delete(entry.id);
+    _handleConnectFailure(err);
+  } finally {
+    if (!accepted) _finishOAuthLaunchFeedback(entry.id, launch.token);
   }
   await loadConnectors();
 }
@@ -2118,7 +2131,6 @@ function escapeHtml(s) {
 window.addEventListener('i18n-change', () => {
   if (currentView === 'connectors') _renderConnectorsGrid();
 });
-window.addEventListener('blur', _clearOAuthLaunchFeedback);
 
 // Refresh the grid when a connector or client-config push arrives. Right now the
 // only consumer is the connectors panel itself, but registering at module load lets future

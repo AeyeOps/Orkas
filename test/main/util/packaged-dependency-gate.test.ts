@@ -11,6 +11,8 @@ const gate = require('../../../bin/packaged-dependency-gate.cjs') as {
   comparePackagedDependencyInventories(left: any, right: any): string;
   packageRootFromManifestPath(manifestPath: string): string | null;
   verifyNodeRuntimeBuildConfig(sourcePackage: Manifest, lock: Manifest): string[];
+  verifySourceDependencyGraph(sourcePackage: Manifest, lock: Manifest, platform: string, arch: string): any;
+  verifyInstalledProductionDependencies(root: string, platform: string, arch: string): any;
   verifyPackagedDependencyGraph(options: {
     appAsar: string;
     packageJsonFile: string;
@@ -134,6 +136,48 @@ async function verify(value: Fixture): Promise<any> {
 }
 
 describe('packaged-dependency-gate', () => {
+  function sourceGraphFixture(): Fixture {
+    const value = fixture();
+    for (const [root, manifest] of Object.entries(value.packages)) {
+      value.lock.packages[root] = { ...manifest };
+    }
+    value.sourcePackage.devDependencies = { 'build-only': '1.0.0' };
+    value.lock.packages[''].devDependencies = { 'build-only': '1.0.0' };
+    value.lock.packages['node_modules/build-only'] = { version: '1.0.0', dev: true };
+    return value;
+  }
+
+  it.each([['darwin', 'x64'], ['darwin', 'arm64'], ['win32', 'x64']])('validates the source graph for %s/%s without requiring other-platform optional packages', (platform, arch) => {
+    const value = sourceGraphFixture();
+    expect(() => gate.verifySourceDependencyGraph(value.sourcePackage, value.lock, platform, arch)).not.toThrow();
+    delete value.lock.packages['node_modules/consumer/node_modules/alpha'];
+    expect(() => gate.verifySourceDependencyGraph(value.sourcePackage, value.lock, platform, arch)).toThrow(/alpha/);
+  });
+
+  it('rejects root lock drift before packaging', () => {
+    const value = sourceGraphFixture();
+    value.lock.packages[''].dependencies = { alpha: '1.0.0' };
+    expect(() => gate.verifySourceDependencyGraph(value.sourcePackage, value.lock, 'win32', 'x64')).toThrow(/root dependencies/);
+  });
+
+  it('rechecks a cached production tree without executing dependencies or requiring dev packages', () => {
+    const value = sourceGraphFixture();
+    writeJson(path.join(tmpDir, 'package.json'), value.sourcePackage);
+    writeJson(path.join(tmpDir, 'package-lock.json'), value.lock);
+    for (const [root, manifest] of Object.entries(value.packages)) {
+      writeJson(path.join(tmpDir, root, 'package.json'), manifest);
+      fs.writeFileSync(path.join(tmpDir, root, 'index.js'), "throw new Error('must not execute during validation');");
+    }
+    expect(() => gate.verifyInstalledProductionDependencies(tmpDir, 'darwin', 'x64')).not.toThrow();
+    fs.rmSync(path.join(tmpDir, 'node_modules/platform-addon'), { recursive: true });
+    expect(() => gate.verifyInstalledProductionDependencies(tmpDir, 'darwin', 'x64')).not.toThrow();
+    const dependency = path.join(tmpDir, 'node_modules/consumer/node_modules/alpha/package.json');
+    writeJson(dependency, { name: 'alpha', version: '2.0.1' });
+    expect(() => gate.verifyInstalledProductionDependencies(tmpDir, 'darwin', 'x64')).toThrow(/version/);
+    fs.rmSync(path.dirname(dependency), { recursive: true });
+    expect(() => gate.verifyInstalledProductionDependencies(tmpDir, 'darwin', 'x64')).toThrow(/alpha/);
+  });
+
   // A valid archive graph is insufficient for the stock Node image process:
   // every dependency it resolves must also exist outside the archive.
   function imageFixture(): Fixture {

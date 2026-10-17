@@ -59,6 +59,7 @@ async function loadModuleWithRunner(opts: {
   inputBudget?: number;
   observeBudget?: (budget: number) => void;
   capacityExceeded?: boolean;
+  duringReflection?: () => Promise<void>;
 }) {
   vi.resetModules();
   vi.doMock('../../../src/main/features/reflection-transcript', () => ({
@@ -86,6 +87,7 @@ async function loadModuleWithRunner(opts: {
             onDurableWrite?: () => void,
             onFailure?: (failure: { kind: string; error?: unknown }) => void,
           ) => {
+            await opts.duringReflection?.();
             for (let i = 0; i < opts.writes; i++) onDurableWrite?.();
             if (opts.failure) onFailure?.(opts.failure);
             return opts.responseText ?? 'nothing to save';
@@ -625,6 +627,41 @@ describe('reflection-orchestrator › runOneCycle', () => {
     const mod = await loadModuleWithRunner({ writes: 0, inputBudget: 43210, observeBudget });
     await mod.runOneCycle(TEST_UID, { now: () => NOW, isDirty: async () => true });
     expect(observeBudget).toHaveBeenCalledWith(43210);
+  });
+
+  it.each([0, 1])('keeps a rejected review window pending despite %i other durable writes and a no-change reply', async writes => {
+    const mod = await loadModuleWithRunner({ writes, duringReflection: async () => {
+      const notes = await import('../../../src/main/features/metacognition');
+      const file = path.join(tmpDir, TEST_UID, 'cloud', 'agents', '_default', 'meta', 'COMPETENCE.md');
+      fs.writeFileSync(file, '## Rules\nNEVER publish');
+      expect(notes.writeContentForUser(TEST_UID, '_default', 'competence', '## Rules\nALWAYS publish').ok).toBe(false);
+    } });
+    const notes = await import('../../../src/main/features/metacognition');
+    notes.writeContentForUser(TEST_UID, '_default', 'competence', '## Rules\nPublish after approval');
+    // Repeated deferrals must not hit the generic three-failure window discard.
+    for (let i = 0; i < 4; i++) {
+      expect(await mod.runOneCycle(TEST_UID, { now: () => NOW + i * 5 * HOUR,
+        isDirty: async () => true, isIdle: () => true })).toBe(0);
+      // Restore the original before the next review to repeat the same race.
+      notes.writeContentForUser(TEST_UID, '_default', 'competence', '## Rules\nPublish after approval');
+    }
+    expect(mod.readReflectionState(TEST_UID).lastReflectedAt).toEqual({});
+    const review = notes.beginMetacognitionReview(TEST_UID, '_default');
+    review.close();
+  });
+
+  it('does not consume a deferred write when the deadline fires after another write succeeded', async () => {
+    const mod = await loadModule();
+    const result = await mod.runOneCycle(TEST_UID, {
+      now: () => NOW, isDirty: async () => true, isIdle: () => true, perAgentTimeoutMs: 20,
+      reflect: async (_uid, _agent, _since, _signal, onWrite, onDeferred) => {
+        onWrite?.();
+        onDeferred?.(true);
+        return new Promise<never>(() => {});
+      },
+    });
+    expect(result).toBe(0);
+    expect(mod.readReflectionState(TEST_UID).lastReflectedAt).toEqual({});
   });
 
   it('does not classify fully cropped evidence as a quiet window', async () => {

@@ -706,6 +706,12 @@ export class Session {
    *  next completed call re-anchors. A spurious bump only costs that fallback,
    *  so ambiguous paths bump rather than risk a stale anchor. */
   private contentRewriteEpoch = 0;
+  /** The runner asks for the completed-history window several times per
+   *  model round, and fitting an over-budget window serializes it repeatedly.
+   *  The window is recomputed only when something it reads changes. */
+  private historyWindowMemo: { key: unknown[]; messages: Message[]; tokens?: number } | undefined;
+  /** Bumped when a history resource is added or updated in place. */
+  private historyResourceRevision = 0;
 
   constructor(opts?: { maxHistoryTurns?: number }) {
     this.maxHistoryTurns = opts?.maxHistoryTurns ?? 50;
@@ -856,6 +862,7 @@ export class Session {
   addHistoryResource(resource: HistoryResource): void {
     if (!resource.path) return;
     const state = this.ensureTurnTracking();
+    this.historyResourceRevision++;
     const normalized = {
       ...resource,
       sourceTurnId: resource.sourceTurnId ?? state.activeTurn?.id,
@@ -1488,8 +1495,49 @@ export class Session {
 
   /** Bounded completed-dialogue window; no historical summary or fact injection.
    * Selection depends only on completed turns, so tool/model requests within
-   * the active user turn cannot move its boundary. */
+   * the active user turn cannot move its boundary. Callers receive a fresh
+   * array and must not mutate the shared message objects. */
   private recentHistoryMessages(): Message[] {
+    const key = this.historyWindowKey();
+    const memo = this.historyWindowMemo;
+    if (memo && sameIdentities(memo.key, key)) return memo.messages.slice();
+    const messages = this.computeRecentHistoryMessages();
+    this.historyWindowMemo = { key, messages };
+    return messages.slice();
+  }
+
+  /** Everything the window reads, by identity and mutable text: the completed-turn records and
+   * the stored messages they cover, resources, the summary boundary and the
+   * frozen budget. Content rewrites also bump `contentRewriteEpoch`. */
+  private historyWindowKey(): unknown[] {
+    const state = this.turnState;
+    const turns = state?.completedTurns ?? [];
+    const firstTurn = Math.max(0, turns.length - RECENT_HISTORY_MAX_TURNS);
+    const key: unknown[] = [
+      this.contentRewriteEpoch, this.historyResourceRevision, state, this.messages,
+      state?.activeTurn?.historyBudget?.maxTokens, state?.summaryThroughTurnId,
+      state?.resources, state?.resources.length, turns, turns.length, turns[0], turns[firstTurn - 1],
+    ];
+    const appendMessage = (message: Message | undefined) => {
+      key.push(message, message?.role, message?.turnId, message?.content);
+      // Public message views retain block references. Text edits and array
+      // edits must invalidate the copied dialogue projection too, without
+      // serializing its bodies again on every model round.
+      for (const block of message?.content ?? []) {
+        key.push(block, block.type, block.type === "text" ? block.text : undefined);
+      }
+    };
+    for (let t = firstTurn; t < turns.length; t++) {
+      const turn = turns[t];
+      key.push(turn, turn.id, turn.startIndex, turn.endIndex, turn.userMessageIndex,
+        turn.finalAssistantMessageIndex, turn.outcome);
+      for (let i = turn.startIndex; i <= turn.endIndex; i++) appendMessage(this.messages[i]);
+      if (turn.finalAssistantMessageIndex !== undefined) appendMessage(this.messages[turn.finalAssistantMessageIndex]);
+    }
+    return key;
+  }
+
+  private computeRecentHistoryMessages(): Message[] {
     const maxTokens = this.turnState?.activeTurn?.historyBudget?.maxTokens ?? RECENT_HISTORY_MAX_TOKENS;
     const turns = this.turnState?.completedTurns ?? [];
     const firstTurn = Math.max(0, turns.length - RECENT_HISTORY_MAX_TURNS);
@@ -1528,7 +1576,9 @@ export class Session {
   }
 
   estimateHistoryTokens(): number {
-    return historyWindowTokens(this.recentHistoryMessages());
+    const messages = this.recentHistoryMessages();
+    const memo = this.historyWindowMemo!;
+    return memo.tokens ??= historyWindowTokens(messages);
   }
 
   /** Calibrated history occupancy used only for active-process headroom. */
@@ -1586,6 +1636,7 @@ export class Session {
     this.toolSurfaceState = undefined;
     this.estimatorCalibrationRatio = 1;
     this.contentRewriteEpoch++;
+    this.historyWindowMemo = undefined;
   }
 
   /** Compatibility API; completed history now uses a fixed window. */
@@ -3488,28 +3539,62 @@ function truncateMiddle(text: string, maxChars: number): string {
   return `${text.slice(0, head)}\n[${omitted} chars omitted]\n${text.slice(text.length - tail)}`;
 }
 
+function sameIdentities(a: readonly unknown[], b: readonly unknown[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
+  return true;
+}
+
 /** Include serialized framing in the fixed completed-history allowance. */
 function historyWindowTokens(messages: Message[]): number {
   return messages.length ? estimateTextTokens(JSON.stringify(messages.map(stripBinaryContent))) : 0;
 }
 
 /** Shared estimate for whole-session and retained process messages. */
-function sumMessageTokens(messages: Message[]): number {
+export function sumMessageTokens(messages: Message[]): number {
   let total = 0;
   for (const msg of messages) {
-    for (const c of msg.content) {
-      // Opaque Google replay also consumes context; conservatively count it
-      // in addition to the portable text/function projection.
-      if (c.googleNativeReplay) total += estimateTextTokens(c.googleNativeReplay.partsJson);
-      if (c.type === "text") total += estimateTextTokens(c.text);
-      else if (c.type === "tool_result") {
-        total += estimateTextTokens(c.content) + (c.images?.length ?? 0) * IMAGE_BLOCK_ESTIMATE_TOKENS;
-      }
-      else if (c.type === "tool_use") total += estimateTextTokens(JSON.stringify(c.input));
-      else if (c.type === "image") total += IMAGE_BLOCK_ESTIMATE_TOKENS;
-    }
+    for (const c of msg.content) total += cachedContentTokens(c);
   }
   return total;
+}
+
+function contentTokens(c: MessageContent): number {
+  let total = 0;
+  // Opaque Google replay also consumes context; conservatively count it
+  // in addition to the portable text/function projection.
+  if (c.googleNativeReplay) total += estimateTextTokens(c.googleNativeReplay.partsJson);
+  if (c.type === "text") total += estimateTextTokens(c.text);
+  else if (c.type === "tool_result") {
+    total += estimateTextTokens(c.content) + (c.images?.length ?? 0) * IMAGE_BLOCK_ESTIMATE_TOKENS;
+  }
+  else if (c.type === "tool_use") total += estimateTextTokens(JSON.stringify(c.input));
+  else if (c.type === "image") total += IMAGE_BLOCK_ESTIMATE_TOKENS;
+  return total;
+}
+
+/** The runner estimates the same active-turn blocks several times per model
+ * round, and projections reuse block objects. An entry is reused only while
+ * the block still holds the values it measured, so a rewritten block is
+ * estimated again. */
+const contentTokenCache = new WeakMap<MessageContent, {
+  source: unknown; replay: string | undefined; images: number; tokens: number;
+}>();
+
+function cachedContentTokens(c: MessageContent): number {
+  // Argument objects (including nested values) can change in place. Retain
+  // caching for immutable text/replay strings; measure arguments as before.
+  if (c.type === "tool_use") return contentTokens(c);
+  const source = c.type === "text" ? c.text
+    : c.type === "tool_result" ? c.content
+      : c.type;
+  const replay = c.googleNativeReplay?.partsJson;
+  const images = c.type === "tool_result" ? c.images?.length ?? 0 : 0;
+  const hit = contentTokenCache.get(c);
+  if (hit && hit.source === source && hit.replay === replay && hit.images === images) return hit.tokens;
+  const tokens = contentTokens(c);
+  contentTokenCache.set(c, { source, replay, images, tokens });
+  return tokens;
 }
 
 /** Merge token usage objects. */

@@ -21,7 +21,7 @@ export interface ProviderRequestFailure {
 
 /** Existing runner observations, never a second scan of request content. */
 export type FailureContextBudget = Record<string, number | string>;
-const BUDGET_NUMBERS = ['budget_context_window', 'output_reservation', 'usable_input_tokens',
+const BUDGET_NUMBERS = ['candidate_index', 'preparation_context_window', 'budget_context_window', 'output_reservation', 'usable_input_tokens',
   'input_ceiling_tokens', 'estimated_input_tokens', 'emergency_before_tokens', 'emergency_after_tokens',
   'compaction_before_tokens', 'compaction_after_tokens', 'compaction_attempts', 'compaction_failures'];
 

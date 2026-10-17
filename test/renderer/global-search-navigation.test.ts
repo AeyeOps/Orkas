@@ -58,6 +58,30 @@ function loadingHarness() {
 }
 
 describe('global search conversation navigation', () => {
+  it('loads the Agent detail dependencies before opening a search hit and preserves its return target', async () => {
+    const callbacks: Array<() => Promise<void>> = [];
+    const target = { view: 'conversation', id: 'previous-conversation' };
+    let release!: () => void;
+    const loader = vi.fn(() => new Promise<void>(resolve => { release = resolve; }));
+    const open = vi.fn();
+    const context: any = {
+      _searchActiveIdx: 0, _SEARCH_KIND_META: { agent: {} }, window: {},
+      _captureAgentDetailReturnTarget: () => target,
+      closeGlobalSearch: vi.fn(), loadRendererFeature: loader, openAgentDetail: open,
+      setTimeout: (callback: () => Promise<void>) => { callbacks.push(callback); return 1; },
+    };
+    vm.createContext(context);
+    vm.runInContext(extractFunction(searchSource, '_gotoSearchResult'), context);
+    await context._gotoSearchResult({ kind: 'agent', id: 'matching-agent' });
+    const navigation = callbacks[0]();
+    expect(loader).toHaveBeenCalledWith('agents');
+    expect(open).not.toHaveBeenCalled();
+    release();
+    await navigation;
+    expect(open).toHaveBeenCalledOnce();
+    expect(open).toHaveBeenCalledWith('matching-agent', { returnTarget: target });
+  });
+
   // Visible wait feedback must survive reordering; no stale hit may become
   // actionable while the next input is still waiting for its debounce.
   it('keeps loading for the latest input through stale replies, tabs, clearing and reopening', async () => {
@@ -122,7 +146,7 @@ describe('global search conversation navigation', () => {
     let resolveResults!: (value: any) => void;
     const context: any = {
       _searchResults: [], _searchVisibleResults: [], _searchActiveIdx: -1,
-      _searchLoading: false, _searchTab: 'all', _searchChatIndexComplete: true, _searchSeq: 0, _searchLastQuery: '',
+      _searchLoading: false, _searchTab: 'all', _searchChatIndexBuilding: false, _searchSeq: 0, _searchLastQuery: '',
       _searchTimer: null,
       _SEARCH_FETCH_LIMIT: 200,
       document: { getElementById: () => body }, escapeHtml: (s: string) => s,
@@ -143,13 +167,13 @@ describe('global search conversation navigation', () => {
     const pending = context._runSearchNow('marker');
     expect(body.innerHTML).toContain('search-loading');
     expect(body.innerHTML).toContain(locale['common.loading']);
-    resolveStatus({ ok: true, chat_index_complete: false });
+    resolveStatus({ ok: true, chat_index_complete: false, chat_index_building: true });
     await new Promise(resolve => setImmediate(resolve));
     const copy = '正在准备中，结果暂不完整，请稍后重试。';
     expect(body.innerHTML).toContain(copy);
     expect(body.innerHTML).toContain('search-loading');
     expect(body.innerHTML).not.toContain(locale['search.no_results']);
-    resolveResults({ ok: true, chat_index_complete: false, results: [{ kind: 'chat' }] });
+    resolveResults({ ok: true, chat_index_complete: false, chat_index_building: true, results: [{ kind: 'chat' }] });
     await pending;
     expect(body.innerHTML).toContain(copy);
     expect(body.innerHTML).toContain('existing hit');
@@ -158,7 +182,7 @@ describe('global search conversation navigation', () => {
     const ready = context._runSearchNow('marker');
     resolveResults({ ok: true, chat_index_complete: true, results: [{ kind: 'chat' }] });
     await ready;
-    resolveStatus({ ok: true, chat_index_complete: false });
+    resolveStatus({ ok: true, chat_index_complete: false, chat_index_building: true });
     await new Promise(resolve => setImmediate(resolve));
     expect(body.innerHTML).not.toContain(copy);
     expect(body.innerHTML).toContain('existing hit');
@@ -168,7 +192,7 @@ describe('global search conversation navigation', () => {
   it('ignores preparation status from a closed or superseded search session', async () => {
     let reply!: (value: any) => void;
     const context: any = {
-      _searchSeq: 1, _searchChatIndexComplete: true,
+      _searchSeq: 1, _searchChatIndexBuilding: false,
       apiFetch: () => new Promise(resolve => { reply = data => resolve({ json: async () => data }); }),
       _renderSearchEmptyState: vi.fn(), _renderSearchResults: vi.fn(),
     };
@@ -176,9 +200,9 @@ describe('global search conversation navigation', () => {
     vm.runInContext(extractFunction(searchSource, '_refreshSearchIndexStatus'), context);
     const pending = context._refreshSearchIndexStatus(1, '', { active: true });
     context._searchSeq++;
-    reply({ ok: true, chat_index_complete: false });
+    reply({ ok: true, chat_index_complete: false, chat_index_building: true });
     await pending;
-    expect(context._searchChatIndexComplete).toBe(true);
+    expect(context._searchChatIndexBuilding).toBe(false);
     expect(context._renderSearchEmptyState).not.toHaveBeenCalled();
     expect(context._renderSearchResults).not.toHaveBeenCalled();
   });
@@ -187,7 +211,7 @@ describe('global search conversation navigation', () => {
     const body = { innerHTML: '', classList: { remove: vi.fn() }, querySelectorAll: () => [] };
     const context: any = {
       _searchResults: [], _searchVisibleResults: [], _searchActiveIdx: -1,
-      _searchLoading: false, _searchTab: 'all', _searchChatIndexComplete: false,
+      _searchLoading: false, _searchTab: 'all', _searchChatIndexBuilding: true,
       document: { getElementById: () => body },
       escapeHtml: (s: string) => s, t: (key: string) => key,
       _partitionSearchResults: (rows: any[]) => ({ chats: rows, agents: [], skills: [], contexts: [] }),
@@ -214,10 +238,54 @@ describe('global search conversation navigation', () => {
     expect(body.innerHTML).toContain('search.no_results');
 
     context._searchTab = 'chat';
-    context._searchChatIndexComplete = true;
+    context._searchChatIndexBuilding = false;
     context._renderSearchResults('query');
     expect(body.innerHTML).not.toContain('search.history_indexing');
     expect(body.innerHTML).toContain('search-result');
+  });
+
+  // An index that was built once and only waits for its catch-up repair
+  // (after a restart, a crash or a sync) is not announced: it lacks at most
+  // the newest history, and the notice read as broken search.
+  it('stays quiet while an index that was built once only waits for catch-up', async () => {
+    const body = { innerHTML: '', classList: { add: vi.fn(), remove: vi.fn() },
+      querySelectorAll: () => [], querySelector: () => null };
+    const locale = JSON.parse(fs.readFileSync(path.join(root, 'src/renderer/locales/zh.json'), 'utf8'));
+    let resolveResults!: (value: any) => void;
+    const context: any = {
+      _searchResults: [], _searchVisibleResults: [], _searchActiveIdx: -1,
+      _searchLoading: false, _searchTab: 'all', _searchChatIndexBuilding: false, _searchSeq: 0, _searchLastQuery: '',
+      _searchTimer: null, _SEARCH_FETCH_LIMIT: 200,
+      document: { getElementById: () => body }, escapeHtml: (s: string) => s,
+      t: (key: string) => locale[key], _activeProjectIdForSearch: () => '',
+      _setSearchTabsVisible: vi.fn(), _trackGlobalSearchResult: vi.fn(),
+      _renderSearchError: vi.fn(), _reportGlobalSearchFailure: vi.fn(),
+      _loadSearchHistory: () => ['earlier query'],
+      _partitionSearchResults: (rows: any[]) => ({ chats: rows, agents: [], skills: [], contexts: [] }),
+      _sectionRows: (s: any) => s.bucket, _renderSearchRow: () => '',
+      apiFetch: (url: string) => url.endsWith('/status')
+        ? Promise.resolve({ json: async () => ({ ok: true, chat_index_complete: false, chat_index_building: false }) })
+        : new Promise(resolve => { resolveResults = data => resolve({ json: async () => data }); }),
+    };
+    vm.createContext(context);
+    for (const name of ['_refreshSearchIndexStatus', '_showSearchLoading', '_runSearchNow',
+      '_renderSearchResults', '_renderSearchEmptyState']) {
+      vm.runInContext(extractFunction(searchSource, name), context);
+    }
+    const copy = locale['search.history_indexing'];
+    await context._runSearchNow('');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(body.innerHTML).toContain('earlier query');
+    expect(body.innerHTML).not.toContain(copy);
+
+    const pending = context._runSearchNow('absent');
+    await new Promise(resolve => setImmediate(resolve));
+    expect(body.innerHTML).not.toContain(copy);
+    resolveResults({ ok: true, chat_index_complete: false, chat_index_building: false, results: [] });
+    await pending;
+    expect(body.innerHTML).not.toContain(copy);
+    expect(body.innerHTML).toContain(locale['search.no_results']);
+    expect(context._searchChatIndexBuilding).toBe(false);
   });
 
   it('tracks the bounded entry that opened global search', () => {

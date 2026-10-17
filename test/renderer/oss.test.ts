@@ -102,38 +102,14 @@ function loadOss(opts: LoadOpts = {}) {
 }
 
 describe('oss.js', () => {
-  it('surfaces open source as one localized entry on the quick-start header', () => {
+  it('keeps open-source tools off the home quick-start surface', () => {
     const html = fs.readFileSync(path.join(__dirname, '../../src/renderer/index.html'), 'utf8');
-    const css = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
     const conversation = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
-    const locales = Object.fromEntries(['en', 'zh', 'ja', 'pt'].map((lang) => [
-      lang,
-      JSON.parse(fs.readFileSync(path.join(__dirname, `../../src/renderer/locales/${lang}.json`), 'utf8')),
-    ]));
-    const zh = locales.zh;
-
-    // Neither the old rail nor a grid card: the entry lives on the header row
-    // beside the quick-start title, so the grid stays a list of runnable tasks.
     expect(html).not.toContain('id="oss-entry"');
     expect(html).not.toContain('id="oss-entry-grid"');
-    expect(html.match(/id="quick-panel-oss-more"/g)).toHaveLength(1);
-    expect(html).toMatch(/quick-panel-rule[\s\S]{0,200}quick-panel-oss-more/);
+    expect(html).not.toContain('id="quick-panel-oss-more"');
     expect(conversation).not.toContain('oss-quick-task-card');
     expect(conversation).not.toContain("_quickStartText('new_chat.quick.task.oss'");
-    expect(css).toContain('.quick-panel-more');
-    expect(css).not.toContain('.quick-thumb-oss');
-    expect(css).not.toContain('.oss-entry {');
-    expect(zh['new_chat.quick.oss_more']).toBe('接入开源工具能力');
-    expect(zh['new_chat.quick.oss']).toBeUndefined();
-    expect(zh['new_chat.quick.task.oss']).toBeUndefined();
-    expect(zh['new_chat.quick.deliver.oss']).toBeUndefined();
-    for (const [lang, messages] of Object.entries(locales)) {
-      expect((messages as any)['new_chat.quick.oss_more'], `${lang} label`).toBeTruthy();
-    }
-    expect(Object.fromEntries(Object.entries(locales).map(([lang, messages]: [string, any]) => [
-      lang,
-      messages['sidebar.new_chat'],
-    ]))).toEqual({ en: 'New Task', zh: '新任务', ja: '新規タスク', pt: 'Nova tarefa' });
   });
 
   it('prefillCommander writes the task, focuses, sets the Commander recipient, and does NOT send', () => {
@@ -154,31 +130,10 @@ describe('oss.js', () => {
     expect(calls.setView).toEqual([]);
   });
 
-  it('prefillCommander keeps only structured Commander attribution', () => {
-    const { context, el } = loadOss();
-    const applied = context.prefillCommander('Use X for [task].', {
-      entry_point: 'oss_tool',
-      resource_id: 'project-x',
-      position: 4,
-      source: 'commander_home',
-      recipient_type: 'commander',
-    });
-
-    expect(applied).toBe(true);
-    expect(el('new-chat-input').dataset).toMatchObject({
-      commanderEntryPoint: 'oss_tool',
-      commanderResourceId: 'project-x',
-      commanderPosition: '4',
-      commanderSource: 'commander_home',
-      commanderRecipientType: 'commander',
-    });
-  });
-
   it('does not treat bracketed content in an existing task as an OSS placeholder', () => {
     const { context, el } = loadOss();
     const applied = context.prefillCommander(
       'Use Project X for this task: keep [sample] in the copy.',
-      { entry_point: 'oss_tool', resource_id: 'project-x' },
       { trackPlaceholder: false },
     );
 
@@ -195,7 +150,7 @@ describe('oss.js', () => {
     };
     const quickStartInput = {
       value: 'Build a landing page with $& in the example copy.',
-      dataset: { commanderEntryPoint: 'quick_start' },
+      dataset: {},
     };
     const enhanced = context._ossPromptForComposer(project, quickStartInput);
     expect(enhanced).toContain('Build a landing page with $& in the example copy.');
@@ -203,37 +158,10 @@ describe('oss.js', () => {
 
     const existingOssInput = {
       value: enhanced,
-      dataset: { commanderEntryPoint: 'oss_tool' },
+      dataset: { ossTemplateDraft: '1' },
     };
     expect(context._ossPromptForComposer(project, existingOssInput))
       .toContain('[describe your task here]');
-  });
-
-  it('opens the marketplace OSS page from the header entry and keeps New Task as the return view', async () => {
-    const { context, calls, invokeCount } = loadOss();
-    let cardClick: Function | null = null;
-    const card = {
-      dataset: {} as Record<string, string>,
-      addEventListener(type: string, fn: Function) { if (type === 'click') cardClick = fn; },
-    };
-    const baseGetElementById = context.document.getElementById;
-    context.document.getElementById = (id: string) => {
-      if (id === 'quick-panel-oss-more') return card;
-      return baseGetElementById(id);
-    };
-
-    context.initOssQuickTask();
-    context.initOssQuickTask();
-    expect(card.dataset.bound).toBe('1');
-    expect(invokeCount()).toBe(0);
-    cardClick!();
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(calls.openMarketplace).toEqual([{
-      tab: 'oss',
-      opts: { returnView: 'new-chat', preserveReturnTab: true },
-    }]);
   });
 
   it('loadOssCatalog uses bundled cache first, then refreshes without duplicate calls', async () => {
@@ -593,4 +521,22 @@ describe('oss.js', () => {
       expect(context.ossDescFor({})).toBe('');
     }
   });
+});
+
+it('keeps application logging free of retired statistics wrappers and their success-only payloads', () => {
+  const retired = /\b(?:_logManageResult|_logOpenResult|_logCreateAction|_logSavedAppSaveResult|_logLibraryImportResult|_artifactSaveSourceView|_logArtifactSaveResult|_savedAppSourceKind|_fileKindForLog|_trackRendererFeatureLoad|_autoCreateActionLogger|_autoAttachmentPayload|_logWorkspaceOpenFolderResult)\b/;
+  for (const module of ['saved-apps.js', 'chat-artifact.js', 'conversation-info.js', 'lazy-features.js', 'auto.js', 'user-workspace.js']) {
+    const source = fs.readFileSync(path.resolve(process.cwd(), 'src/renderer/modules', module), 'utf8');
+    expect(source, module).not.toMatch(retired);
+  }
+});
+
+it('keeps private creation and execution analytics out of the local executors', () => {
+  for (const file of ['src/main/features/agent_creation_telemetry.ts', 'bin/execution-error-diagnostics.cjs', 'bin/execution-error-diagnostics.d.cts']) {
+    expect(fs.existsSync(path.resolve(process.cwd(), file)), file).toBe(false);
+  }
+  for (const file of ['src/main/features/project_setup_tool.ts', 'src/main/features/auto_tasks_tool.ts', 'src/core-agent/src/agent/runner.ts']) {
+    expect(fs.readFileSync(path.resolve(process.cwd(), file), 'utf8'), file)
+      .not.toMatch(/\b(?:reportAgentCreation|onAgentCreationTelemetry|onInternalToolError|reportInternalToolError|captureErrorDiagnostic|priorErrorDiagnostic)\b/);
+  }
 });

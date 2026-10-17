@@ -29,8 +29,6 @@ function executeSubmitAction(options: {
   becomesSensitive?: boolean;
   nextLabel?: string;
   becomesDisabled?: boolean;
-  /** The host reports that the user approved this exact control. */
-  granted?: boolean;
 }): {
   result: Record<string, unknown>;
   clicks: number;
@@ -87,7 +85,7 @@ function executeSubmitAction(options: {
     querySelectorAll: (selector: string) => selector.startsWith('a[href]') ? [submit] : [],
   };
   submit.parentNode = document;
-  const context = {
+  const context = { crypto: require('node:crypto').webcrypto,
     document, Element: FakeElement, ShadowRoot: class {},
     getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
   };
@@ -101,15 +99,17 @@ function executeSubmitAction(options: {
       path: observation.elements[0].path,
       signature: observation.elements[0].signature,
     },
-  }, options.scope, { grantedProtectedAction: options.granted === true });
+  }, options.scope);
   const result = vm.runInNewContext(script, context) as Record<string, unknown>;
-  return { result, clicks: submit.clicks, checked: submit.checked, requiresUserAction: observation.elements[0].requires_user_action };
+  // Task actions are never flagged for the user (2026-10-03); the flag is no
+  // longer emitted at all, so an absent flag counts as not flagged.
+  return { result, clicks: submit.clicks, checked: submit.checked, requiresUserAction: observation.elements[0].requires_user_action === true };
 }
 
 describe('Web Assist security boundary', () => {
-  it('hands sensitive-field drags back without dispatching page input', () => {
-    const action = executeSubmitAction({ sensitive: false, action: 'drag', tag: 'input', type: 'password', label: 'Secret' });
-    expect(action.result).toMatchObject({ ok: false, code: 'user_action_required', reason: 'sensitive_input' });
+  it('permits sensitive native targeting in connector setup without returning values', () => {
+    const action = executeSubmitAction({ sensitive: false, scope: 'connector_setup', action: 'drag', tag: 'input', type: 'password', label: 'Secret' });
+    expect(action.result).toMatchObject({ ok: false, code: 'invalid_action' });
     expect(action.clicks).toBe(0);
   });
 
@@ -211,7 +211,6 @@ describe('Web Assist security boundary', () => {
         checked: null,
         sensitive: true,
         fillable: false,
-        requires_user_action: true,
         options: [],
         value: 'must-never-escape',
       }],
@@ -224,13 +223,44 @@ describe('Web Assist security boundary', () => {
       elements: [{
         ref: 'e1',
         sensitive: true,
-        fillable: false,
-        requires_user_action: true,
       }],
     });
     expect(JSON.stringify(sanitized?.publicSnapshot)).not.toContain('must-never-escape');
     expect(JSON.stringify(sanitized?.publicSnapshot)).not.toContain('"path"');
     expect(sanitized?.refs.get('e1')).toMatchObject({ path: [0, 1, 2] });
+  });
+
+  // Defaults were about half of an observation's tokens. Absence now means the
+  // default, so every value that differs from it must still be sent.
+  it('sends only element fields that differ from their defaults', () => {
+    const raw = (overrides: Record<string, unknown>) => ({
+      path: [0], signature: { tag: String(overrides.tag), type: '', role: '', label: '' },
+      tag: 'a', role: '', label: '', input_type: '', placeholder: '', href: '',
+      disabled: false, checked: null, sensitive: false, fillable: false, options: [], option_count: 0,
+      ...overrides,
+    });
+    const sanitized = sanitizeWebAssistObservation({
+      ok: true,
+      title: 'Shop',
+      text: '',
+      elements: [
+        raw({ tag: 'a', label: '加入购物车', href: 'https://shop.example/item?id=7&from=list' }),
+        raw({ tag: 'input', input_type: 'checkbox', label: 'Remember me', checked: false }),
+        raw({ tag: 'button', role: 'button', label: 'Pay', disabled: true }),
+        raw({ tag: 'input', input_type: 'password', label: 'Password', placeholder: 'Password', sensitive: true, fillable: true }),
+        raw({ tag: 'select', label: 'Size', option_count: 0 }),
+        raw({ tag: 'select', label: 'Color', options: ['Red', 'Blue'], option_count: 2 }),
+      ],
+    }, 'page-1', 'https://shop.example/list');
+
+    expect(sanitized?.publicSnapshot.elements).toEqual([
+      { ref: 'e1', tag: 'a', label: '加入购物车', href: 'https://shop.example/item?id=7&from=list' },
+      { ref: 'e2', tag: 'input', label: 'Remember me', input_type: 'checkbox', checked: false },
+      { ref: 'e3', tag: 'button', role: 'button', label: 'Pay', disabled: true },
+      { ref: 'e4', tag: 'input', label: 'Password', input_type: 'password', placeholder: 'Password', sensitive: true, fillable: true },
+      { ref: 'e5', tag: 'select', label: 'Size', option_count: 0 },
+      { ref: 'e6', tag: 'select', label: 'Color', option_count: 2, options: ['Red', 'Blue'] },
+    ]);
   });
 
   it('windows page text at the requested offset instead of always reading the top', () => {
@@ -250,7 +280,7 @@ describe('Web Assist security boundary', () => {
     const observe = (textOffset?: number) => vm.runInNewContext(
       webAssistObserveScript('browser', textOffset === undefined ? {} : { textOffset }),
       {
-        document: {
+        crypto: require('node:crypto').webcrypto, document: {
           title: 'long page',
           body: Object.assign(new FakeBlock(''), { childNodes: blocks }),
           querySelectorAll: (selector: string) => (selector.includes('h1,h2,h3,h4,p') ? blocks : []),
@@ -327,7 +357,7 @@ describe('Web Assist security boundary', () => {
     const observe = (elementOffset?: number) => vm.runInNewContext(
       webAssistObserveScript('browser', elementOffset === undefined ? {} : { elementOffset }),
       {
-        document: makeDocument(),
+        crypto: require('node:crypto').webcrypto, document: makeDocument(),
         Element: FakeLink,
         ShadowRoot: class {},
         getComputedStyle: () => ({ display: 'block', visibility: 'visible' }),
@@ -367,7 +397,7 @@ describe('Web Assist security boundary', () => {
     const observe = (contentType: string, pre: string | null, textOffset?: number) => vm.runInNewContext(
       webAssistObserveScript('browser', textOffset === undefined ? {} : { textOffset }),
       {
-        document: {
+        crypto: require('node:crypto').webcrypto, document: {
           title: 'report.json',
           contentType,
           querySelectorAll: () => [],
@@ -421,7 +451,7 @@ describe('Web Assist security boundary', () => {
     expect(htmlSnapshot?.publicSnapshot).not.toHaveProperty('document_kind');
   });
 
-  it('uses fixed reviewed scripts and structurally protects sensitive actions', () => {
+  it('serializes model text as data and structurally protects sensitive readback', () => {
     const observeScript = webAssistObserveScript();
     expect(observeScript).not.toContain('element.value');
     expect(observeScript).not.toContain('document.body.innerText');
@@ -436,11 +466,11 @@ describe('Web Assist security boundary', () => {
       },
     });
     expect(actionScript).not.toContain('</script>');
-    expect(actionScript).toContain("code: 'user_action_required'");
-    expect(actionScript).toContain("reason: 'sensitive_input'");
+    expect(actionScript).toContain("code: 'value_not_readable'");
+    expect(actionScript).toContain("autocomplete.includes('one-time-code')");
   });
 
-  it.each(['browser', 'connector_setup'] as const)('automates ordinary submissions but protects sensitive forms in %s', (scope) => {
+  it.each(['browser', 'connector_setup'] as const)('automates authorized ordinary and sensitive submissions in %s', (scope) => {
     for (const label of ['Save', 'Search', 'Send', '发送', '提交', '确认', 'Apply', '送信', '確認', 'Enviar', 'Confirmar']) {
       for (const type of ['button', 'submit']) {
         const ordinary = executeSubmitAction({ sensitive: false, scope, label, type });
@@ -458,11 +488,9 @@ describe('Web Assist security boundary', () => {
       { sensitive: false, autocomplete: 'SECTION-PAYMENT CC-CSC' },
     ]) {
       const sensitive = executeSubmitAction({ ...fields, scope, label: 'Confirm' });
-      expect(sensitive.requiresUserAction).toBe(true);
-      expect(sensitive.result).toMatchObject({
-        ok: false, code: 'user_action_required', reason: 'sensitive_form_submission',
-      });
-      expect(sensitive.clicks).toBe(0);
+      expect(sensitive.requiresUserAction).toBe(false);
+      expect(sensitive.result).toMatchObject({ ok: true });
+      expect(sensitive.clicks).toBe(1);
     }
   });
 
@@ -470,14 +498,12 @@ describe('Web Assist security boundary', () => {
     { tag: 'button' as const, type: 'submit', label: '' },
     { tag: 'input' as const, type: 'submit', label: 'Submit' },
     { tag: 'input' as const, type: 'image', label: 'Send' },
-  ])('keeps ordinary and sensitive $tag/$type submissions distinct', (control) => {
+  ])('allows task submissions with ordinary or sensitive fields', (control) => {
     const ordinary = executeSubmitAction({ ...control, sensitive: false });
     expect(ordinary).toMatchObject({ requiresUserAction: false, result: { ok: true }, clicks: 1 });
     const sensitive = executeSubmitAction({ ...control, sensitive: true });
     expect(sensitive).toMatchObject({
-      requiresUserAction: true,
-      result: { ok: false, code: 'user_action_required', reason: 'sensitive_form_submission' },
-      clicks: 0,
+      requiresUserAction: false, result: { ok: true }, clicks: 1,
     });
   });
 
@@ -489,70 +515,34 @@ describe('Web Assist security boundary', () => {
     expect(action).toMatchObject({ requiresUserAction: false, result: { ok: false, code: change.code }, clicks: 0 });
   });
 
-  it('rechecks sensitive form contents after observation before an ordinary submission', () => {
-    const action = executeSubmitAction({ sensitive: false, label: 'Send', becomesSensitive: true });
+  it('permits an authorized submission when a form adds sensitive controls', () => {
+    const action = executeSubmitAction({ sensitive: false, scope: 'connector_setup', label: 'Send', becomesSensitive: true });
     expect(action.requiresUserAction).toBe(false);
-    expect(action.result).toMatchObject({ ok: false, code: 'user_action_required', reason: 'sensitive_form_submission' });
-    expect(action.clicks).toBe(0);
+    expect(action.result).toMatchObject({ ok: true });
+    expect(action.clicks).toBe(1);
   });
 
   // Latin label evidence uses whole action words; sensitive payment fields
   // are covered independently by the form-submission cases above.
   it.each(['Purchase now', 'Pay now', '确认支付', '删除', 'Authorize', 'Publish', 'CAPTCHA'])(
-    'preserves the general browser handback for %s', (label) => {
+    'executes a task button labelled %s without classifying its text', (label) => {
       const action = executeSubmitAction({ sensitive: false, type: 'submit', label });
-      expect(action.requiresUserAction).toBe(true);
-      expect(action.result).toMatchObject({ ok: false, code: 'user_action_required', reason: 'high_impact_action' });
-      expect(action.clicks).toBe(0);
+      expect(action.requiresUserAction).toBe(false);
+      expect(action.result).toMatchObject({ ok: true });
+      expect(action.clicks).toBe(1);
     },
   );
 
-  it.each([
-    { type: 'submit', label: 'Save' },
-    { type: 'button', label: 'Send prompt' },
-    { type: 'button', label: 'Authorize' },
-  ])('runs $label once the host reports a user grant', ({ type, label }) => {
-    const action = executeSubmitAction({ sensitive: false, type, label, granted: true });
-    expect(action.result).toMatchObject({ ok: true, outcome: 'acted', action: 'click' });
-    expect(action.clicks).toBe(1);
-  });
-
-  it('keeps credential submission and uploads with the user despite a grant', () => {
-    const credentials = executeSubmitAction({ sensitive: true, granted: true });
-    expect(credentials.result).toMatchObject({
-      ok: false,
-      code: 'user_action_required',
-      reason: 'sensitive_form_submission',
-    });
-    expect(credentials.clicks).toBe(0);
-
-    const upload = executeSubmitAction({ sensitive: false, tag: 'input', type: 'file', label: 'Attach', granted: true });
-    expect(upload.result).toMatchObject({
-      ok: false,
-      code: 'user_action_required',
-      reason: 'file_upload',
-    });
-    expect(upload.clicks).toBe(0);
-  });
-
-  it('still blocks a granted control that fills a password field', () => {
-    const script = buildWebAssistActionScript({
-      action: 'fill',
-      text: 'hunter2',
-      ref: { path: [0], signature: { tag: 'input', type: 'password', role: '', label: 'Password' } },
-    }, 'browser', { grantedProtectedAction: true });
-    expect(script).toContain("reason: 'sensitive_input'");
-  });
   it.each([
     { action: 'click', type: 'checkbox', checked: false, label: 'Authorize access' },
     { action: 'check', type: 'checkbox', checked: false, label: 'Authorize access' },
     { action: 'uncheck', type: 'checkbox', checked: true, label: 'Cancel subscription' },
     { action: 'check', type: 'radio', checked: false, label: 'Approve payment' },
-  ] as const)('hands high-impact $type $action back without changing the control', (control) => {
+  ] as const)('executes $type $action regardless of its label', (control) => {
     const action = executeSubmitAction({ sensitive: false, tag: 'input', ...control });
-    expect(action.result).toMatchObject({ ok: false, code: 'user_action_required', reason: 'high_impact_action' });
-    expect(action.clicks).toBe(0);
-    expect(action.checked).toBe(control.checked);
+    expect(action.result).toMatchObject({ ok: true });
+    expect(action.clicks).toBe(1);
+    expect(action.checked).toBe(control.type === 'radio' || control.action !== 'uncheck');
   });
 
   it.each([
@@ -583,16 +573,55 @@ describe('Web Assist security boundary', () => {
     expect(action.checked).toBe(control.checked);
   });
 
+});
+
+describe('browser field value readback', () => {
+  function reader(tag = 'INPUT', type = 'text', autocomplete = '', value = '') {
+    class Field {
+      tagName = tag; disabled = true; readOnly = true;
+      type = type; autocomplete = autocomplete; value = value;
+      innerText = value; isContentEditable = tag === 'DIV';
+      selectedOptions = [{ label: '日本語' }];
+      getAttribute(name: string) { return name === 'aria-label' ? 'Draft' : name === 'type' ? this.type : null; }
+      scrollIntoView() { throw new Error('Read must not move or focus the field'); }
+    }
+    const field = new Field();
+    return (offset = 0) => vm.runInNewContext(buildWebAssistActionScript({
+      action: 'read_value', textOffset: offset,
+      ref: { path: [0], signature: { tag: tag.toLowerCase(), type, role: '', label: 'Draft' } },
+    }), { document: { children: [field] }, Element: Field });
+  }
+
+  it.each(['INPUT', 'TEXTAREA', 'DIV'])('reconstructs exact multiline Unicode from %s without mutating it', tag => {
+    const value = ('  中文🙂\t日本語\n\n').repeat(1100) + '  tail\n';
+    const read = reader(tag, tag === 'INPUT' ? 'text' : '', '', value);
+    let offset = 0, actual = '';
+    for (;;) {
+      const chunk = read(offset);
+      expect(chunk).toMatchObject({ ok: true, value_total: value.length, value_offset: offset, untrusted_content: true });
+      actual += chunk.value;
+      if (chunk.value_next_offset === null) break;
+      offset = chunk.value_next_offset;
+    }
+    expect(actual).toBe(value);
+    expect(read(value.length)).toMatchObject({ ok: true, value: '', value_next_offset: null });
+    expect(read(value.length + 1)).toMatchObject({ ok: false, code: 'invalid_offset' });
+  });
+
+  it('returns a selected value and bounded label without relying on visible page text', () => {
+    expect(reader('SELECT', '', '', 'ja')()).toMatchObject({ ok: true, value: 'ja', selected_options: ['日本語'] });
+    expect(reader('INPUT', 'text', '', '')()).toMatchObject({ ok: true, value: '', value_total: 0 });
+  });
+
   it.each([
-    { action: 'check', type: 'checkbox', checked: false, expected: true },
-    { action: 'uncheck', type: 'checkbox', checked: true, expected: false },
-    { action: 'check', type: 'radio', checked: false, expected: true },
-  ] as const)('honors the host grant for a high-impact $type $action', (control) => {
-    const action = executeSubmitAction({
-      sensitive: false, tag: 'input', label: 'Authorize access', granted: true, ...control,
-    });
-    expect(action.result).toMatchObject({ ok: true, outcome: 'acted' });
-    expect(action.clicks).toBe(1);
-    expect(action.checked).toBe(control.expected);
+    ['INPUT', 'password', ''], ['INPUT', 'text', 'section-login current-password'],
+    ['INPUT', 'text', 'new-password'], ['INPUT', 'text', 'one-time-code'],
+    ['INPUT', 'text', 'cc-number'], ['TEXTAREA', '', 'cc-csc'], ['DIV', '', 'one-time-code'],
+    ['INPUT', 'file', ''], ['INPUT', 'hidden', ''],
+  ])('refuses %s %s %s without returning any value or length', (tag, type, autocomplete) => {
+    const result = reader(tag, type, autocomplete, 'fixture-secret')();
+    expect(result).toMatchObject({ ok: false, code: 'value_not_readable' });
+    expect(JSON.stringify(result)).not.toContain('fixture-secret');
+    expect(result).not.toHaveProperty('value_total');
   });
 });

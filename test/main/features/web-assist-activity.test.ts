@@ -24,6 +24,7 @@ describe('automatic browser handback after human input', () => {
     const window = { addEventListener: (type: string, handler: any) => listeners.set(type, handler) };
     vm.runInNewContext(readFileSync(path.join(__dirname, '../../../src/main/features/web_assist_activity_preload.js'), 'utf8'), {
       require: (name: string) => { expect(name).toBe('electron'); return { ipcRenderer: { send } }; }, window,
+      process: { isMainFrame: false },
     });
     listeners.get('compositionstart')!({ isTrusted: false });
     expect(send).not.toHaveBeenCalled();
@@ -130,4 +131,17 @@ describe('automatic browser handback after human input', () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(p.changed).toHaveBeenCalledTimes(1);
   });
+  it('hands back immediately on a trusted chrome action after released input, once only', async () => {
+    const p = page(); p.mouse('mouseWheel');
+    expect(p.activity.handback()).toBe(true); expect(p.changed).toHaveBeenLastCalledWith(false);
+    expect(vi.getTimerCount()).toBe(0); await vi.advanceTimersByTimeAsync(10000);
+    expect(p.changed.mock.calls.filter(([active]) => !active)).toHaveLength(1);
+  });
+  it.each(['key', 'mouse', 'composition'])('does not hand back while %s is still active', reason => {
+    const p = page();
+    if (reason === 'key') p.key('keyDown'); else if (reason === 'mouse') p.mouse('mouseDown');
+    else p.contents.ipc.emit('web-assist:composition', { sender: p.contents, senderFrame: {} }, true);
+    expect(p.activity.handback()).toBe(false); expect(p.changed).not.toHaveBeenCalledWith(false);
+  });
+
 });

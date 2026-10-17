@@ -15,7 +15,7 @@ Before authoring, read the matching reference through this Skill's read ref:
 - New Skill, SKILL.md body rewrite, new reference, or bundled script → [authoring.md](references/authoring.md).
 - Name, description, category, routing hints, or any SKILL.md frontmatter work → [metadata.md](references/metadata.md).
 - URL, local directory, ZIP, attachment, pasted existing Skill, or any source-preserving import → [importing.md](references/importing.md) and [metadata.md](references/metadata.md).
-- File deletion or imported-package cleanup → [file-deletion.md](references/file-deletion.md).
+- Deleting files, package cleanup, or removing a whole Skill → [file-deletion.md](references/file-deletion.md).
 
 Do not read unrelated references. A category-only edit needs only `metadata.md`; a body-only guide edit normally needs only `authoring.md`; an import needs `importing.md` plus `metadata.md`.
 
@@ -38,7 +38,7 @@ Do not read unrelated references. A category-only edit needs only `metadata.md`;
 
 - Bound Skill editor: mutate the current Skill without an outer `<skill>` wrapper for ordinary file/meta edits.
 - Unbound create: omit `<skill_id>` and include a complete new `SKILL.md` plus category.
-- Unbound edit: resolve the target and check its `Source` in Available skills or `skill_search` before reading files or preparing edits. For `Source: builtin` or `Source: platform`, explain that the platform Skill definition cannot be edited through chat and nothing changed; emit no mutation protocol and do not retry the edit. For `Source: custom`, obtain the current `<skill_id>`, read the current SKILL.md, and emit only changed metadata or whole files.
+- Unbound edit: resolve the target and check its `Source` in Available skills or `skill_search` before reading files or preparing edits. For `Source: builtin` or `Source: platform`, explain that the platform Skill definition cannot be edited through chat and nothing changed; emit no mutation protocol and do not retry the edit. For `Source: custom`, read SKILL.md via `@skill/<ref>`, put that ref in `<skill_id>`, and emit only changed metadata or whole files.
 - Pure discussion or no actual change: emit no protocol.
 
 Before a new Skill, compare its name and typical objects/actions with Available skills. If one substantially overlaps, stop and ask whether to use it or still create a new one. Otherwise create in the same turn.

@@ -10,7 +10,7 @@ import { spawn } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { withWindowsGitOnPath } from './test-runtime-env.mjs';
+import { withTestPython, withWindowsGitOnPath } from './test-runtime-env.mjs';
 import { formatDriftReport, installedDependencyDrift } from './check-installed-dependencies.mjs';
 
 // A merge that advanced the lockfile leaves stale packages installed, and the
@@ -25,7 +25,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const require_ = createRequire(import.meta.url);
 const electronBin = require_('electron');
 const vitestBin = resolve(here, '..', 'node_modules', 'vitest', 'vitest.mjs');
-const testEnvironment = withWindowsGitOnPath(process.env);
+const testEnvironment = withTestPython(withWindowsGitOnPath(process.env));
 
 // npm appends arguments to the final shell command of a compound script.
 // Own the suite here so filters reach Vitest without first running every JS

@@ -390,9 +390,11 @@ async function initUser() {
 // ─── View routing ───
 
 function setView(view, cid, opts = {}) {
+  const restoreTaskCleanup = window.TaskCleanupNavigation?.beforeNavigate(view, cid, opts) === true;
   // A resource detail opened from another page is only a transient overlay.
   // Any explicit sidebar/programmatic navigation dismisses it first, so a
   // later visit to AI Team or Skills always starts from its list.
+  if (typeof _closeProjectDriverHint === 'function') _closeProjectDriverHint();
   if (typeof _resetAgentsDetailForNavigation === 'function') {
     _resetAgentsDetailForNavigation();
   }
@@ -608,7 +610,7 @@ function setView(view, cid, opts = {}) {
     });
   } else if (view === 'settings') {
     currentCid = null;
-    _deferSidebarNavWork('settings-tab-load', () => {
+    if (!restoreTaskCleanup) _deferSidebarNavWork('settings-tab-load', () => {
       _loadViewFeature('settings', 'settings', () => {
         if (typeof loadSettings === 'function') {
           Promise.resolve(loadSettings())
@@ -622,7 +624,9 @@ function setView(view, cid, opts = {}) {
     currentCid = null;
     if (typeof primeProjectDetailShell === 'function') primeProjectDetailShell(cid || '');
     _deferSidebarNavWork('project-tab-load', () => {
+      if (!_isProjectSelected(cid || '')) return;
       _loadViewFeature('project', 'project', () => {
+        if (!_isProjectSelected(cid || '')) return;
         if (typeof loadProjectDetail === 'function') loadProjectDetail(cid || '', { refreshShared: true });
       });
     });

@@ -17,7 +17,7 @@ Every revision response must preserve all three proof groups together; missing a
 
 1. **Canonical reuse**: read the current manifest/entry/assets and patch the same directory in place.
 2. **Preservation**: explicitly say `fork/v2: forbidden` and preserve named user edits plus unrelated hooks, interactions, tokens, and asset paths.
-3. **Revision acceptance**: requested visual change or state plus non-blank first render, requested viewport behavior, and local asset/reference resolution; increment the manifest once only after all pass.
+3. **Revision acceptance**: requested visual change or state plus non-blank first render, requested viewport behavior, local asset/reference resolution, and a written visual review against the executor's Visual Craft Baseline; increment the manifest once only after all pass.
 
 When tools are off, emit the Revision Executor Contract near the start of the response. Every check remains `not run` but still includes its future action and concrete pass criterion. Do not output a replacement manifest with guessed fields or a reduced `files` list; describe the pending revision delta until the existing manifest has been read.
 
@@ -94,7 +94,7 @@ Rules:
 - Treat `files` as the complete sorted package inventory. It must include `artifact.json` itself, the entry, and every shipped relative asset/source file; omit only generated ZIPs and temporary QA files.
 - Record only compact design continuity facts. Do not store full prompts, chat transcripts, secrets, credentials, cookies, auth headers, or raw provider responses.
 - Prefer relative paths. Do not embed machine-specific absolute paths in the deliverable or manifest when a workspace-relative reference is sufficient.
-- `fixed_decisions` are commitments from the user, source, or accepted direction. Do not use them to freeze incidental implementation details.
+- `fixed_decisions` are commitments from the user, source, or accepted direction. Do not use them to freeze incidental implementation details. Name the authority in each entry: when the user ties a decision to the live product ("same as now"), record the product source it points to, such as `quick cards: live app PC/src/renderer/style.css .quick-tile`, not a paraphrase like "keep the original card style" that a later turn reads as the artifact's own styling.
 
 ## In-Place Iteration Protocol
 
@@ -102,14 +102,14 @@ When the user asks to adjust, polish, fix, restyle, extend, or review-and-apply 
 
 1. Resolve and state the canonical artifact root internally.
 2. Read `artifact.json`, the current entry file, referenced local assets/styles/scripts, and any `DESIGN.md`; do not rely only on the earlier chat summary.
-3. Establish a baseline from the current artifact. If preview or screenshots are available, inspect the current render before editing.
+3. Establish a baseline from the current artifact. If preview or screenshots are available, inspect the current render before editing. When the request refers to the live product, read that product source first; the artifact is not the authority for it.
 4. Translate the request into a compact change set: requested changes, invariants to preserve, affected files, and acceptance checks.
-5. Patch the smallest coherent set of existing files. Preserve unrelated user edits, content, interactions, stable DOM hooks, relative asset paths, design tokens, and accepted layout decisions.
+5. Patch the smallest coherent set of existing files. Preserve unrelated user edits, content, interactions, stable DOM hooks, relative asset paths, design tokens, and accepted layout decisions. When the request changes structure, grouping, or hierarchy, the coherent set is the whole affected region: rewrite its markup and style block together, delete selectors and classes that no longer match, and do not append override blocks to the end of a stylesheet.
 6. Do not regenerate the whole artifact or reset it to a generic template for a local change. Broader restructuring is valid only when required by the request or by a blocking craft failure; state that reason.
-7. Validate the changed files first, then run focused checks for the requested visual change or state plus non-blank first render, requested viewport behavior, and local asset/reference resolution. When `html_preview` is available, run it with `interactions:false`; its runtime, resource, layout, and keyboard-focus diagnostics must pass before screenshots are evaluated. Use `target:"responsive"` only when the user explicitly requests responsive, multi-device, or narrow-screen behavior; otherwise omit it for desktop or use mobile for an explicitly mobile artifact. `screenshots` defaults to false and returns no model images; set `screenshots:true` only for the final visual review. Failed diagnostics never return model images. The source-only validator cannot satisfy rendered checks, and visual review is not proof of business behavior.
+7. Validate the changed files first, then run focused checks for the requested visual change or state plus non-blank first render, requested viewport behavior, and local asset/reference resolution. When `html_preview` is available, run it with `interactions:false`; its runtime, resource, layout, and keyboard-focus diagnostics must pass before screenshots are evaluated. Use `target:"responsive"` only when the user explicitly requests responsive, multi-device, or narrow-screen behavior; otherwise omit it for desktop or use mobile for an explicitly mobile artifact. `screenshots` defaults to false and returns no model images; set `screenshots:true` only for the final visual review, and write that review against the executor's Visual Craft Baseline, side by side with the user's screenshot or source rendering when one exists, within its single repair round. Failed diagnostics never return model images. The source-only validator cannot satisfy rendered checks, and visual review is not proof of business behavior.
 8. Update `artifact.json` only after those checks pass. Increment the revision exactly once, run the final package validation, and publish. If a required available preview was skipped, leave the revision pending rather than claiming completion.
 
-Before completing a revision, record a compact revision proof with the baseline revision and files inspected, files changed, user/manual edits preserved, requested visual result, rendered checks, and the resulting manifest revision. A generic sentence such as “verified successfully” is not sufficient evidence. If a check could not run, name it as unverified instead of implying success.
+Before completing a revision, record a compact revision proof with the baseline revision and files inspected, files changed, user/manual edits preserved, requested visual result, rendered checks, visual review findings and fixes, and the resulting manifest revision. A generic sentence such as “verified successfully” is not sufficient evidence. If a check could not run, name it as unverified instead of implying success.
 
 When tools are unavailable, do not drop this protocol. Provide the exact in-place executor plan against the canonical directory, including manifest read/increment, preserved manual edits, no-v2 rule, requested visual check, and rendered regression checks. For every unexecuted check, state both the future action and its concrete pass criterion; a bare list of `not run` labels is not a sufficient executor plan. Mark every unexecuted step `not run`; future-tense plans are not claims of completed work.
 
@@ -129,6 +129,7 @@ If the prior artifact has no manifest, adopt it in place: create `artifact.json`
 Make future changes cheap without turning the artifact into a framework:
 
 - Put repeated visual values in CSS custom properties or the target repo's existing tokens.
+- Keep HTML and CSS formatted rather than minified, with one block per region, so a revision can replace a region instead of overriding it.
 - Keep major regions and components clearly named.
 - Use stable IDs or `data-*` hooks only where interaction or host integration needs them.
 - Separate sample data from presentation when the task is data-heavy or refreshable.

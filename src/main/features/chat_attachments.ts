@@ -59,6 +59,7 @@ import {
   conversationMessageReadFile,
 } from '../util/project-layout';
 import { createLogger } from '../logger';
+import { renameWithRetry } from '../storage';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t } from '../i18n';
 import { toCompressedGrayJpeg } from '../util/image-transform';
@@ -753,12 +754,18 @@ export function listPendingAttachments(userId: string, cid: string): AttachmentI
   try { safeConvId = safeCid(cid); }
   catch { return all; }
 
-  const committed = new Set<string>();
   const jsonlPath = conversationMessageReadFile(userId, safeConvId);
   let raw: string;
   try { raw = fs.readFileSync(jsonlPath, 'utf8'); }
-  catch { return all; }  // new conv, no messages yet → everything is pending
+  catch { return all; }
+  const committed = committedAttachmentNames(userId, safeConvId, raw);
 
+  return all.filter((a) => !committed.has(a.name));
+}
+
+/** Shared structured attachment-reference parser; preserves the composer contract. */
+function committedAttachmentNames(userId: string, safeConvId: string, raw: string): Set<string> {
+  const committed = new Set<string>();
   for (const line of raw.split('\n')) {
     const s = line.trim();
     if (!s) continue;
@@ -800,7 +807,38 @@ export function listPendingAttachments(userId: string, cid: string): AttachmentI
     } catch { /* skip malformed line */ }
   }
 
-  return all.filter((a) => !committed.has(a.name));
+  return committed;
+}
+
+/** Bounded, asynchronous maintenance check. Unknown histories stay protected. */
+export async function hasPendingAttachmentsForCleanup(userId: string, cid: string): Promise<boolean> {
+  const safeConvId = safeCid(cid);
+  let entries: fs.Dirent[];
+  try { entries = await fs.promises.readdir(attachmentDirForCid(userId, safeConvId), { withFileTypes: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+  const names = entries.filter(e => !e.name.startsWith('.')
+    && ALLOWED_EXTENSIONS.has(path.extname(e.name).toLowerCase()));
+  if (!names.length) return false;
+  if (names.some(e => !e.isFile())) return true;
+  let file: Awaited<ReturnType<typeof fs.promises.open>>;
+  try { file = await fs.promises.open(conversationMessageReadFile(userId, safeConvId), 'r'); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    throw error;
+  }
+  try {
+    const limit = 4 * 1024 * 1024;
+    const size = (await file.stat()).size;
+    if (size > limit) return true;
+    const buffer = Buffer.alloc(size + 1);
+    const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+    if (bytesRead !== size) return true;
+    const committed = committedAttachmentNames(userId, safeConvId, buffer.subarray(0, size).toString('utf8'));
+    return names.some(e => !committed.has(e.name));
+  } finally { await file.close(); }
 }
 
 export function deleteAttachment(userId: string, cid: string, name: string): Result {
@@ -843,7 +881,7 @@ function mediaFileFailureCode(error: unknown): MediaFileDiagnostic {
 export async function diagnoseMediaFile(
   userId: string,
   source: { localPath: string } | { cid: string; name: string },
-): Promise<{ diagnosis: string; media_kind?: AttachmentKind }> {
+): Promise<{ diagnosis: string; media_kind?: AttachmentKind; media_failure_context?: string }> {
   let abs: string;
   let local = false;
   if ('localPath' in source) {
@@ -867,14 +905,22 @@ export async function diagnoseMediaFile(
     return { diagnosis: 'bad_input' };
   }
   const media_kind = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? 'image' : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? 'audio' : kindOf(ext));
+  // Lexical scope only, not file provenance or a symlink target. No additional
+  // I/O, message/index scan or path hash; distinguish the actual stat errno.
+  const tempRelative = local ? path.relative(os.tmpdir(), abs) : '';
+  const inOsTemp = !tempRelative || (!path.isAbsolute(tempRelative) && tempRelative !== '..' && !tempRelative.startsWith(`..${path.sep}`));
+  const scope = local ? (inOsTemp ? 'os_temp' : 'other_local') : 'attachment';
+  const context = (state: string) => ({ media_failure_context: `${local ? 'local' : 'cid'}|${scope}|${state}` });
   try {
     const stat = await fs.promises.stat(abs);
-    if (!stat.isFile()) return { diagnosis: 'not_file', media_kind };
+    if (!stat.isFile()) return { diagnosis: 'not_file', media_kind, ...context('not_file') };
     const cap = LOCAL_DISPLAY_IMAGE_EXTS.has(ext) ? MAX_BYTES_IMAGE : (LOCAL_DISPLAY_AUDIO_EXTS.has(ext) ? MAX_BYTES_AUDIO : maxBytesFor(ext));
-    if (local && stat.size > cap) return { diagnosis: 'too_large', media_kind };
-    return { diagnosis: 'stat_available', media_kind };
+    if (local && stat.size > cap) return { diagnosis: 'too_large', media_kind, ...context('too_large') };
+    return { diagnosis: 'stat_available', media_kind, ...context('stat_available') };
   } catch (error) {
-    return { diagnosis: mediaFileFailureCode(error), media_kind };
+    const code = (error as NodeJS.ErrnoException)?.code;
+    const state = ['ENOENT', 'ENOTDIR', 'EACCES', 'EPERM'].includes(code || '') ? code!.toLowerCase() : 'io_error';
+    return { diagnosis: mediaFileFailureCode(error), media_kind, ...context(state) };
   }
 }
 
@@ -1266,77 +1312,95 @@ function imageMimeFromExt(ext: string): ImageMimeType {
  * ensureFresh rebuilds for the new path. pruneOrphans sweeps the stale
  * draft-path cache at startup.
  */
-export function adoptDraftAttachments(
+export async function adoptDraftAttachments(
   userId: string,
   fromCid: string,
   toCid: string,
-): Result<{ count: number; items: Array<{ sourceName: string; targetName: string }> }> {
+): Promise<Result<{ count: number; items: Array<{ sourceName: string; targetName: string }> }>> {
   let srcSafe: string;
   let dstSafe: string;
   try { srcSafe = safeCid(fromCid); dstSafe = safeCid(toCid); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   if (srcSafe === dstSafe) return { ok: false, error: 'same cid' };
 
-  const src = attachmentDirForCid(userId, srcSafe);
-  if (!fs.existsSync(src)) return { ok: true, count: 0, items: [] };
-  const dst = chatAttachmentDirForConversation(userId, dstSafe);
-  let sourceNames: string[] = [];
-  try { sourceNames = fs.readdirSync(src).filter((n) => !n.startsWith('.')); }
-  catch { /* ignore */ }
-  let movedNames: Array<{ source: string; target: string }> = [];
-  const movedPaths: Array<{ from: string; target: string }> = [];
+  // Both owners stay locked across asynchronous Windows rename retries. A stable
+  // order also prevents reciprocal adoptions from waiting on each other.
+  const [first, second] = [srcSafe, dstSafe].sort();
+  return withAttachmentWriteLock(userId, first, () => withAttachmentWriteLock(userId, second, async () => {
+    const src = attachmentDirForCid(userId, srcSafe);
+    if (!fs.existsSync(src)) return { ok: true, count: 0, items: [] };
+    const dst = chatAttachmentDirForConversation(userId, dstSafe);
+    let sourceNames: string[] = [];
+    try { sourceNames = fs.readdirSync(src).filter((n) => !n.startsWith('.')); }
+    catch { /* ignore */ }
+    let movedNames: Array<{ source: string; target: string }> = [];
+    const movedPaths: Array<{ from: string; target: string }> = [];
 
-  try {
-    if (!fs.existsSync(dst)) {
-      fs.mkdirSync(path.dirname(dst), { recursive: true });
-      fs.renameSync(src, dst);
-      movedNames = sourceNames.map((name) => ({ source: name, target: name }));
-    } else {
-      for (const name of fs.readdirSync(src)) {
-        const from = path.join(src, name);
-        const target = uniqueTarget(dst, name);
-        _moveFileBestEffort(from, target);
-        movedPaths.push({ from, target });
-        if (!name.startsWith('.')) {
-          movedNames.push({ source: name, target: path.basename(target) });
+    try {
+      if (!fs.existsSync(dst)) {
+        fs.mkdirSync(path.dirname(dst), { recursive: true });
+        await renameWithRetry(src, dst);
+        movedNames = sourceNames.map((name) => ({ source: name, target: name }));
+      } else {
+        for (const name of fs.readdirSync(src)) {
+          const from = path.join(src, name);
+          const target = uniqueTarget(dst, name);
+          await moveDraftEntry(from, target);
+          movedPaths.push({ from, target });
+          if (!name.startsWith('.')) {
+            movedNames.push({ source: name, target: path.basename(target) });
+          }
+        }
+        try { fs.rmdirSync(src); } catch { /* best-effort */ }
+      }
+    } catch (err) {
+      // The freshly-created conversation must never receive only part of the
+      // user's draft. Restore every entry already moved so the renderer can keep
+      // the original chips and let the user retry the whole send.
+      for (const item of movedPaths.reverse()) {
+        try {
+          fs.mkdirSync(path.dirname(item.from), { recursive: true });
+          await moveDraftEntry(item.target, item.from);
+        } catch (rollbackErr) {
+          log.warn('draft attachment adoption rollback failed', {
+            user_id: maskId(userId), from_cid: maskId(dstSafe), to_cid: maskId(srcSafe),
+            error: logErrorSummary(rollbackErr),
+          });
         }
       }
-      try { fs.rmdirSync(src); } catch { /* best-effort */ }
+      return { ok: false, error: (err as Error).message };
     }
-  } catch (err) {
-    // The freshly-created conversation must never receive only part of the
-    // user's draft. Restore every entry already moved so the renderer can keep
-    // the original chips and let the user retry the whole send.
-    for (const item of movedPaths.reverse()) {
-      try {
-        fs.mkdirSync(path.dirname(item.from), { recursive: true });
-        _moveFileBestEffort(item.target, item.from);
-      } catch (rollbackErr) {
-        log.warn('draft attachment adoption rollback failed', {
-          user_id: maskId(userId), from_cid: maskId(dstSafe), to_cid: maskId(srcSafe),
-          error: logErrorSummary(rollbackErr),
-        });
-      }
-    }
-    return { ok: false, error: (err as Error).message };
-  }
 
-  for (const name of movedNames) {
-    notifyAttachmentDeletedIfSyncable(userId, srcSafe, name.source);
-    notifyAttachmentDirty(userId, dstSafe, name.target);
+    for (const name of movedNames) {
+      notifyAttachmentDeletedIfSyncable(userId, srcSafe, name.source);
+      notifyAttachmentDirty(userId, dstSafe, name.target);
+    }
+    const count = movedNames.length;
+    log.info('draft attachments adopted', {
+      user_id: maskId(userId), from_cid: maskId(srcSafe), to_cid: maskId(dstSafe), count,
+    });
+    return {
+      ok: true,
+      count,
+      items: movedNames.map((name) => ({
+        sourceName: name.source,
+        targetName: name.target,
+      })),
+    };
+  }));
+}
+
+async function moveDraftEntry(from: string, to: string): Promise<void> {
+  try { await renameWithRetry(from, to); }
+  catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EXDEV') throw err;
+    fs.copyFileSync(from, to);
+    try { fs.unlinkSync(from); }
+    catch (unlinkErr) {
+      fs.rmSync(to, { force: true });
+      throw unlinkErr;
+    }
   }
-  const count = movedNames.length;
-  log.info('draft attachments adopted', {
-    user_id: maskId(userId), from_cid: maskId(srcSafe), to_cid: maskId(dstSafe), count,
-  });
-  return {
-    ok: true,
-    count,
-    items: movedNames.map((name) => ({
-      sourceName: name.source,
-      targetName: name.target,
-    })),
-  };
 }
 
 /** Remove the entire `<cid>/` attachment dir + drop all file_cache entries
@@ -1350,13 +1414,28 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
     let count = 0;
     let names: string[] = [];
     try {
-      if (fs.existsSync(dir)) {
-        const entries = fs.readdirSync(dir);
-        names = entries.filter((n) => !n.startsWith('.'));
-        for (const n of entries) {
-          try { fs.unlinkSync(path.join(dir, n)); count++; } catch { /* best-effort */ }
+      const root = await fs.promises.lstat(dir).catch(err => {
+        if (err.code === 'ENOENT') return null;
+        throw err;
+      });
+      if (root) {
+        const pending = root.isDirectory() ? [''] : [];
+        const files: string[] = [];
+        for (let cursor = 0; cursor < pending.length; cursor++) {
+          const parent = pending[cursor];
+          const entries = await fs.promises.readdir(path.join(dir, parent), { withFileTypes: true });
+          for (const entry of entries) {
+            const relative = path.join(parent, entry.name);
+            if (entry.isDirectory()) pending.push(relative);
+            else files.push(relative);
+          }
         }
-        try { fs.rmdirSync(dir); } catch { /* best-effort */ }
+        // rm removes links themselves; neither inventory nor removal follows
+        // a linked directory into another task or an external workspace.
+        await fs.promises.rm(dir, { recursive: true, force: true });
+        count = files.length;
+        names = files.filter(name => !name.split(path.sep).some(part => part.startsWith('.')))
+          .map(name => name.split(path.sep).join('/'));
       }
     } catch (err) { log.warn('attachment purge failed', { cid: maskId(cid), error: logErrorSummary(err) }); }
     try { await purgeFileCacheByCid(userId, safeConvId); }

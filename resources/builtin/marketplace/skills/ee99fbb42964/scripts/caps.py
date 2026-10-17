@@ -8,11 +8,13 @@ does with `add_costs` keyed by `_current_step`:
   plan     — before fanning out: de-duplicate the proposed sub-questions, trim
              them to the cap, allocate a per-sub-question fetch budget, and refuse
              to recurse past max_depth. Nothing is dropped silently — trimmed and
-             duplicate questions are reported back.
+             duplicate questions are reported back. Fetch caps below the defaults
+             require a top-level `caps_reason`, which the plan records.
   account  — count actual attempts directly from caps_plan.json and
              fetch_ledger.jsonl, or aggregate an explicit work ledger (fetches /
              model_calls / cost per step), and say `stop: true` the moment any
-             hard ceiling is reached.
+             hard ceiling is reached. File-backed accounting exempts a bounded
+             number of no-content outcomes and continuation windows.
 
 File-backed fetch accounting owns the attempt count instead of trusting a model
 to reproduce it. Explicit accounting remains available for model-call and cost
@@ -52,6 +54,18 @@ ABSOLUTE_CAPS = {
 }
 
 NEAR_DUP_JACCARD = 0.8   # reordered / same-token sub-question rephrasings
+
+# Collection caps that may be lowered only with a stated reason. A
+# "detailed research" run once set them to 12/5 with no budget behind the
+# choice, exhausted them, and stopped before reading sources its own evidence
+# named (2026-10-02 Astra review).
+REASONED_COLLECTION_CAPS = ("max_fetches", "max_fetches_per_subquestion")
+
+# Fetch outcomes that returned no usable source text. They are dead ends, not
+# evidence, so a bounded number of them do not consume the fetch budget.
+NO_CONTENT_STATUSES = frozenset({
+    "no_content", "unusable_binary", "binary", "navigation_only", "empty",
+})
 
 _WORD_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z'\-]*", re.UNICODE)
 # Han (incl. ext-A / compat), kana, and hangul runs — mirrors compress.py.
@@ -136,8 +150,33 @@ def _dedup_questions(qs: list) -> tuple:
     return kept, dropped
 
 
+def _lowered_collection_caps(overrides) -> dict:
+    """Collection caps an override sets below the defaults: {field: value}."""
+    if not isinstance(overrides, dict):
+        return {}
+    lowered = {}
+    for field in REASONED_COLLECTION_CAPS:
+        value = overrides.get(field)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) \
+                and int(value) < DEFAULT_CAPS[field]:
+            lowered[field] = int(value)
+    return lowered
+
+
 def plan(payload: dict) -> dict:
     caps = effective_caps(payload.get("caps"))
+    lowered = _lowered_collection_caps(payload.get("caps"))
+    reason = payload.get("caps_reason")
+    reason = reason.strip() if isinstance(reason, str) else ""
+    if lowered and not reason:
+        requested = ", ".join("{} {}".format(k, v) for k, v in lowered.items())
+        defaults = ", ".join("{} {}".format(k, DEFAULT_CAPS[k]) for k in lowered)
+        raise ValueError(
+            "caps below the defaults need a reason: requested {}; defaults {}. "
+            "Omit these caps to keep the defaults, or add a top-level caps_reason "
+            "naming the user, task, cost, or resume budget that requires them."
+            .format(requested, defaults)
+        )
     depth = int(_num(payload.get("depth")))
     raw = [q for q in (payload.get("subquestions") or []) if isinstance(q, str) and q.strip()]
 
@@ -150,7 +189,7 @@ def plan(payload: dict) -> dict:
     n = len(kept) or 1
     per_subq = min(caps["max_fetches_per_subquestion"], max(1, caps["max_fetches"] // n))
     allowed = depth <= caps["max_depth"]
-    return {
+    result = {
         "allowed": allowed,
         "reason": None if allowed else "max_depth_exceeded",
         "depth": depth,
@@ -160,6 +199,9 @@ def plan(payload: dict) -> dict:
         "dropped": {"duplicates": dup, "over_cap": over_cap},
         "caps": caps,
     }
+    if reason:
+        result["caps_reason"] = reason
+    return result
 
 
 def account(payload: dict) -> dict:
@@ -214,8 +256,9 @@ def _load(path):
     return json.loads(raw)
 
 
-def _fetch_attempt_count(path: str) -> int:
-    count = 0
+def _fetch_attempts(path: str) -> dict:
+    """Count fetch rows by kind: ordinary, no-content, and continuation windows."""
+    counts = {"fetch": 0, "no_content": 0, "continuation": 0}
     with open(path, encoding="utf-8") as fh:
         for line_number, raw in enumerate(fh, start=1):
             if not raw.strip():
@@ -234,12 +277,34 @@ def _fetch_attempt_count(path: str) -> int:
             if (not kind and row.get("query") is not None
                     and row.get("url") is None and row.get("canonical_url") is None):
                 continue
-            count += 1
-    return count
+            # A window of an already-fetched page reads the run cache, not the
+            # network; the ledger marks it with continuation:true or an offset.
+            if row.get("continuation") is True or _num(row.get("offset")) > 0:
+                counts["continuation"] += 1
+            elif str(row.get("status") or "").strip().casefold() in NO_CONTENT_STATUSES:
+                counts["no_content"] += 1
+            else:
+                counts["fetch"] += 1
+    return counts
+
+
+def _fetch_allowances(caps: dict) -> dict:
+    """Attempts that do not consume max_fetches until these allowances are used."""
+    return {
+        "no_content": max(2, caps["max_fetches"] // 4),
+        "continuation": caps["max_fetches"],
+    }
 
 
 def account_from_files(plan_path: str, fetch_ledger_path: str) -> dict:
-    """Account persisted fetch attempts, not discovery searches, against caps."""
+    """Account persisted fetch attempts, not discovery searches, against caps.
+
+    Failed and cached attempts still count. Up to a quarter of the fetch budget
+    (at least two) of no-content outcomes — a binary payload, a navigation-only
+    page, an empty body — and up to one budget of continuation windows are
+    exempt, so dead ends and reading the rest of a long primary source do not
+    starve the collection of new sources. Beyond the allowances they count.
+    """
     plan_document = _load(plan_path)
     if not isinstance(plan_document, dict):
         raise ValueError("caps plan must be a JSON object")
@@ -250,10 +315,22 @@ def account_from_files(plan_path: str, fetch_ledger_path: str) -> dict:
     if not isinstance(plan_caps, dict):
         raise ValueError("caps plan data must contain a caps object")
 
-    return account({
+    attempts = _fetch_attempts(fetch_ledger_path)
+    allowances = _fetch_allowances(effective_caps(plan_caps))
+    exempt = {key: min(attempts[key], allowances[key]) for key in allowances}
+    charged = attempts["fetch"] + sum(attempts[key] - exempt[key] for key in allowances)
+    result = account({
         "caps": plan_caps,
-        "steps": [{"step": "fetch_ledger", "fetches": _fetch_attempt_count(fetch_ledger_path)}],
+        "steps": [{"step": "fetch_ledger", "fetches": charged}],
     })
+    result["fetch_rows"] = {
+        "fetch": attempts["fetch"],
+        "no_content": attempts["no_content"],
+        "continuation": attempts["continuation"],
+        "exempt": exempt,
+        "allowances": allowances,
+    }
+    return result
 
 
 def main(argv):

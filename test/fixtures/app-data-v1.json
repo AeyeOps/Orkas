@@ -1,0 +1,1459 @@
+{
+  "definition": {
+    "version": 1,
+    "tables": [
+      {
+        "id": "items",
+        "name": "items",
+        "fields": [
+          {
+            "id": "title",
+            "name": "title",
+            "type": "string",
+            "nullable": true,
+            "unique": true
+          },
+          {
+            "id": "count",
+            "name": "count",
+            "type": "integer",
+            "default": 0
+          },
+          {
+            "id": "enabled",
+            "name": "enabled",
+            "type": "boolean",
+            "default": false
+          },
+          {
+            "id": "object",
+            "name": "object",
+            "type": "json",
+            "default": {}
+          },
+          {
+            "id": "time",
+            "name": "time",
+            "type": "timestamp",
+            "default": "2026-10-12T00:00:00Z"
+          }
+        ],
+        "access": {
+          "read": [
+            "title",
+            "count",
+            "enabled",
+            "object",
+            "time"
+          ],
+          "insert": [
+            "title",
+            "count",
+            "enabled",
+            "object",
+            "time"
+          ],
+          "count": true,
+          "aggregate": [
+            "count"
+          ]
+        }
+      }
+    ]
+  },
+  "inserts": [
+    {
+      "title": "é",
+      "count": 2.0,
+      "enabled": true,
+      "object": {
+        "z": 1,
+        "a": "中"
+      },
+      "time": "2026-10-12T00:00:00.001Z"
+    },
+    {
+      "title": null
+    },
+    {
+      "title": "Z",
+      "count": 3
+    }
+  ],
+  "queries": [
+    {
+      "args": {
+        "table": "items",
+        "fields": [
+          "title"
+        ],
+        "order": {
+          "field": "title",
+          "direction": "asc"
+        }
+      },
+      "expected": {
+        "records": [
+          {
+            "title": null
+          },
+          {
+            "title": "Z"
+          },
+          {
+            "title": "é"
+          }
+        ]
+      }
+    },
+    {
+      "args": {
+        "table": "items",
+        "fields": [
+          "title",
+          "enabled"
+        ],
+        "filters": [
+          {
+            "field": "title",
+            "op": "eq",
+            "value": null
+          }
+        ]
+      },
+      "expected": {
+        "records": [
+          {
+            "title": null,
+            "enabled": false
+          }
+        ]
+      }
+    },
+    {
+      "args": {
+        "table": "items",
+        "fields": [
+          "time"
+        ],
+        "limit": 1,
+        "order": {
+          "field": "time",
+          "direction": "asc"
+        }
+      },
+      "expected": {
+        "records": [
+          {
+            "time": "2026-10-12T00:00:00.000Z"
+          }
+        ]
+      }
+    },
+    {
+      "args": {
+        "table": "items",
+        "fields": [
+          "time"
+        ],
+        "order": {
+          "field": "time",
+          "direction": "asc"
+        }
+      },
+      "expected": {
+        "records": [
+          {
+            "time": "2026-10-12T00:00:00.000Z"
+          },
+          {
+            "time": "2026-10-12T00:00:00.000Z"
+          },
+          {
+            "time": "2026-10-12T00:00:00.001Z"
+          }
+        ]
+      }
+    }
+  ],
+  "aggregates": [
+    {
+      "args": {
+        "table": "items",
+        "field": "count",
+        "op": "sum"
+      },
+      "expected": {
+        "value": 5
+      }
+    }
+  ],
+  "rejections": [
+    {
+      "method": "data.insert",
+      "args": {
+        "table": "items",
+        "values": {
+          "count": 2.5
+        }
+      }
+    },
+    {
+      "method": "data.query",
+      "args": {
+        "table": "items",
+        "fields": [
+          "private"
+        ]
+      }
+    },
+    {
+      "method": "data.insert",
+      "args": {
+        "table": "items",
+        "values": {
+          "enabled": 1
+        }
+      }
+    },
+    {
+      "method": "data.insert",
+      "args": {
+        "table": "items",
+        "values": {
+          "object": "{}"
+        }
+      }
+    },
+    {
+      "method": "data.insert",
+      "args": {
+        "table": "items",
+        "values": {
+          "title": "Z"
+        }
+      },
+      "code": "E_CONFLICT"
+    },
+    {
+      "method": "data.insert",
+      "args": {
+        "table": "items",
+        "values": {
+          "time": "tomorrow"
+        }
+      },
+      "code": "E_INPUT"
+    },
+    {
+      "method": "data.insert",
+      "args": {
+        "table": "items",
+        "values": {
+          "time": "2026-02-30T00:00:00Z"
+        }
+      },
+      "code": "E_INPUT"
+    },
+    {
+      "method": "data.insert",
+      "args": {
+        "table": "items",
+        "values": {
+          "time": "2026-10-12T00:00:00+08:00"
+        }
+      },
+      "code": "E_INPUT"
+    },
+    {
+      "method": "data.query",
+      "args": {
+        "table": "items",
+        "filters": [
+          {
+            "field": "count",
+            "op": "gt",
+            "value": 9007199254740992
+          }
+        ]
+      }
+    },
+    {
+      "method": "data.insert",
+      "args": {
+        "table": "items",
+        "values": {
+          "time": "0000-01-01T00:00:00Z"
+        }
+      },
+      "code": "E_INPUT"
+    },
+    {
+      "method": "data.query",
+      "args": {
+        "table": "items",
+        "fields": [
+          "title"
+        ],
+        "order": {
+          "field": "createdAt",
+          "direction": "desc"
+        }
+      },
+      "code": "E_PERMISSION"
+    },
+    {
+      "method": "data.query",
+      "args": {
+        "table": "items",
+        "fields": [
+          "title"
+        ],
+        "order": {
+          "field": "private",
+          "direction": "desc"
+        }
+      },
+      "code": "E_PERMISSION"
+    },
+    {
+      "method": "data.query",
+      "args": {
+        "table": "items",
+        "fields": [
+          "title"
+        ],
+        "order": {
+          "field": [
+            "title"
+          ],
+          "direction": "asc"
+        }
+      },
+      "code": "E_INPUT"
+    },
+    {
+      "method": "data.query",
+      "args": {
+        "table": "items",
+        "fields": [
+          "title"
+        ],
+        "order": {
+          "field": "title",
+          "direction": "sideways"
+        }
+      },
+      "code": "E_INPUT"
+    },
+    {
+      "method": "data.query",
+      "args": {
+        "table": "items",
+        "fields": [
+          "title"
+        ],
+        "order": {
+          "field": "title",
+          "direction": "asc",
+          "sql": "SELECT *"
+        }
+      },
+      "code": "E_INPUT"
+    },
+    {
+      "method": "data.query",
+      "args": {
+        "table": "items",
+        "fields": [
+          "title"
+        ],
+        "order": {
+          "field": "",
+          "direction": "asc"
+        }
+      },
+      "code": "E_INPUT"
+    },
+    {
+      "method": "data.query",
+      "args": {
+        "table": "items",
+        "fields": [
+          "title"
+        ],
+        "order": {
+          "field": "body; SELECT *",
+          "direction": "asc"
+        }
+      },
+      "code": "E_INPUT"
+    },
+    {
+      "method": "data.query",
+      "args": {
+        "table": "items",
+        "fields": [
+          "title"
+        ],
+        "order": {
+          "field": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "direction": "asc"
+        }
+      },
+      "code": "E_INPUT"
+    }
+  ],
+  "invalidDefinitions": [
+    {
+      "version": 1,
+      "tables": [
+        {
+          "id": "items",
+          "name": "items",
+          "fields": [
+            {
+              "id": "title",
+              "name": "title",
+              "type": "string",
+              "nullable": true,
+              "unique": true
+            },
+            {
+              "id": "count",
+              "name": "count",
+              "type": "integer",
+              "default": "wrong type"
+            },
+            {
+              "id": "enabled",
+              "name": "enabled",
+              "type": "boolean",
+              "default": false
+            },
+            {
+              "id": "object",
+              "name": "object",
+              "type": "json",
+              "default": {}
+            },
+            {
+              "id": "time",
+              "name": "time",
+              "type": "timestamp",
+              "default": "2026-10-12T00:00:00Z"
+            }
+          ],
+          "access": {
+            "read": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "insert": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "count": true,
+            "aggregate": [
+              "count"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "tables": [
+        {
+          "id": "items",
+          "name": "items",
+          "fields": [
+            {
+              "id": "title",
+              "name": "title",
+              "type": "string",
+              "nullable": true,
+              "unique": true
+            },
+            {
+              "id": "count",
+              "name": "relations",
+              "type": "integer",
+              "default": 0
+            },
+            {
+              "id": "enabled",
+              "name": "enabled",
+              "type": "boolean",
+              "default": false
+            },
+            {
+              "id": "object",
+              "name": "object",
+              "type": "json",
+              "default": {}
+            },
+            {
+              "id": "time",
+              "name": "time",
+              "type": "timestamp",
+              "default": "2026-10-12T00:00:00Z"
+            }
+          ],
+          "access": {
+            "read": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "insert": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "count": true,
+            "aggregate": [
+              "count"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "version": true,
+      "tables": [
+        {
+          "id": "items",
+          "name": "items",
+          "fields": [
+            {
+              "id": "title",
+              "name": "title",
+              "type": "string",
+              "nullable": true,
+              "unique": true
+            },
+            {
+              "id": "count",
+              "name": "count",
+              "type": "integer",
+              "default": 0
+            },
+            {
+              "id": "enabled",
+              "name": "enabled",
+              "type": "boolean",
+              "default": false
+            },
+            {
+              "id": "object",
+              "name": "object",
+              "type": "json",
+              "default": {}
+            },
+            {
+              "id": "time",
+              "name": "time",
+              "type": "timestamp",
+              "default": "2026-10-12T00:00:00Z"
+            }
+          ],
+          "access": {
+            "read": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "insert": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "count": true,
+            "aggregate": [
+              "count"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "tables": [
+        {
+          "id": "items",
+          "name": "items",
+          "fields": [
+            {
+              "id": "title",
+              "name": "title",
+              "type": [],
+              "nullable": true,
+              "unique": true
+            },
+            {
+              "id": "count",
+              "name": "count",
+              "type": "integer",
+              "default": 0
+            },
+            {
+              "id": "enabled",
+              "name": "enabled",
+              "type": "boolean",
+              "default": false
+            },
+            {
+              "id": "object",
+              "name": "object",
+              "type": "json",
+              "default": {}
+            },
+            {
+              "id": "time",
+              "name": "time",
+              "type": "timestamp",
+              "default": "2026-10-12T00:00:00Z"
+            }
+          ],
+          "access": {
+            "read": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "insert": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "count": true,
+            "aggregate": [
+              "count"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "tables": [
+        {
+          "id": "items",
+          "name": "items",
+          "fields": [
+            {
+              "id": "title",
+              "name": "title",
+              "type": "string",
+              "nullable": true,
+              "unique": true
+            },
+            {
+              "id": "count",
+              "name": "count",
+              "type": "integer",
+              "default": 0
+            },
+            {
+              "id": "enabled",
+              "name": "enabled",
+              "type": "boolean",
+              "default": false
+            },
+            {
+              "id": "object",
+              "name": "object",
+              "type": "json",
+              "default": {}
+            },
+            {
+              "id": "time",
+              "name": "time",
+              "type": "timestamp",
+              "default": "2026-10-12T00:00:00Z"
+            }
+          ],
+          "access": {
+            "read": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "insert": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "count": true,
+            "aggregate": [
+              "count"
+            ],
+            "readFilters": [
+              {
+                "field": "title",
+                "op": {},
+                "value": "x"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "tables": [
+        {
+          "id": "items",
+          "name": "items",
+          "fields": [
+            {
+              "id": "title",
+              "name": "title",
+              "type": "string",
+              "nullable": true,
+              "unique": true
+            },
+            {
+              "id": "count",
+              "name": "count",
+              "type": "integer",
+              "default": 0
+            },
+            {
+              "id": "enabled",
+              "name": "enabled",
+              "type": "boolean",
+              "default": false
+            },
+            {
+              "id": "object",
+              "name": "object",
+              "type": "json",
+              "default": {}
+            },
+            {
+              "id": "time",
+              "name": "time",
+              "type": "timestamp",
+              "default": "2026-10-12T00:00:00Z"
+            }
+          ],
+          "access": {
+            "read": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "insert": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "count": true,
+            "aggregate": [
+              "count"
+            ]
+          },
+          "indexes": [
+            [
+              []
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "tables": [
+        {
+          "id": "items",
+          "name": "items",
+          "fields": [
+            {
+              "id": "title",
+              "name": "title",
+              "type": "string",
+              "nullable": true,
+              "unique": true,
+              "references": {
+                "table": []
+              }
+            },
+            {
+              "id": "count",
+              "name": "count",
+              "type": "integer",
+              "default": 0
+            },
+            {
+              "id": "enabled",
+              "name": "enabled",
+              "type": "boolean",
+              "default": false
+            },
+            {
+              "id": "object",
+              "name": "object",
+              "type": "json",
+              "default": {}
+            },
+            {
+              "id": "time",
+              "name": "time",
+              "type": "timestamp",
+              "default": "2026-10-12T00:00:00Z"
+            }
+          ],
+          "access": {
+            "read": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "insert": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "count": true,
+            "aggregate": [
+              "count"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "tables": [
+        {
+          "id": "items",
+          "name": "items",
+          "fields": [
+            {
+              "id": "title",
+              "name": "__proto__",
+              "type": "string",
+              "nullable": true,
+              "unique": true
+            },
+            {
+              "id": "count",
+              "name": "count",
+              "type": "integer",
+              "default": 0
+            },
+            {
+              "id": "enabled",
+              "name": "enabled",
+              "type": "boolean",
+              "default": false
+            },
+            {
+              "id": "object",
+              "name": "object",
+              "type": "json",
+              "default": {}
+            },
+            {
+              "id": "time",
+              "name": "time",
+              "type": "timestamp",
+              "default": "2026-10-12T00:00:00Z"
+            }
+          ],
+          "access": {
+            "read": [
+              "__proto__"
+            ],
+            "insert": [
+              "__proto__"
+            ],
+            "count": true
+          }
+        }
+      ]
+    },
+    {
+      "version": 1,
+      "tables": [
+        {
+          "id": "items",
+          "name": "items",
+          "fields": [
+            {
+              "id": "title",
+              "name": "title",
+              "type": "string",
+              "nullable": true,
+              "unique": true
+            },
+            {
+              "id": "count",
+              "name": "count",
+              "type": "integer",
+              "default": 0
+            },
+            {
+              "id": "enabled",
+              "name": "enabled",
+              "type": "boolean",
+              "default": false
+            },
+            {
+              "id": "object",
+              "name": "object",
+              "type": "json",
+              "default": {}
+            },
+            {
+              "id": "time",
+              "name": "time",
+              "type": "timestamp",
+              "default": "0000-01-01T00:00:00Z"
+            }
+          ],
+          "access": {
+            "read": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "insert": [
+              "title",
+              "count",
+              "enabled",
+              "object",
+              "time"
+            ],
+            "count": true,
+            "aggregate": [
+              "count"
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "scenarios": {
+    "definition": {
+      "version": 1,
+      "tables": [
+        {
+          "id": "authors",
+          "name": "authors",
+          "fields": [
+            {
+              "id": "name",
+              "name": "name",
+              "type": "string"
+            },
+            {
+              "id": "hidden",
+              "name": "hidden",
+              "type": "boolean",
+              "default": false
+            }
+          ],
+          "access": {
+            "read": [
+              "name"
+            ],
+            "insert": [
+              "name",
+              "hidden"
+            ],
+            "readFilters": [
+              {
+                "field": "hidden",
+                "op": "eq",
+                "value": false
+              }
+            ]
+          }
+        },
+        {
+          "id": "posts",
+          "name": "posts",
+          "fields": [
+            {
+              "id": "title",
+              "name": "title",
+              "type": "string"
+            },
+            {
+              "id": "rank",
+              "name": "rank",
+              "type": "integer"
+            },
+            {
+              "id": "author",
+              "name": "author",
+              "type": "string",
+              "nullable": true,
+              "references": {
+                "table": "authors"
+              }
+            },
+            {
+              "id": "state",
+              "name": "state",
+              "type": "string",
+              "default": "public"
+            }
+          ],
+          "access": {
+            "read": [
+              "title",
+              "rank",
+              "author"
+            ],
+            "insert": [
+              "title",
+              "rank",
+              "author",
+              "state"
+            ],
+            "count": true,
+            "readFilters": [
+              {
+                "field": "state",
+                "op": "eq",
+                "value": "public"
+              }
+            ]
+          }
+        },
+        {
+          "id": "seats",
+          "name": "seats",
+          "fields": [
+            {
+              "id": "name",
+              "name": "name",
+              "type": "string"
+            }
+          ],
+          "access": {
+            "read": [
+              "name"
+            ],
+            "insert": [
+              "name"
+            ],
+            "count": true,
+            "maxCount": 2
+          }
+        }
+      ]
+    },
+    "steps": [
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "authors",
+          "values": {
+            "name": "Ann"
+          }
+        },
+        "save": "ann"
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "authors",
+          "values": {
+            "name": "Ghost",
+            "hidden": true
+          }
+        },
+        "save": "ghost"
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "posts",
+          "values": {
+            "title": "A",
+            "rank": 1,
+            "author": {
+              "$ref": "ann"
+            }
+          }
+        }
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "posts",
+          "values": {
+            "title": "B",
+            "rank": 2,
+            "author": {
+              "$ref": "ghost"
+            }
+          }
+        }
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "posts",
+          "values": {
+            "title": "C",
+            "rank": 2,
+            "author": null
+          }
+        }
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "posts",
+          "values": {
+            "title": "D",
+            "rank": 2
+          }
+        }
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "posts",
+          "values": {
+            "title": "E",
+            "rank": 1,
+            "state": "draft"
+          }
+        }
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "posts",
+          "values": {
+            "title": "F",
+            "rank": 1
+          }
+        }
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "posts",
+          "values": {
+            "title": "G",
+            "rank": 1,
+            "author": "00000000000000000000000000000000"
+          }
+        },
+        "code": "E_RELATION"
+      },
+      {
+        "method": "data.count",
+        "args": {
+          "table": "posts"
+        },
+        "expected": {
+          "count": 5
+        }
+      },
+      {
+        "method": "data.count",
+        "args": {
+          "table": "posts",
+          "filters": [
+            {
+              "field": "rank",
+              "op": "eq",
+              "value": 1
+            }
+          ]
+        },
+        "expected": {
+          "count": 2
+        }
+      },
+      {
+        "method": "data.query",
+        "args": {
+          "table": "posts",
+          "fields": [
+            "title"
+          ],
+          "filters": [
+            {
+              "field": "title",
+              "op": "eq",
+              "value": "E"
+            }
+          ]
+        },
+        "expected": {
+          "records": []
+        }
+      },
+      {
+        "method": "data.query",
+        "args": {
+          "table": "posts",
+          "fields": [
+            "title"
+          ],
+          "include": [
+            "author"
+          ],
+          "order": {
+            "field": "title",
+            "direction": "asc"
+          }
+        },
+        "expected": {
+          "records": [
+            {
+              "title": "A",
+              "relations": {
+                "author": {
+                  "name": "Ann"
+                }
+              }
+            },
+            {
+              "title": "B",
+              "relations": {
+                "author": null
+              }
+            },
+            {
+              "title": "C",
+              "relations": {
+                "author": null
+              }
+            },
+            {
+              "title": "D",
+              "relations": {
+                "author": null
+              }
+            },
+            {
+              "title": "F",
+              "relations": {
+                "author": null
+              }
+            }
+          ]
+        }
+      },
+      {
+        "method": "data.query",
+        "args": {
+          "table": "authors",
+          "fields": [
+            "name"
+          ]
+        },
+        "expected": {
+          "records": [
+            {
+              "name": "Ann"
+            }
+          ]
+        }
+      },
+      {
+        "paginate": {
+          "table": "posts",
+          "fields": [
+            "title",
+            "rank"
+          ],
+          "order": {
+            "field": "rank",
+            "direction": "asc"
+          }
+        },
+        "pageSize": 2,
+        "expectedRanks": [
+          1,
+          1,
+          2,
+          2,
+          2
+        ],
+        "expectedTitles": [
+          "A",
+          "B",
+          "C",
+          "D",
+          "F"
+        ]
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "seats",
+          "values": {
+            "name": "x"
+          },
+          "requestId": "seat-1"
+        },
+        "save": "seat"
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "seats",
+          "values": {
+            "name": "x"
+          },
+          "requestId": "seat-1"
+        },
+        "sameIdAs": "seat"
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "seats",
+          "values": {
+            "name": "changed"
+          },
+          "requestId": "seat-1"
+        },
+        "code": "E_CONFLICT"
+      },
+      {
+        "method": "data.count",
+        "args": {
+          "table": "seats"
+        },
+        "expected": {
+          "count": 1
+        }
+      },
+      {
+        "reopen": true
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "seats",
+          "values": {
+            "name": "x"
+          },
+          "requestId": "seat-1"
+        },
+        "sameIdAs": "seat"
+      },
+      {
+        "method": "data.insertIf",
+        "args": {
+          "table": "seats",
+          "values": {
+            "name": "tight"
+          },
+          "maxCount": 1
+        },
+        "code": "E_CONDITION"
+      },
+      {
+        "method": "data.insertIf",
+        "args": {
+          "table": "seats",
+          "values": {
+            "name": "z"
+          },
+          "maxCount": 5,
+          "requestId": "seat-2"
+        },
+        "save": "last"
+      },
+      {
+        "method": "data.insertIf",
+        "args": {
+          "table": "seats",
+          "values": {
+            "name": "w"
+          },
+          "maxCount": 5
+        },
+        "code": "E_CONDITION"
+      },
+      {
+        "method": "data.insert",
+        "args": {
+          "table": "seats",
+          "values": {
+            "name": "w"
+          }
+        },
+        "code": "E_CONDITION"
+      },
+      {
+        "method": "data.insertIf",
+        "args": {
+          "table": "seats",
+          "values": {
+            "name": "z"
+          },
+          "maxCount": 5,
+          "requestId": "seat-2"
+        },
+        "sameIdAs": "last"
+      },
+      {
+        "method": "data.query",
+        "args": {
+          "table": "seats",
+          "order": {
+            "field": "name",
+            "direction": "asc"
+          }
+        },
+        "expected": {
+          "records": [
+            {
+              "name": "x"
+            },
+            {
+              "name": "z"
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

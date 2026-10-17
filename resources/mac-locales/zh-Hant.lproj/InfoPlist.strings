@@ -1,1 +1,3 @@
-"NSMicrophoneUsageDescription" = "Orkas 會使用麥克風進行語音輸入。";
+"NSMicrophoneUsageDescription" = "Orkas 使用麥克風進行語音輸入，並供你授權的網站使用。";
+"NSCameraUsageDescription" = "Orkas 經你允許後，讓網站使用攝影機。";
+"NSBluetoothAlwaysUsageDescription" = "Orkas 使用藍牙確認儲存通行密鑰的手機在附近。";

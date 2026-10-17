@@ -9,6 +9,7 @@ const _rendererFeatureManifest = Object.freeze({
   settings: [
     { src: './modules/settings.js' },
     { src: './modules/memory.js' },
+    { src: './modules/task-cleanup.js' },
   ],
   marketplace: [
     { src: './modules/semver.js' },
@@ -63,22 +64,19 @@ function _rendererFeatureLogName(feature) {
     : 'unknown';
 }
 
-function _trackRendererFeatureLoad(result, feature, startedAt, retryCount, errorCode = '') {
-  const normalizedResult = result === 'success' ? 'success' : 'failure';
+function _logRendererFeatureLoadFailure(feature, startedAt, retryCount, errorCode = '') {
   const normalizedFeature = _rendererFeatureLogName(feature);
   const normalizedCode = errorCode === 'unknown_feature'
     ? 'unknown_feature'
     : 'script_load_failed';
   const payload = {
-    result: normalizedResult,
+    result: 'failure',
     feature: normalizedFeature,
     duration_ms: Math.max(0, Math.round(_rendererFeatureNow() - startedAt)),
     retry_count: Math.max(0, Number(retryCount) || 0),
   };
-  if (normalizedResult === 'failure') payload.error_code = normalizedCode;
-  if (normalizedResult === 'failure') {
-    try { console.warn('[renderer-feature]', payload); } catch (_) {}
-  }
+  payload.error_code = normalizedCode;
+  try { console.warn('[renderer-feature]', payload); } catch (_) {}
 }
 
 function _appendRendererFeatureScript(entry) {
@@ -113,7 +111,7 @@ function loadRendererFeature(name) {
   const entries = _rendererFeatureManifest[feature];
   if (!entries) {
     const startedAt = _rendererFeatureNow();
-    _trackRendererFeatureLoad('failure', feature, startedAt, 0, 'unknown_feature');
+    _logRendererFeatureLoadFailure(feature, startedAt, 0, 'unknown_feature');
     return Promise.reject(new Error(`unknown renderer feature: ${feature}`));
   }
   const existing = _rendererFeatureLoads.get(feature);
@@ -125,11 +123,8 @@ function loadRendererFeature(name) {
     for (const entry of entries) await _appendRendererFeatureScript(entry);
   })();
   _rendererFeatureLoads.set(feature, run);
-  run.then(
-    () => _trackRendererFeatureLoad('success', feature, startedAt, attempt - 1),
-    () => _trackRendererFeatureLoad('failure', feature, startedAt, attempt - 1, 'script_load_failed'),
-  );
   run.catch(() => {
+    _logRendererFeatureLoadFailure(feature, startedAt, attempt - 1, 'script_load_failed');
     if (_rendererFeatureLoads.get(feature) === run) _rendererFeatureLoads.delete(feature);
   });
   return run;

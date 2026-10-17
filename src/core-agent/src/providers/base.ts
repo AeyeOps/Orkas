@@ -42,8 +42,9 @@ export type CompletionParams = {
    * it and continue to honor `signal` for the whole request. */
   firstEventTimeoutMs?: number;
   /** Thinking/reasoning level.
-   *  - `"off"` explicitly disables thinking even if the provider has a
-   *    `defaultReasoning` configured (used to opt out per-call).
+   *  - `"off"` opts out of configured effort and disables thinking where
+   *    supported. Models explicitly declaring off unsupported retain their
+   *    official default thinking rather than sending an invalid control.
    *  - `undefined` falls back to the provider's `defaultReasoning`, when one
    *    is configured; otherwise the request omits an explicit effort.
    *  - `"minimal"`/`"low"`/`"medium"`/`"high"` map directly to pi-ai's

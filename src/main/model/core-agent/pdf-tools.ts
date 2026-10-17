@@ -1,3 +1,4 @@
+import { defaultNumericRange } from '../../../../bin/tool-input-compat.cjs';
 /**
  * Sandboxed PDF editing and rendering tools.
  *
@@ -553,7 +554,7 @@ function createPdfRenderTool(opts: PdfToolsOpts): AgentTool {
       if (inputErr) return errResult(inputErr.startsWith('E_') ? inputErr.split(':')[0] : 'E_BAD_INPUT', inputErr.replace(/^E_[A-Z_]+:\s*/, ''));
       const pageNumber = finiteNumber(input.page, 1, 1, 100_000, 'page');
       if (!Number.isInteger(pageNumber)) return errResult('E_BAD_INPUT', 'page must be an integer');
-      const scale = finiteNumber(input.scale, 1.5, 0.5, 3, 'scale');
+      const scale = finiteNumber(defaultNumericRange(input.scale, 1.5, 0.5, 3, false), 1.5, 0.5, 3, 'scale');
       let loadingTask: any;
       let document: any;
       try {

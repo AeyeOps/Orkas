@@ -21,9 +21,14 @@
  * would be a bug — showDownloadProgress stays false.
  *
  * This file is plain CommonJS on purpose: utilityProcess runs it as-is with no
- * tsx hook, and it resolves `fastembed` from the (asar-unpacked) node_modules
- * exactly like the in-process require did.
+ * tsx hook. Resolve dependencies through the logical application root: the
+ * physical unpacked tree does not contain every JavaScript dependency.
  */
+
+const path = require('node:path');
+const { createRequire } = require('node:module');
+const requireApp = createRequire(path.join(__dirname, '..', 'package.json')
+  .replace(/([\\/])app\.asar\.unpacked([\\/])/g, '$1app.asar$2'));
 
 const DEFAULT_EMBED_BATCH_SIZE = 32;
 
@@ -46,7 +51,7 @@ async function initEmbedder() {
     _initPromise = (async () => {
       // CJS entry (fastembed's ESM entry imports `tar` as a default export,
       // which breaks with tar@7) — same require the in-process path used.
-      const { FlagEmbedding, EmbeddingModel } = require('fastembed');
+      const { FlagEmbedding, EmbeddingModel } = requireApp('fastembed');
       const cacheDir = process.env.ORKAS_EMBED_MODEL_DIR || undefined;
       const em = await FlagEmbedding.init({
         model: EmbeddingModel.BGESmallZH,

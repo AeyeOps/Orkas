@@ -2,9 +2,10 @@ import { expectComposerText } from './fixtures/composer';
 /**
  * Conversation task-board scheduling — real app, real bus, stubbed model.
  *
- * Scenario value (D18, plan conversation-task-board.md): a user writing
- * "@A do X. @B do Y from it." in ONE message gets serial execution with a
- * visible dependency and a real hand-off. Multi-task coordination and the
+ * Scenario value (D29, plan conversation-task-board.md): a user writing
+ * "@A do X. @B do Y from it." in ONE message gets the planned split — here the
+ * fixture planner's in-order chain — with a visible dependency and a real
+ * hand-off. Multi-task coordination and the
  * blocked/run-anyway recovery path stay visible on the board, then the board
  * retracts when only an ordinary single run remains.
  * The cases here reproduce live-app defects: the invisible chain handover
@@ -48,12 +49,12 @@ async function sendMultiMention(
   const input = page.locator('#chat-input');
   await input.fill(text);
   await input.dispatchEvent('input');
-  // D18 UI: a two-group composer text surfaces the serial/parallel toggle.
-  await expect(page.locator('#chat-seq-toggle')).toBeVisible();
+  // D29: the dispatch planner decides order; there is no composer toggle.
+  await expect(page.locator('#chat-seq-toggle')).toHaveCount(0);
   await page.locator('#chat-send-btn').click();
 }
 
-test.describe('task board scheduling (D18 serial chain)', () => {
+test.describe('task board scheduling (D29 planned dependencies)', () => {
   test.describe.configure({
     timeout: process.platform === 'win32' ? 120_000 : 60_000,
   });
@@ -239,18 +240,16 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     await input.fill('@ContentWriter write the intro piece. @UIDesigner build the deck from it.');
     await input.dispatchEvent('input');
     // The chip is this surface's only routing preview: it must name BOTH
-    // assignees rather than a single picked recipient — and the landing page
-    // now surfaces the serial/parallel order choice too (D23), defaulting to
-    // the adjudicated written-order chain for a two-group text.
+    // assignees rather than a single picked recipient. Order is decided by
+    // the dispatch planner (D29), so no order toggle is offered.
     await expect(page.locator('#new-chat-recipient-name')).toHaveText('ContentWriter, UIDesigner');
-    await expect(page.locator('#new-chat-seq-toggle')).toBeVisible();
-    await expect(page.locator('#new-chat-seq-toggle')).toHaveText('Run in order');
+    await expect(page.locator('#new-chat-seq-toggle')).toHaveCount(0);
 
     await page.locator('#new-chat-send-btn').click();
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
 
     // Both assignees reach the board of the conversation this send created,
-    // and the second one depends on the first (serial default, D18).
+    // and the second one depends on the first (the fixture plan's chain).
     const rows = page.locator('#chat-task-board-list .chat-queue-item');
     await expect(rows).toHaveCount(2, { timeout: 30_000 });
     await expect(page.locator('#chat-task-board-list .chat-queue-dep')).toHaveCount(1);
@@ -263,23 +262,32 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     expect(app.modelRequests.length).toBeGreaterThanOrEqual(before + 2);
   });
 
-  test('runs a substantive preamble through Commander before the mentioned Agent (D22)', async ({
+  test('plans prose before a mention: Commander takes its part and the mentioned Agent waits for it (D29)', async ({
     modelOrkas, boardPage,
   }) => {
     const app = modelOrkas;
     const page = boardPage;
     const before = app.modelRequests.length;
+    const plannerCalls = app.dispatchPlannerRequests.length;
     app.setModelMode('controlled-slow');
+    app.setDispatchPlanReplies([JSON.stringify({
+      tasks: [
+        { key: 't1', assignee: 'commander', part: '写一个大纲', after: [] },
+        { key: 't2', assignee: 'a1', part: '基于大纲写正文', after: ['t1'] },
+      ],
+      references: [],
+      question: null,
+    })]);
 
     const input = page.locator('#chat-input');
     await input.fill('写一个大纲 @ContentWriter 基于大纲写正文');
     await input.dispatchEvent('input');
-    await expect(page.locator('#chat-recipient-name')).toHaveText('Commander, ContentWriter');
-    await expect(page.locator('#chat-seq-toggle')).toBeVisible();
+    await expect(page.locator('#chat-recipient-name')).toHaveText('ContentWriter');
     await page.locator('#chat-send-btn').click();
+    await expect.poll(() => app.dispatchPlannerRequests.length, { timeout: 15_000 }).toBe(plannerCalls + 1);
     await expect.poll(() => app.modelRequests.length, { timeout: 15_000 }).toBe(before + 1);
 
-    // Commander owns the preamble; the addressed Agent waits for its result.
+    // Commander runs its planned part; the addressed Agent waits for its result.
     const board = page.locator('#chat-task-board');
     const rows = page.locator('#chat-task-board-list .chat-queue-item');
     await expect(board).toBeVisible();
@@ -299,6 +307,35 @@ test.describe('task board scheduling (D18 serial chain)', () => {
     await expect(page.locator('#chat-history')).toContainText('E2E article written from the outline.', { timeout: 30_000 });
     await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/, { timeout: 20_000 });
     await expect(board).toBeHidden();
+  });
+
+  test('shows a send as running while it is planned, and Stop leaves no task (D29)', async ({
+    modelOrkas, boardPage,
+  }, testInfo) => {
+    const app = modelOrkas;
+    const page = boardPage;
+    const before = app.modelRequests.length;
+    const plannerCalls = app.dispatchPlannerRequests.length;
+    app.holdDispatchPlan();
+    await sendMultiMention(page, '@ContentWriter 写初稿，然后 @UIDesigner 做成幻灯片 STOP_WHILE_PLANNING');
+    await expect.poll(() => app.dispatchPlanParked, { timeout: 15_000 }).toBe(true);
+
+    // Planning takes seconds: the message is already in history and the send
+    // is visibly running, so the user can see it and stop it.
+    await expect(page.locator('#chat-history .chat-message.user').last()).toContainText('STOP_WHILE_PLANNING');
+    const sendBtn = page.locator('#chat-send-btn');
+    await expect(sendBtn).toHaveClass(/\bstreaming\b/);
+    await page.screenshot({ path: testInfo.outputPath('planning-in-progress.png') });
+    await sendBtn.click();
+    await expect(sendBtn).not.toHaveClass(/\bstreaming\b/, { timeout: 15_000 });
+    app.releaseDispatchPlan();
+
+    const cid = await page.evaluate<string>('currentCid');
+    const { tasks } = await app.invoke<{ tasks: Array<{ instruction: string }> }>('groupChat.tasks.list', { cid });
+    expect(tasks.filter((task) => task.instruction.includes('STOP_WHILE_PLANNING'))).toEqual([]);
+    expect(app.dispatchPlannerRequests.length).toBe(plannerCalls + 1);
+    expect(app.modelRequests.length).toBe(before);
+    await expect(page.locator('#chat-task-board')).toBeHidden();
   });
 
   test('stopping the running predecessor blocks the successor visibly; run-anyway releases it visibly', async ({

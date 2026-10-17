@@ -115,7 +115,7 @@ beforeEach(async () => {
   mockHermesBackendImpl = null;
 });
 
-afterEach(() => {
+afterEach(async () => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -161,6 +161,31 @@ async function callRunnerBridge(
 }
 
 describe('local_agents/runner', () => {
+  it.each(['claude', 'codex'] as const)('saves a native %s reply through the conversation owner before returning it to the CLI', async cli => {
+    mockDetect.mockResolvedValue({ type: cli, available: true, path: '/fake/' + cli, version: cli === 'claude' ? '2.1.296' : '0.156.1' });
+    const inputs = await import('../../../../src/main/features/local_agents/cli_user_input');
+    const saveUserInput = vi.fn(async (_text: string, _id: string) => {});
+    let reply!: Promise<any>;
+    inputs._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') reply = inputs.respond(payload.request_id, TEST_UID, { scope: ['Current'] });
+    });
+    const backend = async (opts: any) => {
+      const answer = await opts.requestUserInput({ questions: [{ id: 'scope', question: 'Which scope?' }] });
+      expect(saveUserInput).toHaveBeenCalledExactlyOnceWith('Which scope?\nCurrent', expect.any(String));
+      expect(answer).toEqual({ cancelled: false, answers: { scope: ['Current'] } });
+      opts.onEvent({ type: 'done', status: 'completed', output: 'Continued.' });
+    };
+    if (cli === 'claude') mockBackendImpl = backend;
+    else mockCodexBackendImpl = backend;
+    try {
+      const result = await (await loadRunner()).run({ uid: TEST_UID, cid: 'question-chat', agentId: 'a',
+        currentMessageId: 'request', cli, prompt: 'Inspect.', cwd: tmpDir,
+        signal: new AbortController().signal, onEvent: () => {}, saveUserInput });
+      expect(result.status).toBe('completed');
+      expect(await reply).toEqual({ handled: true, cancelled: false });
+    } finally { inputs._resetForTest(); }
+  });
+
   it.each([false, true])('wires OS-aware idle time into the CLI, retaining wall time if monitoring is unavailable: %s', async unavailable => {
     suspensionClock.unavailable = unavailable;
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
@@ -200,6 +225,14 @@ describe('local_agents/runner', () => {
     // The MCP tool description owns the write rule; the prompt keeps the pointer only.
     expect(restricted).not.toContain('Decide from meaning');
     expect(restricted).not.toContain('stable, reusable information');
+    expect(restricted).not.toContain('save only compact facts');
+    // A CLI also loads its own native memory; Orkas memory wins for both
+    // saving and conflicts, without disabling the native store.
+    const precedence = "Orkas memory takes precedence over this CLI's native memory: save durable facts with cross_session_memory, "
+      + 'and when native memory conflicts with Orkas memory or project context, follow Orkas.';
+    expect(restricted).toContain(precedence);
+    expect(restricted.indexOf(precedence)).toBeGreaterThan(restricted.indexOf('user/shared global memory is read-only'));
+    expect(runner.buildBridgeSystemPrompt(['skills.read', 'chat.read', 'commander.handoff'])).not.toContain('native memory');
     expect(restricted).toContain('orkas_handoff_to_commander');
     expect(restricted).toContain('Authorized workspace edits, including Agent/Skill source files and documentation, remain your work.');
     expect(restricted).toContain('complete the supported workspace work before handing off the remaining app operations');
@@ -457,7 +490,7 @@ describe('local_agents/runner', () => {
     const runner = await loadRunner();
     const events: any[] = [];
     const result = await runner.run({
-      uid: TEST_UID, cid: 'c', agentId: 'agent-x',
+      uid: TEST_UID, cid: 'c', agentId: 'agent-x', currentMessageId: 'persisted-user-trigger',
       cli: 'claude', prompt: 'do work', cwd: tmpDir,
       signal: new AbortController().signal,
       onEvent: e => events.push(e),
@@ -476,9 +509,105 @@ describe('local_agents/runner', () => {
     expect(fs.readFileSync(path.join(dir, 'output.txt'), 'utf8')).toBe('hello world');
     const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
     expect(meta.status).toBe('completed');
+    expect(meta.currentMessageId).toBe('persisted-user-trigger');
     expect(meta.cli).toBe('claude');
     expect(meta.cliPath).toBe('/fake/claude');
     expect(meta.endedAt).toBeTruthy();
+  });
+
+  it.each([
+    [false, 'completed'], [true, 'completed'], [false, 'failed'], [true, 'failed'],
+  ] as const)('recovers a Codex bootstrap timeout once with the same binary (resumed=%s, recovery=%s)', async (resumed, recoveryStatus) => {
+    const bin = path.join(tmpDir, 'codex');
+    fs.writeFileSync(bin, 'fixture');
+    const entry = { type: 'codex', available: true, path: bin, version: '0.160.0' };
+    mockDetect.mockResolvedValue(entry);
+    // A recovery failure must end this task even when another binary exists.
+    mockCliFallback.mockImplementation(current => current.path === bin
+      ? { ...entry, path: path.join(tmpDir, 'other-codex') } : null);
+    const attempts: any[] = [];
+    const deadlineAt = Date.now() + 10_000;
+    mockCodexBackendImpl = async opts => {
+      attempts.push(opts);
+      if (attempts.length === 1 || recoveryStatus === 'failed') {
+        opts.onEvent({ type: 'done', status: 'failed', failureKind: 'cli_protocol',
+          bootstrapTimeout: true, retrySafe: true, error: 'fixture bootstrap timeout' });
+      } else {
+        opts.onEvent({ type: 'done', status: 'completed', output: 'task delivered', sessionId: 'replacement-thread' });
+      }
+    };
+    const previous = process.env.ORKAS_BRIDGE_DISABLED;
+    process.env.ORKAS_BRIDGE_DISABLED = '1';
+    try {
+      const events: any[] = [];
+      const result = await (await loadRunner()).run({
+        uid: TEST_UID, cid: 'bootstrap', agentId: 'codex', cli: 'codex', cwd: tmpDir,
+        prompt: resumed ? 'current delta' : 'context and task',
+        ...(resumed ? { resumeSessionId: 'old-thread', resumeFallbackPrompt: 'bounded history and task', reuseSessionInstructions: true } : {}),
+        systemPrompt: 'durable instructions', permissionPolicy: 'ask', modelOverride: 'chosen-model', thinkingLevel: 'high',
+        deadlineAt, signal: new AbortController().signal, onEvent: event => events.push(event),
+      });
+      expect(attempts).toHaveLength(2);
+      expect(attempts[1]).toMatchObject({ binPath: bin, deadlineAt, systemPrompt: 'durable instructions',
+        permissionPolicy: 'ask', modelOverride: 'chosen-model', thinkingLevel: 'high',
+        prompt: resumed ? 'bounded history and task' : 'context and task', reuseSessionInstructions: false });
+      expect(attempts[1].resumeSessionId).toBeUndefined();
+      expect(mockCliFallback).not.toHaveBeenCalled();
+      expect(events.filter(event => event.type === 'done')).toEqual([
+        expect.objectContaining({ status: recoveryStatus }),
+      ]);
+      expect(events).toContainEqual(expect.objectContaining({ type: 'status', status: 'retrying', reason: 'cli-bootstrap-timeout', attempt: 1, maxRetries: 1 }));
+      const meta = JSON.parse(fs.readFileSync(path.join(tmpDir, TEST_UID, 'local', 'file_cache', 'local-agent-runs', result.runId, 'meta.json'), 'utf8'));
+      expect(meta.status).toBe(recoveryStatus);
+      if (recoveryStatus === 'completed') {
+        expect(result).toMatchObject({ output: 'task delivered' });
+        expect(events.find(event => event.type === 'done').sessionId).toBe('replacement-thread');
+        expect(meta.sessionId).toBe('replacement-thread');
+        expect(mockCliFailure).not.toHaveBeenCalled();
+      }
+    } finally {
+      if (previous === undefined) delete process.env.ORKAS_BRIDGE_DISABLED;
+      else process.env.ORKAS_BRIDGE_DISABLED = previous;
+    }
+  });
+
+  it.each(['submitted', 'missing-context', 'cancelled', 'deadline', 'non-timeout', 'non-codex', 'tool-completed'])('does not restart Codex on %s without a safe recovery boundary', async boundary => {
+    const bin = path.join(tmpDir, 'codex'); fs.writeFileSync(bin, 'fixture');
+    const cli = boundary === 'non-codex' ? 'claude' : 'codex';
+    mockDetect.mockResolvedValue({ type: cli, available: true, path: bin, version: cli === 'codex' ? '0.160.0' : '2.1.0' });
+    if (boundary === 'missing-context' || boundary === 'tool-completed') {
+      mockCliFallback.mockImplementation(current => current.path === bin
+        ? { type: cli, available: true, path: path.join(tmpDir, 'other-codex'), version: '0.159.3' } : null);
+    }
+    const controller = new AbortController();
+    let now = Date.now();
+    const deadlineAt = now + 10_000;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const backend = vi.fn(async opts => {
+      if (boundary === 'tool-completed') {
+        opts.onEvent({ type: 'tool-event', phase: 'use', callId: 'effect', tool: 'exec_command' });
+        opts.onEvent({ type: 'tool-event', phase: 'result', callId: 'effect', tool: 'exec_command', output: 'done' });
+      }
+      if (boundary === 'cancelled') controller.abort();
+      if (boundary === 'deadline') now = deadlineAt;
+      opts.onEvent({ type: 'done', status: 'failed', failureKind: 'cli_protocol',
+        bootstrapTimeout: boundary !== 'non-timeout', retrySafe: boundary !== 'submitted' });
+    });
+    mockCodexBackendImpl = backend;
+    mockBackendImpl = backend;
+    const previous = process.env.ORKAS_BRIDGE_DISABLED; process.env.ORKAS_BRIDGE_DISABLED = '1';
+    try {
+      const result = await (await loadRunner()).run({ uid: TEST_UID, cid: 'bootstrap-boundary', agentId: 'a',
+        cli, cwd: tmpDir, prompt: 'current delta', resumeSessionId: 'old-thread',
+        ...(boundary === 'missing-context' ? {} : { resumeFallbackPrompt: 'bounded history and task' }),
+        deadlineAt, signal: controller.signal, onEvent: () => {} });
+      expect(backend).toHaveBeenCalledOnce();
+      expect(result.status).toBe('failed');
+    } finally {
+      clock.mockRestore();
+      if (previous === undefined) delete process.env.ORKAS_BRIDGE_DISABLED;
+      else process.env.ORKAS_BRIDGE_DISABLED = previous;
+    }
   });
 
   it('retries a pre-turn CLI protocol failure with the cached fallback only once', async () => {
@@ -496,10 +625,12 @@ describe('local_agents/runner', () => {
     mockDetect.mockResolvedValue(firstEntry);
     mockCliFallback.mockReturnValue(fallbackEntry);
     const attemptedPaths: string[] = [];
+    const attemptedVersions: string[] = [];
     const deadlines: number[] = [];
     const originalDeadline = Date.now() + 60_000;
-    mockCodexBackendImpl = async ({ binPath, onEvent, deadlineAt }) => {
+    mockCodexBackendImpl = async ({ binPath, cliVersion, onEvent, deadlineAt }) => {
       attemptedPaths.push(binPath);
+      attemptedVersions.push(cliVersion);
       deadlines.push(deadlineAt);
       if (binPath === firstBin) {
         onEvent({
@@ -525,6 +656,7 @@ describe('local_agents/runner', () => {
       });
 
       expect(attemptedPaths).toEqual([firstBin, fallbackBin]);
+      expect(attemptedVersions).toEqual(['0.151.0-alpha.7.2', '0.146.0']);
       expect(deadlines).toEqual([originalDeadline, originalDeadline]);
       expect(result).toMatchObject({
         status: 'completed',
@@ -561,8 +693,12 @@ describe('local_agents/runner', () => {
     mockDetect.mockResolvedValue(firstEntry);
     mockCliFallback.mockReturnValue(fallbackEntry);
     const attemptedPaths: string[] = [];
-    mockBackendImpl = async ({ binPath, onEvent }) => {
+    const attemptedCapabilities: any[] = [];
+    const capabilities = vi.spyOn(await import('../../../../src/main/features/local_agents/runtime_options'), 'getLocalCliSupportedFlags')
+      .mockImplementation(async entry => entry.path === firstBin ? ['--effort', '--include-hook-events'] : []);
+    mockBackendImpl = async ({ binPath, cliVersion, cliFlags, onEvent }) => {
       attemptedPaths.push(binPath);
+      attemptedCapabilities.push({ cliVersion, cliFlags });
       if (binPath === firstBin) {
         onEvent({
           type: 'done', status: 'failed', error: 'spawn contract rejected',
@@ -585,17 +721,95 @@ describe('local_agents/runner', () => {
       });
 
       expect(attemptedPaths).toEqual([firstBin, fallbackBin]);
+      expect(attemptedCapabilities).toEqual([
+        { cliVersion: '2.2.0', cliFlags: ['--effort', '--include-hook-events'] },
+        { cliVersion: '2.1.0', cliFlags: [] },
+      ]);
       expect(result).toMatchObject({
         status: 'completed', output: 'known good', cliPath: fallbackBin, cliVersion: '2.1.0',
       });
       expect(mockCliFailure).toHaveBeenCalledWith(firstEntry);
       expect(mockCliSuccess).toHaveBeenCalledWith(fallbackEntry);
     } finally {
+      capabilities.mockRestore();
       if (previousBridgeDisabled === undefined) delete process.env.ORKAS_BRIDGE_DISABLED;
       else process.env.ORKAS_BRIDGE_DISABLED = previousBridgeDisabled;
     }
   });
 
+  it.each(['cancelled', 'timeout'] as const)('does not start a task when capability discovery ends after %s', async status => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    const controller = new AbortController();
+    let now = Date.now();
+    const deadlineAt = now + 60_000;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    const capabilities = vi.spyOn(await import('../../../../src/main/features/local_agents/runtime_options'), 'getLocalCliSupportedFlags')
+      .mockImplementation(async () => {
+        if (status === 'cancelled') controller.abort();
+        else now = deadlineAt + 1;
+        return ['--effort'];
+      });
+    const backend = vi.fn(async ({ onEvent }: any) => onEvent({ type: 'done', status: 'completed', output: 'unexpected task' }));
+    mockBackendImpl = backend;
+    const previousBridgeDisabled = process.env.ORKAS_BRIDGE_DISABLED;
+    process.env.ORKAS_BRIDGE_DISABLED = '1';
+    try {
+      const result = await (await loadRunner()).run({
+        uid: TEST_UID, cid: 'c-capability-deadline', agentId: 'agent-x',
+        cli: 'claude', prompt: 'do work', cwd: tmpDir, deadlineAt,
+        signal: controller.signal, onEvent: () => {},
+      });
+      expect(capabilities).toHaveBeenCalledOnce();
+      expect(backend).not.toHaveBeenCalled();
+      expect(result.status).toBe(status);
+    } finally {
+      capabilities.mockRestore();
+      clock.mockRestore();
+      if (previousBridgeDisabled === undefined) delete process.env.ORKAS_BRIDGE_DISABLED;
+      else process.env.ORKAS_BRIDGE_DISABLED = previousBridgeDisabled;
+    }
+  });
+
+
+  it('runs an older fallback with its native default when optional effort is unavailable', async () => {
+    const firstBin = path.join(tmpDir, 'claude-capable'); const fallbackBin = path.join(tmpDir, 'claude-old');
+    fs.writeFileSync(firstBin, 'first'); fs.writeFileSync(fallbackBin, 'fallback');
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: firstBin, version: '2.2.0' });
+    mockCliFallback.mockReturnValue({ type: 'claude', available: true, path: fallbackBin, version: '2.0.0' });
+    const capabilities = vi.spyOn(await import('../../../../src/main/features/local_agents/runtime_options'), 'getLocalCliSupportedFlags')
+      .mockImplementation(async entry => entry.path === firstBin ? ['--effort'] : []);
+    const attempted: { binPath: string; thinkingLevel?: string }[] = [];
+    mockBackendImpl = async ({ binPath, thinkingLevel, onEvent }) => {
+      attempted.push({ binPath, thinkingLevel });
+      onEvent(binPath === firstBin ? { type: 'done', status: 'failed', failureKind: 'cli_spawn', retrySafe: true }
+        : { type: 'done', status: 'completed', output: 'compatible fallback completed' });
+    };
+    const previous = process.env.ORKAS_BRIDGE_DISABLED; process.env.ORKAS_BRIDGE_DISABLED = '1';
+    try {
+      const result = await (await loadRunner()).run({ uid: TEST_UID, cid: 'c-selected-fallback-effort', agentId: 'agent-x',
+        cli: 'claude', prompt: 'fixture', thinkingLevel: 'high', cwd: tmpDir, signal: new AbortController().signal, onEvent: () => {} });
+      expect(attempted).toEqual([{ binPath: firstBin, thinkingLevel: 'high' }, { binPath: fallbackBin, thinkingLevel: undefined }]);
+      expect(capabilities).toHaveBeenCalledTimes(2);
+      expect(result).toMatchObject({ status: 'completed', output: 'compatible fallback completed' });
+    } finally { capabilities.mockRestore(); if (previous === undefined) delete process.env.ORKAS_BRIDGE_DISABLED; else process.env.ORKAS_BRIDGE_DISABLED = previous; }
+  });
+
+  it('cancels promptly while shared capability discovery is still pending', async () => {
+    const bin = path.join(tmpDir, 'claude-pending-help'); fs.writeFileSync(bin, 'fixture');
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: bin, version: '2.0.0' });
+    const controller = new AbortController(); let started!: () => void;
+    const discoveryStarted = new Promise<void>(resolve => { started = resolve; });
+    const capabilities = vi.spyOn(await import('../../../../src/main/features/local_agents/runtime_options'), 'getLocalCliSupportedFlags')
+      .mockImplementation(() => { started(); return new Promise(() => {}); });
+    const backend = vi.fn(); mockBackendImpl = backend;
+    const previous = process.env.ORKAS_BRIDGE_DISABLED; process.env.ORKAS_BRIDGE_DISABLED = '1';
+    try {
+      const run = (await loadRunner()).run({ uid: TEST_UID, cid: 'c-cancel-pending-help', agentId: 'agent-x',
+        cli: 'claude', prompt: 'fixture', cwd: tmpDir, signal: controller.signal, onEvent: () => {} });
+      await discoveryStarted; controller.abort();
+      expect((await run).status).toBe('cancelled'); expect(backend).not.toHaveBeenCalled();
+    } finally { capabilities.mockRestore(); if (previous === undefined) delete process.env.ORKAS_BRIDGE_DISABLED; else process.env.ORKAS_BRIDGE_DISABLED = previous; }
+  });
   it('adds and persists a duration for each correlated CLI tool result', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     mockBackendImpl = async ({ onEvent }) => {
@@ -1049,6 +1263,54 @@ describe('local_agents/runner', () => {
     expect(result.status).toBe('completed');
     expect(selected).toEqual([[output], []]);
     expect(fs.readFileSync(output, 'utf8')).toBe('Exact output');
+  });
+
+  it('offers saved tasks through the live CLI bridge, excluding reads and rejected edits', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    const saved: unknown[] = [];
+    let todoId = '';
+    let autoId = '';
+    mockBackendImpl = async ({ bridge, onEvent }) => {
+      const todo = await callRunnerBridge(bridge, 'todo_tasks', { action: 'create', content: 'Review launch' });
+      expect(todo.ok).toBe(true);
+      todoId = todo.result.task.id;
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'update', task_id: todoId, content: 'Review release' })).ok).toBe(true);
+      const auto = await callRunnerBridge(bridge, 'auto_tasks', {
+        action: 'create', title: 'Daily review', content: 'Review changes', enabled: false,
+        schedule: { type: 'daily', hour: 0, minute: 0 },
+      });
+      expect(auto.ok).toBe(true);
+      autoId = auto.result.taskId;
+      const count = saved.length;
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'get', task_id: todoId })).ok).toBe(true);
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'update', task_id: todoId, content: '' })).ok).toBe(false);
+      expect((await callRunnerBridge(bridge, 'auto_tasks', { action: 'delete', task_id: autoId })).ok).toBe(true);
+      expect(saved).toHaveLength(count);
+      // A duplicate created by a retried call and then removed is withdrawn.
+      const duplicate = await callRunnerBridge(bridge, 'todo_tasks', { action: 'create', content: 'Review launch again' });
+      expect(duplicate.ok).toBe(true);
+      duplicateId = duplicate.result.task.id;
+      expect((await callRunnerBridge(bridge, 'todo_tasks', { action: 'delete', task_id: duplicateId })).ok).toBe(true);
+      onEvent({ type: 'done', status: 'completed', output: 'Saved' });
+    };
+    let duplicateId = '';
+    const deleted: unknown[] = [];
+    const runner = await loadRunner();
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c-saved-tasks', agentId: 'agent-x', currentMessageId: 'message-x', cli: 'claude',
+      prompt: 'Save tasks', cwd: tmpDir, signal: new AbortController().signal, onEvent: () => {},
+      onAutoTaskSaved: (id, title) => saved.push(['automation', id, title]),
+      onTodoTaskSaved: (id, pid, content) => saved.push(['todo', id, pid, content]),
+      onAutoTaskDeleted: (id) => deleted.push(['automation', id]),
+      onTodoTaskDeleted: (id, pid) => deleted.push(['todo', id, pid]),
+    });
+    expect(result.status).toBe('completed');
+    expect(saved).toEqual([
+      ['todo', todoId, '', 'Review launch'], ['todo', todoId, '', 'Review release'],
+      ['automation', autoId, 'Daily review'],
+      ['todo', duplicateId, '', 'Review launch again'],
+    ]);
+    expect(deleted).toEqual([['automation', autoId], ['todo', duplicateId, '']]);
   });
 
   it('forwards the backend active-run ingress and always clears it after the attempt', async () => {

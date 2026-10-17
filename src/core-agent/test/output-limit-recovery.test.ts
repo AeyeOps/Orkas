@@ -117,8 +117,34 @@ describe("output limit task recovery", () => {
     expect((await runner.run({ message: "Write the requested file." })).meta.error).toBeUndefined();
     expect(executed).toEqual(["accepted"]);
     expect(JSON.stringify(requests[1].messages)).not.toContain("discard-one");
-    expect(JSON.stringify(requests[1].messages)).not.toContain("reasoning_content");
+    // Plain Chat reasoning is independent of the discarded tool proposals.
+    expect(requests[1].messages.flatMap(m => m.content)).toContainEqual(thinking);
     expect(JSON.stringify(session.getMessages())).not.toContain("discard-two");
+  });
+
+  it.each([
+    ["opaque signature", { thinkingSignature: "opaque-provider-signature" }],
+    ["redacted reasoning", { ...thinking, redacted: true }],
+    ["missing signature", { thinkingSignature: undefined }],
+    ["encrypted Responses state", { thinkingSignature: JSON.stringify({ type: "reasoning", encrypted_content: "cipher", content: [{ type: "reasoning_text", text: "Work remains." }] }) }],
+    ["incomplete Responses item", { thinkingSignature: JSON.stringify({ type: "reasoning", status: "incomplete", content: [{ type: "reasoning_text", text: "Work remains." }] }) }],
+    ["summary-only Responses item", { thinkingSignature: JSON.stringify({ type: "reasoning", summary: [{ type: "summary_text", text: "Work remains." }] }) }],
+    ["unknown replay metadata", { thinkingSignature: JSON.stringify({ type: "reasoning", native_state: "opaque", content: [{ type: "reasoning_text", text: "Work remains." }] }) }],
+    ["malformed Responses content", { thinkingSignature: JSON.stringify({ type: "reasoning", content: [{ type: "function_call", name: "write_file" }] }) }],
+    ["Google native replay", { googleNativeReplay: { api: "google-generative-ai", provider: "google", model: "mock-model", partsJson: '[{"functionCall":{"name":"write_file","args":{}}}]' } }],
+  ] as const)("does not revive %s from a discarded tool batch", async (_label, patch) => {
+    let writes = 0;
+    const privateBlock = { ...thinking, ...patch } as MessageContent;
+    const { runner, requests, session } = setup([
+      response([privateBlock, text("Preparing changes."), call("discard")]),
+      response([text("No change made.")], "end_turn"),
+    ], [tool("write_file", async () => { writes++; return { content: "saved" }; })]);
+    expect((await runner.run({ message: "Prepare the change." })).meta.error).toBeUndefined();
+    expect(writes).toBe(0);
+    expect(requests).toHaveLength(2);
+    for (const messages of [requests[1].messages, session.getMessages()]) {
+      expect(messages.flatMap(m => m.content).every(c => c.type !== "thinking" && c.type !== "tool_use" && !c.googleNativeReplay)).toBe(true);
+    }
   });
 
   it("shares three recovery attempts across thinking, text and incomplete tool transitions", async () => {

@@ -8,7 +8,7 @@ const skillsSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/mo
 const conversationSource = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
 const composerHelpers = [
   ['const _MENTION_FALLBACK_CLASS', 'function _highlightMentionsIn'],
-  ['function _quotedLineRanges', 'function _composerDispatchShape'],
+  ['function _quotedLineRanges', 'function _resolvedMentionSpans'],
   ['function _resolvedMentionSpans', 'function _explicitMentionRecipients'],
   ['function _findChatComposerTokens', 'function _chatRichAutoGrowMax'],
 ].map(([start, end]) => {

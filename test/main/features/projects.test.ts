@@ -137,6 +137,7 @@ describe('projects › createProject', () => {
 });
 
 describe('projects › listProjects', () => {
+
   it('sorts project display names alphabetically with natural number order', async () => {
     const projects = await loadProjects();
     for (const name of ['Zulu', 'Beta 10', 'alpha', 'Beta 2']) {

@@ -30,6 +30,7 @@ describe('local_agents/persist', () => {
     const handle = await persist.start(TEST_UID, {
       agentId: 'agent-1',
       cid: 'conv-1',
+      currentMessageId: 'user-trigger-1',
       cli: 'claude',
       cliPath: '/fake/claude',
       prompt: 'write tests',
@@ -65,6 +66,7 @@ describe('local_agents/persist', () => {
       cli: 'claude',
       cliPath: '/fake/claude',
       status: 'completed',
+      currentMessageId: 'user-trigger-1',
       durationMs: 42,
       output: 'complete body',
       sessionId: 'sess-1',

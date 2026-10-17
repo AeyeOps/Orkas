@@ -37,6 +37,78 @@ function cidDir(): string {
 }
 
 const MIN_FILES = [{ path: 'index.html', content: '<!doctype html><h1>hi</h1>' }];
+it.each(['local','web'] as const)('accepts a valid base64 manifest for a %s artifact while preserving the host permission boundary',async appType=>{
+  const m=await loadMod(),manifest={sdkVersion:1,capabilities:['data'],data:{version:1,tables:[]}};
+  const result=await m.createArtifact(UID,CID,AGENT,{appType,files:[...MIN_FILES,{path:'orkas-app.json',content:Buffer.from(JSON.stringify(manifest)).toString('base64'),encoding:'base64'}]});
+  if (appType === 'web') { expect(result).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' }); expect(fs.existsSync(cidDir())).toBe(false); return; }
+  expect(result.ok).toBe(true);if(!result.ok)throw new Error(result.error);
+  const saved=JSON.parse(fs.readFileSync(path.join(cidDir(),result.artifactId,'orkas-app.json'),'utf8'));
+  expect(saved).toMatchObject(manifest);expect(m.readArtifactMeta(UID,CID,result.artifactId)?.appType).toBe(appType);
+  const denied=await m.createArtifact(UID,CID,AGENT,{appType:'web',files:[...MIN_FILES,{path:'orkas-app.json',content:Buffer.from(JSON.stringify({sdkVersion:1,capabilities:['ai']})).toString('base64'),encoding:'base64'}]});
+  expect(denied).toMatchObject({ok:false,code:'E_COMMERCIAL_REQUIRED',feature:'web_apps'});
+  const missing=await m.createArtifact(UID,CID,AGENT,{appType,files:[...MIN_FILES,{path:'orkas-app.json',content:JSON.stringify({sdkVersion:1,capabilities:['data']})}]});
+  expect(missing).toMatchObject({ok:false,error:'data definition is required'});
+});
+
+// 2026-10-15 live regression: an opaque manifest rejection made authors drop
+// the declaration instead of correcting it. Each rejection names its cause,
+// stays bounded, and creates nothing.
+const PREFIX = 'invalid application interface declaration in orkas-app.json: ';
+const TABLE = (fields: unknown, access: unknown = { read: ['body'], insert: ['body'] }) =>
+  ({ sdkVersion: 1, capabilities: ['data'], data: { version: 1, tables: [{ id: 'notes', name: 'notes', fields, access }] } });
+const BODY = [{ id: 'body', name: 'body', type: 'string' }];
+it.each([
+  ['non-UTF-8 bytes', { content: Buffer.from([0x7b, 0xff, 0xfe, 0x7d]).toString('base64'), encoding: 'base64' }, 'must be UTF-8 text'],
+  ['malformed JSON', { content: '{"sdkVersion":1,' }, 'must be valid JSON'],
+  ['a non-object root', { content: '[]' }, 'root must be object, received array'],
+  ['a missing sdkVersion', { content: JSON.stringify({ capabilities: [] }) }, 'sdkVersion is required'],
+  ['an unsupported sdkVersion', { content: JSON.stringify({ sdkVersion: 2, capabilities: [] }) }, 'sdkVersion must be 1'],
+  ['an unknown capability', { content: JSON.stringify({ sdkVersion: 1, capabilities: ['storage', 'shell'] }) },
+    'capabilities[1] must be one of storage, appFiles, files, ai, library, connectors, data'],
+  ['capabilities as an object', { content: JSON.stringify({ sdkVersion: 1, capabilities: { data: true } }) }, 'capabilities must be array, received object'],
+  ['invented top-level fields', { content: JSON.stringify({ sdkVersion: 1, capabilities: [], name: 'Notes', version: '1' }) },
+    'root has unsupported field(s) name, version'],
+  ['an unknown field type', { content: JSON.stringify(TABLE([{ id: 'body', name: 'body', type: 'text' }])) },
+    'data.tables[0].fields[0].type must be one of string, number, integer, boolean, json, timestamp'],
+  ['an access list naming an undeclared field', { content: JSON.stringify(TABLE(BODY, { read: ['body', 'createdBy'], insert: ['body'] })) },
+    'data: Unknown or duplicate access field'],
+] as const)('names the cause of a manifest with %s and creates no artifact', async (_label, file, cause) => {
+  const m = await loadMod();
+  for (const appType of ['local', 'web'] as const) {
+    const result = await m.createArtifact(UID, CID, AGENT, { appType, files: [...MIN_FILES, { path: 'orkas-app.json', ...file }] });
+    if (appType === 'web') { expect(result).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' }); continue; }
+    expect(result.ok).toBe(false); if (result.ok) return;
+    expect(result.error.startsWith(PREFIX)).toBe(true);
+    expect(result.error).toContain(cause);
+  }
+  expect(fs.existsSync(cidDir()) ? fs.readdirSync(cidDir()) : []).toEqual([]);
+});
+
+it('bounds a rejection with many issues and never echoes non-identifier keys or rejected values', async () => {
+  const m = await loadMod();
+  const secret = '/Users/test/private notes ' + 'x'.repeat(400);
+  const manifest = { sdkVersion: 2, capabilities: ['shell-' + secret, 'a', 'b', 'c'], data: 'tables', [secret]: 1, extra_field: true };
+  const result = await m.createArtifact(UID, CID, AGENT, { files: [...MIN_FILES, { path: 'orkas-app.json', content: JSON.stringify(manifest) }] });
+  expect(result.ok).toBe(false); if (result.ok) return;
+  expect(result.error.startsWith(PREFIX)).toBe(true);
+  // Invented members come first; repeated reasons share one entry.
+  expect(result.error).toContain('root has unsupported field(s) extra_field, 1 other key(s)');
+  expect(result.error).toContain('capabilities[0], capabilities[1], capabilities[2] (+1 more) must be one of');
+  expect(result.error).toMatch(/\(\+1 more\)$/);
+  expect(result.error).not.toContain('someone');
+  expect(result.error).not.toContain('shell-');
+  expect(result.error.length).toBeLessThanOrEqual(600);
+  expect(fs.existsSync(cidDir()) ? fs.readdirSync(cidDir()) : []).toEqual([]);
+});
+
+it('names the local-only capabilities a web manifest declared', async () => {
+  const m = await loadMod();
+  const result = await m.createArtifact(UID, CID, AGENT, { appType: 'web', files: [...MIN_FILES,
+    { path: 'orkas-app.json', content: JSON.stringify({ sdkVersion: 1, capabilities: ['data', 'storage', 'ai'], data: { version: 1, tables: [] } }) }] });
+  expect(result).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
+  expect(fs.existsSync(cidDir()) ? fs.readdirSync(cidDir()) : []).toEqual([]);
+});
+
 
 /**
  * 2026-08-26: the host cannot measure a cross-origin iframe, so an artifact
@@ -415,4 +487,65 @@ it('creates and serves the same media/model/font resources accepted by saved app
     expect(result).toMatchObject({ok:true,mime});
     if(result.ok)expect(fs.readFileSync(result.absPath)).toEqual(Buffer.from([0,1]));
   }
+});
+
+
+describe('chat_artifacts › application type for bubble labels', () => {
+  it.each(['local', 'web'] as const)('returns the actual %s bundle type during preview inspection', async appType => {
+    const m = await loadMod();
+    let created: any;
+    if (appType === 'web') {
+      const dir = path.join(cidDir(), 'legacy-web'); fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'index.html'), MIN_FILES[0].content);
+      fs.writeFileSync(path.join(dir, '__orkas-meta.json'), JSON.stringify({ title: 'Legacy web app', appType: 'web' }));
+      created = { ok: true, artifactId: 'legacy-web' };
+    } else created = await m.createArtifact(UID, CID, AGENT, { appType, files: MIN_FILES });
+    if (!created.ok) throw new Error(created.error);
+    expect(await m.inspectArtifactIndex(UID, CID, created.artifactId)).toEqual({ ok: true, status: 'ok', appType });
+  });
+
+  it('identifies a legacy bundle as local and does not label a missing preview', async () => {
+    const m = await loadMod();
+    const created = await m.createArtifact(UID, CID, AGENT, { files: MIN_FILES });
+    if (!created.ok) throw new Error(created.error);
+    const dir = path.join(cidDir(), created.artifactId);
+    fs.writeFileSync(path.join(dir, '__orkas-meta.json'), JSON.stringify({ title: 'Legacy app' }));
+    expect(await m.inspectArtifactIndex(UID, CID, created.artifactId)).toEqual({ ok: true, status: 'ok', appType: 'local' });
+    fs.rmSync(path.join(dir, 'index.html'));
+    const missing = await m.inspectArtifactIndex(UID, CID, created.artifactId);
+    expect(missing).toMatchObject({ ok: true, status: 'unavailable' });
+    expect(missing).not.toHaveProperty('appType');
+  });
+});
+
+describe('chat_artifacts › application type input', () => {
+  // Sync notification is loaded through CommonJS require and cannot be
+  // intercepted here; it is sent only after the staged directory is renamed,
+  // so an absent directory is the observable no-publication oracle.
+  it('denies authoring through the legacy cloud alias without allocating a bundle', async () => {
+    const m = await loadMod();
+    const created = await m.createArtifact(UID, CID, AGENT, { appType: 'cloud', files: MIN_FILES });
+    expect(created).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
+    expect(fs.existsSync(cidDir())).toBe(false);
+  });
+
+  it.each([['desktop'], ['Web'], [1], [{ type: 'web' }]])('rejects unknown type %j without creating an artifact', async appType => {
+    const m = await loadMod();
+    const result = await m.createArtifact(UID, CID, AGENT, { appType, files: MIN_FILES });
+    expect(result).toEqual({ ok: false, error: 'app type must match the task or editing source' });
+    expect(fs.existsSync(cidDir()) ? fs.readdirSync(cidDir()) : []).toEqual([]);
+    expect(m.listArtifacts(UID, CID)).toEqual([]);
+  });
+
+  it('denies an undeclared web app and retains local auto-sizing authoring', async () => {
+    const m = await loadMod();
+    const html = '<!doctype html><html><head><title>Web</title></head><body><p>Plain</p></body></html>';
+    const created = await m.createArtifact(UID, CID, AGENT, { appType: 'web', files: [{ path: 'index.html', content: html }] });
+    expect(created).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
+    expect(fs.existsSync(cidDir())).toBe(false);
+    const local = await m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: html }] });
+    expect(local.ok).toBe(true); if (!local.ok) return;
+    expect(fs.readFileSync(path.join(cidDir(), local.artifactId, 'index.html'), 'utf8')).toContain(m.BRIDGE_RELPATH);
+    expect(fs.existsSync(path.join(cidDir(), local.artifactId, 'orkas-app.json'))).toBe(false);
+  });
 });

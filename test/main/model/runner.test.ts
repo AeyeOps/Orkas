@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { expectTestLog } from '../../helpers/test-log-analysis';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -28,6 +29,7 @@ const CITATION_VERIFY_AGENT_IDS = [
 const OFFICE_WORKER_AGENT_ID = 'a19101ba698a';
 const IMAGE_STUDIO_AGENT_ID = '814b61b027f0';
 const VIDEO_STUDIO_AGENT_ID = '79df9cc89f5f';
+const RUNNER_TEST_UID = 'runner-test';
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-runner-'));
@@ -38,6 +40,10 @@ beforeEach(async () => {
   delete process.env.ANTHROPIC_API_KEY;
   vi.resetModules();
   closeLogWorkers = await captureMainLogWorkers();
+  // Missing-model cases must reach the account's empty store, not fail earlier
+  // because no account was activated in this isolated main-process fixture.
+  const users = await import('../../../src/main/features/users');
+  users.activateUser(RUNNER_TEST_UID);
 });
 
 afterEach(async () => {
@@ -115,8 +121,8 @@ describe('runner › buildRunner auth gate', () => {
   });
 
   it('throws a clear "no model configured" error when no entries exist and no env fallback', async () => {
-    // Fresh tmpDir → no workspace/auth/auth-profiles.json → pickChatEntry
-    // returns null. ANTHROPIC_API_KEY cleared in beforeEach.
+    // The isolated active account has no saved profiles, so pickChatEntry
+    // returns null. ANTHROPIC_API_KEY is cleared in beforeEach.
     const { buildRunner } = await loadRunner();
     await expect(buildRunner({ sessionId: 'u1-gconv-x' })).rejects.toThrow(
       /No model configured/,
@@ -151,10 +157,11 @@ describe('runner › buildRunner auth gate', () => {
   it('throws the "no model configured" error when auth-profiles.json has empty entries', async () => {
     // Simulate a user who opened settings, saved nothing, ended up with an
     // empty profiles file — pickChatEntry still returns null.
-    const authDir = path.join(tmpDir, 'auth');
-    fs.mkdirSync(authDir, { recursive: true });
+    const paths = await import('../../../src/main/paths');
+    const profileFile = paths.userAuthProfilesFile(RUNNER_TEST_UID);
+    fs.mkdirSync(path.dirname(profileFile), { recursive: true });
     fs.writeFileSync(
-      path.join(authDir, 'auth-profiles.json'),
+      profileFile,
       JSON.stringify({ profiles: {}, entries: [] }),
     );
     const { buildRunner } = await loadRunner();
@@ -1097,7 +1104,9 @@ describe('runner › scoped tool loading', () => {
     expect(await tasks.listTasks(uid, '')).toEqual([
       expect.objectContaining({ content: '全局待办', status: 'todo' }),
     ]);
-    expect((await tasks.listTasks(uid, ''))[0]).not.toHaveProperty('origin_cid');
+    // A global to-do saved from a conversation links back to it, so opening or
+    // running it later returns there.
+    expect((await tasks.listTasks(uid, ''))[0]).toHaveProperty('origin_cid', 'outside-project');
     const request = { action: 'create', project: '测试项目', content: '这是一条测试待办' };
     const created = await tool.execute(request, context);
     expect(JSON.parse(created.content)).toMatchObject({
@@ -1205,8 +1214,8 @@ describe('runner › scoped tool loading', () => {
       .toContainEqual(expect.objectContaining({ content: 'AGENT_BACKLOG_ON_DEMAND' }));
     expect(agent.runner.getActiveToolDefinitions().map((tool) => tool.name)).toContain('todo_tasks');
     expect(bound.inputSchema.properties.action.enum).toEqual(['list', 'get', 'create', 'update', 'complete', 'add_attachment', 'delete']);
-    expect((await bound.execute({ action: 'update', task_id: agentTask.task.id, status: 'review', result_ref: 'artifact-1' }, context)).isError).toBeFalsy();
-    expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).toMatchObject({ status: 'review', result_ref: 'artifact-1' });
+    expect((await bound.execute({ action: 'update', task_id: agentTask.task.id, status: 'review' }, context)).isError).toBeFalsy();
+    expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).toMatchObject({ status: 'review' });
     expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).not.toHaveProperty('origin_cid');
     expect((await bound.execute({ action: 'complete', task_id: agentTask.task.id }, context)).isError).toBeFalsy();
     expect((await tasks.getTask(uid, first.project.project_id, agentTask.task.id))?.status).toBe('done');
@@ -2063,7 +2072,17 @@ describe('runner › scoped tool loading', () => {
     const body = await read.execute({paths:[{path:'@skill/web-app-sdk'}]}, context);
     expect(body.isError).toBeFalsy();
     expect(body.content).toContain('references/api.json');
-    const schema = await read.execute({paths:[{path:'@skill/web-app-sdk/references/api.json'}]}, context);
+    let schema = await read.execute({paths:[{path:'@skill/web-app-sdk/references/api.json'}]}, context);
+    let previousStart = -1;
+    while (!schema.content.includes('ai.generate')) {
+      expect(schema.isError).toBeFalsy();
+      const continuation = /next_range="char:(\d+)-(\d+)"/.exec(schema.content);
+      expect(continuation, 'SDK references remain readable through their declared continuation').toBeTruthy();
+      const start = Number(continuation![1]), end = Number(continuation![2]);
+      expect(start).toBeGreaterThan(previousStart);
+      previousStart = start;
+      schema = await read.execute({paths:[{path:'@skill/web-app-sdk/references/api.json', range:{unit:'char',start,end}}]}, context);
+    }
     expect(schema.isError).toBeFalsy();
     expect(schema.content).toContain('ai.generate');
     const denied = await read.execute({paths:[{path:'@skill/skill-creator'}]}, context);
@@ -2251,7 +2270,7 @@ describe('runner › scoped tool loading', () => {
         call('todo_tasks', {action:'get', task_id:todo.task.id}),
         call('auto_tasks', {action:'get', task_id:auto.taskId})
       ]);
-      await call('todo_tasks', {action:'complete', task_id:todo.task.id, result_ref:'verified-delivery'});
+      await call('todo_tasks', {action:'complete', task_id:todo.task.id});
       await call('auto_tasks', {action:'enable', task_id:auto.taskId});
       await call('auto_tasks', {action:'disable', task_id:auto.taskId});
       json({todoId:todo.task.id, autoId:auto.taskId, summaries, details});
@@ -2266,7 +2285,7 @@ describe('runner › scoped tool loading', () => {
       { task: { content: 'Program todo\nFull task detail' } }, { task: { content: 'Full automation detail' } },
     ]);
     expect(await todos.getTask(uid, pid, receipt.todoId)).toMatchObject({
-      status: 'done', result_ref: 'verified-delivery',
+      status: 'done',
     });
     expect(await todos.getTask(uid, pid, receipt.todoId)).not.toHaveProperty('origin_cid');
     expect(await automations.getTask(uid, receipt.autoId)).toMatchObject({
@@ -3137,7 +3156,7 @@ describe('runner › conversation task board turn block (D8/P3)', () => {
     const plainNames = plain.toolDefs.map(tool => tool.name);
     expect(plainNames).not.toContain('create_artifact');
     let appSystemPrompt: string | undefined;
-    await chats.updateConversation(uid, cid, { assistance: { kind: 'app_creation' } });
+    await chats.updateConversation(uid, cid, { assistance: { kind: 'app_creation', appType:'web' } });
     const unavailable = await buildRunner({ sessionId: `gconv-${cid}`, userId: uid, cid });
     expect(unavailable.toolDefs.map(tool => tool.name)).not.toContain('create_artifact');
     for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -3151,6 +3170,7 @@ describe('runner › conversation task board turn block (D8/P3)', () => {
       expect(appTool?.inputSchema).toMatchObject({
         type: 'object', required: ['files'], properties: { files: { type: 'array' } },
       });
+      expect(appTool?.inputSchema.properties.appType.enum).toEqual(['web']);
       expect(bound.toolDefs.map(tool => tool.name).filter(name => !plainNames.includes(name))).toEqual(['create_artifact']);
       expect(bound.toolDefs.filter(tool => tool.name === 'create_artifact')).toHaveLength(1);
       expect(bound.resolvedSystemPrompt).not.toContain('## App creation');
@@ -3168,6 +3188,69 @@ describe('runner › conversation task board turn block (D8/P3)', () => {
     expect(cleared.toolDefs.map(tool => tool.name)).toEqual(plainNames);
     expect(cleared.turnEphemeral).not.toContain('## App creation');
     expect(fs.readFileSync(path.join(tmpDir, uid, 'cloud', 'chats', `${cid}.jsonl`), 'utf8')).toBe('');
+  });
+
+  it.each(['local'] as const)('offers create_artifact only the original %s type inside an application editing task', async appType => {
+    const uid = `app-edit-runner-${appType}`;
+    const users = await import('../../../src/main/features/users');
+    const auth = await import('../../../src/main/features/auth');
+    users.activateUser(uid);
+    const profile = await auth.addApiKey('anthropic', `k-${uid}`, 'Anthropic');
+    await auth.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: profile.profileId });
+    const artifacts = await import('../../../src/main/features/chat_artifacts');
+    const saved = await import('../../../src/main/features/saved_apps');
+    const created = await artifacts.createArtifact(uid, 'edit-source', 'helper', { appType, files: [{ path: 'index.html', content: '<h1>Original</h1>' }] });
+    if (!created.ok) throw new Error(created.error);
+    const kept = await saved.saveFromArtifact(uid, 'edit-source', created.artifactId);
+    if (!kept.ok) throw new Error(kept.error);
+    const edited = await saved.openForEditing(uid, kept.id);
+    if (!edited.ok) throw new Error(edited.error);
+    const cid = (edited.conversation as any).conversation_id;
+    // The full rollback surface exposes create_artifact without a model tool_load.
+    process.env.ORKAS_TOOL_LOADING_MODE = 'legacy';
+    const { buildRunner } = await loadRunner();
+    const runner = await buildRunner({ sessionId: `gconv-${cid}`, userId: uid, cid, onArtifactCreated: vi.fn() });
+    const tool = runner.toolDefs.find(definition => definition.name === 'create_artifact');
+    expect(tool?.inputSchema.properties.appType.enum).toEqual([appType]);
+    const ordinary = await buildRunner({ sessionId: 'gconv-unbound', userId: uid, cid: 'unbound', onArtifactCreated: vi.fn() });
+    expect(ordinary.toolDefs.find(definition => definition.name === 'create_artifact')?.inputSchema.properties.appType.enum).toEqual(['local', 'web']);
+  });
+
+  it.each(['damaged', 'invalid'] as const)('keeps an editing conversation usable but fails create_artifact closed when the binding is %s', async failure => {
+    const uid = `app-edit-binding-${failure}`;
+    const users = await import('../../../src/main/features/users');
+    const auth = await import('../../../src/main/features/auth');
+    users.activateUser(uid);
+    const profile = await auth.addApiKey('anthropic', `k-${uid}`, 'Anthropic');
+    await auth.addEntry({ provider: 'anthropic', model: 'claude-opus-4-8', profileId: profile.profileId });
+    const artifacts = await import('../../../src/main/features/chat_artifacts');
+    const saved = await import('../../../src/main/features/saved_apps');
+    const created = await artifacts.createArtifact(uid, 'edit-source', 'helper', { appType: 'local', files: [{ path: 'index.html', content: '<h1>Original</h1>' }] });
+    if (!created.ok) throw new Error(created.error);
+    const kept = await saved.saveFromArtifact(uid, 'edit-source', created.artifactId);
+    if (!kept.ok) throw new Error(kept.error);
+    const edited = await saved.openForEditing(uid, kept.id);
+    if (!edited.ok) throw new Error(edited.error);
+    const cid = (edited.conversation as any).conversation_id;
+    const contextFile = path.join(tmpDir, uid, 'local/app-edits', cid, 'context.json');
+    const appDir = path.join(tmpDir, uid, 'cloud/saved_apps', kept.id);
+    if (failure === 'damaged') fs.writeFileSync(contextFile, '{ damaged');
+    else {
+      const context = JSON.parse(fs.readFileSync(contextFile, 'utf8')); delete context.appType;
+      fs.writeFileSync(contextFile, JSON.stringify(context));
+      fs.writeFileSync(path.join(appDir, '__orkas-meta.json'), '{ damaged');
+    }
+    process.env.ORKAS_TOOL_LOADING_MODE = 'legacy';
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: `gconv-${cid}`, userId: uid, cid, onArtifactCreated: vi.fn() });
+    expect(built.toolDefs.map(definition => definition.name)).toEqual(expect.arrayContaining(['create_artifact', 'read_files']));
+    const tool = (built.runner as unknown as { tools: Map<string, any> }).tools.get('create_artifact');
+    for (const appType of [undefined, 'local', 'web']) {
+      const result = await tool.execute({ ...(appType ? { appType } : {}), files: [{ path: 'index.html', content: '<h1>Revised</h1>' }] }, { workingDir: tmpDir, state: new Map() } as any);
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result.content)).toContain('reopen editing from the app or save as a new app');
+    }
+    expect(fs.existsSync(path.join(tmpDir, uid, 'cloud/chat_artifacts', cid))).toBe(false);
   });
 
   it('passes setup guidance only through Commander turn context without loading connector tools or changing the system prefix', async () => {
@@ -3243,34 +3326,67 @@ describe('runner › conversation task board turn block (D8/P3)', () => {
   });
 });
 
-describe('runner › isolated memory consolidation', () => {
-  it('uses the configured provider with only the supplied records and no tools or task session', async () => {
-    const complete = vi.fn(async () => ({
-      content: [{ type: 'text', text: '{"groups":[]}' }], stopReason: 'end_turn', model: 'test-model',
-      usage: { inputTokens: 10, outputTokens: 5 },
-    }));
+// D29: the planner uses only the user's primary candidate with no retries,
+// because a planning failure falls back to Commander and must never move a
+// bring-your-own-key user onto another provider.
+describe('runner › tools-free dispatch planning call', () => {
+  async function setup(result: any) {
+    const complete = vi.fn(async () => {
+      if (result instanceof Error) throw result;
+      return result;
+    });
     vi.doMock('#core-agent', async () => ({
       ...(await vi.importActual<any>('#core-agent')),
       createPiProvider: () => ({ id: 'openrouter', name: 'test', complete, validateAuth: async () => true }),
     }));
     const users = await import('../../../src/main/features/users');
     const auth = await import('../../../src/main/features/auth');
-    users.activateUser('maintenance-model-owner');
-    const profile = await auth.addApiKey('openrouter', 'sk-or-maintenance-fixture', 'Fixture');
-    await auth.addEntry({ provider: 'openrouter', model: 'future-lab/test-model', profileId: profile.profileId });
-    const { completeMemoryConsolidation } = await loadRunner();
-    const signal = new AbortController().signal;
-    const message = 'Only the requested memory records.';
-    expect(await completeMemoryConsolidation('maintenance-model-owner', message, signal)).toBe('{"groups":[]}');
+    users.activateUser('dispatch-planner-owner');
+    const profile = await auth.addApiKey('openrouter', 'sk-or-planner-fixture', 'Fixture');
+    // A new entry goes on top of the priority list, so the primary is added last.
+    await auth.addEntry({ provider: 'openrouter', model: 'future-lab/fallback-model', profileId: profile.profileId });
+    await auth.addEntry({ provider: 'openrouter', model: 'future-lab/primary-model', profileId: profile.profileId });
+    const { completeDispatchPlan } = await loadRunner();
+    const input = { userId: 'dispatch-planner-owner', cid: 'planner-task', turnId: 'planner-turn',
+      message: 'Split this message into tasks.', signal: new AbortController().signal };
+    return { complete, run: completeDispatchPlan, input };
+  }
+
+  it('offers no tools or reasoning, keeps billing attribution and charges the task token backstop', async () => {
+    const { complete, run, input } = await setup({
+      content: [{ type: 'text', text: ' {"tasks":[]} ' }], stopReason: 'end_turn',
+      usage: { inputTokens: 20, outputTokens: 10 }, model: 'primary-model',
+    });
+    const meter = await import('../../../src/main/util/conversation-cost-meter');
+    meter.resetTaskTokens(input.cid);
+    expect(await run(input)).toBe('{"tasks":[]}');
     expect(complete).toHaveBeenCalledTimes(1);
     const request = complete.mock.calls[0][0] as any;
-    expect(request.messages).toEqual([{ role: 'user', content: [{ type: 'text', text: message }] }]);
     expect(request.tools).toEqual([]);
+    expect(request.maxTokens).toBe(2048);
+    expect(request.reasoning).toBe('off');
+    expect(request.model).toContain('primary-model');
+    expect(request.messages).toEqual([{ role: 'user', content: [{ type: 'text', text: input.message }] }]);
     expect(request.systemPrompt).toBeUndefined();
     expect(request.sessionId).toBeUndefined();
-    expect(request.maxTokens).toBe(4096);
-    await expect(completeMemoryConsolidation('other-owner', message, signal)).rejects.toThrow('cancelled');
+    expect(request.requestMetadata.creditContext).toEqual({ conversationId: input.cid, turnId: input.turnId });
+    expect(meter.taskTokens(input.cid)).toBe(30);
+    await expect(run({ ...input, userId: 'another-account' })).rejects.toThrow('cancelled');
+    await expect(run({ ...input, message: 'x'.repeat(64_001) })).rejects.toThrow('input limit');
+    const controller = new AbortController(); controller.abort();
+    await expect(run({ ...input, signal: controller.signal })).rejects.toThrow('cancelled');
     expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['truncated', { content: [{ type: 'text', text: '{"tasks":' }], stopReason: 'max_tokens' }],
+    ['tool request', { content: [{ type: 'tool_use', id: 't', name: 'bash', input: {} }], stopReason: 'tool_use' }],
+    ['network failure', Object.assign(new Error('network fixture'), { code: 'ECONNRESET' })],
+  ])('rejects %s without retrying or trying the fallback model', async (_, result) => {
+    const { complete, run, input } = await setup(result);
+    await expect(run(input)).rejects.toThrow();
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect((complete.mock.calls[0][0] as any).model).toContain('primary-model');
   });
 });
 

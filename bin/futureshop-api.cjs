@@ -62,10 +62,17 @@ async function request(config, route, { query = {}, body, token = false, method,
   // Provider limit is one request/second per client. At most one second is queued;
   // competing requests fail explicitly instead of accumulating or replaying writes.
   const state = session(config);
-  const delay = state.next - Date.now();
-  if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
-  if (Date.now() < state.next) fail('E_TOOL_CALL_RATE_LIMIT', 'futureshop permits one request per second; try again shortly');
-  state.next = Date.now() + 1000;
+  const availableAt = state.next;
+  let delay = availableAt - performance.now();
+  // Keep this request's deadline fixed so competitors cannot extend its queue.
+  // Timers may wake early; the monotonic clock owns the provider interval.
+  while (delay > 0) {
+    await new Promise(resolve => setTimeout(resolve, Math.ceil(delay)));
+    delay = availableAt - performance.now();
+  }
+  const now = performance.now();
+  if (now < state.next) fail('E_TOOL_CALL_RATE_LIMIT', 'futureshop permits one request per second; try again shortly');
+  state.next = now + 1000;
   const c = config.credentials;
   const deadline = AbortSignal.timeout(60000);
   let response;

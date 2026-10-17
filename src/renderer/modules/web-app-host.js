@@ -12,12 +12,20 @@
   }
   function attach(frame, info) {
     release(frame);
-    frame._orkasUsesSdk = !!info.token;
+    frame._orkasUsesSdk = !!info.token && !info.browserOnly;
     if (!info.token) { frame.src = info.url; return; }
     const parsed = new URL(info.url);
-    const b = { token: info.token, origin: parsed.protocol + '//' + parsed.host, streams: new Map() };
+    const b = { sdk: frame._orkasUsesSdk, token: info.token, origin: parsed.protocol + '//' + parsed.host, streams: new Map() };
     bindings.set(frame, b);
     frame.src = info.url;
+  }
+  async function canSubmitArtifact(frame) {
+    const b = bindings.get(frame);
+    if (!b || !b.sdk || !frame.isConnected) return false;
+    try {
+      const result = await window.orkas.invoke('webApps.canSubmitArtifact', { token: b.token });
+      return result?.ok === true && result.allowed === true && bindings.get(frame) === b && frame.isConnected;
+    } catch { return false; }
   }
   async function open(frame, source) {
     release(frame);
@@ -28,20 +36,21 @@
         if (r.token) window.orkas.invoke('webApps.close', { token: r.token }).catch(() => {});
         return;
       }
-      if (!r.ok) throw new Error(r.error || 'Application unavailable');
+      if (!r.ok) throw Object.assign(new Error(r.error || 'Application unavailable'), r);
       attach(frame, r);
     } catch (error) {
-      if (opening.get(frame) !== generation) return;
+      if (opening.get(frame) !== generation || !frame.isConnected) return;
       frame.removeAttribute('src');
-      if (typeof uiAlert === 'function') uiAlert(error.message);
       // Fail closed for an invalid SDK manifest, never downgrade to the old origin.
-      frame.dispatchEvent(new CustomEvent('orkas-app-error', { detail: error.message }));
+      const commercial = window.OrkasCommercialEntry?.isFailure(error);
+      const unhandled = frame.dispatchEvent(new CustomEvent('orkas-app-error', { detail: commercial ? error : error.message, cancelable: true }));
+      if (unhandled && typeof uiAlert === 'function') uiAlert(error.message);
     }
   }
   window.addEventListener('message', event => {
     const d = event.data;
     if (!d || d.__orkasApp !== 1 || typeof d.id !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(d.id)) return;
-    const entry = [...bindings.entries()].find(([frame, b]) => frame.isConnected && frame.contentWindow === event.source && b.origin === event.origin);
+    const entry = [...bindings.entries()].find(([frame, b]) => b.sdk && frame.isConnected && frame.contentWindow === event.source && b.origin === event.origin);
     if (!entry) return;
     const [frame, b] = entry;
     const reply = (type, extra) => {
@@ -74,5 +83,5 @@
     for (const frame of bindings.keys()) if (!frame.isConnected || !frame.getAttribute('src')) release(frame);
   }).observe(document.documentElement, { subtree: true, childList: true, attributes: true, attributeFilter: ['src'] });
   window.addEventListener('pagehide', () => { for (const frame of bindings.keys()) release(frame); });
-  window.OrkasWebAppHost = { open, attach, release, isManaged: frame => !!frame._orkasUsesSdk };
+  window.OrkasWebAppHost = { open, attach, release, canSubmitArtifact, isManaged: frame => !!frame._orkasUsesSdk };
 })();

@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { createRequire } from 'node:module';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -10,6 +11,9 @@ import {
   ensureEmbeddingModel,
   installVerifiedModel,
 } from '../../../scripts/fetch-embedding-model.mjs';
+
+const require = createRequire(import.meta.url);
+const { EMBEDDING_MODEL_CONTRACT, verifyEmbeddingModelRoot } = require('../../../bin/packaged-resource-gate.cjs');
 
 let root = '';
 const servers: http.Server[] = [];
@@ -105,6 +109,49 @@ describe('embedding model archive download', () => {
 });
 
 describe('embedding model staged installation', () => {
+  it('installs the exact existing model from pinned public files without the retired archive service', async () => {
+    const destination = path.join(root, 'resources', 'embedding-model');
+    const source = path.join(process.cwd(), 'resources', 'embedding-model', EMBEDDING_MODEL_CONTRACT.id);
+    const downloadArchive = vi.fn(async () => { throw new Error('HTTP 403 from retired archive service'); });
+    const downloadFile = vi.fn(async (_url: string, output: string) => {
+      fs.copyFileSync(path.join(source, path.basename(output)), output);
+    });
+
+    await ensureEmbeddingModel({ destination, downloadArchive, downloadFile, log: vi.fn(), warn: vi.fn() });
+
+    expect(verifyEmbeddingModelRoot(destination)).toBe('resource:embedding-model:fast-bge-small-zh-v1.5');
+    expect(downloadArchive).not.toHaveBeenCalled();
+    expect(downloadFile.mock.calls.map(([url]) => url)).toEqual(
+      ['config.json', 'model_optimized.onnx', 'ort_config.json', 'special_tokens_map.json',
+        'tokenizer.json', 'tokenizer_config.json', 'vocab.txt'].map(name =>
+        `https://huggingface.co/Qdrant/bge-small-zh-v1.5/resolve/46fbe35fd4374a00fee7de77dfddaeb6dd6a2c59/${name}`),
+    );
+    for (const call of downloadFile.mock.calls as unknown as Array<[string, string, { expectedBytes: number; totalTimeoutMs: number }]>) {
+      expect(call[2].expectedBytes).toBeGreaterThan(0);
+      expect(call[2].totalTimeoutMs).toBeGreaterThan(0);
+      expect(call[2].totalTimeoutMs).toBeLessThanOrEqual(600_000);
+    }
+  });
+
+  it('rejects a same-size changed public file before replacing the old payload or downloading later files', async () => {
+    const destination = path.join(root, 'resources', 'embedding-model');
+    const old = path.join(destination, EMBEDDING_MODEL_CONTRACT.id, 'old');
+    fs.mkdirSync(path.dirname(old), { recursive: true });
+    fs.writeFileSync(old, 'preserve');
+    const downloadFile = vi.fn(async (_url: string, output: string) => {
+      fs.writeFileSync(output, Buffer.alloc(739, 0));
+    });
+
+    await expect(ensureEmbeddingModel({
+      destination, downloadFile, downloadArchive: async () => { throw new Error('retired archive'); },
+      log: vi.fn(), warn: vi.fn(),
+    })).rejects.toThrow(/sha256 mismatch/);
+
+    expect(downloadFile).toHaveBeenCalledOnce();
+    expect(fs.readFileSync(old, 'utf8')).toBe('preserve');
+    expect(fs.readdirSync(path.dirname(destination)).filter(name => name.startsWith('.embedding-model-fetch-'))).toEqual([]);
+  });
+
   it('uses a verified installed model without downloading and cleans a legacy partial archive', async () => {
     const destination = path.join(root, 'resources', 'embedding-model');
     const modelDir = path.join(destination, 'model');

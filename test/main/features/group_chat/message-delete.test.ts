@@ -17,7 +17,9 @@ beforeEach(async () => {
   users.activateUser(UID);
 });
 
-afterEach(() => {
+afterEach(async () => {
+  // Deletion queues a search rewrite; drain it and close SQLite before cleanup.
+  await (await import('../../../../src/main/features/search/indexer')).flushAll();
   process.env.ORKAS_WORKSPACE_ROOT = previousWorkspace;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -60,5 +62,37 @@ describe('group_chat message deletion', () => {
     expect(fs.existsSync(retainedAttachment)).toBe(true);
     expect(fs.existsSync(sessionFile)).toBe(false);
     expect(fs.readFileSync(retainedResult, 'utf8')).toBe('original output for a surviving record');
+  });
+
+  // A deleted message must also leave global search, including after a clean
+  // restart now that a clean quit keeps a verified index trusted.
+  it('removes deleted text from global search, including after a clean restart', async () => {
+    const layoutModule = await import('../../../../src/main/util/project-layout');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const layout = layoutModule.conversationLayout(UID, CID);
+    const rows = [
+      { id: 'keep-msg', ts: '2026-07-10T10:00:00', from: 'user', to: ['commander'], text: 'wombat itinerary' },
+      { id: 'delete-msg', ts: '2026-07-10T10:01:00', from: 'commander', to: ['user'], text: 'porcupine secret' },
+    ];
+    fs.mkdirSync(path.dirname(layout.messageFile), { recursive: true });
+    fs.writeFileSync(layout.messageFile, rows.map((row) => JSON.stringify(row)).join('\n') + '\n');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    await state.seedReservedActors(UID, CID);
+    const search = await import('../../../../src/main/features/search');
+    const indexer = await import('../../../../src/main/features/search/indexer');
+    await indexer.reconcileChatsIndex(UID);
+    expect((await search.searchChats(UID, 'porcupine')).map((hit) => hit.msg_index)).toEqual([1]);
+
+    expect(await groupChat.deleteMessages(UID, CID, ['delete-msg'])).toMatchObject({ ok: true });
+
+    expect(await search.searchChats(UID, 'porcupine')).toEqual([]);
+    expect((await search.searchChats(UID, 'wombat')).map((hit) => hit.msg_index)).toEqual([0]);
+    expect(indexer.isChatsIndexTrusted(UID)).toBe(true);
+    await indexer.flushAll();
+    vi.resetModules();
+    const restarted = await import('../../../../src/main/features/search');
+    expect(await restarted.searchChats(UID, 'porcupine')).toEqual([]);
+    expect((await restarted.searchChats(UID, 'wombat')).map((hit) => hit.msg_index)).toEqual([0]);
+    await (await import('../../../../src/main/features/search/indexer')).flushAll();
   });
 });

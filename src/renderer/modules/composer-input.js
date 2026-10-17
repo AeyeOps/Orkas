@@ -187,7 +187,24 @@ function composerSnapshot(input) {
 }
 function composerBindOwner(input, owner) {
   const api = _composerApi(input);
-  if (!api || api.owner === owner) return;
+  if (!api) return;
+  let doc = api.view.state.doc;
+  if (api.editor.id === 'project-chat-input') {
+    // The shared project panel must swap documents at the synchronous routing
+    // boundary, before its deferred project data load. Keep immutable drafts
+    // in this renderer session, scoped to the account as well as the project.
+    const account = typeof currentUserId === 'string' ? currentUserId : '';
+    const accountChanged = api.draftAccount !== account;
+    if (!accountChanged && api.owner === owner) return;
+    if (accountChanged) {
+      api.projectDrafts = new Map();
+      api.draftAccount = account;
+    } else if (api.owner) {
+      if (doc.content.size > 2) api.projectDrafts.set(api.owner, { doc, stamp: api.stamp });
+      else api.projectDrafts.delete(api.owner);
+    }
+    doc = api.projectDrafts.get(owner)?.doc || _composerDocument('', api.editor.id);
+  } else if (api.owner === owner) return;
   api.owner = owner;
   api.resetHistoryOnSet = true;
   api.epoch++;
@@ -201,7 +218,14 @@ function composerBindOwner(input, owner) {
   }
   // Undo must never restore a different task's draft.
   api.view.updateState(OrkasEditor.EditorState.create({ schema: _composerSchema,
-    doc: api.view.state.doc, plugins: api.plugins }));
+    doc, plugins: api.plugins }));
+  if (api.editor.id === 'project-chat-input') api.autoGrow();
+}
+function composerDiscardStoredDraft(input, owner, snapshot) {
+  const api = _composerApi(input);
+  // A background send may finish after the panel switched projects. Consume
+  // only the submitted revision; edits made during the send remain unsent.
+  if (api?.projectDrafts?.get(owner)?.stamp === snapshot.stamp) api.projectDrafts.delete(owner);
 }
 function composerSetDisabled(input, disabled) {
   const el = _composerElement(input), api = _composerApi(el);

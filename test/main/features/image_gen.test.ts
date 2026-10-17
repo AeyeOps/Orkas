@@ -144,7 +144,7 @@ describe('image_gen › pickImageGenProfile', () => {
     const m = await import('../../../src/main/features/image_gen');
     const picked = m.pickImageGenProfile();
     expect(picked!.entry.profileId).toBe('google:studio');
-    expect(picked!.capability.model).toBe('gemini-3.1-flash-image-preview');
+    expect(picked!.capability.model).toBe('gemini-nano-banana-2.1');
     expect(picked!.capability.api).toBe('gemini');
   });
 });

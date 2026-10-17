@@ -1,5 +1,5 @@
 import type { Page } from '@playwright/test';
-import { expect, OrkasTestApp, test as base } from './fixtures/orkas';
+import { openSidebarEntry, expect, OrkasTestApp, test as base } from './fixtures/orkas';
 
 const test = base.extend<{ cliModelOrkas: OrkasTestApp }>({
   cliModelOrkas: async ({}, use, testInfo) => {
@@ -36,7 +36,7 @@ type AutoTask = {
 };
 
 async function openAutomation(page: Page): Promise<void> {
-  await page.locator('#auto-btn').click();
+  await openSidebarEntry(page, '#auto-btn');
   await expect(page.locator('#panel-auto')).toHaveClass(/\bactive\b/);
   await expect(page.locator('#auto-add-btn')).toBeVisible();
 }
@@ -54,6 +54,63 @@ test.describe('automation', () => {
   // one-lifecycle budget even when each user-visible assertion is prompt.
   test.describe.configure({
     timeout: process.platform === 'win32' ? 120_000 : 60_000,
+  });
+
+  test.describe('personal project Agent persistence', () => {
+    test('saves and edits a selected personal project Agent across relaunch', async ({ orkas }) => {
+      const project = await orkas.invoke<{ project: { project_id: string } }>('projects.create', {
+        name: 'Personal automation project',
+      });
+      const agent = await orkas.invoke<{ agent: { agent_id: string } }>('agents.create', {
+        name: 'PersonalAutomationReviewer', description: 'Review project status', category: 'general',
+      });
+      // The open build keeps local project Agent bindings without hosted
+      // shared-to-private conversion or its private-roster implementation.
+      const bound = await orkas.invoke<{ bindings: { agents: string[] } }>('projects.bindings.add', {
+        projectId: project.project.project_id, kind: 'agent', id: agent.agent.agent_id,
+      });
+      expect(bound.bindings.agents).toContain(agent.agent.agent_id);
+      let page = await orkas.relaunch();
+      await openAutomation(page);
+      await page.locator('#auto-add-btn').click();
+      await selectAiOption(page, '#auto-project-select', 'Personal automation project');
+      await page.locator('#auto-recipient-chip').click();
+      const picker = page.locator('#agent-picker');
+      await expect(picker).toBeVisible();
+      await picker.locator(`.skill-picker-item[data-id="${agent.agent.agent_id}"]`).click();
+      await expect(page.locator('#auto-recipient-name')).toHaveText('PersonalAutomationReviewer');
+      await page.locator('#auto-task-input').fill('Review personal project status');
+      await page.locator('#auto-title-input').fill('Personal Agent automation');
+      await page.locator('#auto-enabled-input').uncheck();
+      await page.locator('#auto-submit-btn').click();
+      await expect(page.locator('#auto-task-dialog-overlay')).toBeHidden();
+      const listed = await orkas.invoke<{ tasks: Array<AutoTask & { recipient: { id: string } }> }>(
+        'autoTasks.list', { projectId: project.project.project_id },
+      );
+      expect(listed.tasks).toHaveLength(1);
+      expect(listed.tasks[0]).toMatchObject({
+        content: 'Review personal project status', enabled: false,
+        recipient: { kind: 'agent', id: agent.agent.agent_id },
+      });
+      page = await orkas.relaunch();
+      await openAutomation(page);
+      await page.locator(`#auto-list .todo-scope-chip[data-project-id="${project.project.project_id}"]`).click();
+      const row = page.locator(`.auto-row[data-task-id="${listed.tasks[0].id}"]`);
+      await expect(row).toBeVisible();
+      await row.hover();
+      await row.locator('.auto-row-more').click();
+      await page.locator('.auto-row-menu [data-action="edit"]').click();
+      await expect(page.locator('#auto-recipient-name')).toHaveText('PersonalAutomationReviewer');
+      await page.locator('#auto-task-input').fill('Review edited personal project status');
+      await page.locator('#auto-submit-btn').click();
+      await expect(page.locator('#auto-task-dialog-overlay')).toBeHidden();
+      expect((await orkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list', {
+        projectId: project.project.project_id,
+      })).tasks).toEqual([expect.objectContaining({
+        id: listed.tasks[0].id, content: 'Review edited personal project status',
+        recipient: expect.objectContaining({ id: agent.agent.agent_id }),
+      })]);
+    });
   });
 
   test('switches automation projects and keeps the selected scope through project renames', async ({ orkas }, testInfo) => {
@@ -114,17 +171,26 @@ test.describe('automation', () => {
     await expect(project10Scope).toHaveAttribute('aria-pressed', 'true');
     await expect(group10.locator(`.auto-row[data-task-id="${task10.task.id}"]`)).toBeVisible();
 
-    // Only the page-level Create button remains; selecting a scope does not
-    // silently change where a new automation will be filed.
+    // Page-level creation starts in the visible scope, with an editable picker.
     await expect(page.locator('#auto-list .auto-scope-add')).toHaveCount(0);
     await page.locator('#auto-add-btn').click();
-    await expect(page.locator('#auto-project-select')).toHaveAttribute('data-value', '');
+    await expect(page.locator('#auto-project-select')).toHaveAttribute('data-value', project10.project.project_id);
+    await expect(page.locator('#auto-row-project')).toBeVisible();
+    await selectAiOption(page, '#auto-project-select', 'Automation 2');
+    await page.locator('#auto-task-input').fill('Cancelled draft');
+    await page.evaluate(async () => (window as any).loadAutoList(true));
+    await expect(page.locator('#auto-project-select')).toHaveAttribute('data-value', project2.project.project_id);
+    await expect(page.locator('#auto-task-input')).toHaveText('Cancelled draft');
+    await page.locator('#auto-dialog-cancel-btn').click();
+    await page.locator('#auto-add-btn').click();
+    await expect(page.locator('#auto-project-select')).toHaveAttribute('data-value', project10.project.project_id);
+    await expect(page.locator('#auto-task-input')).toHaveText('');
+    await page.locator('#auto-task-dialog-overlay').screenshot({ path: testInfo.outputPath('automation-default-project-en.png') });
     await page.locator('#auto-dialog-cancel-btn').click();
 
-    // The project picker in the shared dialog still files the new task there.
+    // The default itself reaches storage without manually selecting a project.
     await project2Scope.click();
     await page.locator('#auto-add-btn').click();
-    await selectAiOption(page, '#auto-project-select', 'Automation 2');
     await expect(page.locator('#auto-project-select')).toHaveAttribute('data-value', project2.project.project_id);
     await page.locator('#auto-task-input').fill('Prepare a project follow-up');
     await page.locator('#auto-title-input').fill('Project follow-up');
@@ -153,6 +219,19 @@ test.describe('automation', () => {
     await expect(scopeNames).toHaveText(['全局', 'Automation 1', 'Automation 2']);
     await project10Scope.click();
     await expect(group10.locator(`.auto-row[data-task-id="${task10.task.id}"]`)).toBeVisible();
+    await page.locator('#auto-add-btn').click();
+    await expect(page.locator('#auto-project-select')).toHaveAttribute('data-value', project10.project.project_id);
+    await selectAiOption(page, '#auto-project-select', '全局');
+    await page.locator('#auto-task-input').fill('Explicit global follow-up');
+    await page.locator('#auto-enabled-input').uncheck();
+    await page.setViewportSize({ width: 800, height: 850 });
+    await page.locator('#auto-task-dialog-overlay').screenshot({ path: testInfo.outputPath('automation-project-override-zh.png') });
+    await page.locator('#auto-submit-btn').click();
+    await expect(page.locator('#auto-task-dialog-overlay')).toBeHidden();
+    const globalTasks = await orkas.invoke<{ tasks: AutoTask[] }>('autoTasks.list', { projectId: null });
+    expect(globalTasks.tasks.find(task => task.content === 'Explicit global follow-up')).toMatchObject({ enabled: false });
+    expect(globalTasks.tasks.find(task => task.content === 'Explicit global follow-up')?.project_id).toBeUndefined();
+    await page.setViewportSize({ width: 1440, height: 900 });
     await page.screenshot({ path: testInfo.outputPath('automation-project-groups.png') });
     await page.setViewportSize({ width: 800, height: 850 });
     await expect(group10.locator(`.auto-row[data-task-id="${task10.task.id}"]`)).toBeVisible();
@@ -224,6 +303,37 @@ test.describe('automation', () => {
       enabled: true,
       schedule: { type: 'daily', hour: 19, minute: 45 },
     });
+    expect(modelOrkas.modelRequests).toHaveLength(1);
+  });
+
+  test('shows a scheduled run as running before opening its conversation', async ({ modelOrkas }, testInfo) => {
+    const page = modelOrkas.page!;
+    modelOrkas.setModelMode('controlled-slow');
+    // This case owns a running scheduled task after the boot subscription is
+    // connected, rather than a fire during the deliberately deferred warmup.
+    await page.waitForFunction('typeof _autoEventsHandle !== "undefined" && _autoEventsHandle !== null');
+    const created = await modelOrkas.invoke<{ task: AutoTask }>('autoTasks.create', {
+      content: 'Summarize the release checks',
+      title: 'Scheduled status check',
+      schedule: { type: 'one_time', at: new Date(Date.now() + 1_500).toISOString() },
+    });
+    let cid = '';
+    await expect.poll(async () => {
+      const result = await modelOrkas.invoke<{
+        conversations: Array<{ conversation_id: string; origin_auto_task_id?: string }>;
+      }>('conversations.list');
+      cid = result.conversations.find(item => item.origin_auto_task_id === created.task.id)?.conversation_id || '';
+      return cid;
+    }, { timeout: 30_000 }).not.toBe('');
+    await expect.poll(() => modelOrkas.modelRequests.length).toBe(1);
+    const row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await expect(row).toBeVisible();
+    await expect(row.locator('.conv-status-badge.is-streaming')).toBeVisible();
+    await expect(page.locator('#panel-new-chat')).toHaveClass(/\bactive\b/);
+    await page.screenshot({ path: testInfo.outputPath('scheduled-running-status.png') });
+    modelOrkas.releaseControlledModelChunk();
+    modelOrkas.finishControlledModelStream();
+    await expect(row.locator('.conv-status-badge.is-streaming')).toHaveCount(0);
     expect(modelOrkas.modelRequests).toHaveLength(1);
   });
 

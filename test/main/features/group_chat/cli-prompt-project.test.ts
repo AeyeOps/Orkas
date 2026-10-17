@@ -309,6 +309,10 @@ describe('CLI context › own Agent memory', () => {
       expect(rendered).not.toContain('UNSUPPORTED_CLI_PRIVATE_MEMORY');
       expect(rendered).not.toContain('## Durable memory for this agent');
       expect(rendered).toContain('project context remains available');
+      // The bridge grants these CLIs project-memory writes, so the record
+      // heading must not tell the model the store is read-only.
+      expect(plan.turnPrompt).toContain('## Project memory — contextual records');
+      expect(rendered).not.toContain('read-only contextual records');
     },
   );
 });

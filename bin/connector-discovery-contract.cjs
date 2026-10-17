@@ -1,6 +1,8 @@
 /** Shared discovery parameters for native tools and all external CLI bridges. */
 'use strict';
 
+const { defaultNumericRange } = require('./tool-input-compat.cjs');
+
 exports.description = 'Discover visible connectors. With connector_id, small catalogs return all schemas; large catalogs return a bounded page. query searches visible action names, descriptions and argument names with BM25 (keywords, no embeddings); omit connector_id to search across connectors. tool_name expands one exact schema before calling the connector.';
 exports.callSuitability = 'Call only when the action description supports the requested operation. Matching argument types, similar names or shared record numbers do not establish suitability.';
 exports.emptySearchGuidance = 'No keyword matches in the entire visible action catalog for this scope; pagination cannot find more matches for this query. This does not prove the capability is absent. Try provider-language action terms if not tried. If those also find no action whose description supports the request, stop and explain that no suitable action was found in the current visible scope. Do not call an unrelated action.';
@@ -21,5 +23,13 @@ exports.shape = z => Object.fromEntries(Object.entries(exports.inputSchema.prope
   if (field.maxLength !== undefined) value = value.max(field.maxLength);
   if (field.minimum !== undefined) value = value.min(field.minimum);
   if (field.maximum !== undefined) value = value.max(field.maximum);
-  return [key, value.optional().describe(field.description)];
+  return [key, (key === 'limit'
+    ? value.optional().catch(context => {
+      // Keep the operand until host validation: JSON drops undefined, losing
+      // exact-schema conflicts and the search-versus-browse default choice.
+      if (context.input === undefined) return undefined;
+      if (defaultNumericRange(context.input, undefined, 1, 50) !== context.input) return context.input;
+      throw context.error;
+    })
+    : value.optional()).describe(field.description)];
 }));

@@ -65,6 +65,23 @@ afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+describe('task_board › planned split note (D29)', () => {
+  it('keeps a planned task\'s split note across a reload so a later reply still gets it', async () => {
+    const tb = await board();
+    const created = await tb.createTask(TEST_UID, TEST_CID, {
+      assignee: 'agent-a',
+      instruction: 'MAKE_THE_VIDEO',
+      createdBy: 'user',
+      assignmentContext: '<task-assignment>\nThis message continues your task …\n</task-assignment>',
+    });
+    expect(created.assignment_context).toContain('continues your task');
+    expect((await readSnapshot())[0].assignment_context).toContain('continues your task');
+    tb._resetForTest();
+    const reloaded = (await tb.listTasks(TEST_UID, TEST_CID)).find((row) => row.task_id === created.task_id);
+    expect(reloaded?.assignment_context).toContain('continues your task');
+  });
+});
+
 describe('task_board › lifecycle', () => {
   it('reports listener failure privately and still persists the task and notifies other listeners', async () => {
     const tb = await board();
@@ -499,18 +516,32 @@ describe('task_board › prune', () => {
     const ids = new Set((await tb.listTasks(TEST_UID, TEST_CID)).map((t) => t.task_id));
     expect(ids.has('t-ref')).toBe(true);   // referenced predecessor survives
     expect(ids.has('t-live')).toBe(true);  // non-terminal survives
+    // A legacy single-id `after` loads as a one-element dependency list (D29).
+    expect((await tb.listTasks(TEST_UID, TEST_CID)).find((t) => t.task_id === 't-live')?.after).toEqual(['t-ref']);
     expect(ids.has('t-0')).toBe(false);    // oldest unreferenced terminal pruned
     expect(ids.size).toBeLessThanOrEqual(201); // cap + the one new row
   });
 });
 
-describe('task_board › after chain (§4.8)', () => {
+describe('task_board › after dependencies (§4.8, D29)', () => {
+  it('createTask stores every predecessor once, in declared order, and the board snapshot lists them', async () => {
+    const tb = await board();
+    const a = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'x', instruction: 'a', createdBy: 'user' });
+    const b = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'y', instruction: 'b', createdBy: 'user' });
+    const c = await tb.createTask(TEST_UID, TEST_CID, {
+      assignee: 'z', instruction: 'merge both drafts', createdBy: 'user', after: [a.task_id, b.task_id, a.task_id, ''],
+    });
+    expect(c.after).toEqual([a.task_id, b.task_id]);
+    const block = await tb.formatConversationBoardForTurn(TEST_UID, TEST_CID);
+    expect(block).toContain(`after=${a.task_id},${b.task_id}`);
+  });
+
   it('setTaskAfter validates: queued-only, existing predecessor, no self-reference, no cycle', async () => {
     const tb = await board();
     const a = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'x', instruction: 'a', createdBy: 'user' });
     const b = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'y', instruction: 'b', createdBy: 'user' });
 
-    expect((await tb.setTaskAfter(TEST_UID, TEST_CID, b.task_id, a.task_id)).task?.after).toBe(a.task_id);
+    expect((await tb.setTaskAfter(TEST_UID, TEST_CID, b.task_id, a.task_id)).task?.after).toEqual([a.task_id]);
     expect((await tb.setTaskAfter(TEST_UID, TEST_CID, b.task_id, b.task_id)).error).toBe('self_reference');
     expect((await tb.setTaskAfter(TEST_UID, TEST_CID, b.task_id, 'nonexistent1')).error).toBe('predecessor_missing');
     // b→a stands; a→b would close the cycle.
@@ -522,11 +553,13 @@ describe('task_board › after chain (§4.8)', () => {
     expect((await tb.setTaskAfter(TEST_UID, TEST_CID, a.task_id, b.task_id)).error).toBe('not_queued');
   });
 
-  it('blocked lifecycle: queued → blocked → requeue clears the pointer; blocked rows are cancellable', async () => {
+  it('blocked lifecycle: queued → blocked → requeue drops the failed predecessor; blocked rows are cancellable', async () => {
     const tb = await board();
     const a = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'x', instruction: 'a', createdBy: 'user' });
     const b = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'y', instruction: 'b', createdBy: 'user' });
     await tb.setTaskAfter(TEST_UID, TEST_CID, b.task_id, a.task_id);
+    await tb.claimTask(TEST_UID, TEST_CID, a.task_id);
+    await tb.finishTask(TEST_UID, TEST_CID, a.task_id, 'failed');
 
     expect((await tb.markBlocked(TEST_UID, TEST_CID, b.task_id))?.status).toBe('blocked');
     // Only queued rows can block; a blocked row cannot double-block.
@@ -538,6 +571,26 @@ describe('task_board › after chain (§4.8)', () => {
 
     await tb.markBlocked(TEST_UID, TEST_CID, b.task_id);
     expect((await tb.cancelPending(TEST_UID, TEST_CID, b.task_id))?.status).toBe('cancelled');
+  });
+
+  it('run anyway keeps predecessors that are done or still pending and drops the ones that ended without done', async () => {
+    const tb = await board();
+    const failed = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'x', instruction: 'research', createdBy: 'user' });
+    const pending = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'y', instruction: 'statistics', createdBy: 'user' });
+    const done = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'w', instruction: 'outline', createdBy: 'user' });
+    const merge = await tb.createTask(TEST_UID, TEST_CID, {
+      assignee: 'commander', instruction: 'merge into a deck', createdBy: 'user',
+      after: [failed.task_id, pending.task_id, done.task_id],
+    });
+    await tb.claimTask(TEST_UID, TEST_CID, failed.task_id);
+    await tb.finishTask(TEST_UID, TEST_CID, failed.task_id, 'failed');
+    await tb.claimTask(TEST_UID, TEST_CID, done.task_id);
+    await tb.finishTask(TEST_UID, TEST_CID, done.task_id, 'done');
+    await tb.markBlocked(TEST_UID, TEST_CID, merge.task_id);
+
+    const requeued = await tb.requeueBlocked(TEST_UID, TEST_CID, merge.task_id);
+    expect(requeued?.status).toBe('queued');
+    expect(requeued?.after).toEqual([pending.task_id, done.task_id]);
   });
 });
 
@@ -840,11 +893,11 @@ describe('task_board › queued message edits', () => {
     const tb = await board();
     const predecessor = await tb.createTask(TEST_UID, TEST_CID, { assignee: 'commander', instruction: 'first', createdBy: 'user' });
     const queued = await tb.createTask(TEST_UID, TEST_CID, {
-      assignee: 'commander', instruction: 'original', createdBy: 'user', after: predecessor.task_id, attachments: ['file.txt'],
+      assignee: 'commander', instruction: 'original', createdBy: 'user', after: [predecessor.task_id], attachments: ['file.txt'],
     });
     const apply = vi.fn(() => ({ sourceMsgId: 'edited-source' }));
     expect(await tb.editQueued(TEST_UID, TEST_CID, queued.task_id, 'new text', 'original', apply))
-      .toMatchObject({ task: { task_id: queued.task_id, instruction: 'new text', after: predecessor.task_id, attachments: ['file.txt'], instruction_revision: 1 } });
+      .toMatchObject({ task: { task_id: queued.task_id, instruction: 'new text', after: [predecessor.task_id], attachments: ['file.txt'], instruction_revision: 1 } });
     expect((await readSnapshot()).find((row) => row.task_id === queued.task_id))
       .toMatchObject({ instruction: 'new text', source_msg_id: 'edited-source', instruction_revision: 1 });
     tb.dropBoard(TEST_UID, TEST_CID, { persistPending: false });

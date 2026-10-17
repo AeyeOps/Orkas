@@ -375,3 +375,55 @@ it('uses pi to keep distinct parallel receipts when Responses call ids share a p
     { tool_call_id: calls[0].id, content: 'one' }, { tool_call_id: calls[1].id, content: 'two' },
   ]);
 });
+
+// Exercise the installed Anthropic serializer, not a copied normalization callback.
+it.each(['complete', 'stream'] as const)('pairs mixed-source calls on Anthropic %s without losing signed siblings', async method => {
+  const target = { ...model, api: 'anthropic-messages' as const, provider: 'anthropic', id: 'claude-fixture' };
+  const native = replayOrigin(target, 'fixture');
+  const foreign = replayOrigin(model, 'fixture');
+  const ids = ['same-prefix|' + 'x'.repeat(100) + 'a', 'same-prefix|' + 'x'.repeat(100) + 'b', 'valid_native',
+    // A native call can already own the first deterministic projected ID.
+    'ork_708dc3ed11a9d04827b977dc2ead252df3d0a3d0708c08ce3457e460cc5f'];
+  const externalId = 'ork_fd33f0568715d2b634aea328c7a6a1101c643a7065ff698c39e7834a974b|foreign';
+  const messages: CompletionParams['messages'] = [
+    { role: 'assistant', content: [{ type: 'tool_use', id: externalId, name: 'inspect', input: {}, replayOrigin: foreign }] },
+    { role: 'user', content: [{ type: 'tool_result', toolUseId: externalId, content: 'external' }] },
+    { role: 'assistant', content: [
+    { type: 'thinking', thinking: 'Native thought', thinkingSignature: 'NATIVE_SIGNATURE', replayOrigin: native },
+    ...ids.map((id, index): MessageContent => ({ type: 'tool_use', id, name: 'inspect', input: { index },
+      replayOrigin: index >= 2 ? native : foreign, ...(index < 2 ? { thoughtSignature: 'FOREIGN_SIGNATURE' } : {}) })),
+  ] }, { role: 'user', content: ids.map((id, index) => ({ type: 'tool_result', toolUseId: id, content: String(index) })) }];
+  const original = JSON.stringify(messages);
+  const requests: any[] = [];
+  vi.stubGlobal('fetch', vi.fn(async (_url: unknown, init: any) => {
+    requests.push(JSON.parse(init.body));
+    const events = [
+      { type: 'message_start', message: { id: 'msg_fixture', type: 'message', role: 'assistant', model: target.id,
+        content: [], usage: { input_tokens: 1, output_tokens: 0 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Done' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } },
+      { type: 'message_stop' },
+    ];
+    return new Response(events.map(e => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join(''),
+      { headers: { 'content-type': 'text/event-stream' } });
+  }));
+  const provider = createPiProvider({ provider: 'anthropic', apiKey: 'fixture', customModel: target });
+  await invoke(provider, method, { messages });
+  await invoke(provider, method, { messages });
+  const blocks = requests[0].messages.flatMap((m: any) => m.content);
+  const calls = blocks.filter((b: any) => b.type === 'tool_use');
+  const receipts = blocks.filter((b: any) => b.type === 'tool_result');
+  expect(calls).toHaveLength(5);
+  expect(new Set(calls.map((c: any) => c.id)).size).toBe(5);
+  for (const call of calls) expect(call.id).toMatch(/^[a-zA-Z0-9_-]{1,64}$/);
+  expect(calls[3].id).toBe('valid_native');
+  expect(calls[4].id).toBe(ids[3]);
+  expect(receipts.map((r: any) => r.tool_use_id)).toEqual(calls.map((c: any) => c.id));
+  expect(receipts.map((r: any) => r.content)).toEqual(['external', '0', '1', '2', '3']);
+  expect(blocks).toContainEqual({ type: 'thinking', thinking: 'Native thought', signature: 'NATIVE_SIGNATURE' });
+  expect(JSON.stringify(requests[0])).not.toContain('FOREIGN_SIGNATURE');
+  expect(requests[1].messages).toEqual(requests[0].messages);
+  expect(JSON.stringify(messages)).toBe(original);
+});

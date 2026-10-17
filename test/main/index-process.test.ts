@@ -40,7 +40,11 @@ describe('main process child-process ownership', () => {
     expect(relaunchBlock).toContain('windowsVerbatimArguments: resolved.windowsVerbatimArguments');
     expect(relaunchBlock).toContain('env: childEnv');
     expect(relaunchBlock).toContain('child.unref()');
-    expect(relaunchBlock).toContain('await openLifecycleTracking?.flushQuit()');
+    expect(relaunchBlock).toContain('await prepareShutdown()');
+    expect(source).toContain('registerIpc(flushForShutdown)');
+    // The shared coordinator owns the awaitable local drain, including the
+    // public lifecycle receipt. Its behavior is covered by shutdown/lifecycle cases.
+    expect(source).toMatch(/name: 'open-lifecycle',\s*run: async \(\) => \{ await openLifecycleTracking\?\.flushQuit\(\); \}/);
 
     const shellLauncher = fs.readFileSync(
       path.resolve(process.cwd(), 'run.sh'),

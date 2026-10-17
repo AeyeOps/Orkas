@@ -15,6 +15,7 @@ const pcRoot = path.resolve(here, '..');
 const require = createRequire(import.meta.url);
 const {
   EMBEDDING_MODEL_CONTRACT,
+  requirePinnedFile,
   verifyEmbeddingModelArchive,
   verifyEmbeddingModelRoot,
 } = require('../bin/packaged-resource-gate.cjs');
@@ -254,10 +255,12 @@ export function installVerifiedModel({
 export async function ensureEmbeddingModel({
   destination = destDir,
   downloadArchive = download,
+  downloadFile = download,
   extractArchive = extract,
   log = console.log,
   model = MODEL,
   sourceUrl = tarballUrl,
+  filesSource = sourceUrl === tarballUrl ? EMBEDDING_MODEL_CONTRACT.filesSource : null,
   verifyArchive = verifyEmbeddingModelArchive,
   verifyRoot = verifyEmbeddingModelRoot,
   warn = console.warn,
@@ -279,11 +282,27 @@ export async function ensureEmbeddingModel({
   const extractionRoot = path.join(stagingRoot, 'extract');
   fs.mkdirSync(extractionRoot);
 
-  log(`[embedding-model] fetching ${sourceUrl}`);
+  log(`[embedding-model] fetching ${filesSource || sourceUrl}`);
   try {
-    await downloadArchive(sourceUrl, archivePath);
-    verifyArchive(archivePath);
-    await extractArchive(archivePath, extractionRoot);
+    if (filesSource) {
+      const stagedModel = path.join(extractionRoot, model);
+      fs.mkdirSync(stagedModel);
+      const deadline = Date.now() + EMBEDDING_DOWNLOAD_TOTAL_TIMEOUT_MS;
+      for (const file of EMBEDDING_MODEL_CONTRACT.files) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new Error('embedding model download exceeded its total time limit');
+        const output = path.join(stagedModel, file.name);
+        await downloadFile(new URL(file.name, filesSource).toString(), output, {
+          expectedBytes: file.bytes,
+          totalTimeoutMs: remaining,
+        });
+        requirePinnedFile(`embedding-model ${file.name}`, output, file);
+      }
+    } else {
+      await downloadArchive(sourceUrl, archivePath);
+      verifyArchive(archivePath);
+      await extractArchive(archivePath, extractionRoot);
+    }
     verifyRoot(extractionRoot);
 
     // A concurrent installer may have completed while this process fetched.

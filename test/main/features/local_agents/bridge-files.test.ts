@@ -36,6 +36,17 @@ function readAll(file: string, limit: number, encoding: 'utf8' | 'base64') {
   return Buffer.concat(chunks);
 }
 
+it('uses the ordinary byte-page default for out-of-range sizes while preserving the continuation offset', () => {
+  const file = path.join(root, 'pages.txt');
+  fs.writeFileSync(file, '0123456789'.repeat(7000));
+  const expected = readBridgeFilePage(file, { offset: 7 });
+  expect(expected.content).toHaveLength(60000);
+  expect(expected.next_offset).toBe(60007);
+  for (const limit of [-1, 0, 3, 60001, 1000000]) {
+    expect(readBridgeFilePage(file, { offset: 7, limit })).toEqual(expected);
+  }
+});
+
 describe('complete bridge resource retrieval', () => {
   it.skipIf(process.platform === 'win32')('rejects an unopened FIFO without blocking resource retrieval', () => {
     const fifo = path.join(root, 'resource.pipe');
@@ -83,7 +94,7 @@ describe('complete bridge resource retrieval', () => {
     expect(readBridgeFilePage(file, {})).toMatchObject({ content: '', bytes: 0, next_offset: null });
     fs.writeFileSync(file, 'data');
     expect(readBridgeFilePage(file, { offset: 4 })).toMatchObject({ content: '', bytes: 4, next_offset: null });
-    for (const input of [{ offset: 5 }, { offset: -1 }, { offset: 0.5 }, { offset: '0' }, { offset: Number.MAX_SAFE_INTEGER + 1 }, { limit: 3 }, { limit: 60001 }, { encoding: 'hex' }]) {
+    for (const input of [{ offset: 5 }, { offset: -1 }, { offset: 0.5 }, { offset: '0' }, { offset: Number.MAX_SAFE_INTEGER + 1 }, { limit: 1.5 }, { limit: '10' }, { encoding: 'hex' }]) {
       expect(() => readBridgeFilePage(file, input)).toThrow();
     }
     fs.rmSync(file);

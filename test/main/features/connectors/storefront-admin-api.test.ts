@@ -15,6 +15,19 @@ const wrap = (provider: string, value: unknown) => provider === 'shoplazza' ? { 
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe('production storefront API contracts', () => {
+  it.each(providers.flatMap(provider => [true, false].map(accepts => ({ provider, accepts })) ))(
+    '$provider matches the exact storefront integer identity (accepts=$accepts)', async ({ provider, accepts }) => {
+      const c = config(provider);
+      c.credentials.identity.shop_id = accepts ? '9007199254740993' : '9007199254740992';
+      const shop = '{"id":9007199254740993,"name":"Fixture","currency":"USD"}';
+      const wire = provider === 'shopline' ? `{"data":${shop}}`
+        : provider === 'shoplazza' ? `{"code":"","data":${shop}}` : shop;
+      vi.stubGlobal('fetch', vi.fn(async () => new Response(wire)));
+      const read = api.execute(c, 'shop.get');
+      if (accepts) await expect(read).resolves.toMatchObject({ shop_id: '9007199254740993' });
+      else await expect(read).rejects.toMatchObject({ code: 'storefront_binding_mismatch' });
+    });
+
   it.each([
     ['bigcommerce', 'https://api.bigcommerce.com/stores/abc123/v3/', 'abc123'],
     ['bigcommerce', 'ABC123', 'abc123'],

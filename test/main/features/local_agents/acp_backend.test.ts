@@ -559,7 +559,7 @@ describe('local_agents/backends/_acp process lifecycle', () => {
             setModel = message.params && message.params.modelId;
             send({ jsonrpc: '2.0', id: message.id, result: {} });
           } else if (message.method === 'session/prompt') {
-            if (newModel !== 'provider/model-a' || setModel !== 'provider/model-a') {
+            if (newModel !== undefined || setModel !== 'provider/model-a') {
               process.stderr.write('model override was not applied before prompt\n');
               process.exit(7);
             }
@@ -596,7 +596,7 @@ describe('local_agents/backends/_acp process lifecycle', () => {
     });
   });
 
-  it('continues the prompt when an ACP server accepts set_model but never replies', async () => {
+  it('does not prompt when an ACP model setter never acknowledges the selection', async () => {
     const fakeAcpServer = String.raw`
       let buffer = '';
       let selectedModel = '';
@@ -616,8 +616,7 @@ describe('local_agents/backends/_acp process lifecycle', () => {
             send({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'acp-no-setter-reply' } });
           } else if (message.method === 'session/set_model') {
             selectedModel = message.params && message.params.modelId;
-            // Deliberately omit the JSON-RPC response. Version-skewed ACP
-            // servers have been observed to accept this request silently.
+            // No acknowledgment establishes that the selected model was applied.
           } else if (message.method === 'session/prompt') {
             if (selectedModel !== 'provider/model-silent') {
               process.stderr.write('prompt overtook the model setter\n');
@@ -645,14 +644,17 @@ describe('local_agents/backends/_acp process lifecycle', () => {
       modelOverride: 'provider/model-silent',
       cwd: process.cwd(),
       signal: new AbortController().signal,
-      timeoutMs: 2_000,
+      timeoutMs: 5_000,
       onEvent: event => events.push(event),
     });
 
+    expect(events.filter(event => event.type === 'text-delta')).toEqual([]);
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
     expect(events.at(-1)).toMatchObject({
       type: 'done',
-      status: 'completed',
-      output: 'silent setter recovered',
+      status: 'failed',
+      cliError: 'parameter_unsupported',
+      retrySafe: false,
     });
   });
 
@@ -713,5 +715,53 @@ describe('local_agents/backends/_acp process lifecycle', () => {
       status: 'completed',
       output: 'API call failed after 3 retries: HTTP 404: 404 Not found. Check the docs for available routes.',
     });
+  });
+});
+
+describe('ACP optional configuration compatibility', () => {
+  it.each(['supported', 'rejected', 'missing-effort', 'missing-id', 'malformed-ack', 'null-ack-option'])('selects the advertised config-option interface: %s', async mode => {
+    const server = String.raw`
+const rl = require('node:readline').createInterface({ input: process.stdin });
+const mode = process.argv[1]; const methods = []; const selected = {};
+const options = () => [
+  { id: mode === 'missing-id' ? undefined : 'provider-model', category: 'model', type: 'select', currentValue: selected['provider-model'] || 'default',
+    options: [{ group: 'provider', options: [{ value: 'chosen' }] }] },
+  ...(mode === 'missing-effort' ? [] : [{ id: 'reasoning', category: 'thought_level', type: 'select',
+    currentValue: selected.reasoning || 'low', options: [{ value: 'high' }, { value: 'low' }] }]),
+];
+const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+rl.on('line', line => {
+  const m = JSON.parse(line); methods.push(m.method);
+  if (m.method === 'initialize') send({ id: m.id, result: { protocolVersion: 1 } });
+  else if (m.method === 'session/new') {
+    if ('model' in m.params) process.exit(8);
+    send({ id: m.id, result: { sessionId: 'config-session', configOptions: options() } });
+  } else if (m.method === 'session/set_config_option') {
+    if (mode === 'rejected') send({ id: m.id, error: { code: -32602, message: 'unavailable' } });
+    else if (mode === 'malformed-ack') send({ id: m.id, result: { configOptions: {} } });
+    else if (mode === 'null-ack-option') send({ id: m.id, result: { configOptions: [null] } });
+    else { selected[m.params.configId] = m.params.value; send({ id: m.id, result: { configOptions: options() } }); }
+  } else if (m.method === 'session/set_model') process.exit(9);
+  else if (m.method === 'session/prompt') {
+    if (selected['provider-model'] !== 'chosen' || (mode !== 'missing-effort' && selected.reasoning !== 'high')) process.exit(10);
+    send({ method: 'session/update', params: { sessionId: 'config-session', update: {
+      sessionUpdate: 'agent_message_chunk', content: { text: JSON.stringify(methods) },
+    } } });
+    send({ id: m.id, result: { stopReason: 'end_turn' } });
+  }
+});`;
+    const backend = makeAcpBackend({ logName: 'local-agents:test-config-options', argv: ['-e', server, mode], clientName: 'test' });
+    const events: any[] = [];
+    await backend.run({ binPath: TEST_NODE, prompt: 'controlled fixture', modelOverride: 'chosen', thinkingLevel: 'high',
+      cwd: process.cwd(), signal: new AbortController().signal, timeoutMs: 5000, onEvent: event => events.push(event) });
+    const done = events.filter(event => event.type === 'done'); expect(done).toHaveLength(1);
+    if (mode === 'supported' || mode === 'missing-effort') {
+      expect(done[0].status).toBe('completed');
+      expect(JSON.parse(done[0].output)).toEqual(['initialize', 'session/new', 'session/set_config_option',
+        ...(mode === 'supported' ? ['session/set_config_option'] : []), 'session/prompt']);
+    } else {
+      expect(done[0]).toMatchObject({ status: 'failed', cliError: 'parameter_unsupported', retrySafe: false });
+      expect(events.filter(event => event.type === 'text-delta')).toEqual([]);
+    }
   });
 });

@@ -1,7 +1,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { expect, test } from './fixtures/orkas';
+import { openSidebarEntry, expect, test } from './fixtures/orkas';
+import { installEmptyLibrarySearch } from './fixtures/empty-library-search';
 
 test.describe('library and global search', () => {
   test('indexes a Library file and closes the model library search-to-read loop', async ({ modelOrkas }) => {
@@ -63,7 +64,7 @@ test.describe('library and global search', () => {
     );
     await modelOrkas.selectFilesOnNextDialog([source]);
 
-    await page.locator('#contexts-btn').click();
+    await openSidebarEntry(page, '#contexts-btn');
     await page.locator('#ctx-root-menu-btn').click();
     await page.locator('#ctx-row-menu .ctx-row-menu-item[data-action="upload"]').click();
     await expect(page.locator(`.ctx-tree-wrap[data-path="${fileName}"]`)).toBeVisible();
@@ -327,7 +328,7 @@ test.describe('library and global search', () => {
     for (const name of ['first.md', 'second.md']) {
       await orkas.invoke('contexts.write', { path: name, content: `Original ${name}` });
     }
-    await page.locator('#contexts-btn').click();
+    await openSidebarEntry(page, '#contexts-btn');
     const selector = page.locator('#contexts-project-select-trigger');
     const menu = page.locator('#contexts-project-select-listbox');
     const editor = page.locator('#contexts-viewer-body textarea');
@@ -375,7 +376,7 @@ test.describe('library and global search', () => {
     await orkas.invoke('projects.files.upload', {
       projectId: alpha.project.project_id, name: fileName, data: Buffer.from('Alpha original').toString('base64'),
     });
-    await page.locator('#contexts-btn').click();
+    await openSidebarEntry(page, '#contexts-btn');
     const selector = page.locator('#contexts-project-select-trigger');
     await expect(selector).toContainText('Global');
     await page.locator(`#contexts-tree [data-path="${fileName}"] > .skill-tree-node`).click();
@@ -433,7 +434,7 @@ test.describe('library and global search', () => {
     const source = orkas.createFixtureFile(originalName, '# Library E2E\n\nUnique library preview body.\n');
     await orkas.selectFilesOnNextDialog([source]);
 
-    await page.locator('#contexts-btn').click();
+    await openSidebarEntry(page, '#contexts-btn');
     await expect(page.locator('#panel-contexts')).toHaveClass(/\bactive\b/);
     await page.locator('#ctx-root-menu-btn').click();
     await page.locator('#ctx-row-menu .ctx-row-menu-item[data-action="upload"]').click();
@@ -456,7 +457,7 @@ test.describe('library and global search', () => {
     await expect(row).toBeVisible();
 
     const relaunchedPage = await orkas.relaunch();
-    await relaunchedPage.locator('#contexts-btn').click();
+    await openSidebarEntry(relaunchedPage, '#contexts-btn');
     row = relaunchedPage.locator(`.ctx-tree-wrap[data-path="${renamedName}"]`);
     await expect(row).toBeVisible();
     await row.hover();
@@ -486,7 +487,7 @@ test.describe('library and global search', () => {
       content: '# Transfer proof\n\nThis file must have one durable owner.',
     });
 
-    await page.locator('#contexts-btn').click();
+    await openSidebarEntry(page, '#contexts-btn');
     let sourceRow = page.locator(`.ctx-tree-wrap[data-path="${fileName}"]`);
     await expect(sourceRow).toBeVisible();
     await sourceRow.locator(':scope > .skill-tree-node').click();
@@ -526,7 +527,7 @@ test.describe('library and global search', () => {
     expect(destination.tree.filter((entry) => entry.name === fileName)).toHaveLength(1);
 
     page = await orkas.relaunch();
-    await page.locator('#contexts-btn').click();
+    await openSidebarEntry(page, '#contexts-btn');
     await expect(page.locator(`.ctx-tree-wrap[data-path="${fileName}"]`)).toHaveCount(mode === 'move' ? 0 : 1);
     destination = await orkas.invoke<{
       tree: Array<{ name: string }>;
@@ -537,6 +538,7 @@ test.describe('library and global search', () => {
 
   test('searches a real agent and navigates to its detail page', async ({ orkas }) => {
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+    await installEmptyLibrarySearch(orkas, path.resolve(__dirname, '../..'));
     const page = orkas.page;
     const name = 'SearchableE2EAgent';
     const created = await orkas.invoke<{ ok: boolean; agent: { agent_id: string } }>('agents.create', {
@@ -565,5 +567,6 @@ test.describe('library and global search', () => {
     // That is what lets the user return to where they were.
     await expect(page.locator('#panel-agents')).toHaveClass(/\bresource-detail-overlay\b/);
     await expect(page.locator('#agents-detail-name')).toHaveText(name);
+    expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__emptyLibrarySearchQueries)).toBeGreaterThan(0);
   });
 });

@@ -38,22 +38,18 @@ import { splitMarkdownProseCode } from '../../util/markdown-prose-code';
 const TOKEN_CLASS = '[A-Za-z0-9_一-鿿-]+';
 const LEADING_BOUNDARY = '(^|[^A-Za-z0-9_-])';
 const FALLBACK_MENTION_RE = /(^|[^A-Za-z0-9_-])@([A-Za-z0-9_一-鿿-]+)/gu;
-const RESERVED_ACTOR_ALIASES = ['指挥官', 'commander', '用户', 'user'] as const;
 
 function _escapeForRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function _buildMentionRe(names?: readonly string[], includeFallback = true): RegExp {
+function _buildMentionRe(names?: readonly string[]): RegExp {
   if (!names || !names.length) return new RegExp(FALLBACK_MENTION_RE.source, 'gu');
   // Longest-first so multi-word names anchor before any single-word prefix
   // shared with another name. Two agents named "Foo" and "Foo Bar" both
   // match correctly when the longer alternative is tried first.
   const sorted = [...names].sort((a, b) => b.length - a.length);
   const namedAlt = sorted.map(_escapeForRegex).join('|');
-  if (!includeFallback) {
-    return new RegExp(`${LEADING_BOUNDARY}@(${namedAlt})`, 'gu');
-  }
   return new RegExp(`${LEADING_BOUNDARY}@(${namedAlt}|${TOKEN_CLASS})`, 'gu');
 }
 
@@ -79,14 +75,16 @@ function routingMentionRanges(text: string): Array<[number, number]> {
  *  `fromKind` decides whether `@` counts as a dispatch signal:
  *    - `'user'` (or undefined, for back-compat) — full scan; a real
  *      user typing `@A` actually means "send to A".
- *    - `'commander'` — return `[]` immediately; commander LLM prose like
- *      `**@A**` or `@A / @B` is training-data markdown decoration, not a
- *      dispatch signal. The commander dispatch channels are the
- *      `dispatch_to` (single agent) and `plan_set` (multi-actor) tools.
- *    - `'agent'` — ignore arbitrary agent mentions for the same reason, but
- *      still allow reserved user/commander aliases so an agent can explicitly
- *      escalate with `@commander` / `@指挥官`.
- *  See docs/plans/dispatch-via-tool-call.md and CLAUDE.md §5.
+ *    - `'commander'` / `'agent'` — return `[]` immediately; model prose like
+ *      `**@A**`, `@A / @B`, or a sentence that merely names `@指挥官` is
+ *      decoration or reference, not a dispatch signal. The commander
+ *      dispatches through `dispatch_to` / `hand_off_to`; an agent returns
+ *      control through `<handback reason="..." />` (a CLI agent through
+ *      `orkas_handoff_to_commander`), the paths that carry the one-hop and
+ *      loop guards. Agent prose `@commander` / `@指挥官` used to escalate and
+ *      misfired whenever an agent only named the commander (2026-10-04: two
+ *      unsolicited commander turns in one conversation, zero intentional uses
+ *      in production samples).
  *
  *  `names` enables exact multi-word name matching: when a user types
  *  "@Software Requirements Analyst", the fallback char class only
@@ -100,12 +98,9 @@ export function parseMentions(
   opts?: { fromKind?: Actor['kind']; names?: readonly string[] },
 ): string[] {
   if (!text) return [];
+  if (opts?.fromKind === 'commander' || opts?.fromKind === 'agent') return [];
   const excluded = routingMentionRanges(text);
-  if (opts?.fromKind === 'commander') return [];
-  const reservedOnly = opts?.fromKind === 'agent';
-  const re = reservedOnly
-    ? _buildMentionRe(RESERVED_ACTOR_ALIASES, false)
-    : _buildMentionRe(opts?.names);
+  const re = _buildMentionRe(opts?.names);
   const out: string[] = [];
   const seen = new Set<string>();
   let m: RegExpExecArray | null;
@@ -150,8 +145,13 @@ export function buildMention(name: string): string {
 // ── Routing ──────────────────────────────────────────────────────────────
 
 export interface RouteResolution {
-  /** Present for segmented sends, including an empty plan for mention-only text. */
-  plan?: SegmentedMentions;
+  /** User text whose only content is mentions: nothing to dispatch, and it
+   * must never fall back to a default recipient. */
+  mentionOnly?: true;
+  /** D29: the user orchestrated several actors (or named one anywhere but at
+   * the very start). The bus asks the dispatch planner to split the message
+   * into dependent tasks among these mentioned actors (plus Commander). */
+  plannerCandidates?: string[];
   /** Final recipient list (deduped, may include the sender's @-targets). */
   to: string[];
   /** Tokens that didn't resolve to any known actor. UI may surface these. */
@@ -199,6 +199,8 @@ export interface ResolveOpts {
   activeRecipient?: string;
   /** Legacy input accepted for compatibility; a multi-default falls back to Commander. */
   activeRecipients?: readonly string[];
+  /** Host-validated references or attachments can carry a request without prose. */
+  hasMessageContent?: boolean;
 }
 
 /**
@@ -274,13 +276,17 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
 
   if (resolved.length) {
     if (opts.fromKind === 'user') {
-      const plan = segmentUserMentions(opts.text, {
+      const route = classifyUserMentionRoute(opts.text, {
         tokenToId: (token) => tokenToId.get(token) || null,
         recipientIds: new Set(resolved), names: namesForParser,
-        commanderId: COMMANDER_ID,
-        defaultRecipient: opts.activeRecipient || COMMANDER_ID,
+        hasMessageContent: opts.hasMessageContent,
       });
-      if (plan) return { to: [...new Set(plan.segments.map((s) => s.actorId))], unknown, hadExplicitMention: true, plan };
+      if (route.kind === 'mention_only') {
+        return { to: [], unknown, hadExplicitMention: true, mentionOnly: true };
+      }
+      if (route.kind === 'plan') {
+        return { to: route.candidates, unknown, hadExplicitMention: true, plannerCandidates: route.candidates };
+      }
     }
     // De-dupe (someone might @ the same actor twice).
     return { to: Array.from(new Set(resolved)), unknown, hadExplicitMention: true };
@@ -301,8 +307,9 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
   //     the request). This is what lets a handed-off agent keep the user's
   //     follow-ups without re-`@`-ing every message.
   //   - commander → user (its replies are user-facing summaries)
-  //   - agent → user (default surface output to the human; agents only
-  //     reach commander via an explicit `@<commander-name>` mention)
+  //   - agent → user (default surface output to the human; agents return
+  //     control only through `<handback>` / `orkas_handoff_to_commander`,
+  //     never through a prose mention)
   // See the "Group-chat mechanics" section of `chat_agent_in_group.md`
   // and `chat_commander.md`.
   let def: string;
@@ -319,71 +326,43 @@ export function resolveRecipients(opts: ResolveOpts): RouteResolution {
   return { to: [def], unknown, hadExplicitMention: false };
 }
 
-// ── D9 mention segmentation (task-board plan §4.2.1) ─────────────────────
+// ── D29 user mention routing (replaces D9/D22 positional segmentation) ───
 
-export interface MentionSegment {
-  /** Resolved assignee actor id. */
-  actorId: string;
-  /** This assignee's instruction: its own span (plus quote-only context), mention
-   * token stripped. */
-  instruction: string;
-  /** 0-based index of the mention group this segment came from. ADJACENT
-   * mentions (only whitespace between them) share one group; each further
-   * group is a later written span. The dispatcher uses the group count to
-   * decide whether the send has any cross-group ordering to honor. */
-  group: number;
-}
-
-export interface SegmentedMentions {
-  segments: MentionSegment[];
-  /** Raw text before the first mention (trimmed). Prose belongs to the default
-   * recipient; quote-only context is shared. */
-  preamble: string;
-}
+export type UserMentionRoute =
+  | { kind: 'direct' }
+  | { kind: 'mention_only' }
+  | { kind: 'plan'; candidates: string[] };
 
 /**
- * Split a user message into per-assignee instruction segments — the
- * deterministic core that replaces same-text broadcast (D9, re-adjudicated
- * 2026-08-27/D22). Rules:
- *   - each resolved mention opens a segment extending to the next mention or
- *     end of text; ADJACENT mentions (whitespace-only gap) share the
- *     following span; repeated agents in one adjacent group are deduplicated; repeated
- *     agents with separate descriptions keep their ordered segments; empty
- *     descriptions do not dispatch; mentions in code or blockquote lines
- *     never open segments (literal context, matching `parseMentions`);
- *   - commander mentions (via `commanderId` in `tokenToId`) open ordinary
- *     segments — an explicit `@指挥官 … @A …` send segments exactly like an
- *     all-agent send instead of broadcasting the full text (D22);
- *   - an unaddressed first instruction belongs to the current default recipient;
- *     quote-only preambles remain shared context;
- *   - cross-segment context flows through the serial `after` hand-off, not
- *     through prefix duplication.
- *
- * Returns null for one described mention or no mentions — the caller keeps the ordinary
- * single-recipient path. Mention-only input returns an empty plan so it
- * cannot create a fallback task. No LLM participates (§4.2 principle 1); the
- * composer preview bar is the user's misparse guard.
+ * Decide how a USER message with resolved mentions is dispatched (D29).
+ * Deterministic and structural only — no attempt to read intent:
+ *   - `direct`: the message starts with its only mentioned actor (repeats of
+ *     that same actor are fine). The whole text goes to that actor; this is
+ *     ~97% of real mention traffic and keeps the single-recipient path.
+ *   - `mention_only`: nothing but mentions (and quote lines), with no
+ *     host-validated references or attachments — no work.
+ *   - `plan`: anything else — several actors, a mention after prose, or
+ *     Commander mixed with Agents. The user is orchestrating, so the bus asks
+ *     the dispatch planner to split the message into dependent tasks among
+ *     `candidates` (resolved actors, first-mention order) and Commander.
+ * Mentions in code or blockquote lines never count (literal context, same
+ * ranges as `parseMentions`); a quote-only preamble is context, not prose.
  */
-export function segmentUserMentions(
+export function classifyUserMentionRoute(
   text: string,
   opts: {
     /** Raw mention token → actor id (null = unresolvable). */
     tokenToId: (token: string) => string | null;
-    /** Only mentions resolving into this set open segments. */
+    /** Only mentions resolving into this set count. */
     recipientIds: ReadonlySet<string>;
     /** Display names for exact multi-word mention matching. */
     names?: readonly string[];
-    /** Commander actor id. When set, explicit commander mentions open
-     * segments just like selected Agents. */
-    commanderId?: string;
-    /** Owner of an unaddressed first instruction; defaults to Commander. */
-    defaultRecipient?: string;
+    hasMessageContent?: boolean;
   },
-): SegmentedMentions | null {
-  if (!text) return null;
+): UserMentionRoute {
+  if (!text) return { kind: 'direct' };
   const excluded = routingMentionRanges(text);
-  const inQuote = (pos: number) => excluded.some(([s, e]) => pos >= s && pos < e);
-
+  const inExcluded = (pos: number) => excluded.some(([s, e]) => pos >= s && pos < e);
   const re = _buildMentionRe(opts.names);
   const spans: Array<{ start: number; end: number; id: string }> = [];
   let m: RegExpExecArray | null;
@@ -391,55 +370,22 @@ export function segmentUserMentions(
     const token = m[2];
     if (!token) continue;
     const start = m.index + m[1].length; // the '@'
-    if (inQuote(start)) continue;
+    if (inExcluded(start)) continue;
     const id = opts.tokenToId(token);
-    if (!id) continue;
-    if (!opts.recipientIds.has(id) && id !== opts.commanderId) continue;
+    if (!id || id === USER_ID || !opts.recipientIds.has(id)) continue;
     spans.push({ start, end: start + 1 + token.length, id });
   }
-  if (!spans.length) return null;
-
-  const preamble = text.slice(0, spans[0].start).trim();
-  const hasFirstInstruction = preamble.split('\n').some((line) => line.trim() && !/^\s*>/.test(line));
-  if (spans.length < 2 && !hasFirstInstruction && text.slice(spans[0].end).trim()) return null;
-  // Group adjacent mentions: `@A @B do X` — nothing but whitespace between
-  // the spans — share the span that follows the group.
-  const groups: Array<{ ids: string[]; bodyStart: number }> = [];
-  for (let i = 0; i < spans.length; i += 1) {
-    const prev = groups[groups.length - 1];
-    const gapStart = i > 0 ? spans[i - 1].end : -1;
-    const adjacent = i > 0 && /^\s*$/.test(text.slice(gapStart, spans[i].start));
-    if (adjacent && prev) {
-      prev.ids.push(spans[i].id);
-      prev.bodyStart = spans[i].end;
-    } else {
-      groups.push({ ids: [spans[i].id], bodyStart: spans[i].end });
-    }
-  }
-  const segments: MentionSegment[] = hasFirstInstruction
-    ? [{ actorId: opts.defaultRecipient || opts.commanderId || COMMANDER_ID, instruction: preamble, group: 0 }]
-    : [];
-  // Body of group g runs from its bodyStart to the start of group g+1's
-  // FIRST mention (or end of text).
-  const groupFirstStart: number[] = [];
-  {
-    let spanIdx = 0;
-    for (const grp of groups) {
-      groupFirstStart.push(spans[spanIdx].start);
-      spanIdx += grp.ids.length;
-    }
-  }
-  for (let g = 0; g < groups.length; g += 1) {
-    const end = g + 1 < groups.length ? groupFirstStart[g + 1] : text.length;
-    const body = text.slice(groups[g].bodyStart, end).trim();
-    const instruction = !hasFirstInstruction && preamble
-      ? [preamble, body].filter(Boolean).join('\n') : body;
-    if (!body) continue;
-    for (const id of new Set(groups[g].ids)) {
-      segments.push({ actorId: id, instruction, group: g + (hasFirstInstruction ? 1 : 0) });
-    }
-  }
-  return { segments, preamble };
+  if (!spans.length) return { kind: 'direct' };
+  const hasProse = (chunk: string) => chunk.split('\n').some((line) => line.trim() && !/^\s*>/.test(line));
+  let body = text;
+  for (const span of [...spans].reverse()) body = body.slice(0, span.start) + body.slice(span.end);
+  if (!hasProse(body) && !opts.hasMessageContent) return { kind: 'mention_only' };
+  const candidates = [...new Set(spans.map((span) => span.id))];
+  // Commander is always a planner candidate, so naming only Commander leaves a
+  // single possible owner and nothing to split.
+  if (candidates.length === 1
+    && (candidates[0] === COMMANDER_ID || !hasProse(text.slice(0, spans[0].start)))) return { kind: 'direct' };
+  return { kind: 'plan', candidates };
 }
 
 // ── Form payload + agent-container parsers (moved here so bus can apply

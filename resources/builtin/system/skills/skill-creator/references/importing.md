@@ -13,7 +13,7 @@ Read this file for a URL, local directory, ZIP, attachment, pasted existing SKIL
 When `import_skill_package` is available and the user requests importing a local Skill directory or ZIP:
 
 1. Use the exact user-supplied `source_path` allowed by the tool's source-authorization contract; never infer a parent or sibling. Follow its clarification result when the source is ambiguous, changed, or unverifiable.
-2. Call `import_skill_package` once. It discovers every SKILL.md, enforces archive/path limits, copies unchanged files, validates each Skill, rolls back rejected siblings, refreshes the registry, and binds successful Skills when applicable.
+2. Use the native importer's preview for multiple Skills. Recommend a small relevant selection; use all only when the user explicitly requests it. Import selected keys in bounded batches; for all, continue through the returned cursor. Keep the original source and directory layout instead of staging or flattening a replacement tree. The host validates each Skill independently and preserves successful siblings.
 3. Do not re-emit unchanged package files or pass them through model output.
 4. Report rejected siblings with their reason; do not retry by silently renaming or overriding them. Successful siblings remain installed.
 5. After success, use only a small metadata edit when category/routing clearly needs correction. Do not rewrite source files for review alone.
@@ -80,4 +80,4 @@ Do not use source/current identity as cleanup proof. Do not say “no cleanup ne
 
 ## Completion report
 
-Tell the user which Skill(s) were added, what each does, what meaningful files were preserved or minimally adapted, and any missing source/risk. Do **not** show a source URL or path by default unless requested or needed to diagnose failure.
+Tell the user which Skill(s) were installed, what each does, what meaningful files were preserved or minimally adapted, and any missing source/risk. Distinguish installation, discoverability and tested execution; installing Skills does not migrate plugin connectors, hooks, commands or agents. Do **not** show a source URL or path by default unless requested or needed to diagnose failure.

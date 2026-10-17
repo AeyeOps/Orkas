@@ -8,7 +8,20 @@ import {
   webFetchAcceptLanguage,
 } from "./web-fetch-http.js";
 
-const README_SNAPSHOT_MAX_CHARS = 4_500;
+/** README characters in the first snapshot view when the caller sets no maxChars. */
+const README_SNAPSHOT_DEFAULT_CHARS = 4_500;
+/** Line that separates repository metadata from the README in a snapshot. */
+const GITHUB_README_MARKER = "Official repository README:";
+const README_OPENING_MAX_CHARS = 1_800;
+const README_SECTION_EXCERPT_MAX_CHARS = 1_200;
+const README_PRIORITY_EXCERPT_MAX_CHARS = 900;
+/** Share of the README budget available to license/requirement/setup sections. */
+const README_PRIORITY_SHARE = 0.4;
+const README_RECEIPT_RESERVE_CHARS = 800;
+const README_MAX_OMITTED_HEADINGS = 12;
+const README_OMITTED_NAMES_MAX_CHARS = 450;
+/** Smallest README budget worth compacting; below it the plain prefix limit applies. */
+const README_MIN_VIEW_CHARS = 1_000;
 
 export type GitHubRepositoryResource = {
   key: string;
@@ -114,6 +127,8 @@ function metadataValue(value: unknown): string {
 
 type MarkdownSection = {
   index: number;
+  title: string;
+  start: number;
   content: string;
   priority: number;
 };
@@ -121,8 +136,11 @@ type MarkdownSection = {
 function sectionPriority(heading: string): number {
   const normalized = heading.toLowerCase();
   if (/licen[cs]e|许可|授权/.test(normalized)) return 3;
+  // Hardware words need word boundaries: a bare `ram`/`memory` substring also
+  // matched "program", "framework" and feature titles such as "Memory-guided
+  // manipulation", which pulled an arbitrary list entry ahead of the README.
   if (
-    /privacy|security|telemetry|requirement|hardware|gpu|memory|ram|隐私|安全|遥测|配置|硬件|要求/.test(
+    /privacy|security|telemetry|requirement|hardware|\bgpus?\b|\bv?ram\b|memory (?:usage|footprint)|隐私|安全|遥测|配置|硬件|要求/.test(
       normalized,
     )
   ) {
@@ -138,53 +156,160 @@ function sectionPriority(heading: string): number {
   return 0;
 }
 
-/** Preserve the opening and bounded high-signal sections of a long README. */
-export function compactGitHubReadme(readme: string): string {
-  const normalized = readme.replace(/\r\n?/g, "\n").trim();
-  if (normalized.length <= README_SNAPSHOT_MAX_CHARS) return normalized;
+function normalizeGitHubReadme(readme: string): string {
+  return readme.replace(/\r\n?/g, "\n").trim();
+}
 
+type KeptSection = {
+  content: string;
+  /** README position where the shown excerpt stops, or null when complete. */
+  cutAt: number | null;
+};
+
+function sectionExcerpt(section: MarkdownSection, limit: number): KeptSection {
+  return section.content.length > limit
+    ? { content: section.content.slice(0, limit) + "\n[Section excerpt truncated.]", cutAt: section.start + limit }
+    : { content: section.content, cutAt: null };
+}
+
+/**
+ * Fit a long README into `budget` characters without losing its reading order.
+ *
+ * The opening and the first sections are kept in document order; a bounded
+ * share of the budget first pulls in license, requirement, and setup sections
+ * that a comparison needs even when they sit far down the README. The closing
+ * receipt states how many sections were kept and names the omitted ones, so a
+ * reader can tell a curated list apart from a complete one. When `readmeOffset`
+ * (the README's position in the cached web_fetch result) is known, the receipt
+ * also gives the `offset` values that continue the README in order.
+ */
+export function compactGitHubReadme(
+  readme: string,
+  budget = README_SNAPSHOT_DEFAULT_CHARS,
+  readmeOffset?: number,
+): string {
+  const normalized = normalizeGitHubReadme(readme);
+  if (normalized.length <= budget) return normalized;
+
+  const at = (position: number) => (readmeOffset === undefined ? null : readmeOffset + position);
   const headings = [...normalized.matchAll(/^#{1,4}\s+.+$/gm)];
   if (headings.length === 0) {
-    return normalized.slice(0, README_SNAPSHOT_MAX_CHARS)
-      + "\n\n[README snapshot truncated after the bounded source excerpt.]";
+    const shown = Math.max(0, budget - 200);
+    const resume = at(shown);
+    return normalized.slice(0, shown)
+      + `\n\n[README snapshot shows the first ${shown} of ${normalized.length} characters; the README has no section headings.`
+      + (resume === null ? "]" : ` Continue it with "offset": ${resume}.]`);
   }
 
-  const preamble = normalized.slice(0, headings[0].index ?? 0).trim();
   const sections: MarkdownSection[] = headings.map((match, index) => {
     const start = match.index ?? 0;
     const end = headings[index + 1]?.index ?? normalized.length;
+    const title = match[0].replace(/^#{1,4}\s+/, "").trim();
     return {
       index,
+      title,
+      start,
       content: normalized.slice(start, end).trim(),
-      priority: sectionPriority(match[0].replace(/^#{1,4}\s+/, "").trim()),
+      priority: sectionPriority(title),
     };
   });
-  const opening = [preamble, sections[0]?.content]
-    .filter(Boolean)
-    .join("\n\n")
-    .slice(0, 1_800);
-  const candidates = sections
+  // The opening is the preamble plus the first heading's section, read from
+  // the README itself so its positions stay exact for continuation offsets.
+  const openingFull = normalized.slice(0, headings[1]?.index ?? normalized.length).trim();
+  const opening = openingFull.slice(0, Math.min(README_OPENING_MAX_CHARS, Math.floor(budget / 3)));
+
+  const retained = new Map<number, KeptSection>();
+  let remaining = budget - opening.length - README_RECEIPT_RESERVE_CHARS;
+  let priorityRemaining = Math.floor(remaining * README_PRIORITY_SHARE);
+  const priorityCandidates = sections
     .filter((section) => section.index >= 1 && section.priority > 0)
     .sort((a, b) => b.priority - a.priority || a.index - b.index);
-
-  const retained: MarkdownSection[] = [];
-  let remaining = README_SNAPSHOT_MAX_CHARS - opening.length - 250;
-  for (const section of candidates) {
-    if (remaining < 250) break;
-    const content = section.content.length > 900
-      ? section.content.slice(0, 900) + "\n[Section excerpt truncated.]"
-      : section.content;
-    if (content.length > remaining) continue;
-    retained.push({ ...section, content });
-    remaining -= content.length + 2;
+  for (const section of priorityCandidates) {
+    const excerpt = sectionExcerpt(section, README_PRIORITY_EXCERPT_MAX_CHARS);
+    if (excerpt.content.length + 2 > priorityRemaining) continue;
+    retained.set(section.index, excerpt);
+    priorityRemaining -= excerpt.content.length + 2;
+    remaining -= excerpt.content.length + 2;
   }
-  retained.sort((a, b) => a.index - b.index);
+
+  // Fill the rest in document order and stop at the first section that no
+  // longer fits, so the kept run is a prefix the reader can continue from.
+  for (const section of sections) {
+    if (section.index < 1 || retained.has(section.index)) continue;
+    const excerpt = sectionExcerpt(section, README_SECTION_EXCERPT_MAX_CHARS);
+    if (excerpt.content.length + 2 > remaining) break;
+    retained.set(section.index, excerpt);
+    remaining -= excerpt.content.length + 2;
+  }
+
+  // First README position whose text is not shown, walking in reading order.
+  let resumeAt: number | null = opening.length < openingFull.length ? opening.length : null;
+  for (const section of sections) {
+    if (resumeAt !== null) break;
+    if (section.index < 1) continue;
+    const excerpt = retained.get(section.index);
+    if (!excerpt) resumeAt = section.start;
+    else if (excerpt.cutAt !== null) resumeAt = excerpt.cutAt;
+  }
+
+  const kept = [...retained.entries()].sort((a, b) => a[0] - b[0]);
+  const omitted = sections.filter((section) => section.index >= 1 && !retained.has(section.index));
+  const shortened = kept.filter(([, section]) => section.cutAt !== null).length
+    + (opening.length < openingFull.length ? 1 : 0);
+  const keptChars = opening.length + kept.reduce((sum, [, section]) => sum + section.content.length, 0);
+  const receipt = [
+    `[README snapshot kept ${kept.length} of ${sections.length - 1} sections after the opening`
+      + (shortened ? ` (${shortened} shortened)` : "")
+      + `, ${keptChars} of ${normalized.length} characters.`,
+  ];
+  if (omitted.length) {
+    const names: string[] = [];
+    let nameChars = 0;
+    for (const section of omitted.slice(0, README_MAX_OMITTED_HEADINGS)) {
+      const name = section.title.slice(0, 80);
+      if (names.length && nameChars + name.length > README_OMITTED_NAMES_MAX_CHARS) break;
+      names.push(name);
+      nameChars += name.length + 3;
+    }
+    const more = omitted.length - names.length;
+    receipt.push(`Omitted sections: ${names.join(" | ")}${more > 0 ? ` (+${more} more)` : ""}.`);
+  }
+  const resume = resumeAt === null ? null : at(resumeAt);
+  if (resume !== null) {
+    receipt.push(
+      `Continue the README in order with "offset": ${resume} (first text not shown);`
+        + ` the complete README starts at "offset": ${at(0)}.`,
+    );
+  }
 
   return [
     opening,
-    ...retained.map((section) => section.content),
-    "[README snapshot selected high-signal source sections; other sections omitted.]",
+    ...kept.map(([, section]) => section.content),
+    receipt.join(" ") + "]",
   ].filter(Boolean).join("\n\n");
+}
+
+/**
+ * First web_fetch view of a cached repository snapshot: metadata unchanged and
+ * the README fitted into the caller's character budget. Returns null when the
+ * snapshot has no README section or the budget cannot hold the metadata, in
+ * which case the caller applies its ordinary prefix limit.
+ */
+export function renderGitHubSnapshotView(
+  content: string,
+  maxChars: number | null,
+): { content: string; servedEnd: number } | null {
+  const marker = `\n${GITHUB_README_MARKER}\n`;
+  const markerIndex = content.indexOf(marker);
+  if (markerIndex < 0) return null;
+  const readmeStart = markerIndex + marker.length;
+  const head = content.slice(0, readmeStart);
+  const readme = content.slice(readmeStart);
+  if (maxChars !== null && maxChars - head.length < README_MIN_VIEW_CHARS) return null;
+  const budget = maxChars === null ? README_SNAPSHOT_DEFAULT_CHARS : maxChars - head.length;
+  const fitted = compactGitHubReadme(readme, budget, readmeStart);
+  // A compacted README is not a reading-order prefix; only the metadata is.
+  return { content: head + fitted, servedEnd: fitted === readme ? content.length : readmeStart };
 }
 
 /** Fetch one deterministic repository snapshot with two parallel HTTP requests. */
@@ -260,7 +385,9 @@ export async function fetchGitHubRepositorySnapshot(
       } catch {
         // The expected response is raw README text.
       }
-      readme = compactGitHubReadme(readme);
+      // Keep the complete README in the run-cached result. web_fetch fits it
+      // into each call's maxChars and serves later windows by offset.
+      readme = normalizeGitHubReadme(readme);
     } else {
       readmeWarning = readmeBody.error;
     }
@@ -301,7 +428,7 @@ export async function fetchGitHubRepositorySnapshot(
         `- Topics: ${topics || "Not provided"}`,
         ...(warnings.length ? ["", "Snapshot warnings:", ...warnings] : []),
         "",
-        "Official repository README:",
+        GITHUB_README_MARKER,
         readme || "README unavailable; do not infer README-backed claims.",
       ].join("\n"),
     };
@@ -327,7 +454,7 @@ export function compactGitHubSnapshotReplay(resource: GitHubRepositoryResource):
     content: [
       "GITHUB_REPOSITORY_SNAPSHOT_CACHE_HIT: this repository's metadata and README were already fetched in this run; no network request was made.",
       `URL: ${resource.canonicalUrl}`,
-      "Use the earlier structured repository snapshot and durable evidence ledger. Do not fetch a GitHub HTML/API/README alias again.",
+      "Use the earlier structured repository snapshot and durable evidence ledger. Do not fetch a GitHub HTML/API/README alias again; to read more of the README, call web_fetch on the repository URL with the offset its snapshot reported.",
     ].join("\n"),
   };
 }

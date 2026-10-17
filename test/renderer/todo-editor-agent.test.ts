@@ -12,9 +12,13 @@ function harness(load?: (channel: string, args: any) => Promise<any>) {
   const elements: Record<string, any> = {};
   const selects: Record<string, any> = {};
   for (const id of ['input', 'add', 'agent', 'project', 'status', 'save', 'cancel']) {
+    const trigger = { disabled: false };
+    const classes = new Set<string>();
     elements['project-todo-' + id] = {
       id: 'project-todo-' + id, value: '', maxLength: 4000, dataset: {}, hidden: false,
-      focus() {}, setSelectionRange() {}, classList: { toggle() {} }, querySelector() { return null; },
+      focus() {}, setSelectionRange() {}, classes, trigger,
+      classList: { toggle(name: string, active: boolean) { if (active) classes.add(name); else classes.delete(name); } },
+      querySelector(selector: string) { return selector === '.ai-select-trigger' ? trigger : null; },
     };
   }
   const context = vm.createContext({
@@ -42,8 +46,8 @@ function harness(load?: (channel: string, args: any) => Promise<any>) {
     },
   });
   vm.runInContext(source, context);
-  const open = async (task: any = null, pid = '') => {
-    context._openProjectTodoEditor(task, { pid, global: !pid, projects: [{ project_id: 'p', name: 'Project' }] });
+  const open = async (task: any = null, pid = '', extra: any = {}) => {
+    context._openProjectTodoEditor(task, { pid, global: !pid, projects: [{ project_id: 'p', name: 'Project' }], ...extra });
     await tick();
   };
   return { context, calls, alerts, elements, selects, open };
@@ -92,7 +96,7 @@ describe('todo editor assignment', () => {
     await tick();
     release({ agentDetails: [{ agent_id: 'wrong', name: 'Wrong project' }] });
     await tick();
-    expect(h.selects['project-todo-agent'].state.options.map((o: any) => o.value)).toEqual(['', 'p']);
+    expect(h.selects['project-todo-agent'].state.options.map((o: any) => o.value)).toEqual(['', 'commander', 'p']);
     expect(h.selects['project-todo-agent'].getValue()).toBe('');
     h.elements['project-todo-input'].value = 'New';
     await h.context._saveProjectTodoEditor();

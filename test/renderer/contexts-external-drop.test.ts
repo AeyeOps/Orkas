@@ -597,6 +597,30 @@ describe('Library external file drag-and-drop', () => {
 
 
 describe('Library project switching', () => {
+  it('keeps global first and the natural project order when mounting and refreshing the switcher', async () => {
+    const context = loadContextsScript();
+    const host = { addEventListener: vi.fn() };
+    context.document.getElementById = (id: string) => id === 'contexts-project-select' ? host : null;
+    const selector = { setOptions: vi.fn(), setAriaLabel: vi.fn() };
+    context._aiSelectMount = vi.fn(() => selector);
+    const projects = Object.freeze([
+      { project_id: 's2', name: 'Zulu 2' },
+      { project_id: 's10', name: 'Zulu 10' },
+      { project_id: 'p2', name: 'Alpha 2' },
+      { project_id: 'p10', name: 'Alpha 10' },
+    ]);
+    context.loadProjects = vi.fn(async () => projects);
+
+    context._renderCtxScopeSelector(projects);
+    const mounted = context._aiSelectMount.mock.calls[0][1];
+    expect(mounted.options.map((option: any) => option.value)).toEqual(['', 'p2', 'p10', 's2', 's10']);
+    vm.runInContext('_ctxProjectId = "s10"', context);
+    await context._refreshCtxProjects();
+    const [options, selection] = selector.setOptions.mock.calls[0];
+    expect(options.map((option: any) => option.value)).toEqual(['', 'p2', 'p10', 's2', 's10']);
+    expect(selection.value).toBe('s10');
+  });
+
   it('keeps the latest selection when an earlier Library load finishes late', async () => {
     const context = loadContextsScript();
     let finishGlobal: (value: any) => void = () => {};

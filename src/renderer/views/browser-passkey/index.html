@@ -1,0 +1,33 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'self'; script-src 'self'; img-src data:; base-uri 'none'; form-action 'none'">
+  <link rel="stylesheet" href="../../style.css">
+  <link rel="stylesheet" href="passkey.css">
+  <script defer src="../../modules/icons.js"></script>
+  <script defer src="passkey.js"></script>
+</head>
+<body>
+  <main id="dialog" class="modal modal-standard passkey-dialog" aria-labelledby="title">
+    <header class="modal-header"><h1 class="modal-title" id="title"></h1></header>
+    <div class="modal-body passkey-body">
+      <div class="passkey-instructions">
+        <span id="camera" aria-hidden="true"></span>
+        <div><h2 id="heading"></h2><p id="instruction" class="passkey-instruction"></p></div>
+      </div>
+      <div class="passkey-visual">
+        <img id="qr" width="264" height="264" hidden>
+        <div id="waiting" class="passkey-waiting">
+          <span id="phone" aria-hidden="true"></span>
+          <span class="chat-history-inline-spinner" aria-hidden="true"></span>
+        </div>
+      </div>
+      <p id="status" class="passkey-status" role="status" aria-live="polite" aria-atomic="true"></p>
+      <p id="nearby" class="passkey-nearby"></p>
+    </div>
+    <footer class="modal-actions"><button id="cancel" class="btn" type="button"></button></footer>
+  </main>
+</body>
+</html>

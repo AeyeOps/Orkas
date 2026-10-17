@@ -7,6 +7,7 @@ import { createLogger } from '../logger';
 import { hardenedWebPreferences, installExternalNavigationGuard, installHtmlPreviewNavigationGuard } from '../util/window-security';
 import { registerUserSwitchHook } from './user-switch-hooks';
 import { subscribeBus } from './group_chat';
+import { commercialWebAppFailure, isCommercialWebAppFailure, requireLocalAppType, storedAppType } from './web_apps/commercial-entry';
 
 // Host-only window chrome. Generated applications retain the existing iframe
 // sandbox and acquire their SDK instance from their own trusted renderer.
@@ -85,6 +86,19 @@ export async function replacePreview(uid: string, sender: WebContents, accepted:
 export async function openPreview(uid: string, owner: WebContents, payload: unknown) {
   if ((JSON.stringify(payload)?.length || 0) > 8 * 1024 * 1024) throw new Error('Preview is too large.');
   const source = sourceSchema.parse(payload);
+  try {
+    const saved = await import('./saved_apps');
+    if (source.kind === 'app') requireLocalAppType(await saved.resolveSavedAppType(uid, source.appId));
+    else if (source.kind === 'artifact') requireLocalAppType(await saved.resolveArtifactAppType(uid, source.cid, source.artifactId));
+    else if (source.kind === 'file') {
+      if (source.options.cid) requireLocalAppType(await saved.boundAppType(uid, source.options.cid));
+      const file = source.options.absPath || source.path;
+      if (path.isAbsolute(file)) {
+        requireLocalAppType(await saved.managedPathAppType(uid, file));
+        requireLocalAppType(storedAppType(path.dirname(file)));
+      }
+    }
+  } catch (error) { if (isCommercialWebAppFailure(error)) return commercialWebAppFailure(); throw error; }
   if (records.has(owner.id)) throw new Error('Open previews from the main window.');
   const existing = [...records.values()].find(r => r.uid === uid && r.owner === owner
     && (source.kind === 'app' ? sourceKey(r.source) === sourceKey(source) : r.source.kind !== 'app'));

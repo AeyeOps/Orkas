@@ -324,8 +324,8 @@ function _sessionNewerThan(uid: string, sessionId: string, sinceMs: number): boo
 // ── Reflection invocation ────────────────────────────────────────────────
 
 /**
- * How a reflection ended. All three are terminal for this cycle and advance
- * the baseline; only a thrown error means "retry next cycle".
+ * Successful/no-change outcomes advance the baseline. A deferred write keeps
+ * its window pending, just like a failure, without adding a model retry.
  *
  *   - `reflected`          wrote something durable (metacognition or a skill)
  *   - `nothing_to_save`    read the window, deliberately wrote nothing
@@ -337,7 +337,7 @@ function _sessionNewerThan(uid: string, sessionId: string, sinceMs: number): boo
  * reports "the LLM replied" while claiming to report "the loop produced
  * something" — which is exactly how this feature ran for weeks unnoticed.
  */
-export type ReflectOutcome = 'reflected' | 'nothing_to_save' | 'nothing_to_reflect';
+export type ReflectOutcome = 'reflected' | 'nothing_to_save' | 'nothing_to_reflect' | 'write_deferred';
 
 export type ReflectFn = (
   uid: string,
@@ -348,6 +348,7 @@ export type ReflectFn = (
    *  needs it for the outcome it cannot read from a rejected race: a run cut
    *  off by the deadline may already have saved its lessons. */
   onDurableWrite?: () => void,
+  onDeferredWrite?: (pending: boolean) => void,
 ) => Promise<ReflectOutcome>;
 
 /** Tag a failure with a bounded analytics code so the cycle aggregate can
@@ -397,6 +398,7 @@ async function realReflectForAgent(
   signal?: AbortSignal,
   onDurableWrite?: () => void,
   withToolExecution?: (execute: () => Promise<ToolResult>) => Promise<ToolResult>,
+  onDeferredWrite?: (pending: boolean) => void,
 ): Promise<ReflectOutcome> {
   const runnerAgentId = agentId === DEFAULT_AGENT_ID ? '' : agentId;
 
@@ -417,68 +419,77 @@ async function realReflectForAgent(
   if (signal?.aborted) throw reflectionError(abortCode(signal), 'reflection cancelled');
 
   const ca = await import('#core-agent');
-  const comp = metacognition.readContentForUser(uid, agentId, 'competence');
-  const strat = metacognition.readContentForUser(uid, agentId, 'strategies');
-  const languageName = getLocaleMeta(resolveLanguageForUser(uid)).llmName;
-  const fixedPrompt = ca.buildReviewPrompt(comp.content || '', strat.content || '', '', languageName);
-  const transcriptResult = await buildTranscript(uid, agentId, sinceMs, runner.getReflectionInputBudget(fixedPrompt));
-  if (signal?.aborted) throw reflectionError(abortCode(signal), 'reflection cancelled');
-  if (transcriptResult.unavailable || transcriptResult.capacityExceeded) {
-    // Unreadable or entirely cropped evidence is not an examined quiet window;
-    // retain the existing bounded failure/backoff handling.
-    throw reflectionError('transcript_unavailable', transcriptResult.capacityExceeded
-      ? 'reflection evidence exceeds input capacity' : 'transcript sources unavailable');
-  }
-  if (!transcriptResult.text) {
-    // The window was examined and held nothing a reflection could use — a
-    // dirty session file whose in-window content is tool-only, a swept conv,
-    // a race. Terminal for this window: the caller advances the baseline so
-    // the next cycle looks at new activity instead of re-reading this span.
-    log.info(`reflect ${maskId(agentId)}: no reflectable activity in window (considered=${transcriptResult.stats.convsConsidered})`);
-    return 'nothing_to_reflect';
-  }
-
-  const prompt = ca.buildReviewPrompt(comp.content || '', strat.content || '', transcriptResult.text, languageName);
-
-  // `runReflection` swallows provider/LLM/loop errors and returns ''; the
-  // failure observer is the only way to learn which one it was. An empty
-  // response is a failed reflection (baseline not stamped).
-  let writes = 0;
-  let failure: { kind: string; error?: unknown } | undefined;
-  const responseText = await runner.runReflection(
-    prompt, signal, undefined, undefined,
-    () => { writes += 1; onDurableWrite?.(); },
-    (f) => { failure = f; },
-    withToolExecution,
-  );
-  if (!responseText || !responseText.trim()) {
-    // Every failure inside `runReflection` collapses to '', including our own
-    // deadline, so ask the signal before blaming the provider.
+  const review = metacognition.beginMetacognitionReview(uid, agentId, onDeferredWrite);
+  const closeReview = () => review.close();
+  signal?.addEventListener('abort', closeReview, { once: true });
+  try {
+    const comp = { content: review.competence };
+    const strat = { content: review.strategies };
+    const languageName = getLocaleMeta(resolveLanguageForUser(uid)).llmName;
+    const fixedPrompt = ca.buildReviewPrompt(comp.content || '', strat.content || '', '', languageName);
+    const transcriptResult = await buildTranscript(uid, agentId, sinceMs, runner.getReflectionInputBudget(fixedPrompt));
     if (signal?.aborted) throw reflectionError(abortCode(signal), 'reflection cancelled');
-    // Loop exhaustion after the durable writes already landed: the lessons
-    // are saved, so failing here would re-run the same window next cycle
-    // and write them again (2026-08-28 review E1-6).
-    if (writes > 0) {
-      log.warn('reflection produced no final text after durable writes; counting as reflected', {
-        agent_id: maskId(agentId),
-        write_count: writes,
-      });
-      return 'reflected';
+    if (transcriptResult.unavailable || transcriptResult.capacityExceeded) {
+      // Unreadable or entirely cropped evidence is not an examined quiet window;
+      // retain the existing bounded failure/backoff handling.
+      throw reflectionError('transcript_unavailable', transcriptResult.capacityExceeded
+        ? 'reflection evidence exceeds input capacity' : 'transcript sources unavailable');
     }
-    throw reflectionError(
-      failureCode(failure),
-      `reflection returned empty (${failure?.kind ?? 'unreported'}; see core-agent log)`,
-    );
-  }
+    if (!transcriptResult.text) {
+      // The window was examined and held nothing a reflection could use — a
+      // dirty session file whose in-window content is tool-only, a swept conv,
+      // a race. Terminal for this window: the caller advances the baseline so
+      // the next cycle looks at new activity instead of re-reading this span.
+      log.info(`reflect ${maskId(agentId)}: no reflectable activity in window (considered=${transcriptResult.stats.convsConsidered})`);
+      return 'nothing_to_reflect';
+    }
 
-  const transcriptStats = `transcript ${transcriptResult.stats.convsIncluded}/${transcriptResult.stats.convsConsidered} convs, ~${transcriptResult.stats.estimatedTokens} tokens`;
-  if (writes === 0) {
-    // The prompt's own instruction when a window holds no new lesson.
-    log.info(`reflect ${maskId(agentId)}: nothing to save (${transcriptStats})`);
-    return 'nothing_to_save';
+    const prompt = ca.buildReviewPrompt(comp.content || '', strat.content || '', transcriptResult.text, languageName);
+
+    // `runReflection` swallows provider/LLM/loop errors and returns ''; the
+    // failure observer is the only way to learn which one it was. An empty
+    // response is a failed reflection (baseline not stamped).
+    let writes = 0;
+    let failure: { kind: string; error?: unknown } | undefined;
+    const responseText = await runner.runReflection(
+      prompt, signal, undefined, undefined,
+      () => { writes += 1; onDurableWrite?.(); },
+      (f) => { failure = f; },
+      withToolExecution,
+    );
+    if (review.hasDeferredWrites()) return 'write_deferred';
+    if (!responseText || !responseText.trim()) {
+      // Every failure inside `runReflection` collapses to '', including our own
+      // deadline, so ask the signal before blaming the provider.
+      if (signal?.aborted) throw reflectionError(abortCode(signal), 'reflection cancelled');
+      // Loop exhaustion after the durable writes already landed: the lessons
+      // are saved, so failing here would re-run the same window next cycle
+      // and write them again (2026-08-28 review E1-6).
+      if (writes > 0) {
+        log.warn('reflection produced no final text after durable writes; counting as reflected', {
+          agent_id: maskId(agentId),
+          write_count: writes,
+        });
+        return 'reflected';
+      }
+      throw reflectionError(
+        failureCode(failure),
+        `reflection returned empty (${failure?.kind ?? 'unreported'}; see core-agent log)`,
+      );
+    }
+
+    const transcriptStats = `transcript ${transcriptResult.stats.convsIncluded}/${transcriptResult.stats.convsConsidered} convs, ~${transcriptResult.stats.estimatedTokens} tokens`;
+    if (writes === 0) {
+      // The prompt's own instruction when a window holds no new lesson.
+      log.info(`reflect ${maskId(agentId)}: nothing to save (${transcriptStats})`);
+      return 'nothing_to_save';
+    }
+    log.info(`reflect ${maskId(agentId)}: ok (wrote ${writes}, ${transcriptStats})`);
+    return 'reflected';
+  } finally {
+    signal?.removeEventListener('abort', closeReview);
+    review.close();
   }
-  log.info(`reflect ${maskId(agentId)}: ok (wrote ${writes}, ${transcriptStats})`);
-  return 'reflected';
 }
 
 // ── Cycle ───────────────────────────────────────────────────────────────
@@ -555,8 +566,8 @@ export async function runOneCycle(uid: string, opts: RunCycleOpts = {}): Promise
   const lease = beginReflection(uid, opts.signal);
   if (!lease) { opts.onDeferred?.(); return 0; }
   try {
-    const reflect: ReflectFn = opts.reflect ?? ((uid, aid, since, signal, onWrite) =>
-      realReflectForAgent(uid, aid, since, signal, onWrite, (execute) => lease.runTool(execute, signal)));
+    const reflect: ReflectFn = opts.reflect ?? ((uid, aid, since, signal, onWrite, onDeferred) =>
+      realReflectForAgent(uid, aid, since, signal, onWrite, (execute) => lease.runTool(execute, signal), onDeferred));
     return await runCycle(uid, { ...opts, signal: lease.signal, isIdle, reflect });
   } finally {
     if (isReflectionYield(lease.signal.reason)) opts.onDeferred?.();
@@ -577,7 +588,8 @@ async function runCycle(uid: string, opts: RunCycleOpts): Promise<number> {
   fs.mkdirSync(userLocalConfigDir(uid), { recursive: true });
 
   const now = (opts.now ?? Date.now)();
-  const reflect = opts.reflect ?? realReflectForAgent;
+  const reflect: ReflectFn = opts.reflect ?? ((uid, aid, since, signal, onWrite, onDeferred) =>
+    realReflectForAgent(uid, aid, since, signal, onWrite, undefined, onDeferred));
   const dirtyFn = opts.isDirty ?? isAgentDirty;
 
   // Every configured candidate cooling down means no model call can succeed
@@ -624,15 +636,22 @@ async function runCycle(uid: string, opts: RunCycleOpts): Promise<number> {
       break;
     }
     let durableWrites = 0;
+    let writeDeferred = false;
     try {
       const outcome = await withDeadline(
         opts.signal, perAgentTimeoutMs,
-        (signal) => reflect(uid, agentId, sinceMs, signal, () => { durableWrites += 1; }),
+        (signal) => reflect(uid, agentId, sinceMs, signal, () => { durableWrites += 1; }, pending => { writeDeferred = pending; }),
       );
       // Account switching cancels the old cycle. A provider/tool may resolve
       // after observing cancellation, but that stale work must never earn a
       // cooldown stamp or suppress the new account's next reflection.
       if (opts.signal?.aborted) break;
+      if (outcome === 'write_deferred' || writeDeferred) {
+        // A retained, uncommitted candidate is neither success nor no-change.
+        // Keep the activity window; normal cadence owns the next attempt.
+        failed += 1;
+        continue;
+      }
       // Advance the baseline — read fresh state in case another writer touched
       // it. An empty window advances too: re-reading a span already known to
       // hold nothing cannot succeed, and leaving it would let that agent hold
@@ -652,6 +671,7 @@ async function runCycle(uid: string, opts: RunCycleOpts): Promise<number> {
       }
     } catch (err) {
       if (opts.signal?.aborted) break;
+      if (writeDeferred) { failed += 1; continue; }
       // The deadline abandons the run instead of waiting for it, so a
       // reflection that already saved lessons before it fired keeps them.
       // Retrying that window would write the same lessons again, which is the

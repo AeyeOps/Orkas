@@ -2,6 +2,8 @@ import path from 'node:path';
 import { cpSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
 import { createPackageWithOptions } from '@electron/asar';
 import { expect, test, OrkasTestApp } from './fixtures/orkas';
+import { analyzeWebAppLogs } from './fixtures/web-app-log-analysis';
+import { installEmptyLibrarySearch } from './fixtures/empty-library-search';
 
 const pcRoot = path.resolve(__dirname, '../..');
 let previousKeepLogs: string | undefined;
@@ -21,8 +23,7 @@ test('shows preparation before full results, searches partial history, and resum
   const app = new OrkasTestApp(testInfo, { configuredModel: false });
   try {
     await app.launch();
-    await app.invoke('config.setLanguage', { language: 'zh' });
-    await app.page!.evaluate(() => (window as any).setLang('zh'));
+    await installEmptyLibrarySearch(app, pcRoot);
     const created = await app.invoke<{ conversation: { conversation_id: string } }>('conversations.create', {
       title: 'Search recovery fixture',
     });
@@ -69,8 +70,12 @@ test('shows preparation before full results, searches partial history, and resum
       .toMatchObject({ ok: true, chat_index_complete: false, results: [] });
 
     let page = app.page!;
+    // The preparation/loading assertions below intentionally verify Chinese.
+    // Establish that language through the real UI preference before searching.
+    await page.evaluate(async () => { await (window as any).setLang('zh'); });
     // Hold only delivery of the real global request. Status uses the actual
-    // renderer shim/preload/IPC handler; no search or status response is faked.
+    // renderer shim/preload/IPC handler; chat search/status remain real while
+    // the unrelated Library semantic provider is explicitly fixture-only.
     await page.evaluate(() => {
       const app = window as any;
       const original = app.apiFetch;
@@ -100,6 +105,7 @@ test('shows preparation before full results, searches partial history, and resum
     await page.locator('#search-close-btn').click();
 
     page = await app.relaunch();
+    await installEmptyLibrarySearch(app, pcRoot);
     // Startup owns resumption; no manual repair invocation after relaunch.
     // Low-memory hosts start the deferred phase after 6s, then admit disk
     // work after another 30s. Allow that documented boot budget, not a query
@@ -119,7 +125,35 @@ test('shows preparation before full results, searches partial history, and resum
     await expect(page.locator('#search-body .search-result').first()).toBeVisible();
     await expect(page.locator('#search-body [role="status"]')).toHaveCount(0);
     await page.screenshot({ path: testInfo.outputPath('complete-search.png') });
+    await page.locator('#search-close-btn').click();
+
+    // A built index that loses verification (here a sync invalidation) while
+    // agent work keeps its repair waiting is not announced: opening search and
+    // searching stay quiet, and the status check queues the catch-up.
+    await app.electronApp!.evaluate((_electron, root) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      require(`${root}/src/main/util/boot_init.ts`).configureBootAdmission({ isRuntimeBusy: () => true });
+      const uid = require(`${root}/src/main/features/users.ts`).getActiveUserId();
+      require(`${root}/src/main/features/search/indexer.ts`).invalidateChatsIndex(uid);
+    }, pcRoot);
+    expect(await app.invoke('search.status'))
+      .toMatchObject({ ok: true, chat_index_complete: false, chat_index_building: false });
+    await page.locator('#sidebar-search-btn').click();
+    // Let the overlay's own status request settle before checking for silence.
+    await page.evaluate(() => (window as any).apiFetch('/api/search/status').then((r: any) => r.json()));
+    await expect(page.locator('#search-body [role="status"]')).toHaveCount(0);
+    await page.locator('#search-input').fill('prefixmarker');
+    await expect(page.locator('#search-body .search-result').first()).toBeVisible();
+    await expect(page.locator('#search-body [role="status"]')).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath('catch-up-search.png') });
+    await app.electronApp!.evaluate((_electron, root) => {
+      const require = (process as any).mainModule.require.bind((process as any).mainModule);
+      require(`${root}/src/main/util/boot_init.ts`).configureBootAdmission({ isRuntimeBusy: () => false });
+    }, pcRoot);
+    await expect.poll(async () => app.invoke('search.status'), { timeout: 30_000 })
+      .toMatchObject({ ok: true, chat_index_complete: true });
     expect(app.modelRequests).toHaveLength(0);
+    expect(await app.electronApp!.evaluate(() => (globalThis as any).__emptyLibrarySearchQueries)).toBeGreaterThan(0);
   } finally { await app.dispose(); }
 });
 
