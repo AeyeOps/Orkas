@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "أتمتة",
   "settings.cleanup.pinned": "مثبتة",
   "settings.cleanup.unavailable": "غير متاح",
-  "settings.cleanup.unread": "غير مقروءة"
+  "settings.cleanup.unread": "غير مقروءة",
+  "price_comparison.maximum": "تكلفة النماذج أقل بنحو 60% كحد أقصى من API المزوّدين"
 }

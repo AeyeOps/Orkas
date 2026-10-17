@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "Otomatisasi",
   "settings.cleanup.pinned": "Disematkan",
   "settings.cleanup.unavailable": "Tidak tersedia",
-  "settings.cleanup.unread": "Belum dibaca"
+  "settings.cleanup.unread": "Belum dibaca",
+  "price_comparison.maximum": "Biaya model hingga ~60% lebih murah dari API penyedia"
 }

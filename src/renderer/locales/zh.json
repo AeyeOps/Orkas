@@ -2481,7 +2481,7 @@
   "conversation_info.tab_tasks": "任务",
   "connectors.errors.api_key_required": "请先在设置的模型页配置带连接器权限的 Orkas API Key。",
   "settings.orkas_api.title": "Orkas API Key",
-  "settings.orkas_api.sub": "统一用于 Orkas 模型、搜索、图片、语音、视频和需要积分的连接器；密钥仅加密保存在本机。",
+  "settings.orkas_api.sub": "统一用于 Orkas 模型、搜索、图片、语音、视频和需要积分的连接器。密钥仅加密保存在本机。",
   "settings.orkas_api.create_key": "创建 API Key",
   "settings.orkas_api.key_placeholder": "输入 API Key",
   "settings.orkas_api.configure": "配置",
@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "自动化",
   "settings.cleanup.pinned": "置顶",
   "settings.cleanup.unavailable": "暂不可清理",
-  "settings.cleanup.unread": "未读"
+  "settings.cleanup.unread": "未读",
+  "price_comparison.maximum": "模型费用较厂商 API 最高节省约 60%"
 }

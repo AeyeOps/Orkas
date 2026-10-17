@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "Автоматизация",
   "settings.cleanup.pinned": "Закреплено",
   "settings.cleanup.unavailable": "Недоступно",
-  "settings.cleanup.unread": "Не прочитано"
+  "settings.cleanup.unread": "Не прочитано",
+  "price_comparison.maximum": "Стоимость моделей до ~60% ниже API поставщиков"
 }

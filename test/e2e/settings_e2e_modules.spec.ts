@@ -1,5 +1,10 @@
 import { expect, test } from './fixtures/orkas';
 
+declare const _settingsState: {
+  orkasApiCredential: { configured: boolean; keyMasked: string };
+};
+declare function _settingsRenderOrkasApiCard(): void;
+
 async function openSettingsTab(page: import('@playwright/test').Page, tabName: string): Promise<void> {
   await page.locator('#settings-btn').click();
   const tab = page.locator(`.settings-tab[data-settings-tab="${tabName}"]`);
@@ -17,6 +22,54 @@ async function openAddModelDialog(page: import('@playwright/test').Page): Promis
 }
 
 test.describe('settings modules and model guard', () => {
+  test('keeps model savings readable beside the API-key title across languages and widths', async ({ appPage }, testInfo) => {
+    await openSettingsTab(appPage, 'credentials');
+    const card = appPage.locator('#settings-orkas-api-group');
+    const saving = card.locator('[data-i18n="price_comparison.maximum"]');
+    await expect(saving).toHaveText('Model costs up to ~60% less than provider APIs');
+    await expect(card.locator('#settings-orkas-api-key-input')).toBeVisible();
+    // A masked presentation fixture never saves or transmits a credential.
+    await appPage.evaluate(() => {
+      _settingsState.orkasApiCredential = { configured: true, keyMasked: 'sk-demo…1234' };
+      _settingsRenderOrkasApiCard();
+    });
+    for (const [language, width] of [['en', 1280], ['zh', 1280], ['zh', 620], ['de', 620], ['ar', 620]] as const) {
+      await appPage.setViewportSize({ width, height: 900 });
+      await appPage.evaluate(async language => { await (window as any).setLang(language); }, language);
+      await expect(saving).toBeVisible();
+      if (language === 'zh') {
+        await expect(saving).toHaveText('模型费用较厂商 API 最高节省约 60%');
+        await expect(card.locator('[data-i18n="settings.orkas_api.sub"]'))
+          .toHaveText('统一用于 Orkas 模型、搜索、图片、语音、视频和需要积分的连接器。密钥仅加密保存在本机。');
+      }
+      const geometry = await saving.evaluate(element => {
+        const box = element.getBoundingClientRect();
+        const card = element.closest('#settings-orkas-api-group')!;
+        const bounds = card.getBoundingClientRect();
+        return {
+          containsLabel: box.left >= bounds.left && box.right <= bounds.right,
+          noClip: element.scrollWidth <= element.clientWidth + 1,
+          noCardOverflow: card.scrollWidth <= card.clientWidth + 1,
+        };
+      });
+      expect(geometry).toEqual({ containsLabel: true, noClip: true, noCardOverflow: true });
+      if (width === 620) {
+        const copy = (await card.locator('.settings-group-head-main').boundingBox())!;
+        const create = (await card.locator('#settings-orkas-api-create-key').boundingBox())!;
+        expect(create.y).toBeGreaterThanOrEqual(copy.y + copy.height);
+      }
+      await expect(card.locator('#settings-orkas-api-key-masked')).toHaveText('sk-demo…1234');
+      await expect(card.locator('#settings-orkas-api-edit')).toBeVisible();
+      await expect(card.locator('#settings-orkas-api-delete')).toBeVisible();
+      await card.screenshot({ path: testInfo.outputPath(`api-key-${language}-${width}.png`) });
+    }
+    await card.locator('#settings-orkas-api-edit').click();
+    await expect(card.locator('#settings-orkas-api-key-input')).toBeVisible();
+    await expect(card.locator('#settings-orkas-api-key-input')).toHaveValue('');
+    await card.locator('#settings-orkas-api-cancel').click();
+    await expect(card.locator('#settings-orkas-api-key-input')).toBeHidden();
+  });
+
   test('Escape closes the model picker before the dialog and returns focus to Add', async ({ appPage }) => {
     await openSettingsTab(appPage, 'credentials');
     await openAddModelDialog(appPage);

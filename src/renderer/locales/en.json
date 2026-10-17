@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "Automation",
   "settings.cleanup.pinned": "Pinned",
   "settings.cleanup.unavailable": "Unavailable",
-  "settings.cleanup.unread": "Unread"
+  "settings.cleanup.unread": "Unread",
+  "price_comparison.maximum": "Model costs up to ~60% less than provider APIs"
 }

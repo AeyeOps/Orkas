@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "Automação",
   "settings.cleanup.pinned": "Fixada",
   "settings.cleanup.unavailable": "Indisponível",
-  "settings.cleanup.unread": "Não lida"
+  "settings.cleanup.unread": "Não lida",
+  "price_comparison.maximum": "Custo do modelo até ~60% menor que as APIs dos provedores"
 }

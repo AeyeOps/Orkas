@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "อัตโนมัติ",
   "settings.cleanup.pinned": "ปักหมุด",
   "settings.cleanup.unavailable": "ยังล้างไม่ได้",
-  "settings.cleanup.unread": "ยังไม่อ่าน"
+  "settings.cleanup.unread": "ยังไม่อ่าน",
+  "price_comparison.maximum": "ค่าโมเดลถูกกว่า API ผู้ให้บริการสูงสุดประมาณ 60%"
 }

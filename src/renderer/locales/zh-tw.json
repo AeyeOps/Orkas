@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "自動化",
   "settings.cleanup.pinned": "置頂",
   "settings.cleanup.unavailable": "暫不可清理",
-  "settings.cleanup.unread": "未讀"
+  "settings.cleanup.unread": "未讀",
+  "price_comparison.maximum": "模型費用較廠商 API 最高節省約 60%"
 }

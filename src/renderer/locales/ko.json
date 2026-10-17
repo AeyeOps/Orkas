@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "자동화",
   "settings.cleanup.pinned": "고정",
   "settings.cleanup.unavailable": "정리 불가",
-  "settings.cleanup.unread": "읽지 않음"
+  "settings.cleanup.unread": "읽지 않음",
+  "price_comparison.maximum": "모델 비용이 제공업체 API보다 최대 약 60% 저렴"
 }

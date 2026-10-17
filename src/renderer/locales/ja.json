@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "自動化",
   "settings.cleanup.pinned": "固定",
   "settings.cleanup.unavailable": "利用不可",
-  "settings.cleanup.unread": "未読"
+  "settings.cleanup.unread": "未読",
+  "price_comparison.maximum": "モデル料金は提供元 API より最大約 60% お得"
 }

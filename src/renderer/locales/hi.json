@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "ऑटोमेशन",
   "settings.cleanup.pinned": "पिन किया",
   "settings.cleanup.unavailable": "अनुपलब्ध",
-  "settings.cleanup.unread": "अपठित"
+  "settings.cleanup.unread": "अपठित",
+  "price_comparison.maximum": "मॉडल लागत प्रदाता API से लगभग 60% तक कम"
 }

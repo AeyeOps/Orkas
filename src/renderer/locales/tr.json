@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "Otomasyon",
   "settings.cleanup.pinned": "Sabitlenmiş",
   "settings.cleanup.unavailable": "Kullanılamıyor",
-  "settings.cleanup.unread": "Okunmamış"
+  "settings.cleanup.unread": "Okunmamış",
+  "price_comparison.maximum": "Model maliyeti sağlayıcı API’lerinden yaklaşık %60’a kadar düşük"
 }

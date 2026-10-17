@@ -755,26 +755,29 @@ body.is-sidebar-resizing iframe { pointer-events: none; }
   width: 100%;
   padding-right: 8px;
 }
-.sidebar-settings-alerts {
-  display: block;
-  order: 2;
-  flex: 0 0 auto;
+.sidebar-settings-alerts,
+.settings-orkas-api-savings {
   box-sizing: border-box;
   min-width: 0;
-  max-width: min(92px, calc(50% - 7px));
-  margin-left: auto;
-  margin-right: 8px;
   padding: 6px 10px;
   border: 1px solid rgba(91, 87, 214, 0.12);
   border-radius: 8px;
   font-size: 11px;
   font-weight: 550;
   line-height: 1.4;
+  background: #f1f0fc;
+  color: #5753bd;
+}
+.sidebar-settings-alerts {
+  display: block;
+  order: 2;
+  flex: 0 0 auto;
+  max-width: min(92px, calc(50% - 7px));
+  margin-left: auto;
+  margin-right: 8px;
   overflow: hidden;
   white-space: nowrap;
   text-align: left;
-  background: #f1f0fc;
-  color: #5753bd;
 }
 .sidebar-settings-alerts:empty { display: none; }
 @media (prefers-reduced-motion: reduce) {
@@ -18464,41 +18467,6 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 .memory-icon-btn:hover { background: var(--surface-2); }
 .memory-icon-btn.is-muted { color: var(--muted); }
 
-@media (max-width: 720px) {
-  .settings-orkas-api-group {
-    display: block;
-  }
-  .settings-orkas-api-head {
-    display: flex;
-    align-items: stretch;
-    flex-direction: column;
-    gap: 16px;
-    margin-bottom: 14px;
-  }
-  .settings-orkas-api-head .settings-group-head-main,
-  .settings-orkas-api-head .btn {
-    margin-bottom: 0;
-  }
-  .settings-orkas-api-group .settings-orkas-api-configure-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1fr);
-    gap: 10px;
-  }
-  .settings-orkas-api-saved {
-    align-items: stretch;
-    flex-direction: column;
-  }
-  .settings-orkas-api-actions,
-  .settings-orkas-api-editor-actions { width: 100%; }
-  .settings-orkas-api-head .btn,
-  .settings-orkas-api-configure-row .btn {
-    width: 100%;
-  }
-  .settings-orkas-api-configure-row .btn {
-    grid-column: 1;
-  }
-  .settings-orkas-api-editor-actions { grid-column: 1; }
-}
 .memory-modal-overlay {
   position: fixed;
   inset: 0;
@@ -19485,6 +19453,20 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
   font-size: 14px;
   line-height: 1.4;
 }
+.settings-orkas-api-title-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+}
+.settings-orkas-api-savings {
+  display: inline-block;
+  max-width: 100%;
+  text-align: center;
+  text-wrap: balance;
+  overflow-wrap: break-word;
+}
 .settings-orkas-api-head .settings-group-sub {
   max-width: 720px;
 }
@@ -19555,6 +19537,41 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
 }
 .settings-orkas-api-status:empty {
   display: none;
+}
+@media (max-width: 720px) {
+  .settings-orkas-api-group {
+    display: block;
+  }
+  .settings-orkas-api-head {
+    display: flex;
+    align-items: stretch;
+    flex-direction: column;
+    gap: 16px;
+    margin-bottom: 14px;
+  }
+  .settings-orkas-api-head .settings-group-head-main,
+  .settings-orkas-api-head .btn {
+    margin-bottom: 0;
+  }
+  .settings-orkas-api-group .settings-orkas-api-configure-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 10px;
+  }
+  .settings-orkas-api-saved {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .settings-orkas-api-actions,
+  .settings-orkas-api-editor-actions { width: 100%; }
+  .settings-orkas-api-head .btn,
+  .settings-orkas-api-configure-row .btn {
+    width: 100%;
+  }
+  .settings-orkas-api-configure-row .btn {
+    grid-column: 1;
+  }
+  .settings-orkas-api-editor-actions { grid-column: 1; }
 }
 .agent-card-chip.is-cli {
   display: inline-block;

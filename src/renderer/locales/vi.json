@@ -2642,5 +2642,6 @@
   "settings.cleanup.automation": "Tự động hóa",
   "settings.cleanup.pinned": "Đã ghim",
   "settings.cleanup.unavailable": "Không khả dụng",
-  "settings.cleanup.unread": "Chưa đọc"
+  "settings.cleanup.unread": "Chưa đọc",
+  "price_comparison.maximum": "Chi phí mô hình thấp hơn API nhà cung cấp tới khoảng 60%"
 }
