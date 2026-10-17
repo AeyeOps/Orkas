@@ -19,7 +19,7 @@ import { projectHistoryMediaText } from '../../util/history-media';
  */
 
 import * as crypto from 'node:crypto';
-import type { Lang } from '../../i18n.js';
+import { getLocaleMeta, type Lang } from '../../i18n.js';
 import { localCliCapabilities } from './registry.js';
 
 export const CLI_HISTORY_MAX_TURNS = 5;
@@ -225,15 +225,9 @@ export function materializeCliContext(
 }
 
 function buildCompactCliLanguageInstruction(lang: Lang): string {
-  const names: Partial<Record<Lang, string>> = {
-    zh: 'Chinese (简体中文)',
-    en: 'English',
-    ja: 'Japanese (日本語)',
-    pt: 'Portuguese (Brazil)',
-  };
   return [
     '## Response language',
-    `Write human-readable responses and form labels in ${names[lang] || names.en} unless the user explicitly requests another language. Keep XML tags, JSON keys, ids, file paths, and code unchanged.`,
+    `Write human-readable responses and form labels in ${getLocaleMeta(lang).llmName} unless the user explicitly requests another language. Keep XML tags, JSON keys, ids, file paths, and code unchanged.`,
   ].join('\n\n');
 }
 

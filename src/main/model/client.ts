@@ -235,12 +235,19 @@ export interface ChatOptions {
    *  and attaches a `artifacts[]` list to the assistant message so the
    *  renderer embeds each interactive web-app artifact in the bubble. */
   onArtifactCreated?: (a: { id: string; title: string }) => void;
+  /** Host diagnostic delivery is independent of chat completion. The host
+   * pins this promise to the originating task before the stream ends. */
+  onDiagnosticsPending?: (result: Promise<StreamEvent | null>) => void;
   /** Fired only after the custom-connector manager has durably accepted a
    * user-confirmed server. Group chat uses the stable id to offer a review
    * shortcut; the callback is not part of installation authorization. */
   onCustomConnectorAdded?: (connectorId: string) => void;
   /** A saved automation, so the host can offer the user a route to it. */
-  onAutoTaskSaved?: (taskId: string) => void;
+  onAutoTaskSaved?: (taskId: string, title: string) => void;
+  onTodoTaskSaved?: (taskId: string, projectId: string, content: string) => void;
+  /** A deleted automation / todo, so the host withdraws an offer staged earlier in the turn. */
+  onAutoTaskDeleted?: (taskId: string) => void;
+  onTodoTaskDeleted?: (taskId: string, projectId: string) => void;
   /** Fired at turn start with each skill id that entered the system-prompt
    *  index, split by source system (`A.custom` / `A.platform` / `B`).
    *  `features/group_chat` buffers per turn and emits `skill_advertised`

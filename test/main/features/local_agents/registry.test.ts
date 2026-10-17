@@ -282,13 +282,13 @@ function writeArgAwareMockCli(
 // The Windows fixture must use the runner-owned Node executable. Vitest runs
 // under Electron, while production intentionally strips ELECTRON_RUN_AS_NODE
 // before probing a CLI child.
-function writeCountingMockCli(basePath: string, logPath: string): string {
+function writeCountingMockCli(basePath: string, logPath: string, version = '2.1.0'): string {
   if (isWindows) {
     const scriptPath = `${basePath}.js`;
     const script = [
       "const fs = require('node:fs');",
       `fs.appendFileSync(${JSON.stringify(logPath)}, String(process.argv[2] || '') + '\\n');`,
-      "setTimeout(() => process.stdout.write('2.1.0\\n'), 120);",
+      `setTimeout(() => process.stdout.write(${JSON.stringify(version + '\n')}), 120);`,
       '',
     ].join('\n');
     fs.mkdirSync(path.dirname(scriptPath), { recursive: true });
@@ -306,7 +306,7 @@ function writeCountingMockCli(basePath: string, logPath: string): string {
     '#!/bin/sh',
     `printf '%s\\n' "$1" >> ${JSON.stringify(logPath)}`,
     'sleep 0.12',
-    "printf '2.1.0\\n'",
+    `printf '%s\\n' ${JSON.stringify(version)}`,
     '',
   ].join('\n'));
   fs.chmodSync(binPath, 0o755);
@@ -553,6 +553,22 @@ describe('local_agents/registry', () => {
     expect(r.errorDetail).toMatch(/below required minimum/);
   });
 
+  it.each([
+    ['openclaw', '2026.4.10', '2026.4.11', 'ORKAS_OPENCLAW_PATH'],
+    ['hermes', '0.8.9', '0.9.0', 'ORKAS_HERMES_PATH'],
+  ] as const)('enforces the %s floor for externally pinned installations', async (cli, below, floor, envKey) => {
+    const fake = writeMockCli(path.join(tmpDir, `pinned-${cli}`), below);
+    process.env[envKey] = fake;
+    const rejected = await detectOne(cli);
+    expect(rejected).toMatchObject({ available: false, error: 'version_too_old', version: below });
+    expect(rejected.errorDetail).toContain(floor);
+    // Hermes returns the preferred probe before its concurrent fallback has
+    // necessarily closed the old Windows shim. Keep both version fixtures
+    // immutable; replacing a live .cmd races the shell's file handle.
+    process.env[envKey] = writeMockCli(path.join(tmpDir, `pinned-${cli}-floor`), floor);
+    expect(await detectOne(cli)).toMatchObject({ available: true, version: floor });
+  });
+
   it('marks version_unknown when --version output has no semver', async () => {
     const fake = writeMockCli(path.join(tmpDir, 'mute-cli'), 'no version');
     process.env.PATH = '';
@@ -632,7 +648,9 @@ describe('local_agents/registry', () => {
 
   it('coalesces concurrent forced discovery into one set of version processes', async () => {
     const probeLog = path.join(tmpDir, 'probe-calls.log');
-    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-cli'), probeLog);
+    // The scheduling fixture represents all five CLIs, including OpenClaw's
+    // calendar-version floor; the availability oracle must use a valid version.
+    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-cli'), probeLog, '2026.4.11');
     process.env.PATH = '';
     process.env.ORKAS_CLAUDE_PATH = fake;
     process.env.ORKAS_CODEX_PATH = fake;

@@ -285,6 +285,7 @@ describe('core-agent client skill sandbox env', () => {
       result: 'private command output',
       errorCode: 'tool_execution_exception',
       errorSeverity: 'error',
+      durationMs: 80,
     }, 1200);
     client.recordModelRawEventForLog(stats, {
       type: 'tool_start',

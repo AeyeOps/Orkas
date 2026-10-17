@@ -21,8 +21,10 @@
  *   - monthly:  { day, hour, minute }      day=31 → last day of shorter months
  *
  * Scheduler: per-task timers started by `startScheduler()` after
- * `activateUser()`. Missed boundaries while the app was closed or suspended
- * do NOT back-fire.
+ * `activateUser()`. After system wake or startup, the most recent boundary
+ * missed while the computer slept or Orkas was closed is caught up once if it
+ * is at most `CATCH_UP_WINDOW_MS` old. Older misses, and misses noticed by an
+ * account switch or sync, do NOT back-fire.
  *
  * Fire-time seed text composition mirrors the commander composer:
  *   - new UI tasks render ordered `message_parts` into localized inline text;
@@ -41,7 +43,6 @@ import * as path from 'node:path';
 import {
   userLocalRoot,
   projectMetaFile,
-  projectBindingsFile,
 } from '../paths';
 import {
   autoTaskLocationForTask,
@@ -663,11 +664,11 @@ async function _validateProjectScope(
   // orphan directory that no real Project view can surface.
   if (!fs.existsSync(projectMetaFile(uid, projectId))) return 'invalid_project';
   if (!recipient || recipient.kind !== 'agent') return null;
-  const raw: any = await readJson(projectBindingsFile(uid, projectId));
-  const allowed = Array.isArray(raw?.agents)
-    ? raw.agents.filter((id: any) => typeof id === 'string' && id)
-    : [];
-  return allowed.includes(recipient.id) ? null : 'invalid_recipient';
+  // Match the project picker and execution scope, including member-private
+  // choices and shared packages that do not live in bindings.json.
+  const projects = await import('./projects');
+  const bindings = await projects.getBindings(uid, projectId);
+  return bindings.agents.includes(recipient.id) ? null : 'invalid_recipient';
 }
 
 export async function listTasks(uid: string, opts?: { projectId?: string | null }): Promise<AutoTask[]> {
@@ -1005,21 +1006,34 @@ async function _stageMutationAttachments(
   }
 }
 
-async function _markRan(uid: string, taskId: string, atIso: string, alsoDisable: boolean): Promise<void> {
-  if (!_isValidTaskId(taskId)) return;
+async function _markRan(
+  uid: string, taskId: string, at: Date, expectedBoundary: Date,
+  catchUp: boolean, schedulerEpoch?: number,
+): Promise<AutoTask | null> {
+  if (!_isValidTaskId(taskId)) return null;
   if (_markRanFailureForTest) throw _markRanFailureForTest;
-  await _runExclusive(uid, async () => {
+  return _runExclusive(uid, async () => {
     const cur = await _readOne(uid, taskId);
-    if (!cur) return;
+    // CRUD can commit while the timer's initial read is in flight. Admission
+    // and its persisted stamp share the mutation lock, so a stale snapshot
+    // cannot run a deleted/disabled/rescheduled task or use superseded content.
+    if (!cur || !cur.enabled || _schedulerSuspended
+        || !schedulerEpochIsCurrent(schedulerEpoch)
+        || (cur.device_id && cur.device_id !== getCurrentDevice().id)) return null;
+    const boundary = catchUp
+      ? _catchUpBoundary(cur, at)
+      : _dueBoundary(cur, at, _scheduleBaseline(cur));
+    if (!boundary || boundary.getTime() !== expectedBoundary.getTime()) return null;
     const next: AutoTask = {
       ...cur,
-      last_run_at: atIso,
+      last_run_at: at.toISOString(),
       ...(cur.end_condition?.type === 'count'
         ? { scheduled_run_count: _scheduledRunCount(cur) + 1 }
         : {}),
-      ...(alsoDisable ? { enabled: false } : {}),
+      ...(cur.schedule.type === 'one_time' ? { enabled: false } : {}),
     };
     await _writeOne(uid, next);
+    return cur;
   });
 }
 
@@ -1173,6 +1187,73 @@ function _crossedTodayBoundary(now: Date, lastRun: Date | null, hour: number, mi
 
 function _lastDayOfMonth(d: Date): number {
   return new Date(d.getFullYear(), d.getMonth() + 1, 0).getDate();
+}
+
+/** Most recent scheduled occurrence at or before `now`, ignoring runs. Unlike
+ *  `_dueBoundary`, calendar schedules look back across midnight and month
+ *  ends, so a 23:00 occurrence missed overnight is still found in the morning. */
+function _latestOccurrenceAtOrBefore(task: AutoTask, now: Date): Date | null {
+  const sched = task.schedule;
+  if (sched.type === 'one_time') {
+    const at = new Date(sched.at);
+    if (Number.isNaN(at.getTime())) return null;
+    return at.getTime() <= now.getTime() ? at : null;
+  }
+  if (sched.type === 'hourly') {
+    const baseline = _hourlyBaseline(task, _scheduleBaseline(task));
+    if (!baseline) return null;
+    const intervalMs = sched.interval_hours * HOUR_MS;
+    const elapsed = now.getTime() - baseline.getTime();
+    if (!(intervalMs > 0) || elapsed < intervalMs) return null;
+    const boundary = new Date(baseline.getTime() + Math.floor(elapsed / intervalMs) * intervalMs);
+    return Number.isNaN(boundary.getTime()) ? null : boundary;
+  }
+  if (sched.type === 'daily' || sched.type === 'weekly') {
+    const stepDays = sched.type === 'daily' ? 1 : 7;
+    const boundary = new Date(now);
+    if (sched.type === 'weekly') boundary.setDate(boundary.getDate() - ((now.getDay() - sched.weekday + 7) % 7));
+    boundary.setHours(sched.hour, sched.minute, 0, 0);
+    if (boundary.getTime() > now.getTime()) {
+      boundary.setDate(boundary.getDate() - stepDays);
+      boundary.setHours(sched.hour, sched.minute, 0, 0);
+    }
+    return boundary;
+  }
+  if (sched.type === 'monthly') {
+    const inMonth = (year: number, month: number): Date => {
+      const first = new Date(year, month, 1);
+      const day = Math.min(sched.day, _lastDayOfMonth(first));
+      return new Date(first.getFullYear(), first.getMonth(), day, sched.hour, sched.minute, 0, 0);
+    };
+    const boundary = inMonth(now.getFullYear(), now.getMonth());
+    return boundary.getTime() <= now.getTime()
+      ? boundary
+      : inMonth(now.getFullYear(), now.getMonth() - 1);
+  }
+  return null;
+}
+
+/** The occurrence a wake or startup should run late, if any: the most recent
+ *  boundary at most `CATCH_UP_WINDOW_MS` old that falls after the last run,
+ *  creation, and latest edit, is still allowed by the end condition, and
+ *  belongs to this device. An edit or re-enable never scheduled the earlier
+ *  boundary, so a restart must not resurrect it. */
+function _catchUpBoundary(task: AutoTask, now: Date): Date | null {
+  if (!task.enabled) return null;
+  if (task.device_id && task.device_id !== getCurrentDevice().id) return null;
+  if (task.schedule.type === 'one_time' && task.last_run_at) return null;
+  const boundary = _latestOccurrenceAtOrBefore(task, now);
+  if (!boundary) return null;
+  if (now.getTime() - boundary.getTime() > CATCH_UP_WINDOW_MS) return null;
+  for (const covered of [task.last_run_at, task.schedule_anchor_at, task.created_at, task.updated_at]) {
+    const coveredMs = covered ? new Date(covered).getTime() : NaN;
+    if (!Number.isNaN(coveredMs) && coveredMs >= boundary.getTime()) return null;
+  }
+  return _endAllowsAt(task, boundary) ? boundary : null;
+}
+
+export function catchUpBoundaryForTest(task: AutoTask, now: Date): Date | null {
+  return _catchUpBoundary(task, now);
 }
 
 function _claimFile(uid: string, taskId: string, boundary: Date): string {
@@ -1360,13 +1441,18 @@ async function _buildFireSeedText(task: AutoTask): Promise<string> {
   return _buildSeedText(task);
 }
 
-function _buildFireTitle(task: AutoTask): string {
+function _buildFireTitle(task: AutoTask, catchUp = false): string {
   // No glyph prefix — the renderer reads `conv.origin_auto_task_id` and
   // renders the clock UI icon next to the title (same icon as the sidebar
   // "Automation" tab).
-  if (task.title && task.title.trim()) return task.title.trim();
   const firstLine = task.content.split(/\r?\n/)[0] || '';
-  return firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine;
+  const title = task.title && task.title.trim()
+    ? task.title.trim()
+    : (firstLine.length > 40 ? firstLine.slice(0, 40) + '…' : firstLine);
+  // A late run is labeled so it is not mistaken for an on-time occurrence.
+  return catchUp
+    ? _formatSeedPrefix('auto_tasks.catch_up_title', { title }, `${title} (catch-up)`)
+    : title;
 }
 
 type FireTaskResult =
@@ -1386,14 +1472,17 @@ async function _fireTask(
   uid: string,
   task: AutoTask,
   source: AutoFireSource,
+  catchUp = false,
 ): Promise<FireTaskResult> {
   const startedAt = Date.now();
-  const title = _buildFireTitle(task);
+  const title = _buildFireTitle(task, catchUp);
+  const catchUpMark = catchUp ? { catch_up: true as const } : {};
   let cid = '';
   const emitFailure = (errorCode: AutoFireErrorCode): void => {
     _emitFire({
       type: 'fire_failed',
       source,
+      ...catchUpMark,
       user_id: uid,
       task_id: task.id,
       ...(cid ? { cid } : {}),
@@ -1439,10 +1528,11 @@ async function _fireTask(
       emitFailure('send_not_ok');
       return { ok: false, error: 'send_not_ok' };
     }
-    log.info(`fired uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} project=${task.project_id || '-'} attachments=${attachmentNames.length}`);
+    log.info(`fired uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} project=${task.project_id || '-'} attachments=${attachmentNames.length}${catchUp ? ' catch_up=1' : ''}`);
     _emitFire({
       type: 'conv_created',
       source,
+      ...catchUpMark,
       user_id: uid,
       cid,
       task_id: task.id,
@@ -1517,6 +1607,8 @@ export type AutoFireEvent =
   | {
       type: 'conv_created';
       source: AutoFireSource;
+      /** Set only on a scheduled occurrence run late after wake or startup. */
+      catch_up?: true;
       user_id: string;
       cid: string;
       task_id: string;
@@ -1525,6 +1617,7 @@ export type AutoFireEvent =
   | {
       type: 'fire_failed';
       source: AutoFireSource;
+      catch_up?: true;
       user_id: string;
       task_id: string;
       cid?: string;
@@ -1564,7 +1657,9 @@ function _emitFire(ev: AutoFireEvent): void {
 // cancel + re-register the affected task's timer so changes apply
 // immediately without waiting for any tick.
 //
-// Suspend cancels every armed timer and resume restores them without backfill.
+// Suspend cancels every armed timer. Resume and startup restore them and arm
+// a one-shot catch-up for an occurrence missed within CATCH_UP_WINDOW_MS; a
+// missed boundary is otherwise skipped.
 // A locked session is still runnable and must not be mistaken for system sleep:
 // if the callback can run under the current scheduler epoch, it may execute.
 
@@ -1573,6 +1668,17 @@ function _emitFire(ev: AutoFireEvent): void {
  *  int32 setTimeout limit is ~24.85d; this is well below. */
 const MAX_TIMEOUT_MS = 60 * 60 * 1000;
 
+/** Oldest missed occurrence that wake or startup still runs late. Only the
+ *  most recent missed occurrence is run, once; older ones are skipped. */
+const CATCH_UP_WINDOW_MS = 12 * HOUR_MS;
+
+/** Wait after wake or startup before a catch-up run, so networking and the
+ *  app window settle first. Sleeping again before then cancels it like any
+ *  other timer, and the next wake re-evaluates it. */
+const CATCH_UP_DELAY_MS = 60 * 1000;
+export const AUTO_TASK_CATCH_UP_DELAY_MS = CATCH_UP_DELAY_MS;
+export const AUTO_TASK_CATCH_UP_WINDOW_MS = CATCH_UP_WINDOW_MS;
+
 type ArmedTimer = {
   handle: NodeJS.Timeout;
   /** Actual schedule boundary, not the capped one-hour wake-up time. */
@@ -1580,6 +1686,8 @@ type ArmedTimer = {
   /** Only scheduling inputs. Content-only syncs may preserve the timer, while
    *  schedule, run-state, end-condition, or device changes must rebuild it. */
   scheduleStateKey: string;
+  /** Missed boundary this timer runs late; absent for on-time timers. */
+  catchUpBoundaryMs?: number;
 };
 
 type SchedulerPowerMonitor = {
@@ -1747,12 +1855,14 @@ function _scheduleStateKey(task: AutoTask): string {
   ].join('\u0000');
 }
 
-/** Arm one capped wait toward an already-computed schedule boundary. */
+/** Arm one capped wait toward an already-computed schedule boundary. A
+ *  `catchUpBoundaryMs` marks the wait as a late run of that missed boundary. */
 function _armTimerAt(
   uid: string,
   taskId: string,
   dueAtMs: number,
   scheduleStateKey: string,
+  catchUpBoundaryMs?: number,
 ): void {
   if (_schedulerSuspended) return;
   const now = new Date();
@@ -1764,11 +1874,16 @@ function _armTimerAt(
     // A CRUD or sync reschedule may replace this timer after its callback is
     // already queued. Only the currently armed handle may advance the task.
     if (_timers.get(taskId)?.handle !== handle) return;
-    _onTimerFire(uid, taskId, dueAtMs, scheduleStateKey, schedulerEpoch)
+    _onTimerFire(uid, taskId, dueAtMs, scheduleStateKey, schedulerEpoch, catchUpBoundaryMs)
       .catch((err) => log.warn(`timer fire threw id=${taskId}`, logErrorSummary(err)));
   }, delay);
   if (typeof (handle as any).unref === 'function') (handle as any).unref();
-  _timers.set(taskId, { handle, dueAtMs, scheduleStateKey });
+  _timers.set(taskId, {
+    handle,
+    dueAtMs,
+    scheduleStateKey,
+    ...(catchUpBoundaryMs !== undefined ? { catchUpBoundaryMs } : {}),
+  });
 }
 
 /** Register / refresh the timer for a single task. Idempotent: existing
@@ -1797,6 +1912,7 @@ async function _onTimerFire(
   expectedDueAtMs?: number,
   expectedScheduleStateKey?: string,
   schedulerEpoch?: number,
+  catchUpBoundaryMs?: number,
 ): Promise<void> {
   _timers.delete(taskId);
   if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
@@ -1805,14 +1921,18 @@ async function _onTimerFire(
     // MAX_TIMEOUT_MS is only a checkpoint for long waits. Keep the original
     // schedule boundary intact and do not re-run due logic against persisted
     // last_run_at, which may intentionally predate a skipped occurrence.
-    _armTimerAt(uid, taskId, expectedDueAtMs, expectedScheduleStateKey || '');
+    _armTimerAt(uid, taskId, expectedDueAtMs, expectedScheduleStateKey || '', catchUpBoundaryMs);
     return;
   }
   const task = await _readOne(uid, taskId);
   if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
   if (!task) return;
-  const lastRun = _scheduleBaseline(task);
-  const dueBoundary = _dueBoundary(task, now, lastRun);
+  const catchUp = catchUpBoundaryMs !== undefined;
+  // A late run re-checks its occurrence now: a run, edit, disable, or another
+  // scheduler's claim since arming means nothing is missed any more.
+  const dueBoundary = catchUp
+    ? _catchUpBoundary(task, now)
+    : _dueBoundary(task, now, _scheduleBaseline(task));
   let claimedElsewhereBoundary: Date | null = null;
   const canFireHere = !_schedulerSuspended
     && task.enabled
@@ -1825,10 +1945,19 @@ async function _onTimerFire(
       log.info(`fire skipped duplicate uid=${maskId(uid)} id=${taskId} boundary=${dueBoundary.toISOString()}`);
     } else {
       const markStartedAt = Date.now();
+      let admitted: AutoTask | null;
       try {
         // Stamp last_run_at FIRST (and disable on one_time) so a slow fire
         // can't get re-picked by a future re-schedule.
-        await _markRan(uid, taskId, now.toISOString(), task.schedule.type === 'one_time');
+        admitted = await _markRan(uid, taskId, now, dueBoundary, catchUp, schedulerEpoch);
+        if (!admitted) {
+          _releaseFireBoundaryClaim(uid, task, dueBoundary);
+          const fresh = await _readOne(uid, taskId);
+          if (fresh && schedulerEpochIsCurrent(schedulerEpoch)) {
+            _scheduleTask(uid, fresh, catchUp ? _baselineWithoutBackfill(fresh, new Date()) : undefined);
+          }
+          return;
+        }
         if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
       } catch (err) {
         _releaseFireBoundaryClaim(uid, task, dueBoundary);
@@ -1836,17 +1965,27 @@ async function _onTimerFire(
         _emitFire({
           type: 'fire_failed',
           source: 'scheduled',
+          ...(catchUp ? { catch_up: true as const } : {}),
           user_id: uid,
           task_id: taskId,
           error_code: 'mark_ran_failed',
           duration_ms: Math.max(0, Date.now() - markStartedAt),
         });
         const fresh = await _readOne(uid, taskId);
-        if (fresh) _scheduleTask(uid, fresh);
+        if (fresh && catchUp) {
+          // Retry the same late run after the settle delay; an on-time timer
+          // could not find a boundary that is already in the past. Like
+          // `_scheduleTask`, never re-arm across a suspend or account switch.
+          if (!schedulerEpochIsCurrent(schedulerEpoch) || (_started && !isActiveUser(uid))) return;
+          _cancelTimer(taskId);
+          _armTimerAt(uid, taskId, Date.now() + CATCH_UP_DELAY_MS, _scheduleStateKey(fresh), dueBoundary.getTime());
+        } else if (fresh) {
+          _scheduleTask(uid, fresh);
+        }
         return;
       }
       try {
-        await _fireTask(uid, task, 'scheduled');
+        await _fireTask(uid, admitted, 'scheduled', catchUp);
       } catch (err) {
         log.warn(`fire failed id=${taskId}`, logErrorSummary(err));
       }
@@ -1857,7 +1996,11 @@ async function _onTimerFire(
   // capped timer fired before the actual due time, no fire happens but a
   // new timer goes in for the remaining gap (or up to another MAX cap).
   const fresh = await _readOne(uid, taskId);
-  if (fresh) _scheduleTask(uid, fresh, claimedElsewhereBoundary || undefined);
+  if (!fresh) return;
+  // A late run that is no longer owed must not fall back to back-filling.
+  const baseline = claimedElsewhereBoundary
+    || (catchUp && !canFireHere ? _baselineWithoutBackfill(fresh, new Date()) : undefined);
+  _scheduleTask(uid, fresh, baseline);
 }
 
 export function _onTimerFireForTest(uid: string, taskId: string): Promise<void> {
@@ -1876,14 +2019,17 @@ export function nextDueAfterRestoreForTest(task: AutoTask, now: Date): Date | nu
 
 /** Cancel + re-register every timer.
  *
- * On bootstrap, past-due boundaries are used only as an in-memory scheduling
- * baseline. Nothing is persisted and overdue conversations are not created. */
+ * Past-due boundaries are used only as an in-memory scheduling baseline, so
+ * nothing is persisted and no overdue conversation is created here. With
+ * `catchUp` (system wake and startup), an occurrence missed within
+ * CATCH_UP_WINDOW_MS instead gets a one-shot timer that runs it late. */
 type RescheduleMode = 'restore' | 'live_sync';
 
 async function _rescheduleAll(
   uid: string,
   mode: RescheduleMode = 'restore',
   schedulerEpoch?: number,
+  catchUp = false,
 ): Promise<void> {
   if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
   // Live sync rebuilds the process-wide timer map. Preserve the exact boundary
@@ -1894,24 +2040,33 @@ async function _rescheduleAll(
     ? new Map(Array.from(_timers, ([id, timer]) => [id, {
         dueAtMs: timer.dueAtMs,
         scheduleStateKey: timer.scheduleStateKey,
+        catchUpBoundaryMs: timer.catchUpBoundaryMs,
       }]))
-    : new Map<string, { dueAtMs: number; scheduleStateKey: string }>();
+    : new Map<string, { dueAtMs: number; scheduleStateKey: string; catchUpBoundaryMs?: number }>();
   _cancelAllTimers();
   const tasks = await listTasks(uid);
   if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
   const now = new Date();
+  let catchUps = 0;
   for (const t of tasks) {
     if (!schedulerEpochIsCurrent(schedulerEpoch)) return;
     const priorTimer = armedTimers.get(t.id);
     const currentScheduleStateKey = _scheduleStateKey(t);
     if (priorTimer && priorTimer.scheduleStateKey === currentScheduleStateKey) {
-      _armTimerAt(uid, t.id, priorTimer.dueAtMs, currentScheduleStateKey);
+      _armTimerAt(uid, t.id, priorTimer.dueAtMs, currentScheduleStateKey, priorTimer.catchUpBoundaryMs);
+      continue;
+    }
+    const missed = catchUp && (!_started || isActiveUser(uid)) ? _catchUpBoundary(t, now) : null;
+    if (missed) {
+      _armTimerAt(uid, t.id, now.getTime() + CATCH_UP_DELAY_MS, currentScheduleStateKey, missed.getTime());
+      catchUps += 1;
+      log.info(`catch-up armed id=${t.id} boundary=${missed.toISOString()}`);
       continue;
     }
     const baseline = _baselineWithoutBackfill(t, now);
     _scheduleTask(uid, t, baseline);
   }
-  log.info(`rescheduler ran timers=${_timers.size}`);
+  log.info(`rescheduler ran timers=${_timers.size}${catchUp ? ` catch_ups=${catchUps}` : ''}`);
 }
 
 export function rescheduleAllForTest(uid: string): Promise<void> {
@@ -1950,7 +2105,7 @@ async function _resumeScheduler(uid: string): Promise<void> {
   _schedulerSuspended = false;
   const schedulerEpoch = _schedulerEpoch;
   if (!isActiveUser(uid)) return;
-  await _rescheduleAll(uid, 'restore', schedulerEpoch);
+  await _rescheduleAll(uid, 'restore', schedulerEpoch, true);
   log.info('scheduler resumed');
 }
 
@@ -2001,9 +2156,9 @@ export function resumeSchedulerForTest(uid: string): Promise<void> {
 }
 
 /** Initial bootstrap — list every task and register a timer for each
- *  enabled / own-device one. Called once on startup; deferred via
- *  the deferred boot phase (util/boot_init.ts) so first-paint doesn't pay
- *  the disk scan cost. */
+ *  enabled / own-device one, catching up an occurrence missed while Orkas was
+ *  closed. Called once on startup; deferred via the deferred boot phase
+ *  (util/boot_init.ts) so first-paint doesn't pay the disk scan cost. */
 export function startScheduler(): void {
   if (_started) return;
   _started = true;
@@ -2013,7 +2168,7 @@ export function startScheduler(): void {
   const uid = getActiveUserId();
   _pruneFireBoundaryClaims(uid);
   const schedulerEpoch = _schedulerEpoch;
-  _rescheduleAll(uid, 'restore', schedulerEpoch)
+  _rescheduleAll(uid, 'restore', schedulerEpoch, true)
     .catch((err) => log.warn(`bootstrap failed uid=${maskId(uid)}`, logErrorSummary(err)));
 }
 

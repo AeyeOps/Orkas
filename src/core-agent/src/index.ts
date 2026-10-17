@@ -52,6 +52,7 @@ export { ProviderRegistry } from "./providers/index.js";
 
 // Agent Harness
 export { AgentRunner } from "./agent/index.js";
+export { estimateCompletionRequestInputTokens, CONTEXT_COMPACTION_TRIGGER_RATIO } from "./agent/runner.js";
 export type {
   ReflectionModelCallEvent,
   ReflectionFailure,

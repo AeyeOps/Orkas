@@ -73,6 +73,8 @@ export interface SandboxResult {
   stderrStreamedOutput?: StreamedToolOutput;
   /** Explicit cancellation, distinct from command failure or timeout. */
   aborted?: boolean;
+  /** Host-only evidence that the owned Windows root and its tree were terminated. */
+  rootTerminationConfirmed?: boolean;
   /** Execution duration in milliseconds. */
   durationMs: number;
 }
@@ -125,6 +127,7 @@ export function killProcessTree(
     processKill?: ProcessKiller;
     spawnFn?: SpawnFn;
     onComplete?: () => void;
+    onRootTerminated?: () => void;
   } = {},
 ): void {
   const platform = opts.platform ?? process.platform;
@@ -136,6 +139,8 @@ export function killProcessTree(
       return;
     }
     let completed = false;
+    let helperOutput = "";
+    let authorized = false;
     const complete = (failed: boolean) => {
       if (completed) return;
       completed = true;
@@ -146,6 +151,9 @@ export function killProcessTree(
         if (child.exitCode == null && child.signalCode == null) {
           try { child.kill(signal); } catch { /* Process may already be dead. */ }
         }
+      }
+      if (!failed && authorized && helperOutput.replace(/\r\n/g, "\n") === "ready\nroot-terminated\n") {
+        opts.onRootTerminated?.();
       }
       opts.onComplete?.();
     };
@@ -159,21 +167,19 @@ export function killProcessTree(
       });
       // The helper pins the PID first. Only authorize it while the original
       // ChildProcess is still live; a late helper must not target a reused PID.
-      let readiness = "";
       let acknowledged = false;
-      let authorized = false;
       killer.stdin?.on("error", () => undefined);
       killer.stdout?.on("data", (data: Buffer) => {
-        if (acknowledged) return;
-        readiness = (readiness + data.toString("utf8")).slice(0, 16);
-        if (!readiness.includes("\n")) return;
+        helperOutput = (helperOutput + data.toString("utf8")).slice(0, 64);
+        if (acknowledged || !helperOutput.includes("\n")) return;
         acknowledged = true;
-        const owned = readiness.trim() === "ready" && child.exitCode == null && child.signalCode == null;
+        const owned = helperOutput.split(/\r?\n/, 1)[0] === "ready" && child.exitCode == null && child.signalCode == null;
         authorized = owned;
         killer.stdin?.end(owned ? "go\n" : "cancel\n");
       });
       killer.once("error", () => complete(true));
-      killer.once("exit", (code) => complete(code !== 0 &&
+      // Exit can precede the final pipe data; close owns the complete receipt.
+      killer.once("close", (code) => complete(code !== 0 &&
         (authorized || (child.exitCode == null && child.signalCode == null))));
       if (typeof killer.unref === "function") killer.unref();
     } catch {
@@ -225,22 +231,26 @@ export function defaultShellForPlatform(platform: NodeJS.Platform = process.plat
   return "/bin/sh";
 }
 
+/** Resolve the same shell identity for compatibility checks and execution. */
+export function resolveShellTarget(shell: string, command: string, platform: NodeJS.Platform = process.platform) {
+  const explicitCmd = platform === "win32" && /^\s*cmd(?:\.exe)?\s+(?:\/d\s+)?(?:\/s\s+)?\/c\b/i.test(command);
+  const executable = explicitCmd ? "cmd.exe" : shell;
+  const kind = inferShellKind(executable, platform);
+  return { command: executable, kind, explicitCmd,
+    legacyPowerShell: platform === "win32" && kind === "powershell"
+      && shellBaseName(executable).replace(/\.exe$/i, "") === "powershell" };
+}
+
 export function buildShellInvocation(
   shell: string,
   command: string,
   platform: NodeJS.Platform = process.platform,
 ): ShellInvocation {
-  if (platform === "win32" && /^\s*cmd(?:\.exe)?\s+(?:\/d\s+)?(?:\/s\s+)?\/c\b/i.test(command)) {
-    return {
-      command: "cmd.exe",
-      args: ["/d", "/s", "/c", command],
-      kind: "cmd",
-    };
-  }
-
-  const kind = inferShellKind(shell, platform);
+  const target = resolveShellTarget(shell, command, platform);
+  if (target.explicitCmd) return { command: target.command, args: ["/d", "/s", "/c", command], kind: target.kind };
+  const kind = target.kind;
   if (platform === "win32" && kind === "powershell") {
-    const chain = shellBaseName(shell).replace(/\.exe$/i, "") === "powershell"
+    const chain = target.legacyPowerShell
       ? parsePowerShellChain(command) : { kind: "none" as const };
     const executableCommand = chain.kind === "chain" ? compilePowerShellChain(chain) : command;
     // powershell.exe otherwise normalizes a failed native child's exit code to
@@ -649,6 +659,7 @@ export class SandboxExecutor {
       let stderrTruncated = false;
       let settled = false;
       let treeCleanupPending = false;
+      let rootTerminationConfirmed = false;
       let pendingFinish: { code: number | null; startFailed: boolean } | undefined;
       let forceSettleTimer: NodeJS.Timeout | null = null;
       let abortListener: (() => void) | null = null;
@@ -812,6 +823,7 @@ export class SandboxExecutor {
           exitCode: code,
           startFailed,
           ...(aborted ? { aborted: true } : {}),
+          ...(rootTerminationConfirmed ? { rootTerminationConfirmed: true } : {}),
           timedOut,
           outputLimitExceeded,
           stdoutBytes,
@@ -826,7 +838,7 @@ export class SandboxExecutor {
         if (killed || settled) return;
         killed = true;
         treeCleanupPending = process.platform === "win32";
-        killProcessTree(child, "SIGTERM", { onComplete: () => {
+        killProcessTree(child, "SIGTERM", { onRootTerminated: () => { rootTerminationConfirmed = true; }, onComplete: () => {
           treeCleanupPending = false;
           if (pendingFinish) finish(pendingFinish.code, pendingFinish.startFailed);
         } });
@@ -843,9 +855,17 @@ export class SandboxExecutor {
           // Bounded return is not proof that descendants released their pipes.
           log.warn("Shell process cleanup was not confirmed", {
             platform: process.platform, phase: "cleanup_deadline",
+            root_exit_observed: child.exitCode != null || child.signalCode != null,
+            stdout_open: !child.stdout.destroyed,
+            stderr_open: !child.stderr.destroyed,
           });
           treeCleanupPending = false;
           finish(pendingFinish?.code ?? null, pendingFinish?.startFailed ?? false);
+          // Escaped descendants can keep inherited pipes open after the bounded
+          // return. Release host handles without claiming those processes exited.
+          child.stdin.destroy();
+          child.stdout.destroy();
+          child.stderr.destroy();
         }, KILL_SETTLE_GRACE_MS);
         if (typeof forceSettleTimer.unref === "function") forceSettleTimer.unref();
       }
@@ -937,7 +957,11 @@ export class SandboxExecutor {
 
   /** Check if a command matches the blocklist. */
   private checkBlockedCommand(command: string): string | null {
-    return blockedCommand(command, this.config.blockedCommands);
+    // Use the selected executable, including Windows cmd-wrapper overrides.
+    // PowerShell, cmd and unknown/custom shells retain the prior policy.
+    const shell = shellBaseName(buildShellInvocation(this.config.shell, command).command).replace(/\.exe$/, "");
+    const posixLiterals = ["sh", "bash", "dash", "ksh", "zsh"].includes(shell);
+    return blockedCommand(command, this.config.blockedCommands, posixLiterals);
   }
 }
 

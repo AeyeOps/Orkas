@@ -85,7 +85,8 @@ describe('Commander resident prompt surface', () => {
     expect(routing).toMatch(/Prefer a high-confidence enabled Agent match/i);
     expect(routing).toMatch(/Do not read a regular Skill for Agent-owned work/i);
     expect(routing).toMatch(/one Agent owns the remaining user-visible outcome/i);
-    expect(routing).toMatch(/consume the result[\s\S]{0,100}synthesize at least two distinct results/i);
+    expect(routing).toMatch(/consume the result[\s\S]{0,140}combined deliverable the user asked for/i);
+    expect(routing).toMatch(/listing or restating them is not a next action/i);
     expect(routing).toMatch(/owns input sufficiency and execution/i);
     expect(routing).not.toMatch(/Commander Plan|execution Plan|Use a Plan/i);
     expect(routing).toMatch(/Tool schemas own parameters and lifecycle details/i);

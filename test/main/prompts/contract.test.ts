@@ -17,6 +17,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import {
   buildLanguageDirectiveText,
+  buildHostTurnLanguageDirectiveText,
   composeChatPrompt,
 } from '../../../src/main/prompts/chat_prompt_composer';
 
@@ -223,6 +224,27 @@ describe('prompts ↔ code contract', () => {
     );
   });
 
+  it('owns the next-step rule once in shared task rules, with the open to-do facts per turn', () => {
+    const shared = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_shared_rules.md'), 'utf-8');
+    const doingWell = shared.slice(shared.indexOf('## Doing the task well'), shared.indexOf('## Web search rules'));
+    const rule = doingWell.split('\n').find((line) => line.startsWith('- When your reply hands the turn back to the user')) || '';
+    // Only the actor that hands the turn back names the step; saving it waits
+    // for consent, defers to schedule/project offers, and is not repeated.
+    expect(rule).toContain('(not to another participant)');
+    expect(rule).toContain('no open to-do from this conversation already covers it');
+    expect(rule).toContain('only after the user agrees');
+    expect(rule).toContain('when a schedule or project offer applies, make that offer instead');
+    expect(rule).toContain('After the user declines, do not offer again');
+    // The replaced reply-structure clause must not survive as a second owner.
+    expect(shared).not.toContain('add a next action/question only when continuation is expected');
+    expect(shared.match(/save it as a to-do/g)).toHaveLength(1);
+    const openTodos = fs.readFileSync(path.join(PROMPTS_DIR, 'conversation_open_todos.md'), 'utf-8');
+    expect(openTodos).toContain('Their content is not shown here.');
+    expect(openTodos).toMatch(/\$count[\s\S]*\$ids/);
+    expect(readFile('src/main/features/conversation_assistance_context.ts'))
+      .toContain("prompts.load('conversation_open_todos'");
+  });
+
   it('keeps tool, data, and platform security boundaries after removing content moderation', () => {
     const shared = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_shared_rules.md'), 'utf-8');
     const projectContext = fs.readFileSync(path.join(PROMPTS_DIR, 'chat_project_context_policy.md'), 'utf-8');
@@ -293,10 +315,13 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).toMatch(/Never combine handback with an input request/i);
     expect(agentPrompt).not.toContain('call `dispatch_to({ to, message })`');
     expect(bus).toContain("let runtimeProtocol = ''");
-    expect(bus).toContain('runtimeProtocol = [');
+    expect(bus).toContain('runtimeProtocol = _returnControlProtocol()');
     expect(bus).toContain('buildCliTurnPrompt({');
     expect(bus).toContain('runtimeProtocol,');
-    expect(bus).toContain('stateFile.active_recipient === agent.agent_id');
+    expect(bus).toContain('_holdsCommanderRoutedFloor(stateFile, agent.agent_id)');
+    expect(bus).toContain('stateFile.active_recipient === agentId && stateFile.active_recipient_source !== \'user_selection\'');
+    // In-process Agents holding a Commander-routed floor get the same reminder.
+    expect(bus).toMatch(/turnHoldsRoutedFloor && preloadedNamedAgent && !agentsFeat\.isCliAgent\(preloadedNamedAgent\)[\s\S]{0,80}_returnControlProtocol\(\)/);
     expect(bus).toContain('Use `<handback reason="completed_handoff" />` only to close this routed interaction.');
     expect(bus).toContain('Do not use it as a capability-routing or error signal');
     expect(bus).toContain("item.fromActorId === USER_ID");
@@ -360,8 +385,8 @@ describe('prompts ↔ code contract', () => {
     // The project tier is schema-gated: offered only when the host marks the
     // session as belonging to a project.
     expect(memoryTool).toContain('includeProjectTier');
-    // Task progress is routed to todo_tasks, never into memory.
-    expect(memoryTool).toContain('Use todo_tasks for task progress');
+    // Work content (specs, plans, progress) stays with the work, never in memory.
+    expect(memoryTool).toContain('leave specs, plans and progress in their files, tasks or library');
 
 
     // The tool owns storage choices and permissions; the role preserves the
@@ -369,8 +394,13 @@ describe('prompts ↔ code contract', () => {
     expect(agentPrompt).toMatch(/tool contract owns durability, destination, and write permissions/i);
     expect(agentPrompt).not.toMatch(/Decide from meaning/i);
     expect(agentPrompt).not.toMatch(/Never store current task progress/i);
-    expect(memoryTool).toContain('Decide from meaning, never trigger words');
-    expect(memoryTool).toContain('Do not store current-task progress');
+    expect(memoryTool).toContain('Decide by meaning, not trigger words');
+    expect(agentPrompt).not.toMatch(/save only compact facts/i);
+    // Native-memory precedence exists only for external CLIs (bridge prompt);
+    // in-process actors have no native store to rank against.
+    for (const name of fs.readdirSync(PROMPTS_DIR).filter((f) => f.endsWith('.md'))) {
+      expect(fs.readFileSync(path.join(PROMPTS_DIR, name), 'utf8'), name).not.toMatch(/native memory/i);
+    }
     expect(agentPrompt).toMatch(/Preserve the intended scope/i);
     expect(agentPrompt).not.toMatch(/use `(?:agent|user|shared)`/i);
     expect(agentPrompt).toMatch(/Project memory\/instructions are preloaded/i);
@@ -390,6 +420,21 @@ describe('prompts ↔ code contract', () => {
     expect(commanderPrompt).not.toContain('current response/UI language');
     expect(sharedPrompt).not.toContain('current response/UI language');
     expect(readFile('src/main/features/group_chat/bus.ts')).toContain("prompts.load('chat_shared_rules'");
+  });
+
+  it('app-generated language guidance distinguishes new tasks from continuations without changing ordinary chat precedence', () => {
+    const fresh = buildHostTurnLanguageDirectiveText('Traditional Chinese (繁體中文)', false);
+    expect(fresh).toContain('Respond in Traditional Chinese (繁體中文)');
+    expect(fresh).toContain('unless the original user request explicitly specifies another response language');
+    const resumed = buildHostTurnLanguageDirectiveText('French (Français)', true);
+    expect(resumed).toContain('Preserve the response language established by the original user request');
+    expect(resumed).toContain('including explicit language requirements');
+    expect(resumed).toContain('If no response language was established, use French (Français)');
+    for (const directive of [fresh, resumed]) {
+      expect(directive).toContain('application-generated instructions is not a user language choice');
+      expect(directive.length).toBeLessThan(450);
+    }
+    expect(buildLanguageDirectiveText('English')).not.toContain('application-generated instructions');
   });
 
   it('group-chat system prompts prefer the user language and keep the UI language as fallback', () => {
@@ -659,7 +704,7 @@ describe('prompts ↔ code contract', () => {
 
     expect(commanderPrompt).toMatch(/Do not collapse distinct user-visible materials into one task/i);
     expect(commanderPrompt).toMatch(/independent outcomes with different named owners as parallel `dispatch_to` calls/i);
-    expect(commanderPrompt).toMatch(/in one response, then synthesize/i);
+    expect(commanderPrompt).toMatch(/in one response; afterwards add only what their visible replies do not already show/i);
     expect(commanderPrompt).toMatch(/Task size alone does not justify multiple Agents/i);
     expect(commanderPrompt).toMatch(/never dispatch merely to look busy/i);
   });
@@ -699,21 +744,24 @@ describe('prompts ↔ code contract', () => {
     // The resident prompt carries one semantic decision and delegates lifecycle
     // details to the authoritative schemas instead of repeating them.
     expect(commanderPrompt).toMatch(/Use `hand_off_to` when one Agent owns the remaining user-visible outcome/i);
-    expect(commanderPrompt).toMatch(/Use `dispatch_to` only when Commander must consume the result[\s\S]{0,120}synthesize at least two distinct results/i);
+    expect(commanderPrompt).toMatch(/Use `dispatch_to` only when Commander must consume the result[\s\S]{0,140}combined deliverable the user asked for/i);
+    expect(commanderPrompt).toMatch(/do not call that Agent again or produce its outcome yourself/i);
     expect(commanderPrompt).toMatch(/Tool schemas own parameters and lifecycle details/i);
     expect(commanderPrompt).not.toMatch(/(?:hand_off_to|dispatch_to|run_worker)\(\{/);
 
     // Single-owner final delivery and multi-result synthesis are mutually
     // exclusive in the model-visible tool contracts.
-    expect(bus).toMatch(/NON-TERMINAL delegation:[\s\S]{0,320}synthesis across at least two distinct results/i);
-    expect(bus).toMatch(/Delivering, formatting, approving, or summarizing one agent result is not a next action/i);
+    expect(bus).toMatch(/NON-TERMINAL delegation:[\s\S]{0,360}combined deliverable the user asked for/i);
+    expect(bus).toMatch(/delivering, formatting, approving, listing, or summarizing results the user can already see is not a next action/i);
     expect(bus).toMatch(/TERMINAL delegation by default:[\s\S]{0,260}single agent-owned final outcome or interactive experience/i);
     expect(bus).toMatch(/ends the commander turn without synthesis/i);
 
     // Blocking recovery remains explicit without changing the ordinary
     // terminal default or inventing a new continuation field.
     expect(bus).toMatch(/resume only when this hand-off blocks a broader commander-owned task/i);
-    expect(bus).toMatch(/after this agent completes or finishes collecting user input/i);
+    expect(bus).toMatch(/Required when (?:any )?requested work remains after this agent finishes/i);
+    expect(bus).toMatch(/State the commander\\'s next step/);
+    expect(bus).toMatch(/Omit it when only presenting agent replies again; they are already visible/i);
   });
 
   it('commander resolves the current user intent before choosing self-service or delegation', () => {

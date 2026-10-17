@@ -4,9 +4,15 @@ import { nowIso } from '../storage';
 import { taskContent } from '../util/project-task-content';
 import type { ProjectTask, TaskStatus } from './project_tasks';
 
-export const TASK_RESULT_REF_MAX = 400;
 export const TASK_STATUSES: readonly TaskStatus[] = ['todo', 'progress', 'review', 'done'];
 const TASK_ID_RE = /^t_[a-f0-9]{12}$/;
+
+/** Commander is a reserved actor, including legacy name-only task records.
+ * A stable id takes precedence over the display name. */
+export function isCommanderTaskOwner(owner: { owner_agent_id?: string; owner_agent?: string }): boolean {
+  return owner.owner_agent_id === 'commander' || (!owner.owner_agent_id
+    && (owner.owner_agent === 'commander' || owner.owner_agent === 'Commander'));
+}
 
 export function clampStr(v: unknown, max: number): string | undefined {
   if (typeof v !== 'string') return undefined;
@@ -47,8 +53,6 @@ export function normaliseTask(raw: any): ProjectTask | null {
     const deps = [...new Set(depCandidates)];
     if (deps.length) t.depends_on = deps;
   }
-  const resultRef = clampStr(raw.result_ref, TASK_RESULT_REF_MAX);
-  if (resultRef) t.result_ref = resultRef;
   if (typeof raw.origin_cid === 'string' && raw.origin_cid) t.origin_cid = raw.origin_cid;
   if (Array.isArray(raw.attachments)) {
     const names = [...new Set(

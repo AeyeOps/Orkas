@@ -1039,11 +1039,42 @@ describe("Tools", () => {
         "Licensed under Apache-2.0.",
       ].join("\n");
       const compacted = compactGitHubReadme(readme);
-      expect(compacted.length).toBeLessThan(readme.length);
+      expect(compacted.length).toBeLessThanOrEqual(4_500);
       expect(compacted).toContain("Local-first desktop assistant.");
       expect(compacted).toContain("Install with the signed desktop package.");
       expect(compacted).toContain("Licensed under Apache-2.0.");
-      expect(compacted).toContain("other sections omitted");
+      // The receipt says the long section was shortened rather than implying
+      // the README was shown whole.
+      expect(compacted).toContain("[README snapshot kept 3 of 3 sections after the opening (1 shortened)");
+    });
+
+    it("keeps a long list README in reading order and ignores look-alike priority titles", () => {
+      const filler = Array.from({ length: 30 }, (_, index) => (
+        `## Topic ${index + 1}\n${`Topic ${index + 1} background text. `.repeat(8)}`
+      ));
+      const readme = [
+        "# Toolkit",
+        "Opening paragraph.",
+        "",
+        ...filler,
+        "## Memory-guided manipulation\nMEMORY_FEATURE_TEXT describes an agent feature.",
+        "## Programming guide\nPROGRAMMING_GUIDE_TEXT explains the API.",
+        "## RAM requirements\nRAM_REQUIREMENT_TEXT: 16 GB.",
+        "## License\nLICENSE_TEXT: MIT.",
+      ].join("\n");
+      const compacted = compactGitHubReadme(readme);
+      expect(compacted.length).toBeLessThanOrEqual(4_500);
+      expect(compacted).toContain("Topic 1 background text.");
+      expect(compacted).not.toContain("Topic 30 background text.");
+      // Hardware and license facts are still pulled forward from the end...
+      expect(compacted).toContain("RAM_REQUIREMENT_TEXT");
+      expect(compacted).toContain("LICENSE_TEXT");
+      // ...but a feature title containing "Memory" and a word containing "ram"
+      // are ordinary sections, not requirements.
+      expect(compacted).not.toContain("MEMORY_FEATURE_TEXT");
+      expect(compacted).not.toContain("PROGRAMMING_GUIDE_TEXT");
+      // Omitted sections are named up to a bound, then counted.
+      expect(compacted).toMatch(/Omitted sections: Topic \d+ \|[^\]]*\(\+\d+ more\)\.\]$/);
     });
 
     it("does not apply the former 50K default truncation before Result Store handling", async () => {
@@ -1455,6 +1486,300 @@ describe("Tools", () => {
       } finally {
         vi.unstubAllGlobals();
       }
+    });
+
+    describe("long sources", () => {
+      // A release page whose decisive results sit far below a long opening, the
+      // shape that a 12,000-character first read used to cut off unannounced.
+      const paragraphs = Array.from(
+        { length: 40 },
+        (_, index) => `<p>Paragraph ${index}: ${"background evidence ".repeat(30)}end.</p>`,
+      ).join("");
+      const releaseHtml = "<html><head><title>Model release</title></head><body>"
+        + `<h2>Overview</h2>${paragraphs}`
+        + "<h2>Benchmark results</h2><p>BENCHMARK_TABLE_ROW 95.9 versus 83.3.</p>"
+        + "<h2>Limitations</h2><p>Known gaps remain.</p></body></html>";
+
+      function stubRelease() {
+        const fetchMock = vi.fn(async () => new Response(releaseHtml, {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        }));
+        vi.stubGlobal("fetch", fetchMock);
+        return fetchMock;
+      }
+
+      function windowBody(content: string): { start: number; end: number; total: number; body: string } {
+        const match = /^Window: characters (\d+)-(\d+) of (\d+) /m.exec(content);
+        if (!match) throw new Error(`no window line in: ${content.slice(0, 200)}`);
+        const [start, end, total] = match.slice(1).map(Number);
+        const bodyStart = content.indexOf("\n\n", match.index) + 2;
+        return { start, end, total, body: content.slice(bodyStart, bodyStart + end - start) };
+      }
+
+      it("reports the unread remainder of a truncated page and continues it from the run cache", async () => {
+        const fetchMock = stubRelease();
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const ctx: ToolContext = { state: { runScopedLedger: new Map<string, unknown>() } };
+          const first = await webFetch.execute({ url: "https://example.test/release", maxChars: 4_000 }, ctx);
+          const full = (await webFetch.execute({ url: "https://example.test/release" }, ctx)).content;
+          expect(full).toContain("BENCHMARK_TABLE_ROW");
+          expect(first.isError).toBeUndefined();
+          expect(first.content.startsWith(full.slice(0, 4_000))).toBe(true);
+          expect(first.content).not.toContain("BENCHMARK_TABLE_ROW");
+          expect(first.content).toContain("explicitly requested maxChars");
+          expect(first.content).toContain(`characters 0-4000 of ${full.length} shown; ${full.length - 4_000} more characters remain`);
+          expect(first.content).toContain('"offset": 4000');
+          expect(first.content).toContain("Headings after this point (detected): Benchmark results | Limitations.");
+          expect(first.content).not.toMatch(/detected\):[^\n]*Overview/);
+
+          // Following the reported offsets reconstructs the page exactly, and
+          // the last window carries the results the first read could not show.
+          let reconstructed = first.content.slice(0, 4_000);
+          let next = 4_000;
+          let last = first;
+          while (next < full.length) {
+            last = await webFetch.execute({ url: "https://example.test/release", maxChars: 4_000, offset: next }, ctx);
+            const window = windowBody(last.content);
+            expect(window.start).toBe(next);
+            expect(window.total).toBe(full.length);
+            expect(last.content).toContain("URL: https://example.test/release");
+            expect(last.content).toContain("Title: Model release");
+            reconstructed += window.body;
+            next = window.end;
+          }
+          expect(reconstructed).toBe(full);
+          expect(last.content).toContain("BENCHMARK_TABLE_ROW");
+          expect(last.content).toContain(`end of the extracted content at character ${full.length}`);
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
+
+      it("continues past what was read after compaction without re-injecting earlier text", async () => {
+        const fetchMock = stubRelease();
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const runScopedLedger = new Map<string, unknown>();
+          const before = { state: { runScopedLedger, toolResultReadLedger: { epoch: 0 } } };
+          const after = { state: { runScopedLedger, toolResultReadLedger: { epoch: 1 } } };
+          await webFetch.execute({ url: "https://example.test/release", maxChars: 4_000 }, before);
+
+          const replay = await webFetch.execute({ url: "https://example.test/release", maxChars: 4_000 }, after);
+          const reread = await webFetch.execute({ url: "https://example.test/release", maxChars: 4_000, offset: 1_000 }, after);
+          const onward = await webFetch.execute({ url: "https://example.test/release", maxChars: 4_000, offset: 4_000 }, after);
+
+          for (const result of [replay, reread]) {
+            expect(result.content).toContain("WEB_FETCH_RUN_CACHE_HIT");
+            expect(result.content).not.toContain("Paragraph 3:");
+            expect(result.content).toMatch(/have not been read in order yet; to continue, call web_fetch with "offset": 4000/);
+          }
+          expect(onward.isError).toBeUndefined();
+          expect(windowBody(onward.content).start).toBe(4_000);
+          expect(onward.content).not.toContain("WEB_FETCH_RUN_CACHE_HIT");
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
+
+      it("starts a cold fetch at the requested window", async () => {
+        const fetchMock = stubRelease();
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const ctx: ToolContext = { state: {} };
+          const window = await webFetch.execute({ url: "https://example.test/release", maxChars: 50, offset: 100 }, ctx);
+          const full = (await webFetch.execute({ url: "https://example.test/release" }, ctx)).content;
+          const parsed = windowBody(window.content);
+          expect(parsed).toMatchObject({ start: 100, end: 150, total: full.length });
+          expect(parsed.body).toBe(full.slice(100, 150));
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
+
+      it.each([-1, 1.5, "later"])("rejects offset %p before any request", async (offset) => {
+        const fetchMock = stubRelease();
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const result = await webFetch.execute({ url: "https://example.test/release", offset }, { state: {} });
+          expect(result.isError).toBe(true);
+          expect(result.content).toContain("offset must be a non-negative integer");
+          expect(fetchMock).not.toHaveBeenCalled();
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
+
+      it("names the content length when an offset is past the end", async () => {
+        const fetchMock = stubRelease();
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const ctx: ToolContext = { state: {} };
+          const full = (await webFetch.execute({ url: "https://example.test/release" }, ctx)).content;
+          const result = await webFetch.execute(
+            { url: "https://example.test/release", maxChars: 4_000, offset: full.length + 10 },
+            ctx,
+          );
+          expect(result.isError).toBe(true);
+          expect(result.content).toContain("E_WEB_FETCH_OFFSET_OUT_OF_RANGE");
+          expect(result.content).toContain(`(${full.length} characters)`);
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
+    });
+
+    describe("binary responses", () => {
+      const pdfBytes = new Uint8Array([
+        ...Buffer.from("%PDF-1.7\n%"), 0xe2, 0xe3, 0xcf, 0xd3,
+        ...Buffer.from("\n5 0 obj\n<< /Filter /FlateDecode >>\nstream\n"), 0x78, 0x9c, 0x00, 0xff, 0x10,
+      ]);
+
+      it.each([
+        ["application/pdf", "a PDF document"],
+        ["application/octet-stream", "a PDF document"],
+      ])("fails a PDF served as %s instead of returning decoded bytes", async (contentType, kind) => {
+        const fetchMock = vi.fn(async () => new Response(pdfBytes, {
+          status: 200,
+          headers: { "content-type": contentType },
+        }));
+        vi.stubGlobal("fetch", fetchMock);
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const ctx: ToolContext = { state: {} };
+          const first = await webFetch.execute({ url: "https://example.test/card.pdf", maxChars: 12_000 }, ctx);
+          const repeated = await webFetch.execute({ url: "https://example.test/card.pdf", maxChars: 12_000 }, ctx);
+          expect(first.isError).toBe(true);
+          expect(first.content).toContain("E_WEB_FETCH_BINARY_CONTENT");
+          expect(first.content).toContain(`returned ${kind}`);
+          expect(first.content).not.toContain("FlateDecode");
+          expect(repeated.content).toContain("E_WEB_FETCH_NONRETRYABLE_CACHE_HIT");
+          expect(fetchMock).toHaveBeenCalledTimes(1);
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
+
+      it("fails an image response", async () => {
+        vi.stubGlobal("fetch", vi.fn(async () => new Response(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a]), {
+          status: 200,
+          headers: { "content-type": "image/png" },
+        })));
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const result = await webFetch.execute({ url: "https://example.test/chart.png" }, { state: {} });
+          expect(result.isError).toBe(true);
+          expect(result.content).toContain("a binary file (image/png)");
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
+
+      it.each([
+        ["an HTML page that mentions PDFs", "text/html; charset=utf-8", "<html><body><p>Download the %PDF-1.7 spec as application/pdf.</p></body></html>", "Download the %PDF-1.7 spec"],
+        ["text served as an octet stream", "application/octet-stream", "# Notes\nPlain markdown served without a text type.", "Plain markdown served"],
+        ["a text page whose charset was guessed wrong", "text/html", `<html><body><p>${"\uFFFD".repeat(400)} readable tail</p></body></html>`, "readable tail"],
+      ])("keeps %s as readable text", async (_label, contentType, body, expected) => {
+        vi.stubGlobal("fetch", vi.fn(async () => new Response(body, {
+          status: 200,
+          headers: { "content-type": contentType },
+        })));
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const result = await webFetch.execute({ url: "https://example.test/text" }, { state: {} });
+          expect(result.isError).toBeUndefined();
+          expect(result.content).toContain(expected);
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
+    });
+
+    describe("GitHub list README", () => {
+      const listReadme = [
+        "# Awesome Robot Demos",
+        "Curated robot workflows.",
+        "",
+        "## Contents",
+        "- Zero-shot control",
+        "",
+        "## Zero-shot Control",
+        "",
+        "### Deploy in Simulation",
+        "",
+        ...Array.from({ length: 37 }, (_, index) => {
+          const number = index + 1;
+          const title = number === 23 ? "Memory-guided agentic manipulation" : `Robot demo number ${number}`;
+          return `#### Case ${number}: ${title}\n\n**Source:** Lab ${number}\n\n${`Case ${number} describes its demonstration. `.repeat(14)}`;
+        }),
+      ].join("\n");
+
+      function stubRepository() {
+        const fetchMock = vi.fn(async (input: string | URL | Request) => {
+          const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+          if (requestUrl.endsWith("/readme")) {
+            return new Response(listReadme, { status: 200, headers: { "content-type": "text/plain; charset=utf-8" } });
+          }
+          return new Response(JSON.stringify({ full_name: "example/awesome", description: "Robot demos" }), {
+            status: 200,
+            headers: { "content-type": "application/json; charset=utf-8" },
+          });
+        });
+        vi.stubGlobal("fetch", fetchMock);
+        return fetchMock;
+      }
+
+      it("keeps the first entries, names the omitted ones, and continues the README by offset", async () => {
+        const fetchMock = stubRepository();
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const ctx: ToolContext = { state: { runScopedLedger: new Map<string, unknown>() } };
+          const view = await webFetch.execute({ url: "https://github.com/example/awesome", maxChars: 12_000 }, ctx);
+          expect(view.isError).toBeUndefined();
+          expect(view.content.length).toBeLessThanOrEqual(12_000);
+          expect(view.content).toContain("Case 1 describes its demonstration.");
+          // A list entry is not promoted just because its title says "Memory".
+          expect(view.content).not.toContain("Case 23 describes");
+          const receipt = /README snapshot kept (\d+) of 40 sections after the opening/.exec(view.content);
+          expect(receipt).not.toBeNull();
+          const omitted = /Omitted sections: Case (\d+): Robot demo number \1 \|/.exec(view.content);
+          expect(omitted).not.toBeNull();
+          const firstOmitted = Number(omitted![1]);
+          expect(view.content).toContain(`Case ${firstOmitted - 1} describes its demonstration.`);
+          const offset = Number(/Continue the README in order with "offset": (\d+)/.exec(view.content)?.[1]);
+
+          const next = await webFetch.execute(
+            { url: "https://github.com/example/awesome", maxChars: 4_000, offset },
+            ctx,
+          );
+          const body = next.content.slice(next.content.indexOf("\n\n") + 2);
+          expect(next.content).toContain("URL: https://github.com/example/awesome");
+          expect(body.startsWith(`#### Case ${firstOmitted}: Robot demo number ${firstOmitted}`)).toBe(true);
+          // Metadata and README requests only; windows reuse the cached snapshot.
+          expect(fetchMock).toHaveBeenCalledTimes(2);
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
+
+      it("keeps the default README budget when maxChars is omitted", async () => {
+        stubRepository();
+        try {
+          const webFetch = getBuiltinTools().find((tool) => tool.name === "web_fetch")!;
+          const view = await webFetch.execute({ url: "https://github.com/example/awesome" }, { state: {} });
+          const readme = view.content.slice(view.content.indexOf("Official repository README:\n") + "Official repository README:\n".length);
+          expect(readme.length).toBeLessThanOrEqual(4_500);
+          expect(readme).toContain("Case 1 describes its demonstration.");
+          expect(readme).toContain("README snapshot kept");
+        } finally {
+          vi.unstubAllGlobals();
+        }
+      });
     });
   });
 

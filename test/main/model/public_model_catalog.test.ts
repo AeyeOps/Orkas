@@ -41,6 +41,7 @@ describe('public model catalog', () => {
       'claude-fable-5',
       'claude-sonnet-5-5',
       'claude-sonnet-5',
+      'claude-haiku-5-5',
     ]);
     expect(PUBLIC_PROVIDER_MODELS.google?.map((model) => model.id)).toEqual([
       'gemini-3.8-flash',
@@ -107,6 +108,7 @@ describe('public model catalog', () => {
       'anthropic/claude-fable-5',
       'anthropic/claude-sonnet-5.5',
       'anthropic/claude-sonnet-5',
+      'anthropic/claude-haiku-5.5',
       'openai/gpt-6-astra',
       'openai/gpt-6.1-sol',
       'openai/gpt-6-sol',

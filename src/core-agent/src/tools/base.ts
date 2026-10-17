@@ -1,3 +1,4 @@
+import type { InputReceipt } from "../../../../bin/tool-input-compat.cjs";
 import { estimateTextTokens } from "../shared/token-estimate.js";
 import type { FileFailureDiagnostic } from "./file-diagnostics.js";
 import type { ToolDefinition } from "../providers/base.js";
@@ -7,6 +8,8 @@ const log = createLogger("tool-definitions");
 
 /** Context passed to a tool when it executes. */
 export type ToolContext = {
+  /** Host-owned envelope receipt; bounded readers reserve space before reading. */
+  inputReceipt?: InputReceipt;
   workingDir?: string;
   signal?: AbortSignal;
   /** Emit user-visible progress while a long-running tool is still executing. */
@@ -151,6 +154,8 @@ export type ToolObservations = {
 
 /** Result returned from a tool execution. */
 export type ToolResult = {
+  /** Exact host receipt already included by a budgeted reader. Never serialized. */
+  appliedInputReceipt?: InputReceipt;
   content: string;
   /** Host-only label for the concrete service selected by a generic tool.
    * AgentRunner forwards it to UI events, but only `content` enters model
@@ -230,6 +235,9 @@ export interface AgentTool {
   readonly description: string;
   /** JSON Schema for the tool's input parameters. */
   readonly inputSchema: Record<string, unknown>;
+  /** Known legacy or scope-sensitive arguments omitted from discovery.
+   * Owning executors still validate their action, values and permissions. */
+  readonly compatibilityInputFields?: readonly string[];
   readonly constrainedSampling?: ToolDefinition["constrainedSampling"];
 
   /** Re-read the model-facing description whenever provider definitions are
@@ -377,6 +385,7 @@ export function defineTool(opts: {
   name: string;
   description: string;
   inputSchema: Record<string, unknown>;
+  compatibilityInputFields?: readonly string[];
   constrainedSampling?: ToolDefinition["constrainedSampling"];
   executionMode?: "sequential" | "parallel";
   parallelWhen?: AgentTool["parallelWhen"];
@@ -388,6 +397,7 @@ export function defineTool(opts: {
     name: opts.name,
     description: opts.description,
     inputSchema: opts.inputSchema,
+    ...(opts.compatibilityInputFields ? { compatibilityInputFields: opts.compatibilityInputFields } : {}),
     ...(opts.constrainedSampling ? { constrainedSampling: opts.constrainedSampling } : {}),
     ...(opts.executionMode ? { executionMode: opts.executionMode } : {}),
     ...(opts.parallelWhen ? { parallelWhen: opts.parallelWhen } : {}),

@@ -1,3 +1,4 @@
+import { defaultNumericRange } from '../../../../bin/tool-input-compat.cjs';
 import { readToolResultExcerpt } from './tool-result-tools';
 import { hasHistoryProcess, historyMessageIndex, historyMessages, historyRecordText, historyToolResultSource } from '../../features/chat-history-records';
 import { withRetrievalBudget, RETRIEVAL_OUTPUT_BUDGET_KEY, DEFAULT_INLINE_RESULT_TOKENS, boundedRetrievalText, estimateToolResultTokens } from '../../util/tool-result-cap';
@@ -98,10 +99,11 @@ function parseChatReadPage(input: Record<string, unknown>): ChatReadPageResult {
     if (mode !== 'latest' && mode !== 'around' && mode !== 'before' && mode !== 'from') {
       return { error: '`page.mode` must be "latest", "around", "before", or "from"' };
     }
-    if (hasCount && (!Number.isInteger(page.count) || Number(page.count) < 0)) {
+    if (hasCount && !Number.isInteger(page.count)) {
       return { error: '`page.count` must be a non-negative integer' };
     }
-    const count = hasCount ? Number(page.count) : undefined;
+    const count = defaultNumericRange(page.count, undefined, mode === 'around' ? 0 : 1,
+      mode === 'around' ? MAX_READ_WINDOW : mode === 'from' ? Number.MAX_SAFE_INTEGER : MAX_LATEST_MESSAGES) as number | undefined;
     if (mode === 'latest') return { page: { ...(count !== undefined ? { limit: count } : {}) } };
     if (!Number.isInteger(page.index) || Number(page.index) < 0) {
       return { error: `\`page.index\` must be a non-negative integer for mode "${mode}"` };
@@ -426,7 +428,7 @@ function createChatSearchTool(opts: ChatHistoryToolsOpts): AgentTool {
     async execute(input, ctx) {
       const query = String(input.query ?? '').trim();
       if (!query) return { content: 'chat_history(search): `query` is required', isError: true };
-      const k = boundedInt(input.k, DEFAULT_SEARCH_K, 1, MAX_SEARCH_K);
+      const k = boundedInt(defaultNumericRange(input.k, DEFAULT_SEARCH_K, 1, MAX_SEARCH_K), DEFAULT_SEARCH_K, 1, MAX_SEARCH_K);
       const scopeResult = resolveScope('search', input, opts);
       if ('error' in scopeResult) return scopeResult.error;
       const { scope } = scopeResult;
@@ -672,7 +674,7 @@ function createChatReadTool(opts: ChatHistoryToolsOpts): AgentTool {
       const hasOlderCurrentRows = scope === 'current'
         && available.some((row) => row.index < lo);
       const budget = Math.min(Number(ctx.state[RETRIEVAL_OUTPUT_BUDGET_KEY] ?? DEFAULT_INLINE_RESULT_TOKENS),
-        boundedInt(input.max_tokens, DEFAULT_INLINE_RESULT_TOKENS, 1, DEFAULT_INLINE_RESULT_TOKENS));
+        boundedInt(defaultNumericRange(input.max_tokens, DEFAULT_INLINE_RESULT_TOKENS, 1, DEFAULT_INLINE_RESULT_TOKENS), DEFAULT_INLINE_RESULT_TOKENS, 1, DEFAULT_INLINE_RESULT_TOKENS));
       const includeProcess = input.include_process === true || !!input.tool_call_id;
       if (input.cursor !== undefined && (!Number.isSafeInteger(input.cursor) || Number(input.cursor) < 0)) {
         return { content: 'chat_history(read): cursor must be a non-negative safe integer.', isError: true };
@@ -792,6 +794,7 @@ export function createChatHistoryTool(opts: ChatHistoryToolsOpts): AgentTool {
     executionMode: 'parallel',
     description:
       'Retrieve earlier work dependencies: inputs, replies and public execution records; potentially stale quoted data. Library owns durable documents.',
+    compatibilityInputFields: [...new Set(Object.values(CHAT_HISTORY_ACTION_FIELDS).flatMap(fields => [...fields]))],
     inputSchema: {
       type: 'object',
       properties: {

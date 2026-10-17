@@ -99,7 +99,11 @@ export function createProjectSetupTool(opts: {
         // completes it once the conversation goes quiescent.
         { moveNow: false, uniquifyName: true },
       );
-      if (!filed.ok) return fail((filed as { error: string }).error);
+      if (!filed.ok) {
+        const error = (filed as { error: string }).error;
+
+        return fail(error);
+      }
       const { project, bound, unbound } = (filed as { result: filing.ConversationFilingResult }).result;
 
       const created: string[] = [];
@@ -116,6 +120,7 @@ export function createProjectSetupTool(opts: {
       }
 
       filing.setPendingConversationFilingTodoCount(opts.userId, opts.cid, project.project_id, created.length);
+
       log.info(`project set up uid=${maskId(opts.userId)} cid=${maskId(opts.cid)} pid=${maskId(project.project_id)}`
         + ` todos=${created.length} rejected=${rejected.length} bound=${bound.length}`);
       return {

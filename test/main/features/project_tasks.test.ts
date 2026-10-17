@@ -39,9 +39,15 @@ beforeEach(async () => {
   users.activateUser(TEST_UID);
 });
 
-afterEach(() => {
-  process.env.ORKAS_WORKSPACE_ROOT = prevWs;
-  fs.rmSync(tmpDir, { recursive: true, force: true });
+afterEach(async () => {
+  try {
+    // Yield between Windows cleanup retries so pending IO can close its
+    // handles. Synchronous retries block those callbacks and fail with EPERM.
+    await fs.promises.rm(tmpDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+  } finally {
+    if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
+    else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
+  }
 });
 
 async function setup() {
@@ -67,6 +73,7 @@ function globalAttachDir(tid: string): string {
 }
 
 describe('project_tasks › global scope', () => {
+
   it.each(['project', 'global'])('copies a chat attachment through the todo tool into durable %s storage', async (scope) => {
     const { pt, pid: projectId } = await setup();
     const pid = scope === 'global' ? '' : projectId;
@@ -491,19 +498,19 @@ describe('project_tasks › update / complete / delete', () => {
     const { pt, pid } = await setup();
     const created = await pt.createTask(TEST_UID, pid, { content: 'Already reviewed' });
     if (!created.ok) throw new Error('task fixture failed');
-    const completed = await pt.completeTask(TEST_UID, pid, created.task.id, 'verified-result');
+    const completed = await pt.completeTask(TEST_UID, pid, created.task.id);
     if (!completed.ok) throw new Error('completion fixture failed');
     const events: unknown[] = [];
     pt.onTasksChanged((event) => events.push(event));
     const rejected = await pt.updateTask(TEST_UID, pid, created.task.id,
-      { status: 'progress', result_ref: '' }, { expectedStatus: 'todo' });
+      { status: 'progress' }, { expectedStatus: 'todo' });
     expect(rejected).toEqual({ ok: false, error: 'status_conflict' });
     expect(await pt.getTask(TEST_UID, pid, created.task.id)).toEqual(completed.task);
     expect(events).toEqual([]);
     // A deliberate manual reopen still works; only the stale conditional
     // operation is rejected, not the user's ordinary status control.
     expect((await pt.updateTask(TEST_UID, pid, created.task.id, { status: 'todo' })).ok).toBe(true);
-    expect(await pt.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'todo', result_ref: 'verified-result' });
+    expect(await pt.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'todo' });
     expect(events).toHaveLength(1);
   });
 
@@ -511,12 +518,12 @@ describe('project_tasks › update / complete / delete', () => {
     const { pt, pid } = await setup();
     const c = await pt.createTask(TEST_UID, pid, { content: 't' });
     if (!c.ok) return;
-    const done = await pt.completeTask(TEST_UID, pid, c.task.id, 'chat-abc');
+    const done = await pt.completeTask(TEST_UID, pid, c.task.id);
     expect(done.ok).toBe(true);
     if (done.ok) {
       expect(done.task.status).toBe('done');
       expect(done.task.done_at).toBeTruthy();
-      expect(done.task.result_ref).toBe('chat-abc');
+      expect(done.task).not.toHaveProperty('result_ref');
     }
     const reopened = await pt.updateTask(TEST_UID, pid, c.task.id, { status: 'todo' });
     if (reopened.ok) expect(reopened.task.done_at).toBeUndefined();
@@ -555,22 +562,17 @@ describe('project_tasks › update / complete / delete', () => {
     expect(await pt.updateTask(TEST_UID, pid, created.task.id, { status: 'invalid' as any }))
       .toEqual({ ok: false, error: 'bad_status' });
 
-    const longRef = 'r'.repeat(pt.TASK_RESULT_REF_MAX + 50);
-    const updated = await pt.updateTask(TEST_UID, pid, created.task.id, { result_ref: longRef });
-    expect(updated.ok).toBe(true);
-    if (updated.ok) expect(updated.task.result_ref).toBe('r'.repeat(pt.TASK_RESULT_REF_MAX));
     const cleared = await pt.updateTask(TEST_UID, pid, created.task.id, {
       content: 'Updated work',
       owner_agent: '',
       owner_agent_id: '',
-      result_ref: '',
     });
     expect(cleared.ok).toBe(true);
     if (cleared.ok) {
       expect(cleared.task.content).toBe('Updated work');
       expect(cleared.task.owner_agent).toBeUndefined();
       expect(cleared.task.owner_agent_id).toBeUndefined();
-      expect(cleared.task.result_ref).toBeUndefined();
+      expect(cleared.task).not.toHaveProperty('result_ref');
     }
     expect(await pt.updateTask(TEST_UID, 'p_ffffffffffff', created.task.id, {}))
       .toEqual({ ok: false, error: 'project_not_found' });
@@ -697,13 +699,11 @@ describe('project_tasks › model task view', () => {
     expect(created.ok).toBe(true);
     if (!created.ok) return;
     const updated = await pt.updateTask(TEST_UID, pid, created.task.id, {
-      result_ref: 'chat-result',
     });
     expect(updated.ok).toBe(true);
 
     expect(pt.taskView(updated.ok ? updated.task : created.task)).toMatchObject({
       origin_cid: 'chat-origin',
-      result_ref: 'chat-result',
     });
   });
 
@@ -862,13 +862,13 @@ describe('project_tasks › concurrent persistence paths', () => {
     if (!created.ok) throw new Error('task fixture failed');
     const results = await Promise.all([
       pt.uploadTaskAttachment(TEST_UID, taskPid, created.task.id, 'brief.txt', Buffer.from('source brief')),
-      pt.updateTask(TEST_UID, taskPid, created.task.id, { status: 'done', result_ref: 'artifact:delivery' }),
+      pt.updateTask(TEST_UID, taskPid, created.task.id, { status: 'done' }),
     ]);
     expect(results.every(result => result.ok)).toBe(true);
     vi.resetModules();
     const reloaded = await import('../../../src/main/features/project_tasks');
     expect(await reloaded.getTask(TEST_UID, taskPid, created.task.id)).toMatchObject({
-      status: 'done', result_ref: 'artifact:delivery', attachments: ['brief.txt'],
+      status: 'done', attachments: ['brief.txt'],
     });
     expect(await reloaded.listTaskAttachments(TEST_UID, taskPid, created.task.id)).toEqual(['brief.txt']);
   });
@@ -964,7 +964,7 @@ describe('project_tasks › persistence failure recovery', () => {
     });
     syncBuiltinESMExports();
     try {
-      await expect(pt.updateTask(TEST_UID, pid, tid, { status: 'review', result_ref: 'delivery.md' }))
+      await expect(pt.updateTask(TEST_UID, pid, tid, { status: 'review' }))
         .rejects.toThrow(fault);
       expect(fs.readFileSync(file, 'utf8')).toBe(before);
       expect(changes).toEqual([]);
@@ -975,13 +975,13 @@ describe('project_tasks › persistence failure recovery', () => {
     }
     const results = await Promise.all([
       pt.updateTask(TEST_UID, pid, tid, { content: 'Release review\nClarified brief' }),
-      pt.updateTask(TEST_UID, pid, tid, { status: 'review', result_ref: 'delivery.md' }),
+      pt.updateTask(TEST_UID, pid, tid, { status: 'review' }),
     ]);
     expect(results.every(result => result.ok)).toBe(true);
     vi.resetModules();
     const reloaded = await import('../../../src/main/features/project_tasks');
     expect(await reloaded.listTasks(TEST_UID, pid)).toEqual([expect.objectContaining({
-      id: tid, content: 'Release review\nClarified brief', status: 'review', result_ref: 'delivery.md', origin_cid: 'original-chat',
+      id: tid, content: 'Release review\nClarified brief', status: 'review', origin_cid: 'original-chat',
     })]);
   });
 });
@@ -1025,7 +1025,7 @@ describe('project_tasks › retired status compatibility', () => {
       fs.writeFileSync(file, originalBytes);
       vi.resetModules();
       const reloaded = await import('../../../src/main/features/project_tasks');
-      const { done_at: _staleTimestamp, ...context } = legacy;
+      const { done_at: _staleTimestamp, result_ref: _retiredReference, ...context } = legacy;
       const expected = { ...context, status };
       expect(await reloaded.getTask(TEST_UID, pid, created.task.id)).toEqual(expected);
       expect(await reloaded.listTasks(TEST_UID, pid)).toContainEqual(expected);
@@ -1040,6 +1040,7 @@ describe('project_tasks › retired status compatibility', () => {
       expect(persisted).toMatchObject({ ...preservedContext, content: 'Input received' });
       expect(Date.parse(persisted.updated_at)).toBeGreaterThanOrEqual(Date.parse(previousUpdatedAt));
       expect(persisted).not.toHaveProperty('done_at');
+      expect(persisted).not.toHaveProperty('result_ref');
       vi.resetModules();
       expect(await (await import('../../../src/main/features/project_tasks')).getTask(TEST_UID, pid, created.task.id)).toEqual(persisted);
     }
@@ -1079,13 +1080,14 @@ describe('project_tasks › single content compatibility', () => {
     const bytes = JSON.stringify(legacy);
     fs.writeFileSync(file, bytes);
     const content = '核对发布\n保留链接与验收条件。\n确认后再处理。';
-    const { title: _title, detail: _detail, ...metadata } = legacy;
-    expect(await pt.getTask(TEST_UID, pid, tid)).toEqual({ ...metadata, content });
-    expect(await pt.listTasks(TEST_UID, pid)).toEqual([{ ...metadata, content }]);
+    const { title: _title, detail: _detail, result_ref: _retiredReference, ...metadata } = legacy;
+    const responsibility = {};
+    expect(await pt.getTask(TEST_UID, pid, tid)).toEqual({ ...metadata, ...responsibility, content });
+    expect(await pt.listTasks(TEST_UID, pid)).toEqual([{ ...metadata, ...responsibility, content }]);
     expect(fs.readFileSync(file, 'utf8')).toBe(bytes);
     expect((await pt.updateTask(TEST_UID, pid, tid, { content: content + '\n补充检查。' })).ok).toBe(true);
     const persisted = JSON.parse(fs.readFileSync(file, 'utf8'));
-    expect(persisted).toEqual({ ...metadata, content: content + '\n补充检查。', updated_at: expect.any(String) });
+    expect(persisted).toEqual({ ...metadata, ...responsibility, content: content + '\n补充检查。', updated_at: expect.any(String) });
     vi.resetModules();
     const reloaded = await import('../../../src/main/features/project_tasks');
     expect(await reloaded.getTask(TEST_UID, pid, tid)).toEqual(persisted);

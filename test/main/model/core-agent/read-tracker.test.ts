@@ -111,6 +111,24 @@ describe('read-tracker › checkEditFreshness', () => {
     const block = checkEditFreshness(ctx, file, st, { currentHash: 'sha256:new' });
     expect(block?.code).toBe('E_STALE');
   });
+
+  it('accepts an unchanged content hash after a timestamp-only update', () => {
+    const ctx = ctxWithMap();
+    const before = fs.statSync(file);
+    recordRead(ctx, file, before, 'sha256:unchanged');
+    fs.utimesSync(file, before.atime, new Date(before.mtimeMs + 5000));
+    expect(checkEditFreshness(ctx, file, fs.statSync(file), { currentHash: 'sha256:unchanged' })).toBeNull();
+  });
+
+  it.each([['sha256:known', undefined], [undefined, 'sha256:known']])(
+    'retains metadata protection when either hash is absent (%s, %s)', (baselineHash, currentHash) => {
+      const ctx = ctxWithMap();
+      const before = fs.statSync(file);
+      recordRead(ctx, file, before, baselineHash);
+      fs.utimesSync(file, before.atime, new Date(before.mtimeMs + 5000));
+      expect(checkEditFreshness(ctx, file, fs.statSync(file), { currentHash })?.code).toBe('E_STALE');
+    },
+  );
 });
 
 describe('read-tracker › recordRead', () => {

@@ -66,13 +66,14 @@ export function findAppNavSurface(id: string): AppNavSurface | null {
 export function appNavSurfaceDescription(): string {
   const idsByActionSet = new Map<string, string[]>();
   for (const surface of APP_NAV_SURFACES) {
-    const actionSet = surface.actions.join('|');
+    const actionSet = surface.actions.filter((action) => action !== 'open').join('|');
+    if (!actionSet) continue;
     const ids = idsByActionSet.get(actionSet) ?? [];
     ids.push(surface.id);
     idsByActionSet.set(actionSet, ids);
   }
-  return `Actions: ${[...idsByActionSet.entries()]
-    .map(([actions, ids]) => `${ids.join(', ')}=${actions}`)
+  return `All support open. Other actions: ${[...idsByActionSet.entries()]
+    .map(([actions, ids]) => `${ids.join(',')}=${actions}`)
     .join(';')}.`;
 }
 

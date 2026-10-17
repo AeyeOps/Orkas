@@ -127,6 +127,7 @@ describe('project_driver › config + state IO', () => {
     vi.resetModules();
   });
   afterEach(() => {
+    vi.restoreAllMocks();
     process.env.ORKAS_WORKSPACE_ROOT = prevWs;
     fs.rmSync(tmpDir, { recursive: true, force: true });
   });
@@ -141,7 +142,47 @@ describe('project_driver › config + state IO', () => {
     expect(w.max_advances_per_day).toBe(200); // clamped to cap
     expect(await drv.readConfig(UID, PID)).toEqual(w);
     const lowered = await drv.writeConfig(UID, PID, { max_advances_per_day: 0 });
-    expect(lowered).toEqual({ enabled: true, max_advances_per_day: 1 }); // enabled preserved, floor 1
+    expect(lowered).toEqual({ ...w, max_advances_per_day: 1 }); // owner and enabled preserved, floor 1
+  });
+
+  it.each([PID, ''])('binds enables to the caller and allows another device to disable then take over (%s)', async pid => {
+    const drv = await load();
+    const machine = await import('../../../src/main/features/machine_device_id');
+    const device = await import('../../../src/main/util/device');
+    const identity = vi.spyOn(machine, 'getDeviceId').mockReturnValue('device-a');
+    vi.spyOn(device, 'getCurrentDevice').mockReturnValue({ id: 'legacy-a', name: 'Desktop A' });
+    const a = await drv.writeConfig(UID, pid, { enabled: true });
+    expect(a).toMatchObject({ enabled: true, device_id: 'device-a', device_name: 'Desktop A' });
+    expect(drv.runsOnCurrentDevice(await drv.readConfig(UID, pid))).toBe(true);
+
+    // A synced file keeps its owner even when edited from another installation.
+    identity.mockReturnValue('device-b');
+    vi.mocked(device.getCurrentDevice).mockReturnValue({ id: 'legacy-b', name: 'Laptop B' });
+    const edited = await drv.writeConfig(UID, pid, { max_advances_per_day: 7 });
+    expect(edited).toMatchObject({ device_id: 'device-a', device_name: 'Desktop A', max_advances_per_day: 7 });
+    expect(drv.runsOnCurrentDevice(edited)).toBe(false);
+    expect(await drv.writeConfig(UID, pid, { enabled: false })).toEqual({ enabled: false, max_advances_per_day: 7 });
+    const b = await drv.writeConfig(UID, pid, { enabled: true });
+    expect(b).toMatchObject({ enabled: true, device_id: 'device-b', device_name: 'Laptop B' });
+    expect(drv.runsOnCurrentDevice(await drv.readConfig(UID, pid))).toBe(true);
+    identity.mockReturnValue('device-a');
+    expect(drv.runsOnCurrentDevice(await drv.readConfig(UID, pid))).toBe(false);
+  });
+
+  it('pauses old opt-ins without claiming them on read, then binds an explicit re-enable', async () => {
+    const drv = await load();
+    const { projectDriverFile } = await import('../../../src/main/paths');
+    const file = projectDriverFile(UID, PID);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const legacy = JSON.stringify({ enabled: true, max_advances_per_day: 4 });
+    fs.writeFileSync(file, legacy);
+    const old = await drv.readConfig(UID, PID);
+    expect(old).toEqual({ enabled: false, max_advances_per_day: 4 });
+    expect(drv.runsOnCurrentDevice(old)).toBe(false);
+    expect(fs.readFileSync(file, 'utf8')).toBe(legacy);
+    // The displayed switch is already off, so one enable action is enough.
+    const rebound = await drv.writeConfig(UID, PID, { enabled: true });
+    expect(rebound).toMatchObject({ enabled: true, device_id: drv.getCurrentDevice().id });
   });
 
   it('config file lives under cloud/, state file under local/ (never synced)', async () => {

@@ -35,6 +35,8 @@ const browserHost = vi.hoisted(() => ({
   openModelWebAssist: vi.fn(async () => ({ ok: true, active_tab_id: '0123456789ab' })),
   observeModelWebAssist: vi.fn(async () => ({ ok: true, page_id: 'page-1', untrusted_content: true, text: 'Settings' })),
   actOnModelWebAssist: vi.fn(async () => ({ ok: true })),
+  waitForModelWebAssist: vi.fn(async () => ({ ok: true })),
+  screenshotModelWebAssist: vi.fn(async () => ({ content: JSON.stringify({ ok: true, sensitive_fields_masked: true }), images: [{ data: 'cG5nLWV2aWRlbmNl', mediaType: 'image/png' }] })),
 }));
 vi.mock('../../../../src/main/features/web_assist', () => browserHost);
 
@@ -49,6 +51,7 @@ const TEST_UID = 'u-bridge-e2e';
 let tmpDir: string;
 let prevWs: string | undefined;
 let prevHome: string | undefined;
+let protocolEra: 'legacy' | 'modern' = 'legacy';
 
 beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-bridge-e2e-'));
@@ -79,6 +82,7 @@ afterEach(async () => {
 
 class McpStdioClient {
   private child: ChildProcessWithoutNullStreams;
+  private era = protocolEra;
   private buf = '';
   private stderrBuf = '';
   private protocolProblems: string[] = [];
@@ -113,6 +117,10 @@ class McpStdioClient {
         if (waiter) {
           this.waiters.delete(msg.id);
           clearTimeout(waiter.timer);
+          if (this.era === 'modern' && msg.result) {
+            if (msg.result.resultType !== 'complete') this.protocolProblems.push('missing modern resultType');
+            if (msg.result._meta?.['io.modelcontextprotocol/serverInfo']?.name !== 'orkas') this.protocolProblems.push('missing modern server identity');
+          }
           waiter.resolve(msg);
         }
       }
@@ -131,6 +139,10 @@ class McpStdioClient {
     });
   }
   request(id: number, method: string, params: Record<string, unknown>, timeoutMs = 8000): Promise<any> {
+    if (this.era === 'modern') {
+      if (method === 'initialize') { method = 'server/discover'; params = {}; }
+      params = { ...params, _meta: { 'io.modelcontextprotocol/protocolVersion': '2026-07-28', 'io.modelcontextprotocol/clientCapabilities': {}, ...(params._meta as Record<string, unknown> || {}) } };
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { this.waiters.delete(id); reject(new Error(`mcp timeout: ${method}`)); }, timeoutMs);
       this.waiters.set(id, { resolve, reject, timer });
@@ -138,6 +150,7 @@ class McpStdioClient {
     });
   }
   notify(method: string, params: Record<string, unknown> = {}): void {
+    if (this.era === 'modern' && method === 'notifications/initialized') return;
     this.child.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
   }
   signal(signal: NodeJS.Signals): void {
@@ -322,7 +335,8 @@ function bridgeDescriptionBudgetProblems(tools: any[]): string[] {
   return problems;
 }
 
-describe('orkas-bridge.cjs › MCP stdio e2e', () => {
+describe.each(['legacy', 'modern'] as const)('orkas-bridge.cjs › %s MCP stdio e2e', era => {
+  beforeEach(() => { protocolEra = era; });
   it.each(['claude', 'codex', 'opencode', 'hermes', 'openclaw'] as const)('discovers, searches, expands and calls large connector catalogs over the %s bridge', async cli => {
     const tools = Array.from({ length: 100 }, (_, i) => ({ name: `read_${i}`, description: 'Read ordinary entry', annotations: { readOnlyHint: true }, input_schema: { type: 'object' } }));
     const target = { name: 'lookup_invoice', description: 'Find overdue invoices', annotations: { readOnlyHint: true }, input_schema: { type: 'object', properties: { invoice_id: { type: 'string' } } } };
@@ -353,9 +367,9 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       expect(Object.keys(list.inputSchema.properties)).toEqual(['connector_id', 'tool_name', 'query', 'limit', 'offset']);
       expect(list.inputSchema.properties.query.description).toContain('not record ids');
       expect(definitions.find((t: any) => t.name === 'orkas_call_connector_tool').description).toContain(require('../../../../bin/connector-discovery-contract.cjs').callSuitability);
-      // MCP rejects numeric constraints at its schema boundary, before host discovery.
+      // Exact cursors and malformed sizes still fail before host discovery.
       bridgeConnectorMock.resolveVisibleConnectors.mockClear();
-      for (const [args, field, bound] of [[{ limit: 51 }, 'limit', '50'], [{ offset: -1 }, 'offset', '0']] as const) {
+      for (const [args, field, bound] of [[{ limit: 1.5 }, 'limit', 'integer'], [{ offset: -1 }, 'offset', '0']] as const) {
         const rejected = await client.request(++id, 'tools/call', { name: 'orkas_list_connector_tools', arguments: args });
         expect(rejected.result.isError).toBe(true);
         expect(rejected.result.content[0].text).toContain(field);
@@ -363,7 +377,16 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       }
       expect(bridgeConnectorMock.resolveVisibleConnectors).not.toHaveBeenCalled();
       expect(bridgeConnectorMock.callTool).not.toHaveBeenCalled();
+      for (const limit of [-1, 0, 51, 1000]) {
+        const rejected = await client.request(++id, 'tools/call', { name: 'orkas_list_connector_tools', arguments: {
+          connector_id: instance.id, tool_name: target.name, limit,
+        } });
+        expect(rejected.result.isError).toBe(true);
+        expect(rejected.result.content[0].text).toContain('cannot be combined');
+      }
+      expect(bridgeConnectorMock.resolveVisibleConnectors).not.toHaveBeenCalled();
       const inventory = await call({});
+      expect(await call({ limit: 51 })).toEqual(inventory);
       expect(inventory.connectors).toEqual([{ id: instance.id, name: instance.display_name, tool_count: 101 }]);
       expect(JSON.stringify(inventory)).not.toContain('input_schema');
       const first = await call({ connector_id: instance.id });
@@ -379,15 +402,12 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       expect((await call({ query: 'overdue invoices 发票', limit: 1 })).tools[0].name).toBe(target.name);
       expect(await call({ connector_id: instance.id, tool_name: target.name })).toMatchObject({ mode: 'schema', tools: [expect.objectContaining({ input_schema: target.input_schema })] });
       expect(approval).not.toHaveBeenCalled();
-      const blocked = await client.request(++id, 'tools/call', { name: 'orkas_call_connector_tool', arguments: {
-        connector_id: instance.id, tool_name: target.name, args: { invoice_id: '123' }, dry_run: true,
+      const called = await client.request(++id, 'tools/call', { name: 'orkas_call_connector_tool', arguments: {
+        connector_id: instance.id, tool_name: target.name, args: { invoice_id: '123' }, future_option: 'PRIVATE_VALUE',
       } });
-      expect(blocked.result.isError).toBe(true);
-      expect(blocked.result.content[0].text).toContain('dry_run');
-      expect(bridgeConnectorMock.callTool).not.toHaveBeenCalled();
-      expect(approval).not.toHaveBeenCalled();
-      const called = await client.request(++id, 'tools/call', { name: 'orkas_call_connector_tool', arguments: { connector_id: instance.id, tool_name: target.name, args: { invoice_id: '123' } } });
       expect(called.result.isError).not.toBe(true);
+      expect(JSON.parse(called.result.content.at(-1).text)).toEqual({ ignored_fields: ['future_option'] });
+      expect(JSON.stringify(called)).not.toContain('PRIVATE_VALUE');
       expect(bridgeConnectorMock.callTool).toHaveBeenCalledOnce();
       expect(approval).toHaveBeenCalledOnce(); // A custom readOnlyHint never bypasses host approval.
       expect(bridgeConnectorMock.callTool).toHaveBeenCalledWith(TEST_UID, instance.id, target.name, { invoice_id: '123' }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
@@ -486,16 +506,13 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect(offset).toBeNull();
         expect(Buffer.concat(pages)).toEqual(resource.expected);
       }
-      const resource = await call('orkas_read_skill', { id: 'private-helper', path: 'references/guide.md', extra_note: 'PRIVATE_VALUE' });
+      const resource = await call('orkas_read_skill', { id: 'private-helper', path: 'references/guide.md', limit: 100000, extra_note: 'PRIVATE_VALUE' });
       expect(JSON.parse(resource.result.content[0].text).content).toBe('Exact private reference');
       expect(JSON.parse(resource.result.content[1].text)).toEqual({ ignored_fields: ['extra_note'] });
       expect(JSON.stringify(resource)).not.toContain('PRIVATE_VALUE');
-      const blockedRun = await call('orkas_run_skill', { skill: 'private-helper', script: 'check', dry_run: true });
-      expect(blockedRun.result.isError).toBe(true);
-      expect(blockedRun.result.content[0].text).toContain('dry_run');
-      expect(blockedRun.result.content[0].text).not.toContain('PRIVATE_EXECUTION_OK');
-      expect(fs.existsSync(executionMarker)).toBe(false);
-      const ran = await call('orkas_run_skill', { skill: 'private-helper', script: 'check' });
+      const ran = await call('orkas_run_skill', { skill: 'private-helper', script: 'check', future_option: 'PRIVATE_VALUE' });
+      expect(JSON.parse(ran.result.content.at(-1).text)).toEqual({ ignored_fields: ['future_option'] });
+      expect(JSON.stringify(ran)).not.toContain('PRIVATE_VALUE');
       expect(ran.result.isError).not.toBe(true);
       expect(JSON.parse(ran.result.content[0].text).stdout).toContain('PRIVATE_EXECUTION_OK');
       expect(fs.readFileSync(executionMarker, 'utf8')).toBe('run\n');
@@ -506,7 +523,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       const ref = page.output_ref;
       for (let i = 0; page.next_offset !== null && i < 20; i++) {
         const previousOffset = page.next_offset;
-        const next = await call('orkas_call_connector_tool', { action: 'read', output_ref: ref, offset: page.next_offset });
+        const next = await call('orkas_call_connector_tool', { action: 'read', output_ref: ref, offset: page.next_offset, limit: -1 });
         page = JSON.parse(next.result.content[0].text);
         if (page.next_offset !== null) expect(page.next_offset).toBeGreaterThan(previousOffset);
         joined += page.text;
@@ -550,7 +567,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       const native = buildConversationBrowserTool(TEST_UID, cid);
       expect(definition.description).toBe(native.description);
       expect(definition.inputSchema.properties).toEqual(native.inputSchema.properties);
-      expect(definition.inputSchema.additionalProperties).toBe(false);
+      expect(definition.inputSchema.additionalProperties).toBe(true);
       expect(bridgeDescriptionBudgetProblems([definition])).toEqual([]);
       expect(listed.result.tools.map((tool: any) => tool.name)).toEqual(expect.arrayContaining(['inner_browser', 'auto_tasks', 'todo_tasks', 'orkas_list_skills', 'cross_session_memory']));
       let id = 3;
@@ -565,17 +582,31 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
       ] as const) {
         const rejected = await call(args);
         expect(rejected.isError).toBe(true);
-        // SDK validation serializes issues as JSON inside its error text.
+        // SDK 1.31 renders the actionable message and field as plain text.
         expect(rejected.content[0].text).toContain(field);
-        expect(rejected.content[0].text).toContain(JSON.stringify(message).slice(1, -1));
+        expect(rejected.content[0].text).toContain(message);
       }
       expect(browserHost.observeModelWebAssist).not.toHaveBeenCalled();
       expect(browserHost.actOnModelWebAssist).not.toHaveBeenCalled();
       const opened = await call({ operation: 'open', url: 'https://example.com/settings' });
       expect(JSON.parse(opened.content[0].text)).toEqual({ ok: true, active_tab_id: '0123456789ab' });
       expect(browserHost.openModelWebAssist).toHaveBeenCalledWith(TEST_UID, cid, { url: 'https://example.com/settings' });
+      expect((await call({ operation: 'wait', timeout_ms: 60000 })).isError).toBeFalsy();
+      expect(browserHost.waitForModelWebAssist).toHaveBeenLastCalledWith(TEST_UID, cid, { condition: 'loaded' },
+        expect.objectContaining({ signal: expect.anything(), isActive: expect.any(Function) }));
+      const waitLifetime = (browserHost.waitForModelWebAssist.mock.lastCall as any)[3];
+      expect(waitLifetime.signal.aborted).toBe(false);
+      expect(waitLifetime.isActive()).toBe(true);
       const observed = await call({ operation: 'observe', tab_id: '0123456789ab' });
       expect(JSON.parse(observed.content[0].text)).toMatchObject({ page_id: 'page-1', untrusted_content: true });
+      const captured = await call({ operation: 'screenshot', tab_id: '0123456789ab' });
+      expect(captured.content).toEqual([{ type: 'text', text: JSON.stringify({ ok: true, sensitive_fields_masked: true }) }, { type: 'image', data: 'cG5nLWV2aWRlbmNl', mimeType: 'image/png' }]);
+      await call({ operation: 'screenshot', tab_id: '0123456789ab', clip: [10, 20, 300, 200] });
+      expect(browserHost.screenshotModelWebAssist).toHaveBeenCalledWith(TEST_UID, cid,
+        { tabId: '0123456789ab', clip: [10, 20, 300, 200] }, expect.anything());
+      expect((await call({ operation: 'act', tab_id: '0123456789ab', page_id: 'shot-1', page_action: 'click', point: [25, 60] })).isError).toBeFalsy();
+      expect(browserHost.actOnModelWebAssist).toHaveBeenCalledWith(TEST_UID, cid,
+        { tabId: '0123456789ab', pageId: 'shot-1', action: 'click', point: [25, 60] }, expect.anything());
       const article = '# 中文文章\n\n|字段|值|\n|---|---|\n|正文|完整|\n'.repeat(4000).slice(0, 100000);
       expect(article.length).toBe(100000);
       const fill = { operation: 'act', tab_id: '0123456789ab', page_id: 'page-1', element_ref: 'e1', page_action: 'fill' };
@@ -595,14 +626,18 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect(JSON.parse(result.content[0].text)).toMatchObject({ ok: false, code });
       }
       const forged = await call({ operation: 'open', url: 'https://example.com/forged', cid: 'other-task' });
-      expect(forged.isError).toBe(true);
-      expect(browserHost.openModelWebAssist).toHaveBeenCalledTimes(1);
+      expect(forged.isError).toBeFalsy();
+      expect(JSON.parse(forged.content.at(-1).text)).toEqual({ ignored_fields: ['cid'] });
+      expect(browserHost.openModelWebAssist).toHaveBeenLastCalledWith(TEST_UID, cid,
+        expect.objectContaining({ url: 'https://example.com/forged' }));
+      expect(browserHost.openModelWebAssist).toHaveBeenCalledTimes(2);
       life.finishBrowserTaskRun(TEST_UID, cid, label);
       life.beginBrowserTaskRun(TEST_UID, cid, `${label}-replacement`);
+      expect(waitLifetime.isActive()).toBe(false);
       const stale = await call({ operation: 'open', url: 'https://example.com/stale' });
       expect(stale.isError).toBe(true);
       expect(JSON.parse(stale.content[0].text).code).toBe('task_run_ended');
-      expect(browserHost.openModelWebAssist).toHaveBeenCalledTimes(1);
+      expect(browserHost.openModelWebAssist).toHaveBeenCalledTimes(2);
     } finally {
       client.kill();
       await client.waitForExit();
@@ -708,8 +743,10 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
           assert(!result.isError);
           const task = JSON.parse(result.content[0].text).tasks[0];
           assert.equal(task.content, 'Global task fetched on demand');
-          const forbidden = await client.callTool({ name: 'todo_tasks', arguments: { action: 'create', content: 'must not persist', project_id: 'foreign-project' } });
-          assert.equal(forbidden.isError, true);
+          const scoped = await client.callTool({ name: 'todo_tasks', arguments: { action: 'list', project_id: 'foreign-project' } });
+          assert(!scoped.isError);
+          assert.deepEqual(JSON.parse(scoped.content[0].text).tasks.map(t => t.id), [task.id]);
+          assert.deepEqual(JSON.parse(scoped.content.at(-1).text).ignored_fields, ['project_id']);
           process.stderr.write(JSON.stringify({ payloads: [{ text: task.status }], meta: { agentMeta: { sessionId: 'openclaw-test-session' } } }));
         } finally { await client.close(); }
       })().catch(error => { process.stderr.write('OpenClaw MCP contract probe failed: ' + error.message); process.exitCode = 1; });
@@ -754,14 +791,20 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect(!!tool).toBe(true);
         expect(tool.inputSchema.properties).not.toHaveProperty('title');
         expect(tool.inputSchema.properties).not.toHaveProperty('detail');
+        expect(tool.inputSchema.properties).not.toHaveProperty('result_ref');
+        expect(JSON.stringify(tool.inputSchema)).not.toContain('library_save');
         const stale = await client.request(22, 'tools/call', { name: 'project_tasks', arguments: { action: 'create', content: 'Stale tool must not write' } });
         expect(stale.result?.isError || stale.error).toBeTruthy();
         expect(bridgeDescriptionBudgetProblems([tool])).toEqual([]);
+        for (const term of ['sync_state', 'pending/retry', 'conflict', 'status_conflict']) {
+          expect(tool.description).toContain(term);
+        }
         expect(tool.inputSchema.properties).not.toHaveProperty('project');
         expect(tool.inputSchema.properties.status.enum).toEqual(['todo', 'progress', 'review', 'done']);
         const { createProjectTasksTool } = await import('../../../../src/core-agent/src/tools/project-tasks-tool');
         const { createProjectTasksHandler } = await import('../../../../src/main/features/project_tasks_tool_handler');
         const native = createProjectTasksTool(createProjectTasksHandler(TEST_UID, scope, 'c-tasks-true', new Map()));
+        expect(native.inputSchema.properties).not.toHaveProperty('result_ref');
         for (const field of ['offset', 'limit', 'status', 'task_id', 'content']) {
           expect(tool.inputSchema.properties[field]).toEqual((native.inputSchema as any).properties[field]);
         }
@@ -850,7 +893,10 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         const task = (await tasks.listTasks(TEST_UID, scope))[0];
         expect(task.status).toBe('todo');
         expect(task).not.toHaveProperty('assignee_uid');
-        expect(task.origin_cid).toBeUndefined();
+        // A global to-do saved from a conversation links back to it; a project
+        // backlog item links only on its first run.
+        if (bound) expect(task.origin_cid).toBeUndefined();
+        else expect(task.origin_cid).toBe(`c-tasks-${bound}`);
         const { chatAttachmentDirForConversation } = await import('../../../../src/main/util/project-layout');
         const sourceDir = chatAttachmentDirForConversation(TEST_UID, `c-tasks-${bound}`);
         fs.mkdirSync(sourceDir, { recursive: true });
@@ -881,21 +927,30 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
             expect(await tasks.listTasks(TEST_UID, scope)).toEqual([taskAfterAttachment]);
           }
         }
-        const update = await client.request(6, 'tools/call', { name: 'todo_tasks', arguments: { action: 'update', task_id: task.id, status: 'review', result_ref: 'artifact-1', content: 'Edited through MCP\nRetained requirement' } });
+        const update = await client.request(6, 'tools/call', { name: 'todo_tasks', arguments: { action: 'update', task_id: task.id, status: 'review', content: 'Edited through MCP\nRetained requirement' } });
         expect(update.result.isError).toBeFalsy();
         expect(JSON.parse(update.result.content[0].text)).toMatchObject({ ok: true });
-        expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'review', result_ref: 'artifact-1', content: 'Edited through MCP\nRetained requirement' });
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'review', content: 'Edited through MCP\nRetained requirement' });
         expect(await tasks.getTask(TEST_UID, scope, task.id)).not.toHaveProperty('assignee_uid');
-        const complete = await client.request(7, 'tools/call', { name: 'todo_tasks', arguments: { action: 'complete', task_id: task.id, result_ref: 'verified-1' } });
+        const complete = await client.request(7, 'tools/call', { name: 'todo_tasks', arguments: { action: 'complete', task_id: task.id, result_ref: 'retired-library-pointer' } });
         expect(complete.result.isError).toBeFalsy();
-        expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'done', result_ref: 'verified-1' });
-        expect(await tasks.getTask(TEST_UID, scope, task.id)).not.toHaveProperty('origin_cid');
+        expect(JSON.parse(complete.result.content[0].text)).toMatchObject({ ok: true });
+        expect(JSON.parse(complete.result.content[1].text)).toEqual({ ignored_fields: ['result_ref'] });
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).toMatchObject({ status: 'done' });
+        expect(await tasks.getTask(TEST_UID, scope, task.id)).not.toHaveProperty('result_ref');
+        // Completion never changes the link: a global to-do keeps the
+        // conversation it was saved from; a project item has none until run.
+        if (bound) expect(await tasks.getTask(TEST_UID, scope, task.id)).not.toHaveProperty('origin_cid');
+        else expect(await tasks.getTask(TEST_UID, scope, task.id)).toHaveProperty('origin_cid', `c-tasks-${bound}`);
         const reopened = await createProjectTasksHandler(TEST_UID, scope, 'new-native-chat', new Map()).update(task.id, { status: 'todo' });
-        expect(reopened.task).toMatchObject({ status: 'todo', result_ref: 'verified-1' });
-        expect(reopened.task).not.toHaveProperty('origin_cid');
+        expect(reopened.task).toMatchObject({ status: 'todo' });
+        expect(reopened.task).not.toHaveProperty('result_ref');
+        // Reopening from another conversation does not relink it either.
+        if (bound) expect(reopened.task).not.toHaveProperty('origin_cid');
+        else expect(reopened.task).toHaveProperty('origin_cid', `c-tasks-${bound}`);
         const reread = await client.request(28, 'tools/call', { name: 'todo_tasks', arguments: { action: 'list' } });
         expect(JSON.parse(reread.result.content[0].text).tasks).toContainEqual(expect.objectContaining({ id: task.id, status: 'todo' }));
-        const queryTodo = { action: 'list', offset: 0, limit: 50, status: 'todo', task_id: 'x' };
+        const queryTodo = { action: 'list', offset: 0, limit: 500, status: 'todo', task_id: 'x' };
         const page = await client.request(93, 'tools/call', { name: 'todo_tasks', arguments: queryTodo });
         expect(JSON.parse(page.result.content[0].text)).toEqual(JSON.parse((await native.execute(queryTodo, { state: {} })).content));
         expect(JSON.parse(page.result.content[0].text).tasks[0]).not.toHaveProperty('detail');
@@ -910,7 +965,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
           }
         }
         const detail = await client.request(94, 'tools/call', { name: 'todo_tasks', arguments: { action: 'get', task_id: task.id } });
-        expect(JSON.parse(detail.result.content[0].text).task).toMatchObject({ content: 'Edited through MCP\nRetained requirement', result_ref: 'verified-1' });
+        expect(JSON.parse(detail.result.content[0].text).task).toMatchObject({ content: 'Edited through MCP\nRetained requirement' });
         const legacy = await client.request(95, 'tools/call', { name: 'todo_tasks', arguments: {
           action: 'create', title: 'Old client', detail: 'Keep this requirement',
         } });
@@ -980,7 +1035,8 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         capabilities: {},
         clientInfo: { name: 'vitest', version: '0' },
       });
-      expect(init.result?.serverInfo?.name).toBe('orkas');
+      if (era === 'modern') expect(init.result?.supportedVersions).toContain('2026-07-28');
+      else expect(init.result?.serverInfo?.name).toBe('orkas');
       client.notify('notifications/initialized');
 
       const tools = await client.request(2, 'tools/list', {});
@@ -1076,7 +1132,7 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
           output_ref: runResult.outputRef,
           stream: 'stdout',
           offset: runResult.stdoutNextOffset,
-          limit: 30000,
+          limit: 100000,
         },
       });
       const continuedResult = JSON.parse(continued.result.content[0].text);
@@ -1134,29 +1190,21 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         expect(reply.error).toBeUndefined();
         return reply.result;
       };
-      const before = await projects.readProjectInstructions(TEST_UID, pid);
-      for (const field of ['project_id', 'scope', 'unrecognized_write_constraint']) {
-        const rejected = await call('project_instructions', { instructions: 'Must not be written.', [field]: 'PRIVATE_VALUE' });
-        expect(rejected.isError).toBe(true);
-        expect(rejected.content[0].text).toContain(field);
-        expect(JSON.stringify(rejected)).not.toContain('PRIVATE_VALUE');
-        expect(await projects.readProjectInstructions(TEST_UID, pid)).toEqual(before);
-      }
-      const updated = await call('project_instructions', { instructions: 'Keep delivery accessible.' });
+      const updated = await call('project_instructions', { instructions: 'Keep delivery accessible.', future_option: 'PRIVATE_VALUE' });
       expect(updated.isError).toBeFalsy();
+      expect(JSON.parse(updated.content.at(-1).text)).toEqual({ ignored_fields: ['future_option'] });
+      expect(JSON.stringify(updated)).not.toContain('PRIVATE_VALUE');
       expect(await projects.readProjectInstructions(TEST_UID, pid)).toMatchObject({ content: 'Keep delivery accessible.' });
       expect((await call('cross_session_memory', { action: 'add', target: 'project', content: 'The audience uses keyboards.' })).isError).toBeFalsy();
       expect(memory.listEntries(TEST_UID, { project: pid }).entries).toEqual(['The audience uses keyboards.']);
-      const wrongTarget = await call('library_save', { source_path: 'deliverable.md', project_id: 'PRIVATE_VALUE' });
-      expect(wrongTarget.isError).toBe(true);
-      expect(wrongTarget.content[0].text).toContain('project_id');
-      expect(JSON.stringify(wrongTarget)).not.toContain('PRIVATE_VALUE');
-      expect((await files.readProjectTextFile(TEST_UID, pid, 'deliverable.md')).ok).toBe(false);
       const rejected = await call('library_save', { source_path: 'deliverable.md', expected_revision: '' });
       expect(rejected.isError).toBe(true);
       expect(rejected.content[0].text).toContain('expected_revision must be a non-empty string');
       expect((await files.readProjectTextFile(TEST_UID, pid, 'deliverable.md')).ok).toBe(false);
-      expect((await call('library_save', { source_path: 'deliverable.md' })).isError).toBeFalsy();
+      const saved = await call('library_save', { source_path: 'deliverable.md', future_option: 'PRIVATE_VALUE' });
+      expect(saved.isError).toBeFalsy();
+      expect(JSON.parse(saved.content.at(-1).text)).toEqual({ ignored_fields: ['future_option'] });
+      expect(JSON.stringify(saved)).not.toContain('PRIVATE_VALUE');
       const checkout = await call('library_save', { action: 'checkout', name: 'deliverable.md', source_path: 'revision.md' });
       expect(checkout.isError).toBeFalsy();
       const receipt = JSON.parse(checkout.content[0].text);
@@ -1291,10 +1339,14 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
         (tool: any) => tool.name === 'cross_session_memory',
       );
       expect(memoryTool).toBeTruthy();
-      expect(memoryTool.description).toContain('Decide from meaning, never trigger words');
-      expect(memoryTool.description).toContain('stable facts, corrections or invalidations');
-      expect(memoryTool.description).toContain('future conversations');
-      expect(memoryTool.description).toContain('exclude task progress and temporary state');
+      // The CLI copy must state the same admission rule and content advice as
+      // the native read-only-global variant; a drifted copy fails here.
+      const { createCrossSessionMemoryTool } = await import('../../../../src/core-agent/src/tools/memory-tool');
+      const native = createCrossSessionMemoryTool({} as any, { globalTiersReadOnly: true });
+      expect(memoryTool.description).toBe(native.description);
+      expect(memoryTool.inputSchema.properties.content.description)
+        .toBe((native.inputSchema as any).properties.content.description);
+      expect(memoryTool.inputSchema.properties.content).not.toHaveProperty('maxLength');
       expect(memoryTool.inputSchema.properties.target.enum).toContain('agent');
       expect(memoryTool.inputSchema.properties).not.toHaveProperty('agent_id');
 
@@ -1673,7 +1725,8 @@ describe('orkas-bridge.cjs › MCP stdio e2e', () => {
 });
 
 
-describe('CLI history process discovery', () => {
+describe.each(['legacy', 'modern'] as const)('CLI history process discovery on %s MCP', era => {
+  beforeEach(() => { protocolEra = era; });
   it('follows returned process locators and continuation over real MCP without changing scope', async () => {
     const { createConversation } = await import('../../../../src/main/features/chats');
     const { conversationMessageFile } = await import('../../../../src/main/util/project-layout');
@@ -1706,7 +1759,7 @@ describe('CLI history process discovery', () => {
     try {
       await client.request(1, 'initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'history-test', version: '0' } });
       client.notify('notifications/initialized');
-      const search = await client.request(2, 'tools/call', { name: 'chat_history', arguments: { action: 'search', scope: 'current', query: 'Cedar 通过 失败' } });
+      const search = await client.request(2, 'tools/call', { name: 'chat_history', arguments: { action: 'search', scope: 'current', query: 'Cedar 通过 失败', k: 100 } });
       const locator = JSON.parse(/^    read: (.+)$/m.exec(search.result.content[0].text)![1]);
       let args = { ...locator, max_tokens: 800 };
       let recovered = '', continued = false;
@@ -1734,6 +1787,32 @@ describe('CLI history process discovery', () => {
       client.kill(); await client.waitForExit(); await bridge.close(); client.assertCleanOutput();
       const { flushAll } = await import('../../../../src/main/features/search/indexer');
       await flushAll();
+    }
+  });
+});
+
+
+describe('orkas bridge modern protocol rejection and recovery', () => {
+  beforeEach(() => { protocolEra = 'modern'; });
+  it('rejects an unsupported revision before execution and remains usable', async () => {
+    const bridge = await startLifecycleBridge('modern-rejection');
+    const client = new McpStdioClient(bridge.serverEnv);
+    try {
+      const refused = await client.request(1, 'server/discover', { _meta: {
+        'io.modelcontextprotocol/protocolVersion': '2999-01-01',
+      } });
+      expect(refused.error?.code).toBe(-32022);
+      expect(refused.error?.data?.supported).toContain('2026-07-28');
+      const discovered = await client.request(2, 'server/discover', {});
+      expect(discovered.result.supportedVersions).toContain('2026-07-28');
+      const listed = await client.request(3, 'tools/list', {});
+      expect(listed.result.tools.some((tool: any) => tool.name === 'orkas_list_skills')).toBe(true);
+      const invalid = await client.request(4, 'tools/call', { name: 'orkas_read_skill', arguments: { id: 4 } });
+      expect(invalid.result.isError).toBe(true);
+      const available = await client.request(5, 'tools/call', { name: 'orkas_list_skills', arguments: {} });
+      expect(available.result.isError).toBeFalsy();
+    } finally {
+      client.kill(); await client.waitForExit(); await bridge.close(); client.assertCleanOutput();
     }
   });
 });

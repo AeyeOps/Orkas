@@ -426,8 +426,12 @@ describe('CLI bridge Skill runner', () => {
     expect(() => runner.read({
       outputRef: result.outputRef,
       stream: 'stdout',
-      limit: 60_001,
+      limit: 1.5,
     })).toThrow(/limit must be an integer from 1 to 60000/);
+    for (const limit of [0, -1, 60_001]) {
+      expect(runner.read({ outputRef: result.outputRef, stream: 'stdout', offset: 2, limit }))
+        .toMatchObject({ text: 'cdefgh', done: true, offset: 2, nextOffset: 8 });
+    }
     expect(() => runner.read({
       outputRef: result.outputRef,
       stream: 'stdout',

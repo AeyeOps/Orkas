@@ -1,8 +1,16 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 
-import { afterEach, describe, expect, it } from 'vitest';
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { notifyUserSwitch } from '../../../src/main/features/user-switch-hooks';
 import {
@@ -50,6 +58,39 @@ async function eventually<T>(
 }
 
 describe('interactive CLI session privacy boundary', () => {
+  it('uses the same configured Windows shell at actual interactive startup', async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-interactive-shell-'));
+    tempRoots.push(cwd);
+    const descriptor = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    vi.stubEnv('ORKAS_WINDOWS_SHELL', 'cmd.exe');
+    vi.stubEnv('SHELL', 'fixture-unrelated-shell');
+    const child = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(), stderr: new PassThrough(), stdin: new PassThrough(), kill: vi.fn(),
+    });
+    const spawnMock = vi.mocked(spawn);
+    spawnMock.mockClear();
+    spawnMock.mockImplementationOnce((() => {
+      setImmediate(() => { child.stdout.end(); child.stderr.end(); child.emit('close', 0, null); });
+      return child;
+    }) as typeof spawn);
+    try {
+      Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+      _setInteractiveCliBroadcastForTest(() => {});
+      const command = 'echo fixture && (echo native)';
+      const started = startInteractiveCliSession({ uid: 'account-a', command, cwd });
+      const terminal = await waitInteractiveCliSession('account-a', started.session_id);
+      expect(terminal).toMatchObject({ status: 'exited', exit_code: 0 });
+      expect(spawnMock).toHaveBeenCalledOnce();
+      expect(spawnMock.mock.calls[0].slice(0, 2)).toEqual(['cmd.exe', ['/d', '/s', '/c', command]]);
+    } finally {
+      Object.defineProperty(process, 'platform', descriptor);
+      vi.unstubAllEnvs();
+      spawnMock.mockReset();
+      const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      spawnMock.mockImplementation(actual.spawn);
+    }
+  });
+
   it.each(['browser_auth', 'agent_terminal', 'connector_input', undefined, 'unknown'] as const)('carries only the host-owned presentation %s across prompts and exit', async (presentation) => {
     const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-browser-auth-'));
     tempRoots.push(cwd);

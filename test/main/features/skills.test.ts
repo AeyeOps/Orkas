@@ -1473,7 +1473,7 @@ describe('skills › createFromDir', () => {
       zip.writeZip(archive);
 
       const s = await loadSkills();
-      const result = await s.importSkillPackageFromPath(archive);
+      const result = await s.importSkillPackageFromPath(archive, { all: true });
 
       expect(result.ok, JSON.stringify(result)).toBe(true);
       expect(result.skills?.map((skill: any) => skill.id)).toEqual(['good-skill']);
@@ -1611,6 +1611,148 @@ describe('skills › createFromDir', () => {
   });
 });
 
+describe('skills › selected batch package import', () => {
+  let source: string;
+  beforeEach(() => { source = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-batch-source-')); });
+  afterEach(() => fs.rmSync(source, { recursive: true, force: true }));
+  function skill(key: string, name = path.basename(key), extraFiles = 0) {
+    const dir = path.join(source, key);
+    fs.mkdirSync(path.join(dir, 'references'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'SKILL.md'), `---\nname: ${name}\ndescription: A selected import fixture\n---\n\n# Instructions\nRead references when needed.\n`);
+    for (let i = 0; i < extraFiles; i++) fs.writeFileSync(path.join(dir, 'references', `${i}.md`), `Reference ${i}.\n`);
+    return dir;
+  }
+
+  it('previews 265 Skills without writes, imports only selected roots and preserves nested references', async () => {
+    for (let i = 0; i < 265; i++) skill(`skills/item-${String(i).padStart(3, '0')}`);
+    const dir = skill('plugins/vendor/skills/large', 'large', 320);
+    fs.mkdirSync(path.join(dir, 'references', 'nested'));
+    fs.writeFileSync(path.join(dir, 'references', 'nested', 'SKILL.md'), '# Nested reference, not a separate installation\n');
+    fs.writeFileSync(path.join(source, '.mcp.json'), '{}');
+    const s = await loadSkills();
+    const preview = await s.importSkillPackageFromPath(source);
+    expect(preview.preview?.candidates).toHaveLength(266);
+    expect(preview.preview?.unsupported).toContain('connectors');
+    expect(preview.skills).toBeUndefined();
+    expect(fs.existsSync(customSkillsDir()) ? fs.readdirSync(customSkillsDir()) : []).toEqual([]);
+    const result = await s.importSkillPackageFromPath(source, {
+      expectedFingerprint: preview.preview!.fingerprint, selection: ['plugins/vendor/skills/large', 'skills/item-000'],
+    });
+    expect(result.ok).toBe(true);
+    expect(result.skills?.map(x => x.id).sort()).toEqual(['item-000', 'large']);
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'large', 'references', '319.md'), 'utf8')).toBe('Reference 319.\n');
+    expect(fs.readFileSync(path.join(customSkillsDir(), 'large', 'references', 'nested', 'SKILL.md'), 'utf8')).toContain('# Nested reference');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'item-001'))).toBe(false);
+    expect(fs.existsSync(path.join(customSkillsDir(), '.mcp.json'))).toBe(false);
+    expect(fs.readFileSync(path.join(dir, 'references', '319.md'), 'utf8')).toBe('Reference 319.\n');
+  });
+
+  it('continues all-selection in bounded batches and does not overwrite on replay', async () => {
+    for (let i = 0; i < 12; i++) skill(`skills/skill-${String(i).padStart(2, '0')}`);
+    const s = await loadSkills();
+    const preview = await s.importSkillPackageFromPath(source, { preview: true });
+    const first = await s.importSkillPackageFromPath(source, { all: true, expectedFingerprint: preview.preview!.fingerprint });
+    expect(first.skills).toHaveLength(10);
+    expect(first.nextOffset).toBe(10);
+    const final = await s.importSkillPackageFromPath(source, { all: true, offset: first.nextOffset!, expectedFingerprint: preview.preview!.fingerprint });
+    expect(final.skills).toHaveLength(2);
+    expect(final.nextOffset).toBeNull();
+    const file = path.join(customSkillsDir(), 'skill-00', 'SKILL.md');
+    const bytes = fs.readFileSync(file);
+    const retry = await s.importSkillPackageFromPath(source, { selection: ['skills/skill-00'] });
+    expect(retry.ok).toBe(false);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    expect(fs.readdirSync(customSkillsDir()).filter(x => x.startsWith('skill-'))).toHaveLength(12);
+  });
+
+  it('isolates file and byte limits while installing valid siblings', async () => {
+    skill('valid', 'valid', 999);
+    skill('too-many', 'too-many', 1000);
+    const large = skill('too-large');
+    fs.writeFileSync(path.join(large, 'references', 'large.bin'), Buffer.alloc(10 * 1024 * 1024));
+    const s = await loadSkills();
+    const result = await s.importSkillPackageFromPath(source, { all: true });
+    expect(result.skills?.map(x => x.id)).toEqual(['valid']);
+    expect(result.failures?.map(x => x.sourceName).sort()).toEqual(['too-large', 'too-many']);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'too-many'))).toBe(false);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'too-large'))).toBe(false);
+  });
+
+  it('rejects stale previews, traversal and an empty selection before writes', async () => {
+    const dir = skill('one'); skill('two');
+    const s = await loadSkills();
+    const preview = await s.importSkillPackageFromPath(source, { preview: true });
+    fs.appendFileSync(path.join(dir, 'SKILL.md'), '\nChanged.\n');
+    const stale = await s.importSkillPackageFromPath(source, { selection: ['one'], expectedFingerprint: preview.preview!.fingerprint });
+    expect(stale).toMatchObject({ ok: false, error: expect.stringContaining('changed') });
+    for (const selection of [[], ['../outside'], ['one', 'one']]) {
+      expect((await s.importSkillPackageFromPath(source, { selection })).ok).toBe(false);
+    }
+    const controller = new AbortController(); controller.abort();
+    expect((await s.importSkillPackageFromPath(source, { all: true, signal: controller.signal })).ok).toBe(false);
+    expect(fs.existsSync(customSkillsDir()) ? fs.readdirSync(customSkillsDir()) : []).toEqual([]);
+  });
+
+  it('keeps ZIP previews stable and reports duplicate names without copying unrelated files', async () => {
+    const first = skill('a', 'same'); skill('b', 'same');
+    fs.writeFileSync(path.join(source, 'settings.json'), 'private settings');
+    const archive = path.join(source, 'source.zip');
+    const zip = new AdmZip();
+    zip.addLocalFolder(first, 'a'); zip.addLocalFolder(path.join(source, 'b'), 'b');
+    zip.addFile('settings.json', Buffer.from('private settings')); zip.writeZip(archive);
+    const s = await loadSkills();
+    const preview = await s.importSkillPackageFromPath(archive, { preview: true });
+    expect(preview.preview?.candidates.every(x => x.duplicate)).toBe(true);
+    const result = await s.importSkillPackageFromPath(archive, { selection: ['a'], expectedFingerprint: preview.preview!.fingerprint });
+    expect(result.skills?.map(x => x.id)).toEqual(['same']);
+    expect(fs.existsSync(path.join(customSkillsDir(), 'same', 'settings.json'))).toBe(false);
+    expect((await s.importSkillPackageFromPath(archive, { preview: true })).preview?.candidates.every(x => x.installed)).toBe(true);
+  });
+
+  it('stops between Skills on cancellation and resumes without skipping uninstalled siblings', async () => {
+    skill('first', 'first', 1); skill('second'); skill('third');
+    const s = await loadSkills();
+    const controller = new AbortController();
+    // The test logger supplies a deterministic interruption after the first
+    // install. Final files and the resumable receipt are the outcome oracle.
+    const info = console.info;
+    const spy = vi.spyOn(console, 'info').mockImplementation((...args) => {
+      info(...args);
+      if (args[0] === '[skills]' && args[1] === 'created-from-dir direct skill install') controller.abort();
+    });
+    let stopped: Awaited<ReturnType<typeof s.importSkillPackageFromPath>>;
+    try { stopped = await s.importSkillPackageFromPath(source, { all: true, signal: controller.signal }); }
+    finally { spy.mockRestore(); }
+    expect(controller.signal.aborted).toBe(true);
+    expect(stopped.skills?.map(x => x.id)).toEqual(['first']);
+    expect(stopped.nextOffset).toBe(1);
+    expect(stopped.failures?.[0].error).toContain('cancelled');
+    expect(fs.existsSync(path.join(customSkillsDir(), 'second'))).toBe(false);
+    const resumed = await s.importSkillPackageFromPath(source, { all: true, offset: stopped.nextOffset! });
+    expect(resumed.skills?.map(x => x.id)).toEqual(['second', 'third']);
+    expect(resumed.nextOffset).toBeNull();
+  });
+
+  it('does not copy linked files or discover linked Skill directories', async () => {
+    const dir = skill('selected');
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-batch-outside-'));
+    try {
+      fs.writeFileSync(path.join(outside, 'secret.txt'), 'must remain outside');
+      fs.writeFileSync(path.join(outside, 'SKILL.md'), '---\nname: outside\ndescription: Outside\n---\nInstructions\n');
+      fs.symlinkSync(outside, path.join(source, 'linked'), 'junction');
+      fs.symlinkSync(path.join(outside, 'secret.txt'), path.join(dir, 'references', 'linked.txt'));
+      const s = await loadSkills();
+      const preview = await s.importSkillPackageFromPath(source, { preview: true });
+      expect(preview.preview?.candidates.map(x => x.name)).toEqual(['selected']);
+      expect(preview.preview?.unsupported).toContain('symbolic_links');
+      const result = await s.importSkillPackageFromPath(source, { selection: ['selected'], expectedFingerprint: preview.preview!.fingerprint });
+      expect(result.skills?.map(x => x.id)).toEqual(['selected']);
+      expect(fs.existsSync(path.join(customSkillsDir(), 'selected', 'references', 'linked.txt'))).toBe(false);
+      expect(fs.existsSync(path.join(customSkillsDir(), 'outside'))).toBe(false);
+    } finally { fs.rmSync(outside, { recursive: true, force: true }); }
+  });
+});
+
 describe('skills › createFromUrl', () => {
   it('creates an editable draft without silently fetching or modeling a GitHub URL', async () => {
     const modelCalls: any[] = [];
@@ -1658,6 +1800,15 @@ describe('skills › createFromUrl', () => {
 });
 
 describe('skills › updateCustomSkill', () => {
+  it('preserves the authoritative sidecar category during a description-only edit, while explicit changes and clearing still work', async () => {
+    const s = await loadSkills();
+    await s.createCustomSkill('categorized-review', 'Review notes.', 'data');
+    const edited = await s.updateCustomSkill('categorized-review', { description_en: 'Review release evidence.' });
+    expect(edited?.category).toBe('data');
+    expect((await s.listSkills()).find(skill => skill.id === 'categorized-review')?.category).toBe('data');
+    expect((await s.updateCustomSkill('categorized-review', { category: 'office' }))?.category).toBe('office');
+    expect((await s.updateCustomSkill('categorized-review', { category: '' }))?.category).toBe('');
+  });
   it('rewrites SKILL.md with new description, preserving body', async () => {
     // Frontmatter name must match the dir id; otherwise updateCustomSkill
     // treats meta.name as a rename target and refuses "already exists".

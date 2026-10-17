@@ -166,6 +166,81 @@ describe('bounded completed-history window', () => {
     expect(text(session)).toContain('chat_history');
   });
 
+  // The window is memoized per Session because the runner reads it several
+  // times per model round; every change it reads must refresh the memo.
+  it('keeps the memoized window identical to a fresh projection after every kind of change', () => {
+    const session = new Session();
+    const internal = session as unknown as { recentHistoryMessages(): unknown; computeRecentHistoryMessages(): unknown };
+    const check = (step: string) => {
+      const fresh = JSON.stringify(internal.computeRecentHistoryMessages());
+      expect(JSON.stringify(internal.recentHistoryMessages()), step).toBe(fresh);
+      expect(JSON.stringify(internal.recentHistoryMessages()), step).toBe(fresh);
+      expect(session.estimateHistoryTokens(), step).toBe(session.estimateHistoryTokens());
+    };
+    check('empty');
+    for (let i = 0; i < 7; i++) { turn(session, i, 'x'.repeat(i % 2 ? 40_000 : 500)); check(`turn ${i}`); }
+    session.beginUserTurn([{ type: 'text', text: 'CURRENT' }]);
+    check('begin');
+    session.configureHistoryBudget(200_000, 160_000, 5000);
+    check('budget');
+    session.addHistoryResource({ kind: 'final_output', path: '/w/a.md', name: 'a.md', sourceTurnId: 6 });
+    check('resource');
+    session.addHistoryResource({ kind: 'final_output', path: '/w/a.md', name: 'a.md', sourceTurnId: 7 });
+    check('resource moved in place');
+    session.configureHistoryBudget(20_000, 16_000, 5000);
+    check('smaller model');
+    session.previewHistorySummaryTokens('preview', [5, 6]);
+    check('preview restored');
+    session.applyEmergencyHistoryFold('notice', [5, 6]);
+    check('emergency fold');
+    session.addAssistantMessage([{ type: 'text', text: 'DONE' }]);
+    session.completeActiveTurn();
+    check('complete');
+    session.replaceConversationHistory([
+      { role: 'user', turnId: 1, content: [{ type: 'text', text: 'USER_1' }] },
+      { role: 'assistant', turnId: 1, content: [{ type: 'text', text: 'ANSWER_1' }] },
+    ], 'canonical');
+    check('replace');
+    session.clear();
+    check('clear');
+  });
+
+  it('re-estimates a content block that is rewritten in place', () => {
+    const session = new Session();
+    session.beginUserTurn([{ type: 'text', text: 'CURRENT' }]);
+    session.addAssistantMessage([{ type: 'text', text: 'short' }]);
+    const before = session.estimateModelTokens();
+    expect(session.estimateModelTokens()).toBe(before);
+    (session.getMessages().at(-1)!.content[0] as { text: string }).text = 'word '.repeat(2000);
+    expect(session.estimateModelTokens()).toBeGreaterThan(before + 1000);
+  });
+
+  it('re-estimates nested tool arguments after a retained block changes', () => {
+    const session = new Session();
+    const input = { nested: { text: 'short' } };
+    session.beginUserTurn([{ type: 'text', text: 'CURRENT' }]);
+    session.addAssistantMessage([{ type: 'tool_use', id: 'read', name: 'evidence', input }]);
+    const before = session.estimateModelTokens();
+    input.nested.text = 'word '.repeat(2000);
+    expect(session.estimateModelTokens()).toBeGreaterThan(before + 1000);
+    expect(text(session)).toContain(input.nested.text);
+  });
+
+  it('projects the current completed dialogue after an in-place text or content-array edit', () => {
+    const session = new Session();
+    turn(session, 0, 'ORIGINAL_BODY');
+    session.beginUserTurn([{ type: 'text', text: 'CURRENT' }]);
+    const before = session.estimateHistoryTokens();
+    expect(text(session)).toContain('ORIGINAL_BODY');
+    const message = session.getMessages()[0];
+    (message.content[0] as { text: string }).text = 'REVISED_BODY ' + 'word '.repeat(2000);
+    expect(text(session)).toContain('REVISED_BODY');
+    expect(text(session)).not.toContain('ORIGINAL_BODY');
+    expect(session.estimateHistoryTokens()).toBeGreaterThan(before + 1000);
+    message.content.push({ type: 'text', text: 'ADDED_DETAIL' });
+    expect(text(session)).toContain('ADDED_DETAIL');
+  });
+
   it('applies the same window after incremental canonical replacements', () => {
     const session = new Session();
     const pair = (id: number) => [

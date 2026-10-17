@@ -42,7 +42,7 @@ export function createMetacognitionTool(
         action: {
           type: 'string',
           enum: ['read', 'write'],
-          description: 'read: target only; write: target/content. Read ignores content and reports ignored_fields; unknown fields are errors.',
+          description: 'read: target only; write: target/content. Read ignores content and reports ignored_fields.',
         },
         target: {
           type: 'string',

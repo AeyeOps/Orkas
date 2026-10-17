@@ -31,7 +31,8 @@
  *     or only the current project inside one.
  *   - memory.agent — reads and updates the calling Agent/current project memory;
  *     user/shared global memory is read-only. Identity is bound by the host.
- *   - publish_outputs — selects observed current-turn files through the host
+ *   - publish_outputs — selects current-turn files (observed writes, or files
+ *     created during the run by native shell commands) through the host
  *     callback without changing bytes; an empty declaration clears selection.
  *   - commander.handoff — records one bounded, run-local request for the bus;
  *     it does not expose any Commander mutation or orchestration method.
@@ -43,7 +44,7 @@
  */
 
 import { librarySaveFieldError } from '../../util/library-save-input';
-import { addEntryWithMaintenance, replaceEntryWithMaintenance } from '../memory-maintenance';
+import { addMemoryEntry, replaceMemoryEntry, removeMemoryEntry } from '../memory-writes';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
@@ -170,6 +171,10 @@ export interface StartBridgeOpts {
   signal?: AbortSignal;
   /** Host-owned selection of this turn's observed produced files. */
   onOutputsPublished?: (paths: string[]) => string[];
+  onAutoTaskSaved?: (taskId: string, title: string) => void;
+  onTodoTaskSaved?: (taskId: string, projectId: string, content: string) => void;
+  onAutoTaskDeleted?: (taskId: string) => void;
+  onTodoTaskDeleted?: (taskId: string, projectId: string) => void;
   runId: string;
   /** Where to write the per-run mcp-config file (the persist run dir). */
   configDir: string;
@@ -555,7 +560,8 @@ function _buildMethods(
   if (capabilities.has('automation')) Object.assign(methods, {
     auto_tasks: async (params) => {
       const { createAutoTasksTool } = await import('../auto_tasks_tool');
-      const result = await createAutoTasksTool({ userId: opts.uid, cid: opts.cid, projectId: opts.projectId || null }).execute(params, { state: {} });
+      const result = await createAutoTasksTool({ userId: opts.uid, cid: opts.cid, projectId: opts.projectId || null,
+        onSaved: opts.onAutoTaskSaved, onDeleted: opts.onAutoTaskDeleted }).execute(params, { state: {} });
       const receipt = JSON.parse(result.content);
       if (result.isError) throw new Error(receipt.error || 'automation operation failed');
       return receipt;
@@ -580,7 +586,7 @@ function _buildMethods(
       // Reads and writes share native validation, paging, scope and execution facts.
       const tool = createProjectTasksTool(createProjectTasksHandler(opts.uid, opts.projectId || '', opts.cid, names, {
         actorId: opts.agentId,
-      }, { sourceProjectId: opts.projectId || '', workingDir: opts.workingDir }), { readOnly, globalScope: !opts.projectId });
+      }, { workingDir: opts.workingDir }, opts.onTodoTaskSaved, opts.onTodoTaskDeleted), { readOnly, globalScope: !opts.projectId });
       const result = await tool.execute(params, { state: {} });
       const receipt = JSON.parse(result.content);
       if (result.isError) throw new Error(receipt.error || 'task operation failed');
@@ -608,9 +614,9 @@ function _buildMethods(
         assertActive();
         const scope = { project: opts.projectId };
         switch (action) {
-          case 'add': return addEntryWithMaintenance(opts.uid, scope, String(params.content || ''), { signal: call.signal });
-          case 'replace': return replaceEntryWithMaintenance(opts.uid, scope, String(params.old_text || ''), String(params.content || ''), { signal: call.signal });
-          case 'remove': return memory.removeEntry(opts.uid, scope, String(params.old_text || ''));
+          case 'add': return addMemoryEntry(opts.uid, scope, String(params.content || ''), { signal: call.signal });
+          case 'replace': return replaceMemoryEntry(opts.uid, scope, String(params.old_text || ''), String(params.content || ''), { signal: call.signal });
+          case 'remove': return removeMemoryEntry(opts.uid, scope, String(params.old_text || ''));
           case 'list': return memory.listEntries(opts.uid, scope);
         }
       }
@@ -618,9 +624,9 @@ function _buildMethods(
 
       switch (action) {
         case 'add':
-          return addEntryWithMaintenance(opts.uid, { agent: opts.agentId }, String(params.content || ''), { signal: call.signal });
+          return addMemoryEntry(opts.uid, { agent: opts.agentId }, String(params.content || ''), { signal: call.signal });
         case 'replace':
-          return replaceEntryWithMaintenance(
+          return replaceMemoryEntry(
             opts.uid,
             { agent: opts.agentId },
             String(params.old_text || ''),

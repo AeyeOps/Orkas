@@ -200,6 +200,26 @@ describe('project_setup › create', () => {
     expect(await projects.listProjects(UID)).toEqual([]);
   });
 
+  it('keeps project creation, already-filed refusal and unfiling independently recoverable', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const conv = await chats.createConversation(UID, { title: 'project recovery' });
+    const created = await call(conv.conversation_id, { action: 'create', name: 'Launch plan', todos: ['Draft the brief'] });
+    expect(created.body.ok).toBe(true);
+
+    const existing = await projects.createProject(UID, 'Existing');
+    const filed = await chats.createConversation(UID, { title: 'already filed' });
+    const pid = (existing as { project: { project_id: string } }).project.project_id;
+    expect((await chats.moveConversationToProject(UID, filed.conversation_id, pid)).ok).toBe(true);
+    const refused = await call(filed.conversation_id, { action: 'create', name: 'Second home' }, pid);
+    expect(refused.body).toMatchObject({ ok: false, error: 'already_in_project' });
+    // Validation errors and undoing are not creations.
+    await call(conv.conversation_id, { action: 'create' });
+    await call(conv.conversation_id, { action: 'unfile' });
+
+    expect(await projects.listProjects(UID)).toHaveLength(2);
+  });
+
   it('rejects an unbounded initial backlog before writing anything', async () => {
     const chats = await import('../../../src/main/features/chats');
     const projects = await import('../../../src/main/features/projects');

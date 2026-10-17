@@ -22,6 +22,7 @@ const PROJECT_CID = 'conv-project-x';
 let tmpDir: string;
 let prevWs: string | undefined;
 let prevHome: string | undefined;
+let prevUserProfile: string | undefined;
 let prevGuard: string | undefined;
 
 function faultStatForPath(targetPath: string, code: 'EACCES' | 'EPERM'): {
@@ -77,8 +78,12 @@ beforeEach(async () => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-filetools-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   prevHome = process.env.HOME;
+  prevUserProfile = process.env.USERPROFILE;
   prevGuard = process.env.ORKAS_TCC_GUARD_FORCE;
   process.env.ORKAS_WORKSPACE_ROOT = tmpDir;
+  process.env.HOME = path.join(tmpDir, 'home');
+  if (process.platform === 'win32') process.env.USERPROFILE = process.env.HOME;
+  expect(os.homedir()).toBe(process.env.HOME);
   delete process.env.ORKAS_TCC_GUARD_FORCE;
   vi.resetModules();
   const users = await import('../../../../src/main/features/users');
@@ -91,6 +96,8 @@ afterEach(() => {
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   if (prevHome === undefined) delete process.env.HOME;
   else process.env.HOME = prevHome;
+  if (prevUserProfile === undefined) delete process.env.USERPROFILE;
+  else process.env.USERPROFILE = prevUserProfile;
   if (prevGuard === undefined) delete process.env.ORKAS_TCC_GUARD_FORCE;
   else process.env.ORKAS_TCC_GUARD_FORCE = prevGuard;
   fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -553,7 +560,6 @@ describe('file-tools › read_file (text)', () => {
 
 describe('file-tools › portable skill documents', () => {
   it('gives every file-based skill source the same verbatim-document semantics', async () => {
-    process.env.HOME = path.join(tmpDir, 'home');
     const paths = await import('../../../../src/main/paths');
     const mod = await import('../../../../src/main/model/core-agent/file-tools');
     const [claudeGlobal, codexGlobal] = paths.globalSkillRoots();
@@ -866,6 +872,50 @@ describe('file-tools › read_file scope guards', () => {
       bashPerms._setBroadcastForTest(null);
       bashPerms._resetForTest();
       fs.rmSync(path.dirname(outside), { recursive: true, force: true });
+    }
+  });
+
+  it('asks once per personal folder for reads, not once per file', async () => {
+    // 2026-09-21: a user approved the images in two Desktop folders one by
+    // one, 58 times. Writing and secret files keep their own prompts.
+    const perm = await import('../../../../src/main/features/permissions');
+    const bashPerms = await import('../../../../src/main/model/core-agent/bash-permissions');
+    perm.setLocalExecMode('all_files_approval');
+    await buildTools();
+    const mod = await import('../../../../src/main/model/core-agent/file-tools');
+    const tools = mod.createFileTools({ userId: UID, cid: CID, agentId: 'a1', agentName: 'Agent' });
+    const ads = path.join(process.env.HOME, 'Desktop', 'ads');
+    const other = path.join(process.env.HOME, 'Desktop', 'other');
+    fs.mkdirSync(ads, { recursive: true });
+    fs.mkdirSync(other, { recursive: true });
+    fs.writeFileSync(path.join(ads, 'a.txt'), 'ad one');
+    fs.writeFileSync(path.join(ads, 'b.txt'), 'ad two');
+    fs.writeFileSync(path.join(ads, '.env'), 'TOKEN=ad-secret');
+    fs.writeFileSync(path.join(other, 'c.txt'), 'other folder');
+    const prompts: any[] = [];
+    bashPerms._setBroadcastForTest((_ch: string, info: any) => {
+      prompts.push(info);
+      bashPerms.respond(info.request_id, prompts.length === 1 ? 'allow_run' : 'deny');
+    });
+    try {
+      const first = await run(getTool(tools, 'read_file'), { path: path.join(ads, 'a.txt') });
+      expect(first.content).toContain('ad one');
+      expect(prompts[0]).toMatchObject({ read_folder: ads, can_allow_run: true });
+
+      const second = await run(getTool(tools, 'read_file'), { path: path.join(ads, 'b.txt') });
+      expect(second.content).toContain('ad two');
+      expect(prompts).toHaveLength(1);
+
+      const elsewhere = await run(getTool(tools, 'read_file'), { path: path.join(other, 'c.txt') });
+      expect(elsewhere.content).toContain('E_SENSITIVE_PATH_DENIED');
+      const secret = await run(getTool(tools, 'read_file'), { path: path.join(ads, '.env') });
+      expect(secret.content).toContain('E_SENSITIVE_PATH_DENIED');
+      expect(secret.content).not.toContain('ad-secret');
+      expect(prompts).toHaveLength(3);
+      expect(prompts[2].read_folder).toBeUndefined();
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      bashPerms._resetForTest();
     }
   });
 

@@ -7,8 +7,10 @@
  *
  * Dispatches by file extension so the LLM uses one invocation form regardless
  * of skill language:
- *   .ts / .mjs / .js — require() with tsx/cjs hook, call default export as
+ *   .ts / .js        — require() with tsx/cjs hook, call default export as
  *                       `async (args) => result`, JSON.stringify result to stdout.
+ *   .mjs             — native ESM with legacy CJS globals on the bundled Node;
+ *                       call the same default-function/JSON entry contract.
  *   .py              — spawn shared data/venv package Python, else nearest
  *                       package `.venv`, else `ORKAS_PYTHON`, else system
  *                       Python (`python3`; Windows: `py -3` then `python`),
@@ -877,6 +879,7 @@ function writeAndFlush(stream, text) {
 }
 
 async function runAsModule(scriptPath, scriptArgs, skillId) {
+  const nativeJsLoader = require('node:module')._extensions['.js'];
   registerTsxLoader();
 
   // Ensure skill scripts can resolve packages from PC/node_modules even when
@@ -901,7 +904,23 @@ async function runAsModule(scriptPath, scriptArgs, skillId) {
 
   let mod;
   try {
-    mod = require(scriptPath);
+    // Select before evaluation. Older standalone Nodes retain their existing
+    // CJS compatibility path; bundled Node supports synchronous ESM hooks.
+    const Module = require('node:module');
+    if (path.extname(scriptPath) === '.mjs' && typeof Module.registerHooks === 'function') {
+      const loader = require('./skill-esm-loader.cjs').registerSkillEsmLoader(
+        process.env.ORKAS_PC_DIR, nodePathParts.flatMap((part) => part.split(path.delimiter)).filter(Boolean), nativeJsLoader,
+      );
+      // An unresolved initialization promise alone does not keep a CJS
+      // launcher alive. Natural exit before import settles must not claim
+      // success when the default entry was never invoked.
+      process.exitCode = 71;
+      mod = loader.isCommonJs(scriptPath) ? require(scriptPath)
+        : await import(require('node:url').pathToFileURL(scriptPath).href);
+      process.exitCode = 0;
+    } else {
+      mod = require(scriptPath);
+    }
   } catch (e) {
     die(71, `failed to load skill script: ${e && (e.stack || e.message)}`, { scriptPath });
   }

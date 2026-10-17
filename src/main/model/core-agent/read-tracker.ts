@@ -5,9 +5,9 @@
  * run-scoped map; `edit_file` checks that stamp before it writes:
  *   - read-before-edit — refuse to edit a file the model has not read this run
  *     (its `old_string` would be a guess), and
- *   - OCC — refuse to edit a file that changed on disk since the model read it
- *     (a parallel worker, a bash command, or an external process moved it),
- *     forcing a fresh `read_files` call so the edit lands on the real current bytes.
+ *   - OCC — refuse to edit changed content, using hashes when both are known
+ *     and filesystem metadata otherwise. Rejections return current context
+ *     for a deliberate retry against the real current bytes.
  *
  * The map lives on `ctx.state[READ_FILE_STATE_KEY]`, injected once per run by
  * core-agent's runner (so it survives across LLM rounds — read and edit are
@@ -34,6 +34,13 @@ export const READ_FILE_STATE_KEY = 'readFileState';
 
 /** Baseline captured when a file is read; compared on edit. */
 export type ReadStamp = { mtimeMs: number; size: number; hash?: string };
+
+/** Shared by enforcement and diagnostics. Matching content hashes make a
+ * timestamp-only update irrelevant; missing hashes retain metadata protection. */
+export function readStampChanged(seen: ReadStamp, st: fs.Stats, currentHash?: string): boolean {
+  if (seen.hash && currentHash) return seen.hash !== currentHash;
+  return seen.mtimeMs !== st.mtimeMs || seen.size !== st.size;
+}
 
 /** Return the run-scoped read-state map, or null when the host didn't inject
  *  one (→ callers skip read-before-edit/OCC enforcement). */
@@ -79,7 +86,7 @@ export type EditBlock = { code: 'E_NOT_READ' | 'E_STALE'; msg: string };
  * Returns null when the edit is allowed (or when the run-scoped map is absent,
  * i.e. the host opted out — see module header), otherwise the block reason:
  *   - never read this run            → E_NOT_READ
- *   - read, but mtime/size changed   → E_STALE
+ *   - content changed, or metadata changed without comparable hashes → E_STALE
  *
  * Message contract: every consumer (edit_file, apply_patch) appends a
  * recovery block with the current bytes and a fresh file_hash, and refreshes
@@ -112,11 +119,7 @@ export function checkEditFreshness(
       msg: `${abs}: not read in this run, so old_string cannot be checked against the real current contents. Use the current context and file_hash returned below to retry (pass expected_hash); use one bounded range in read_files paths only if that window misses your target.`,
     };
   }
-  if (
-    seen.mtimeMs !== st.mtimeMs
-    || seen.size !== st.size
-    || (!!seen.hash && !!opts.currentHash && seen.hash !== opts.currentHash)
-  ) {
+  if (readStampChanged(seen, st, opts.currentHash)) {
     return {
       code: 'E_STALE',
       msg: `${abs}: file changed on disk since you read it (another worker, a command, or an external edit). Retry against the current context and file_hash returned below (pass expected_hash); re-read only the affected region with a read_files paths range if that window is insufficient.`,

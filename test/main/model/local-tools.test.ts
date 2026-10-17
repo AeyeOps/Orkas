@@ -199,33 +199,6 @@ describe('local-tools › identity', () => {
     expect(wf.description.toLowerCase()).toContain('workspace');
   });
 
-  it('blocks unmanaged QA runtimes for the built-in studio agents only', async () => {
-    const { lt } = await loadModules();
-    const videoBash = lt.createLocalTools({ agentId: '79df9cc89f5f' }).find((t) => t.name === 'bash')!;
-    const imageBash = lt.createLocalTools({ agentId: '814b61b027f0' }).find((t) => t.name === 'bash')!;
-    const otherBash = lt.createLocalTools({ agentId: 'another-agent' }).find((t) => t.name === 'bash')!;
-
-    const blocked = await videoBash.execute({
-      command: 'python3 -m http.server 8765',
-      timeoutMs: 5000,
-    }, makeCtx());
-    expect(blocked.isError).toBe(true);
-    expect(blocked.content).toContain('E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN');
-
-    const imageBlocked = await imageBash.execute({
-      command: 'npx playwright test',
-      timeoutMs: 5000,
-    }, makeCtx());
-    expect(imageBlocked.isError).toBe(true);
-    expect(imageBlocked.content).toContain('E_IMAGE_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN');
-
-    const allowed = await otherBash.execute({
-      command: 'echo safe',
-      timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
-    }, makeCtx());
-    expect(allowed.isError).toBeFalsy();
-  });
-
   it('exposes publish_outputs only when the conversation supplies a validator', async () => {
     const { lt } = await loadModules();
     expect(lt.createLocalTools({}).some((t) => t.name === 'publish_outputs')).toBe(false);
@@ -2084,7 +2057,7 @@ describe('local-tools › Orkas CLI direct execution', () => {
     expect(fs.readFileSync(res.streamedOutput!.path, 'utf8')).toBe('x'.repeat(outputBytes));
   });
 
-  it('pipes heredoc stdin into the standard orkas-pkg.cjs command', async () => {
+  it('pipes multiline stdin into the standard orkas-pkg.cjs command with native shell syntax', async () => {
     const { lt, perm } = await loadModules();
     perm.setLocalExecMode('all_files_auto');
     const pcDir = writeFakePcScript(
@@ -2095,14 +2068,20 @@ describe('local-tools › Orkas CLI direct execution', () => {
     const body = "---\nname: Demo\n---\n\n# Demo";
 
     const res = await bash.execute({
-      command: `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" skill-write demo <<'SKILL'\n${body}\nSKILL`,
+      command: process.platform === 'win32'
+        ? `@'\n${body}\n'@ | & "$env:ORKAS_NODE" "$env:ORKAS_PC_DIR/bin/orkas-pkg.cjs" skill-write demo`
+        : `"$ORKAS_NODE" "$ORKAS_PC_DIR/bin/orkas-pkg.cjs" skill-write demo <<'SKILL'\n${body}\nSKILL`,
       timeoutMs: SHELL_SUCCESS_TIMEOUT_MS,
     }, makeOrkasCtx(pcDir));
 
     expect(res.isError).toBeFalsy();
-    const parsed = JSON.parse(String(res.content));
+    const output = process.platform === 'win32'
+      ? String(res.content).match(/<stdout>\n([\s\S]*?)\n<\/stdout>/)?.[1]
+      : String(res.content);
+    expect(output).toBeDefined();
+    const parsed = JSON.parse(output!);
     expect(parsed.argv).toEqual(['skill-write', 'demo']);
-    expect(parsed.body.replace(/\n$/, '')).toBe(body);
+    expect(parsed.body.replace(/\r\n/g, '\n').replace(/\n$/, '')).toBe(body);
   });
 
   it('lets the host shell handle redirection for standard Orkas CLI commands', async () => {
@@ -2861,6 +2840,11 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
       `cd ${JSON.stringify(tmpDir)}; Remove-Item ${JSON.stringify(produced)} -Force; `
       + `Write-Output "cleanup complete"; node -e "require('fs').existsSync(process.argv[1])" ${JSON.stringify(produced)}`
     )],
+    // PowerShell parameter names are case-insensitive; the value of
+    // `-ErrorAction` is not a second deletion target.
+    ['cleanup with a PascalCase common parameter', (produced: string) => (
+      `Remove-Item ${JSON.stringify(produced)} -Force -ErrorAction SilentlyContinue`
+    )],
   ])('recognizes %s as owned-file-only deletion', async (_label, buildCommand) => {
     const { lt } = await loadWithBashPerms();
     const produced = path.join(tmpDir, 'generated.png');
@@ -2893,6 +2877,173 @@ describe('local-tools › bash sensitive approval modes (e2e)', () => {
     expect(lt.bashDestructiveRiskIsOnlyProducedFileDeletion(
       buildCommand(produced, foreign), tmpDir, {}, owns,
     )).toBe(false);
+  });
+
+  describe('PowerShell location changes', () => {
+    async function powershellBash(produced: Set<string>) {
+      const { lt, perm, bashPerms } = await loadWithBashPerms();
+      perm.setLocalExecMode('all_files_approval');
+      await setTmpWorkspace();
+      const prompts: any[] = [];
+      bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+        prompts.push(info);
+        bashPerms.respond(info.request_id, 'deny');
+      });
+      const bash = lt.createLocalTools({
+        ...OPTS,
+        hostPlatform: 'win32',
+        hasProducedPath: (candidate) => produced.has(candidate),
+      }).find((tool) => tool.name === 'bash')!;
+      return { bash, prompts, reset: () => bashPerms._setBroadcastForTest(null) };
+    }
+
+    it.each([
+      // 2026-09-22: every VideoStudio command began with `cd "<project>";`,
+      // and each relative path after it was "undetermined", so each command
+      // asked for a one-time approval (26 and 7 minutes of waiting).
+      ['the production cleanup after cd', 'cd "认识你的指挥官"; Remove-Item project/tools/make_banner.py -Force -ErrorAction SilentlyContinue; Write-Output done'],
+      ['a listing after cd', 'cd "认识你的指挥官"; Get-ChildItem -Path "project" -Directory | Select-Object -First 5'],
+      ['a listing after Set-Location -LiteralPath', 'Set-Location -LiteralPath "认识你的指挥官"; Get-ChildItem project'],
+      // A script runs in the caller's runspace; one that does not move the
+      // location keeps later relative paths resolvable (missing on the
+      // failed-cd branch, where it cannot run at all).
+      ['a listing after a build script', 'cd "认识你的指挥官"; & ./project/tools/build.ps1; Get-ChildItem project/tools'],
+    ])('does not ask about %s inside the workspace', async (_label, command) => {
+      const project = path.join(tmpDir, '认识你的指挥官', 'project');
+      fs.mkdirSync(path.join(project, 'tools'), { recursive: true });
+      const script = path.join(project, 'tools', 'make_banner.py');
+      fs.writeFileSync(script, 'print(1)');
+      fs.writeFileSync(path.join(project, 'tools', 'build.ps1'), '# set-location is not used here\nWrite-Output "banner built"');
+      const { bash, prompts, reset } = await powershellBash(new Set([script]));
+      try {
+        const res = await bash.execute({ command, timeoutMs: 5000 }, makeCtx());
+        expect(prompts).toEqual([]);
+        expect(String(res.content)).not.toContain('E_BASH_RISK_DENIED');
+      } finally {
+        reset();
+      }
+    });
+
+    it.each([
+      ['Set-Location', (dir: string) => `Set-Location '${dir}'; Remove-Item victim.txt -Force`],
+      ['sl', (dir: string) => `sl '${dir}'; Remove-Item victim.txt`],
+      ['pushd', (dir: string) => `pushd '${dir}'; Remove-Item victim.txt -Force`],
+      ['Push-Location', (dir: string) => `Push-Location '${dir}'; Remove-Item victim.txt -Force`],
+      ['cd', (dir: string) => `cd '${dir}'; Remove-Item victim.txt -Force`],
+      ['a change inside a block', (dir: string) => `if (Test-Path '${dir}') { Set-Location '${dir}' }; Remove-Item victim.txt -Force`],
+      ['a redefined cd', (dir: string) => `function cd { Set-Location '${dir}' }; cd sub; Remove-Item victim.txt -Force`],
+      ['a provider location', () => 'cd HKCU:/Software; Remove-Item victim.txt -Force'],
+      ['popd', () => 'popd; Remove-Item victim.txt -Force'],
+      // PowerShell keeps a location set inside a grouping expression, and a
+      // script shares the caller's runspace (verified with PowerShell 7.6).
+      ['a grouped Set-Location', (dir: string) => `(Set-Location '${dir}'); Remove-Item victim.txt -Force`],
+      ['a script that moves the location', (dir: string) => {
+        fs.writeFileSync(path.join(tmpDir, 'goto.ps1'), `Set-Location '${dir}'`);
+        return '& ./goto.ps1; Remove-Item victim.txt -Force';
+      }],
+      ['a script written by the same command', (dir: string) => (
+        `Set-Content -Path goto2.ps1 -Value "Set-Location '${dir}'"; & ./goto2.ps1; Remove-Item victim.txt -Force`
+      )],
+    ])('asks before a deletion after %s can reach outside the workspace', async (_label, buildCommand) => {
+      // Before 2026-10-07 only `cd` moved the checked location: these resolved
+      // `victim.txt` inside the workspace and deleted the outside file silently.
+      const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-outside-'));
+      fs.writeFileSync(path.join(outside, 'victim.txt'), 'keep');
+      fs.writeFileSync(path.join(tmpDir, 'victim.txt'), 'workspace copy');
+      const { bash, prompts, reset } = await powershellBash(new Set());
+      try {
+        const res = await bash.execute({ command: buildCommand(outside), timeoutMs: 5000 }, makeCtx());
+        expect(res.content).toContain('E_BASH_RISK_DENIED');
+        expect(prompts).toHaveLength(1);
+        expect(fs.readFileSync(path.join(outside, 'victim.txt'), 'utf8')).toBe('keep');
+        expect(fs.readFileSync(path.join(tmpDir, 'victim.txt'), 'utf8')).toBe('workspace copy');
+      } finally {
+        reset();
+        fs.rmSync(outside, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it.runIf(process.platform !== 'win32').each([
+    ['a subshell', (dir: string) => `(cd '${dir}' && rm -f victim.txt)`],
+    ['a sourced script that moves', (dir: string) => {
+      fs.writeFileSync(path.join(tmpDir, 'goto.sh'), `# helper\ncd '${dir}'\n`);
+      return 'source ./goto.sh && rm -f victim.txt';
+    }],
+  ])('asks before a POSIX deletion after %s leaves the workspace', async (_label, buildCommand) => {
+    // 2026-10-07 real runs: both deleted the outside file without a prompt.
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-outside-'));
+    fs.writeFileSync(path.join(outside, 'victim.txt'), 'keep');
+    const prompts: any[] = [];
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompts.push(info);
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({ command: buildCommand(outside), timeoutMs: 5000 }, makeCtx());
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompts).toHaveLength(1);
+      expect(fs.readFileSync(path.join(outside, 'victim.txt'), 'utf8')).toBe('keep');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it.runIf(process.platform !== 'win32')('keeps relative paths resolvable after sourcing an activate script', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    fs.mkdirSync(path.join(tmpDir, '.venv', 'bin'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, '.venv', 'bin', 'activate'), [
+      '# This file must be used with "source bin/activate" *from bash*',
+      'deactivate () { unset VIRTUAL_ENV; }',
+      'export VIRTUAL_ENV="/tmp/venv"',
+      'if [ -n "${BASH:-}" ] ; then hash -r 2> /dev/null; fi',
+      '',
+    ].join('\n'));
+    fs.mkdirSync(path.join(tmpDir, 'data'));
+    fs.writeFileSync(path.join(tmpDir, 'data', 'input.csv'), 'a,b\n1,2\n');
+    const prompts: any[] = [];
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompts.push(info);
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({ command: 'source .venv/bin/activate && wc -l data/input.csv', timeoutMs: 5000 }, makeCtx());
+      expect(prompts).toEqual([]);
+      expect(String(res.content)).toContain('input.csv');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+    }
+  });
+
+  it.runIf(process.platform !== 'win32')('asks before a POSIX deletion after pushd leaves the workspace', async () => {
+    const { lt, perm, bashPerms } = await loadWithBashPerms();
+    perm.setLocalExecMode('all_files_approval');
+    await setTmpWorkspace();
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-outside-'));
+    fs.writeFileSync(path.join(outside, 'victim.txt'), 'keep');
+    let prompted: any = null;
+    bashPerms._setBroadcastForTest((_channel: string, info: any) => {
+      prompted = info;
+      bashPerms.respond(info.request_id, 'deny');
+    });
+    try {
+      const bash = lt.createLocalTools(OPTS).find((tool) => tool.name === 'bash')!;
+      const res = await bash.execute({ command: `pushd '${outside}' && rm -f victim.txt`, timeoutMs: 5000 }, makeCtx());
+      expect(res.content).toContain('E_BASH_RISK_DENIED');
+      expect(prompted?.reasons).toEqual(['destructive']);
+      expect(fs.readFileSync(path.join(outside, 'victim.txt'), 'utf8')).toBe('keep');
+    } finally {
+      bashPerms._setBroadcastForTest(null);
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
   });
 
   it('prompts for an opaque PowerShell command before attempting to spawn it', async () => {

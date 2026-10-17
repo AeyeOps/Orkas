@@ -49,7 +49,7 @@ import { chatAttachmentDirForConversation } from '../../util/project-layout';
 import { getWorkspacePath } from '../../features/user_workspace';
 import { isPathAllowed } from '../../util/path-sandbox';
 import { localAccessAllowsOutsideWorkspace, localAccessRequiresSensitiveApproval } from '../../features/permissions';
-import { sensitivePathReasons } from '../../features/local_access_policy';
+import { locationOnlyRead, sensitivePathReasons } from '../../features/local_access_policy';
 import { requestBashDecision } from './bash-permissions';
 import { macosTccSensitivePath } from '../../util/macos-tcc';
 import { parseSkillPath } from '../../features/expert_signals/skill_path';
@@ -60,10 +60,8 @@ import { formatSearchFileResults, type SearchFileHit } from './search-file-resul
 import { formatGrepFileResults, type GrepHit } from './grep-file-result';
 import { logErrorRef, logPathRef, maskId } from '../../util/log-redact';
 import {
-  DEFAULT_INLINE_RESULT_TOKENS,
-  TOOL_RESULT_INLINE_LEDGER_STATE_KEY,
   estimateToolResultTokens,
-  type ToolResultInlineLedger,
+  inlineResultTokenBudget,
 } from '../../util/tool-result-cap';
 import {
   openSkillReadRoots,
@@ -369,8 +367,10 @@ async function gateSensitivePathAccess(
   ctx?: ToolContext,
 ): Promise<string | null> {
   if (!localAccessRequiresSensitiveApproval()) return null;
-  const reasons = sensitivePathReasons(abs, 'read', { trustedRoots: allowedRoots(opts) });
+  const trustedRoots = allowedRoots(opts);
+  const reasons = sensitivePathReasons(abs, 'read', { trustedRoots });
   if (!reasons.length) return null;
+  const folderRead = locationOnlyRead(abs, { trustedRoots });
   const decision = await requestBashDecision({
     uid: opts.userId,
     cid: opts.cid ?? '',
@@ -380,6 +380,7 @@ async function gateSensitivePathAccess(
     operation,
     subject: abs,
     reasons,
+    ...(folderRead ? { folderRead } : {}),
     onWaiting: permissionWaitProgress(ctx, operation),
   });
   if (decision !== 'deny') return null;
@@ -1070,20 +1071,7 @@ async function withReadFilesExtractionSlot<T>(work: () => Promise<T>): Promise<T
 }
 
 function readFilesInlineTokenBudget(ctx: ToolContext, verbatimDocument = false): number {
-  const value = ctx.state?.[TOOL_RESULT_INLINE_LEDGER_STATE_KEY];
-  const ledger = value && typeof value === 'object'
-    ? value as Partial<ToolResultInlineLedger>
-    : undefined;
-  const skillLimit = ledger?.verbatimDocumentTokens;
-  const candidates = [verbatimDocument && Number.isFinite(skillLimit) && skillLimit! > 0
-    ? skillLimit! : DEFAULT_INLINE_RESULT_TOKENS];
-  if (!verbatimDocument && Number.isFinite(ledger?.perResultTokens)) {
-    candidates.push(Math.max(0, ledger!.perResultTokens!));
-  }
-  if (Number.isFinite(ledger?.remainingTokens)) {
-    candidates.push(Math.max(0, ledger!.remainingTokens!));
-  }
-  return Math.max(0, Math.floor(Math.min(...candidates)));
+  return inlineResultTokenBudget(ctx.state, verbatimDocument);
 }
 
 /** Retain one bounded, structured failure through both read envelopes. */

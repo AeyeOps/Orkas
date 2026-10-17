@@ -107,6 +107,9 @@ function _memFailureDetails(result) {
   if (message.includes('empty content')) {
     return { error_type: 'validation', error_code: 'memory_content_empty' };
   }
+  if (message.startsWith('memory full')) {
+    return { error_type: 'validation', error_code: 'memory_full' };
+  }
   if (message.includes('old_text is required')) {
     return { error_type: 'validation', error_code: 'memory_entry_selector_missing' };
   }
@@ -314,6 +317,7 @@ function _memRenderSection(scope, data) {
         <button type="button" class="memory-icon-btn" data-mem-action="add" data-mem-target="${escapeHtml(target)}" title="${escapeHtml(t('memory.add_entry'))}">${_memIc('plus')}</button>
       </div>
       <p class="memory-section-sub">${escapeHtml(scope.sub)}</p>
+      ${usage.full ? `<p class="memory-section-sub is-warn" role="status">${escapeHtml(t('memory.full_notice'))}</p>` : ''}
       ${rows.join('')}
     </div>
   `;
@@ -323,7 +327,7 @@ function _memRenderUsage(usage) {
   const limit = usage.limit || 0;
   const current = usage.current || 0;
   const pct = limit > 0 ? Math.min(100, Math.round((100 * current) / limit)) : 0;
-  const warn = limit > 0 && current / limit > _MEM_LIMIT_WARN;
+  const warn = !!usage.full || (limit > 0 && current / limit > _MEM_LIMIT_WARN);
   return `
     <span class="memory-usage${warn ? ' is-warn' : ''}">
       <span class="memory-usage-track"><span class="memory-usage-fill" style="width:${pct}%"></span></span>
@@ -538,6 +542,7 @@ function _memErrorToText(error) {
   const e = String(error || '');
   if (/^blocked/i.test(e)) return t('memory.blocked_injection');
   if (/empty content/i.test(e)) return t('memory.error_empty');
+  if (/^memory full/i.test(e)) return t('memory.error_full');
   return t('memory.error_generic');
 }
 

@@ -1,3 +1,4 @@
+import { defaultNumericRange } from '../../../../bin/tool-input-compat.cjs';
 /**
  * Local-machine tool wrappers injected into every AgentRunner built by
  * this app.
@@ -66,6 +67,7 @@ import {
 } from '../../../core-agent/src/tools/apply-patch';
 import { managedCommandsEnabled } from '../../../core-agent/src/tools/command-sessions';
 import { parsePowerShellChain } from '../../../core-agent/src/sandbox/powershell-chain';
+import { scanPowerShell } from '../../../core-agent/src/sandbox/powershell-lexical';
 import { getProcessSessionTools } from '../../../core-agent/src/tools/process-session';
 import type { FileChangeObservation } from '../../../core-agent/src/tools/base';
 import {
@@ -78,6 +80,8 @@ import {
 import {
   buildSandboxEnv,
   decodeProcessOutput,
+  defaultShellForPlatform,
+  resolveShellTarget,
   formatProcessStartFailure,
   killProcessTree,
 } from '../../../core-agent/src/sandbox/executor';
@@ -91,7 +95,7 @@ import {
   localAccessAllowsOutsideWorkspace,
   localAccessRequiresSensitiveApproval,
 } from '../../features/permissions';
-import { classifyConfiguredBashCommand, sensitivePathReasons, type LocalAccessRiskCategory } from '../../features/local_access_policy';
+import { classifyConfiguredBashCommand, locationOnlyRead, sensitivePathReasons, type LocalAccessRiskCategory } from '../../features/local_access_policy';
 import { classifyBashCommand, hasDestructiveBashRedirection } from './bash-risk';
 import { ordinaryBashReasons } from './ordinary-shell-operations';
 import { CreationSnapshot, TaskFileOwnership } from './task-file-ownership';
@@ -140,7 +144,7 @@ import { fileEditLock } from '../../util/locks';
 import { fileFailure, type FileFailureDiagnostic } from '../../../core-agent/src/tools/file-diagnostics';
 import { lookupSkillRuntimeRef } from './skill-runtime-ref';
 import { firstMatchOffsets, matchRecoveryContext } from '../../../core-agent/src/tools/match-context';
-import { checkEditFreshness, forgetRead, getReadState, recordRead } from './read-tracker';
+import { checkEditFreshness, forgetRead, getReadState, readStampChanged, recordRead } from './read-tracker';
 import {
   canonicalFileRevisionPath,
   findAppendReplay,
@@ -158,11 +162,7 @@ import {
   startInteractiveCliSession,
 } from './interactive-cli-sessions';
 import type { InteractiveCliSessionView } from './interactive-cli-sessions';
-import { IMAGE_STUDIO_AGENT_ID, VIDEO_STUDIO_AGENT_ID } from './tool-catalog';
 import type { SkillRuntimeBinding } from './skill-registry';
-import {
-  browserRuntimeInstallRequiresExplicitRequest,
-} from './browser-automation-guard';
 import {
   DEEP_RESEARCH_EVIDENCE_ENV,
   DEEP_RESEARCH_EVIDENCE_STATE_KEY,
@@ -191,6 +191,8 @@ export interface ProducedFileWriteInfo {
 }
 
 export interface LocalToolsOpts {
+  /** Trusted creation/editing binding; narrows the existing parameter before generation. */
+  lockedAppType?: 'local'|'web';
   /** Host shell platform override for deterministic wrapper integration tests.
    *  Production callers omit this and use `process.platform`. */
   hostPlatform?: NodeJS.Platform;
@@ -1555,8 +1557,10 @@ async function gateSensitiveLocalPathDetailed(
   ctx?: ToolContext,
 ): Promise<BashPathGateResult> {
   if (!localAccessRequiresSensitiveApproval()) return { error: null, approvedReasons: [] };
-  const reasons = sensitivePathReasons(abs, access, { trustedRoots: allowedRootsFor(opts) });
+  const trustedRoots = allowedRootsFor(opts);
+  const reasons = sensitivePathReasons(abs, access, { trustedRoots });
   if (!reasons.length) return { error: null, approvedReasons: [] };
+  const folderRead = access === 'read' ? locationOnlyRead(abs, { trustedRoots }) : undefined;
   const decision = await requestBashDecision({
     uid: opts.userId ?? '',
     cid: opts.cid ?? '',
@@ -1566,6 +1570,7 @@ async function gateSensitiveLocalPathDetailed(
     operation,
     subject: abs,
     reasons,
+    ...(folderRead ? { folderRead } : {}),
     onWaiting: permissionWaitProgress(ctx, operation),
   });
   if (decision !== 'deny') return { error: null, approvedReasons: reasons };
@@ -2324,6 +2329,83 @@ function bashGuardCommandVariants(
   return [{ command, env: baseEnv }];
 }
 
+const POSIX_DIRECTORY_CHANGES = new Set(['cd', 'pushd', 'popd']);
+const POWERSHELL_DIRECTORY_CHANGES = new Set([
+  'cd', 'chdir', 'sl', 'set-location', 'pushd', 'push-location', 'popd', 'pop-location',
+]);
+// A shell function or alias can make these names go anywhere.
+const POSIX_DIRECTORY_CHANGE_REDEFINITION = /\b(?:cd|pushd|popd)\s*\(\s*\)|\bfunction\s+(?:cd|pushd|popd)\b|\balias\s+(?:cd|pushd|popd)=/;
+const POWERSHELL_DIRECTORY_CHANGE_REDEFINITION = /\b(?:function|filter)\s+(?:global:|script:|local:|private:)?(?:cd|chdir|sl|set-location|pushd|push-location|popd|pop-location)\b|\b(?:set-alias|new-alias|sal|nal)\b/i;
+
+/** How one segment moves the location used by later relative paths:
+ * undefined when it does not, `target: null` when this walk cannot follow it.
+ * Every form that moves the location must be listed: before 2026-10-07 only
+ * `cd` was, so `pushd`/`Set-Location <outside>; Remove-Item x` resolved `x`
+ * in the workspace and deleted an outside file without a prompt. pushd moves
+ * like cd; popd, stack/history/home shorthands and PowerShell provider paths
+ * (`HKCU:`, `Env:`, `FileSystem::`) stay unknown. */
+function shellDirectoryChange(words: string[], hostPlatform: NodeJS.Platform): { target: string | null } | undefined {
+  const [raw = '', ...args] = words;
+  const powershell = hostPlatform === 'win32';
+  const cmd = powershell ? raw.toLowerCase() : raw;
+  if (!(powershell ? POWERSHELL_DIRECTORY_CHANGES : POSIX_DIRECTORY_CHANGES).has(cmd)) return undefined;
+  if (cmd === 'popd' || cmd === 'pop-location') return { target: null };
+  const named = powershell && args.length === 2 && ['-path', '-literalpath'].includes(args[0].toLowerCase());
+  const target = named ? args[1] : args.length === 1 ? args[0] : '';
+  if (!target || /^[-+]/.test(target)) return { target: null };
+  if (powershell && (target.startsWith('~') || /^(?:[^\\/:]{2,}:|[^\\/]+::)/.test(target))) return { target: null };
+  return { target };
+}
+
+const POSIX_SCRIPT_LOCATION_CHANGE = /(?:^|[;&|({]\s*|\b(?:then|do|else)\s+)(?:cd|pushd|popd)(?=\s|;|$)/m;
+const POWERSHELL_SCRIPT_LOCATION_CHANGE = /(?:^|[;&|({]\s*)(?:cd|chdir|sl|set-location|pushd|push-location|popd|pop-location|invoke-expression|iex)(?=\s|;|\)|$)/im;
+
+/** A segment that runs a script inside the current shell, sharing its
+ * location: PowerShell `& x.ps1`/`. x.ps1`/`x.ps1` (one runspace; a real
+ * PowerShell 7 moved the caller on 2026-10-07) and POSIX `source`/`.`. Returns
+ * its literal path, `null` for evaluated code, else undefined. */
+function locationSharingScript(words: string[], hostPlatform: NodeJS.Platform): string | null | undefined {
+  const [head = '', next] = words;
+  if (hostPlatform === 'win32') {
+    const lower = head.toLowerCase();
+    if (lower === 'invoke-expression' || lower === 'iex') return null;
+    if (head === '.' && next) return next;
+    return /\.ps1$/i.test(head) ? head : undefined;
+  }
+  if (head === 'eval') return null;
+  return (head === 'source' || head === '.') && next ? next : undefined;
+}
+
+/** Whether running `raw` in the shell may leave it in another directory. A
+ * script that cannot be read as a whole, or that this command also names
+ * elsewhere (and may write first), is treated as moving it; a missing one
+ * cannot run, as on the failed-cd branch of `cd p; & ./tools/x.ps1`.
+ * Comments aside, only a location command at a command position counts, so
+ * an activate script or a VideoStudio build script keeps paths resolvable. */
+function scriptMayMoveLocation(
+  raw: string,
+  directory: string | null,
+  env: Record<string, string>,
+  command: string,
+  hostPlatform: NodeJS.Platform,
+): boolean {
+  if (directory === null) return true;
+  const resolved = resolveBashCandidate(raw, directory, env);
+  if (!resolved?.abs || resolved.dynamic) return true;
+  if (command.split(path.basename(resolved.abs)).length > 2) return true;
+  let source: string;
+  try {
+    const stat = fs.statSync(resolved.abs);
+    if (!stat.isFile() || stat.size > EXTERNAL_MUTATION_SCRIPT_MAX_BYTES) return true;
+    source = fs.readFileSync(resolved.abs, 'utf8');
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return code !== 'ENOENT' && code !== 'ENOTDIR';
+  }
+  const code = source.replace(/<#[\s\S]*?#>/g, '').replace(/^\s*#.*$/gm, '');
+  return (hostPlatform === 'win32' ? POWERSHELL_SCRIPT_LOCATION_CHANGE : POSIX_SCRIPT_LOCATION_CHANGE).test(code);
+}
+
 function bashGuardPathSegments(
   command: string,
   baseEnv: Record<string, string>,
@@ -2334,6 +2416,9 @@ function bashGuardPathSegments(
     const out: Array<{ segment: BashPathSegment; env: Record<string, string>; workingDir: string | null }> = [];
     const segments = bashPathSegmentsWithEnv(variant.command, variant.env, hostPlatform);
     const conditionalFlow = segments.some(({ segment }) => ['||', '|', '|&', '&'].includes(segment.separatorAfter ?? ''));
+    const directoryChangeRedefined = (hostPlatform === 'win32'
+      ? POWERSHELL_DIRECTORY_CHANGE_REDEFINITION
+      : POSIX_DIRECTORY_CHANGE_REDEFINITION).test(variant.command);
     let directories: Array<string | null> = [initialDirectory];
     let skippedDirectories: Array<string | null> = [];
     let exitsOnError = false;
@@ -2347,22 +2432,37 @@ function bashGuardPathSegments(
         out.push({ segment, env: scopedEnv, workingDir });
       }
       const [cmd, ...args] = segment.words;
-      // Only direct, sequential POSIX directory changes have these semantics.
-      // Keep both outcomes when a failed cd can fall through. Bound branching;
-      // unknown contexts use the existing unresolved-path approval mechanism.
+      // Only direct, sequential directory changes have these semantics. Keep
+      // both outcomes when a failed change can fall through (PowerShell has no
+      // `set -e`, and a failed Set-Location leaves the location unchanged).
+      // Bound branching; unknown contexts use the existing unresolved-path
+      // approval mechanism.
       if (cmd === 'set') {
         exitsOnError = !conditionalFlow && hostPlatform !== 'win32'
           && args.length === 1 && args[0] === '-e';
       }
-      if (cmd === 'cd') {
-        if (hostPlatform === 'win32' || args.length !== 1 || args[0].startsWith('-')
-          || /[*?\[\]{}]/.test(expandKnownShellPathVars(args[0] ?? '', scopedEnv).value)
-          || (!!(scopedEnv.CDPATH || process.env.CDPATH) && !path.isAbsolute(args[0]) && !args[0].startsWith('.'))
+      // This walk does not split `(...)`/`{...}`: a change inside a group, a
+      // block or after a keyword (`(cd x && rm y)`, `{ Set-Location x }`,
+      // `then cd x`) is real but not a plain head, so the location becomes
+      // unknown. 2026-10-07: `(cd <outside> && rm -f y)` deleted outside.
+      const grouped = segment.words.some((word) => /^[({]|[)}]$/.test(word));
+      const sharedScript = locationSharingScript(segment.words, hostPlatform);
+      const directoryChange = (grouped ? undefined : shellDirectoryChange(segment.words, hostPlatform))
+        ?? (segment.words.some((word, index) => (grouped || index > 0)
+          && shellDirectoryChange([word.replace(/^[({]+|[)}]+$/g, '')], hostPlatform)) ? { target: null } : undefined)
+        ?? (sharedScript !== undefined && (sharedScript === null || directories.some((directory) => (
+          scriptMayMoveLocation(sharedScript, directory, scopedEnv, variant.command, hostPlatform)
+        ))) ? { target: null } : undefined);
+      if (directoryChange) {
+        const target = directoryChangeRedefined ? null : directoryChange.target;
+        if (target === null
+          || /[*?\[\]{}]/.test(expandKnownShellPathVars(target, scopedEnv).value)
+          || (hostPlatform !== 'win32' && !!(scopedEnv.CDPATH || process.env.CDPATH) && !path.isAbsolute(target) && !target.startsWith('.'))
           || ['||', '|', '|&', '&'].includes(segment.separatorAfter ?? '')) {
           directories = [null];
         } else {
           const next = directories.map((directory) => directory === null ? null
-            : resolveBashCandidate(args[0], directory, scopedEnv)?.abs ?? null);
+            : resolveBashCandidate(target, directory, scopedEnv)?.abs ?? null);
           if (segment.separatorAfter === '&&') {
             // Failed cd skips the rest of this AND-list, but can resume at
             // its following statement even under set -e.
@@ -2570,7 +2670,15 @@ function powershellDeleteOperands(args: string[]): string[] {
     }
   }
   if (explicit.length) return explicit;
-  return bashNonFlagOperands(args, POWERSHELL_DELETE_FLAGS_WITH_VALUE);
+  // Parameter names are case-insensitive: `-ErrorAction SilentlyContinue`
+  // must not make `SilentlyContinue` a deletion target.
+  const operands: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--') return [...operands, ...args.slice(i + 1)];
+    if (!args[i].startsWith('-')) operands.push(args[i]);
+    else if (POWERSHELL_DELETE_FLAGS_WITH_VALUE.has(args[i].toLowerCase())) i += 1;
+  }
+  return operands;
 }
 
 /** Move-Item and Copy-Item bind source and destination independently: either
@@ -3097,7 +3205,8 @@ function collectBashReadCandidates(
       for (const operand of sedReadOperands(args)) addBashCandidate(out, operand, 'sed read', segmentDirectory, segmentEnv);
     } else if (cmd === 'awk') {
       for (const operand of awkReadOperands(args)) addBashCandidate(out, operand, 'awk read', segmentDirectory, segmentEnv);
-    } else if (cmd === 'cd' || cmd === 'pushd') {
+    } else if (cmd === 'cd' || cmd === 'pushd'
+      || (hostPlatform === 'win32' && ['chdir', 'sl', 'set-location', 'push-location'].includes(cmd))) {
       const operand = bashNonFlagOperands(args)[0];
       if (operand) addBashCandidate(out, operand, cmd, segmentDirectory, segmentEnv);
     } else if (BASH_DEST_LAST_OPERAND.has(cmd)) {
@@ -4060,89 +4169,6 @@ function guardInteractiveNoBrowserAuthFlow(command: string, allowNoBrowserAuth: 
   );
 }
 
-const VIDEO_STUDIO_UNMANAGED_RUNTIME_PATTERNS: RegExp[] = [
-  /\b(?:npm|pnpm|yarn|bun)\s+(?:i|install|ci|add)\b/i,
-  /\b(?:pip3?|uv\s+pip|python3?\s+-m\s+pip)\s+install\b/i,
-  /\bpython3?\s+-m\s+http\.server\b/i,
-  /\bphp\s+-S\s+\S+/i,
-  /\bruby\s+-run\s+-e\s+httpd\b/i,
-  /\b(?:npx|pnpm\s+dlx|bunx)\s+(?:serve|http-server|vite)\b/i,
-  /\b(?:chromium|chromium-browser|google-chrome|chrome)(?:\s|[^;&|])*--headless\b/i,
-  /\b(?:puppeteer(?:-core)?|playwright)\b/i,
-];
-
-function studioUnmanagedRuntimeError(command: string, cwd: string | undefined, studio: 'VideoStudio' | 'ImageStudio'): string | null {
-  const inspect = (text: string): boolean => VIDEO_STUDIO_UNMANAGED_RUNTIME_PATTERNS.some((pattern) => pattern.test(text));
-  const isVideoStudio = studio === 'VideoStudio';
-  if (inspect(command)) {
-    return errText(
-      isVideoStudio ? 'E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN' : 'E_IMAGE_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN',
-      isVideoStudio
-        ? 'VideoStudio may not install ad-hoc packages or start its own browser, HTTP server, watcher, or headless QA runtime. Use the native video_studio composition.lint/inspect/snapshot operations and their persisted findings instead.'
-        : 'ImageStudio may not install ad-hoc packages or start its own browser, HTTP server, watcher, or headless QA runtime. Use the native image_studio project.inspect/project.snapshot operations instead.',
-    );
-  }
-  const scriptRe = /\b(?:python3?|node|bash|sh|zsh)\s+((?:"[^"]+"|'[^']+'|[^\s;&|]+))/gi;
-  let match: RegExpExecArray | null;
-  while ((match = scriptRe.exec(command)) !== null) {
-    const scriptRef = unquoteShellToken(match[1]);
-    if (!scriptRef || scriptRef.startsWith('-')) continue;
-    const abs = path.isAbsolute(scriptRef) ? scriptRef : path.resolve(cwd || process.cwd(), scriptRef);
-    try {
-      const st = fs.statSync(abs);
-      if (st.isFile() && st.size <= 512 * 1024 && inspect(fs.readFileSync(abs, 'utf8'))) {
-        return errText(
-          isVideoStudio ? 'E_VIDEO_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN' : 'E_IMAGE_STUDIO_UNMANAGED_RUNTIME_FORBIDDEN',
-          isVideoStudio
-            ? 'the requested script starts or installs an unmanaged browser/server runtime. Use native video_studio QA operations instead.'
-            : 'the requested script starts or installs an unmanaged browser/server runtime. Use native image_studio QA operations instead.',
-        );
-      }
-    } catch {
-      // Missing scripts fail naturally when executed.
-    }
-  }
-  return null;
-}
-
-function guardVideoStudioUnmanagedRuntime(opts: LocalToolsOpts, command: string, cwd?: string): string | null {
-  if (opts.agentId === VIDEO_STUDIO_AGENT_ID) return studioUnmanagedRuntimeError(command, cwd, 'VideoStudio');
-  if (opts.agentId === IMAGE_STUDIO_AGENT_ID) return studioUnmanagedRuntimeError(command, cwd, 'ImageStudio');
-  return null;
-}
-
-function unquotedShellSurface(command: string): string {
-  let quote = '';
-  let out = '';
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    // PowerShell backslashes are literal, including immediately before a
-    // closing path quote. Backticks escape outside single-quoted strings.
-    if (ch === '`' && quote !== "'") {
-      out += ' ';
-      if (i + 1 < command.length) out += command[++i] === '\n' ? '\n' : ' ';
-      continue;
-    }
-    if (quote) {
-      if (ch === quote && command[i + 1] === quote) {
-        out += '  ';
-        i++;
-        continue;
-      }
-      if (ch === quote) quote = '';
-      out += ch === '\n' ? '\n' : ' ';
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      out += ' ';
-      continue;
-    }
-    out += ch;
-  }
-  return out;
-}
-
 /** Detect commands that are valid POSIX shell but invalid in Windows
  * PowerShell 5.1, the host shell used by the compatibility-named `bash` tool.
  * Keep this conservative: reject only high-confidence syntax mismatches and
@@ -4152,23 +4178,23 @@ export function windowsPowerShellCompatibilityError(
   platform: NodeJS.Platform = process.platform,
 ): string | null {
   if (platform !== 'win32') return null;
-  const chain = parsePowerShellChain(String(command || ''));
+  const target = resolveShellTarget(defaultShellForPlatform(platform), command, platform);
+  if (!target.legacyPowerShell) return null;
+  const lexical = scanPowerShell(String(command || ''));
+  const chain = parsePowerShellChain(String(command || ''), lexical);
   const surface = chain.kind === 'chain'
-    ? chain.commands.map(unquotedShellSurface).join('\n')
-    : unquotedShellSurface(String(command || ''));
+    ? lexical.surface.replace(/&&|\|\|/g, '\n')
+    : lexical.surface;
   const findings: string[] = [];
   if (chain.kind === 'unsupported' || /&&|\|\|/.test(surface)) findings.push('unsupported complex &&/|| chain');
-  if (/<<-?\s*[A-Za-z_][A-Za-z0-9_]*/.test(surface)) findings.push('POSIX heredoc');
-  if (/(?:^|[;\r\n]\s*)(?:source|export)\b/m.test(surface)) findings.push('source/export');
-  if (/(?:^|[;|\r\n]\s*)head(?:\s|$)/m.test(surface)) findings.push('head');
-  if (/(?:^|[;|\r\n]\s*)mktemp(?:\s|$)/m.test(surface)) findings.push('mktemp');
-  const configuredShell = process.env.ORKAS_WINDOWS_SHELL || 'powershell.exe';
-  const usesWindowsPowerShell51 = /(?:^|[\\/])powershell(?:\.exe)?$/i.test(configuredShell);
-  const curlAliasWithSilentFlag = usesWindowsPowerShell51
-    && /(?:^|[;|&\r\n]\s*)curl\s+-s(?=\s|$)/mi.test(surface);
+  if (/<<-?/.test(surface)) findings.push('POSIX heredoc');
+  if (/(?:^|[;({\r\n])\s*(?:source|export)\b/m.test(surface)) findings.push('source/export');
+  if (/(?:^|[;|({\r\n])\s*head(?:\s|$)/m.test(surface)) findings.push('head');
+  if (/(?:^|[;|({\r\n])\s*mktemp(?:\s|$)/m.test(surface)) findings.push('mktemp');
+  const curlAliasWithSilentFlag = /(?:^|[;|&({\r\n])\s*curl\s+-s(?=\s|$)/mi.test(surface);
   if (curlAliasWithSilentFlag) findings.push('PowerShell curl alias with Unix -s');
-  if (/(?:^|[;|&\r\n]\s*)mkdir\s+-p(?:\s|$)/m.test(surface)) findings.push('POSIX mkdir -p');
-  if (/\/dev\/null\b/.test(surface)) findings.push('/dev/null');
+  if (/(?:^|[;|&({\r\n])\s*mkdir\s+-p(?:\s|$)/m.test(surface)) findings.push('POSIX mkdir -p');
+  if (/>\s*\/dev\/null(?=\s|[;|&)]|$)/.test(surface)) findings.push('/dev/null');
   if (/^\s*[A-Za-z_][A-Za-z0-9_]*=[^\s;]+\s+\S/m.test(surface)) findings.push('POSIX inline environment assignment');
   if (!findings.length) return null;
   if (curlAliasWithSilentFlag && findings.length === 1) {
@@ -4223,10 +4249,6 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
             `Shell command. Prefer simple, direct commands that are easy to verify. Write final script-generated deliverables under ${outputDirDescription}.`
             + windowsShellDescription,
         },
-        allow_browser_runtime_install: {
-          type: 'boolean',
-          description: 'Set true only when the user explicitly requested installing Playwright/Puppeteer or another browser automation runtime. Leave false for ordinary web research or one-off page actions.',
-        },
       },
     },
     async execute(input, ctx) {
@@ -4240,25 +4262,6 @@ function createBashTool(opts: LocalToolsOpts): AgentTool {
           command_chars: command.length,
         });
         return { content: shellMismatch, isError: true } as ToolResult;
-      }
-      if (browserRuntimeInstallRequiresExplicitRequest(command)
-        && input.allow_browser_runtime_install !== true) {
-        return {
-          content: errText(
-            'E_BROWSER_RUNTIME_INSTALL_REQUIRES_EXPLICIT_USER_REQUEST',
-            'do not install Playwright/Puppeteer for ad-hoc browsing or to work around a site challenge. Use web_search/web_fetch or an existing browser capability. Only retry with allow_browser_runtime_install=true when the user explicitly requested browser automation runtime installation.',
-          ),
-          isError: true,
-        } as ToolResult;
-      }
-      const unmanagedRuntimeErr = guardVideoStudioUnmanagedRuntime(opts, command, ctx.workingDir);
-      if (unmanagedRuntimeErr) {
-        log.warn('bash VideoStudio unmanaged runtime reject', {
-          user_id: maskId(opts.userId),
-          cid: maskId(opts.cid),
-          command_chars: command.length,
-        });
-        return { content: unmanagedRuntimeErr, isError: true };
       }
       const disabledSkillErr = guardDisabledSkillBash(opts, command);
       if (disabledSkillErr) {
@@ -4435,8 +4438,6 @@ async function gateInteractiveCliStart(
   const mode = getLocalExecMode();
   const shellMismatch = windowsPowerShellCompatibilityError(command, opts.hostPlatform ?? process.platform);
   if (shellMismatch) return { content: shellMismatch, isError: true };
-  const unmanagedRuntimeErr = guardVideoStudioUnmanagedRuntime(opts, command, settings?.workingDir);
-  if (unmanagedRuntimeErr) return { content: unmanagedRuntimeErr, isError: true };
   const disabledSkillErr = guardDisabledSkillBash(opts, command);
   if (disabledSkillErr) {
     log.warn('interactive_cli_start disabled skill reject', {
@@ -5461,7 +5462,7 @@ function editBaselineFacts(ctx: ToolContext, abs: string, st: fs.Stats, currentH
   const seen = getReadState(ctx)?.get(abs);
   return {
     baseline_present: !!seen,
-    ...(seen ? { baseline_changed: seen.mtimeMs !== st.mtimeMs || seen.size !== st.size || (!!seen.hash && seen.hash !== currentHash) } : {}),
+    ...(seen ? { baseline_changed: readStampChanged(seen, st, currentHash) } : {}),
   };
 }
 
@@ -5970,9 +5971,9 @@ function htmlPreviewViewport(
   const value = input && typeof input === 'object'
     ? input as Record<string, unknown>
     : {};
-  const width = value.width === undefined ? fallback.width : Number(value.width);
-  const height = value.height === undefined ? fallback.height : Number(value.height);
   const widthBounds = name === 'desktop' ? [768, 1920] : [320, 480];
+  const width = Number(defaultNumericRange(value.width === undefined ? fallback.width : value.width, fallback.width, widthBounds[0], widthBounds[1]));
+  const height = Number(defaultNumericRange(value.height === undefined ? fallback.height : value.height, fallback.height, 480, 1400));
   if (
     !Number.isInteger(width)
     || width < widthBounds[0]
@@ -6215,9 +6216,10 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       type: 'object',
       properties: {
         title: { type: 'string', description: 'Short title shown above the embedded app. Optional; defaults to "Interactive app".' },
+        appType: {type:'string',enum:opts.lockedAppType?[opts.lockedAppType]:['local','web'],description:'Omit to inherit the selected creation task or editing source; otherwise defaults to local. Web apps use browser and common data interfaces only; read web-app-sdk for the matching contract.'},
         files: {
           type: 'array',
-          description: 'Relative local app files with a top-level index.html. Apps may load __orkas/bridge.js for send and resize.',
+          description: 'Relative app files with a top-level index.html. Local apps may load __orkas/bridge.js for send and resize.',
           items: {
             type: 'object',
             properties: {
@@ -6239,9 +6241,13 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       }
       const r = await chatArtifacts.createArtifact(uid, cid, opts.agentId || '', {
         title: (input as { title?: unknown }).title,
+        appType: (input as {appType?:unknown}).appType,
         files: (input as { files?: unknown }).files,
       });
       if (!r.ok) {
+        if ((await import('../../features/web_apps/commercial-entry')).isCommercialWebAppFailure(r)) {
+          return { content: JSON.stringify(r), isError: true };
+        }
         // Cast in the error branch — `strictNullChecks: false` keeps the
         // whole `Result<>` union here (codebase-wide workaround).
         const errMsg = (r as { error?: string }).error || 'invalid artifact';
@@ -6314,6 +6320,7 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
       // artifact that does not know the box it lands in writes a full-screen
       // shell and ships it clipped.
       const smokeWarnings = [...smoke.blockers, ...(smoke.warnings ?? [])];
+      const web=chatArtifacts.readArtifactMeta(uid,cid,r.artifactId)?.appType==='web';
       return {
         content:
           `Artifact "${r.title}" created (id ${r.artifactId}); preview ${smoke.ok ? 'checks passed' : 'reported issues'} ` +
@@ -6322,14 +6329,15 @@ function createCreateArtifactTool(opts: LocalToolsOpts): AgentTool {
           `It is now shown to the user inside this reply, so do NOT paste its HTML in your message. ` +
           `Frame: the card opens ${chatArtifacts.ARTIFACT_FRAME.defaultHeight}px tall and grows to at most ` +
           `${chatArtifacts.ARTIFACT_FRAME.maxHeight}px, at roughly ${chatArtifacts.ARTIFACT_FRAME.smokeWidth}px wide. ` +
+          (web ? `Web app: use browser and common data interfaces. Keep content within the embedded frame; taller content scrolls. ` :
           `\`${chatArtifacts.BRIDGE_RELPATH}\` is injected for you and reports the content height, so lay the app out ` +
           `at its natural height — a \`100vh\` or fixed full-screen shell takes whatever height the frame happens to ` +
-          `have and gets cut off. Content taller than the cap scrolls inside the frame. ` +
+          `have and gets cut off. Content taller than the cap scrolls inside the frame. `) +
           (smokeWarnings.length ? `Review: ${smokeWarnings.join(' | ')}. ` : '') +
-          `To receive what the user does in it, the app calls ` +
+          (web ? '' : `To receive what the user does in it, the app calls ` +
           `parent.postMessage({ __orkasArtifact: true, type: "submit", payload: <json-serialisable value> }, "*") ` +
           `(or window.orkasArtifact.send(payload) through the injected bridge); ` +
-          `that becomes the user's next message to you.`,
+          `that becomes the user's next message to you.`),
       };
     },
   };

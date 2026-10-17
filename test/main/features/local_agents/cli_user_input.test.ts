@@ -3,9 +3,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as userInput from '../../../../src/main/features/local_agents/cli_user_input';
 import { notifyUserSwitch } from '../../../../src/main/features/user-switch-hooks';
 
+const warnings = vi.hoisted(() => vi.fn());
+vi.mock('../../../../src/main/logger', () => ({
+  createLogger: () => ({ info: vi.fn(), warn: warnings, error: vi.fn() }),
+}));
+
 afterEach(() => {
   vi.useRealTimers();
   userInput._resetForTest();
+  warnings.mockClear();
 });
 
 function request(overrides: Record<string, unknown> = {}) {
@@ -31,6 +37,93 @@ function request(overrides: Record<string, unknown> = {}) {
 }
 
 describe('local_agents/cli_user_input', () => {
+  it.each(['claude', 'codex'])('saves a %s answer once before resuming the native request, including concurrent and lost IPC replies', async cli => {
+    let requestId = '';
+    userInput._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') requestId = payload.request_id;
+    });
+    let saved!: () => void;
+    const saveAnswer = vi.fn(() => new Promise<void>(resolve => { saved = resolve; }));
+    const response = request({ cli, saveAnswer });
+    let resumed = false;
+    void response.then(() => { resumed = true; });
+    const first = userInput.respond(requestId, 'u1', { environment: ['staging'] });
+    const duplicate = userInput.respond(requestId, 'u1', { environment: ['staging'] });
+    await vi.waitFor(() => expect(saveAnswer).toHaveBeenCalledOnce());
+    expect(saveAnswer).toHaveBeenCalledWith('Choose target\nstaging', requestId);
+    expect(resumed).toBe(false);
+    saved();
+    expect(await first).toEqual({ handled: true, cancelled: false });
+    expect(await duplicate).toEqual(await first);
+    expect(await response).toEqual({ cancelled: false, answers: { environment: ['staging'] } });
+    expect(await userInput.respond(requestId, 'u1', { environment: ['staging'] })).toEqual(await first);
+    expect(await userInput.respond(requestId, 'other', { environment: ['staging'] })).toEqual({ handled: false });
+    expect(saveAnswer).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a failed history save retryable without resuming the CLI', async () => {
+    let requestId = '';
+    userInput._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') requestId = payload.request_id;
+    });
+    const saveAnswer = vi.fn<(...args: any[]) => Promise<void>>().mockRejectedValueOnce(new Error('injected write failure')).mockResolvedValue(undefined);
+    const response = request({ saveAnswer });
+    let resumed = false;
+    void response.then(() => { resumed = true; });
+    expect(await userInput.respond(requestId, 'u1', { environment: ['staging'] })).toEqual({ handled: false, save_failed: true });
+    expect(resumed).toBe(false);
+    expect(warnings).toHaveBeenCalledExactlyOnceWith('history save failed', expect.objectContaining({
+      request_id: expect.any(String),
+      error: expect.objectContaining({ message_hash: expect.stringMatching(/^[a-f0-9]{12}$/) }),
+    }));
+    const diagnostic = JSON.stringify(warnings.mock.calls);
+    for (const privateValue of [requestId, 'injected write failure', 'Choose target', 'staging']) {
+      expect(diagnostic).not.toContain(privateValue);
+    }
+    expect(await userInput.respond(requestId, 'u1', { environment: ['staging'] })).toEqual({ handled: true, cancelled: false });
+    expect(saveAnswer.mock.calls.map(call => call[1])).toEqual([requestId, requestId]);
+    await expect(response).resolves.toMatchObject({ cancelled: false });
+  });
+
+  it('lets an in-flight saved answer finish before cancellation, then expires its receipt on account switch', async () => {
+    let requestId = '';
+    userInput._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') requestId = payload.request_id;
+    });
+    let save!: () => void;
+    const saveAnswer = vi.fn(() => new Promise<void>(resolve => { save = resolve; }));
+    const cancel = vi.fn(async () => 'cancelled' as const);
+    const response = request({ saveAnswer, request: { questions: [{ id: 'scope', question: 'Which scope?' }], cancel } });
+    const reply = userInput.respond(requestId, 'u1', { scope: ['Current'] });
+    const declined = userInput.cancelRequest(requestId, 'u1');
+    save();
+    expect(await reply).toEqual({ handled: true, cancelled: false });
+    expect(await declined).toEqual({ handled: false, closed: true });
+    expect(cancel).not.toHaveBeenCalled();
+    await expect(response).resolves.toMatchObject({ cancelled: false });
+    notifyUserSwitch('u1', 'u2');
+    expect(await userInput.respond(requestId, 'u1', { scope: ['Current'] })).toEqual({ handled: false });
+  });
+
+  it('omits secret questions and answers from history, while returning every native answer', async () => {
+    let requestId = '';
+    userInput._setBroadcastForTest((channel, payload: any) => {
+      if (channel === 'local-agent:user-input') requestId = payload.request_id;
+    });
+    const saveAnswer = vi.fn(async () => {});
+    const response = request({ saveAnswer, request: { questions: [
+      { id: 'scope', question: 'Which scope?' },
+      { id: 'token', question: 'Private token prompt', isSecret: true },
+    ] } });
+    await userInput.respond(requestId, 'u1', { scope: ['Current', 'Docs'], token: ['private-fixture-value'] });
+    expect(saveAnswer).toHaveBeenCalledExactlyOnceWith('Which scope?\nCurrent, Docs', requestId);
+    await expect(response).resolves.toEqual({ cancelled: false, answers: { scope: ['Current', 'Docs'], token: ['private-fixture-value'] } });
+    const secret = request({ saveAnswer, request: { questions: [{ id: 'token', question: 'Token', isSecret: true }] } });
+    await userInput.respond(requestId, 'u1', { token: ['private-only'] });
+    await expect(secret).resolves.toMatchObject({ cancelled: false });
+    expect(saveAnswer).toHaveBeenCalledOnce();
+  });
+
   it('retains a failed cancellation for retry and settles only after native confirmation', async () => {
     let requestId = '';
     userInput._setBroadcastForTest((channel, payload: any) => {
@@ -50,7 +143,7 @@ describe('local_agents/cli_user_input', () => {
     const first = userInput.cancelRequest(requestId, 'u1');
     const duplicate = userInput.cancelRequest(requestId, 'u1');
     expect(cancel).toHaveBeenCalledTimes(2);
-    expect(userInput.respond(requestId, 'u1', { scope: ['racing answer'] })).toEqual({ handled: false });
+    expect(await userInput.respond(requestId, 'u1', { scope: ['racing answer'] })).toEqual({ handled: false });
     confirm('cancelled');
     expect(await first).toEqual({ handled: true, cancelled: true });
     expect(await duplicate).toEqual({ handled: true, cancelled: true });
@@ -70,7 +163,7 @@ describe('local_agents/cli_user_input', () => {
     const response = request({ request: { questions: [{ id: 'scope', question: 'Choose scope' }], cancel, signal: controller.signal } });
     expect(await userInput.cancelRequest(requestId, 'u1')).toEqual({ handled: false, unknown: true });
     expect(await userInput.cancelRequest(requestId, 'u1')).toEqual({ handled: false, unknown: true });
-    expect(userInput.respond(requestId, 'u1', { scope: ['late answer'] })).toEqual({ handled: false });
+    expect(await userInput.respond(requestId, 'u1', { scope: ['late answer'] })).toEqual({ handled: false });
     expect(cancel).toHaveBeenCalledOnce();
     controller.abort();
     await expect(response).resolves.toMatchObject({ cancelled: true });
@@ -82,7 +175,7 @@ describe('local_agents/cli_user_input', () => {
     userInput._setBroadcastForTest((_channel, payload: any) => { requestId = payload.request_id || requestId; });
     const response = request();
     expect(await userInput.cancelRequest(requestId, 'u1')).toEqual({ handled: false, cancel_failed: true });
-    expect(userInput.respond(requestId, 'u1', { environment: ['staging'] })).toEqual({ handled: true, cancelled: false });
+    expect(await userInput.respond(requestId, 'u1', { environment: ['staging'] })).toEqual({ handled: true, cancelled: false });
     expect(await response).toEqual({ cancelled: false, answers: { environment: ['staging'] } });
   });
 
@@ -119,7 +212,7 @@ describe('local_agents/cli_user_input', () => {
       channel: 'local-agent:user-input_cancelled',
       payload: { request_ids: [requestId] },
     });
-    expect(userInput.respond(requestId, 'u1', { environment: ['staging'] } as any)).toEqual({ handled: false });
+    expect(await userInput.respond(requestId, 'u1', { environment: ['staging'] } as any)).toEqual({ handled: false });
   });
 
   it('publishes bounded questions and accepts one response from the owning account', async () => {
@@ -163,8 +256,8 @@ describe('local_agents/cli_user_input', () => {
     expect(delivered?.payload.questions[0].options).toHaveLength(12);
 
     const requestId = delivered!.payload.request_id;
-    expect(userInput.respond(requestId, 'u2', { environment: ['production'] })).toEqual({ handled: false });
-    expect(userInput.respond(requestId, 'u1', {
+    expect(await userInput.respond(requestId, 'u2', { environment: ['production'] })).toEqual({ handled: false });
+    expect(await userInput.respond(requestId, 'u1', {
       environment: ['staging', `custom-${'x'.repeat(5_000)}\u0000`],
       token: 'secret-value',
       ignored: ['not accepted'],
@@ -177,7 +270,7 @@ describe('local_agents/cli_user_input', () => {
     expect(response.answers.environment[1]).not.toContain('\u0000');
     expect(response.answers.token).toEqual(['secret-value']);
     expect(response.answers).not.toHaveProperty('ignored');
-    expect(userInput.respond(requestId, 'u1', {})).toEqual({ handled: false });
+    expect(await userInput.respond(requestId, 'u1', {})).toEqual({ handled: false });
   });
 
   it('cancels only the abandoned run and makes its renderer response stale', async () => {
@@ -197,8 +290,8 @@ describe('local_agents/cli_user_input', () => {
       channel: 'local-agent:user-input_cancelled',
       payload: { request_ids: [requests[0]] },
     });
-    expect(userInput.respond(requests[0], 'u1', { environment: ['staging'] })).toEqual({ handled: false });
-    expect(userInput.respond(requests[1], 'u1', { environment: ['staging'] })).toEqual({
+    expect(await userInput.respond(requests[0], 'u1', { environment: ['staging'] })).toEqual({ handled: false });
+    expect(await userInput.respond(requests[1], 'u1', { environment: ['staging'] })).toEqual({
       handled: true, cancelled: false,
     });
     await expect(survivor).resolves.toMatchObject({ cancelled: false });
@@ -225,7 +318,7 @@ describe('local_agents/cli_user_input', () => {
     await vi.advanceTimersByTimeAsync(autoResolutionMs > 0 ? 1 : 0);
     await expect(pending).resolves.toEqual({ cancelled: true, answers: { environment: [] } });
     expect(deliveries.at(-1)).toMatchObject({ channel: 'local-agent:user-input_cancelled' });
-    expect(userInput.respond(deliveries[0].payload.request_id, 'u1', { environment: ['staging'] })).toEqual({ handled: false });
+    expect(await userInput.respond(deliveries[0].payload.request_id, 'u1', { environment: ['staging'] })).toEqual({ handled: false });
   });
 
   it('does not reopen a request already cancelled by the CLI before the host can show it', async () => {
@@ -248,7 +341,7 @@ describe('local_agents/cli_user_input', () => {
     await expect(previous).resolves.toMatchObject({ cancelled: true });
     const nextRequest = deliveries
       .filter(entry => entry.channel === 'local-agent:user-input')[1].payload.request_id;
-    userInput.respond(nextRequest, 'u2', { environment: ['staging'] });
+    await userInput.respond(nextRequest, 'u2', { environment: ['staging'] });
     await expect(next).resolves.toMatchObject({ cancelled: false });
   });
 });

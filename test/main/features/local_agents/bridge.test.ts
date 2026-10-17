@@ -519,12 +519,18 @@ describe('local_agents/bridge › auth + skills', () => {
         expect.objectContaining({ content: 'first\nfull detail' }),
         expect.objectContaining({ content: 'second', depends_on: [created.task.id] }),
       ]));
-      expect((await read({ action: 'update', task_id: created.task.id, status: 'review', result_ref: 'artifact-1' })).ok).toBe(true);
+      expect((await read({ action: 'update', task_id: created.task.id, status: 'review' })).ok).toBe(true);
       expect((await read({ action: 'list' })).result.tasks).toContainEqual(expect.objectContaining({ id: created.task.id, status: 'review' }));
       const filtered = (await read({ action: 'list', status: 'review', limit: 1 })).result;
       expect(filtered).toMatchObject({ total: 1, next_offset: null, tasks: [{ id: created.task.id }], progress: { total: 2 } });
       expect(filtered.tasks[0]).not.toHaveProperty('detail');
-      expect((await read({ action: 'get', task_id: created.task.id })).result.task).toMatchObject({ content: 'first\nfull detail', result_ref: 'artifact-1' });
+      expect((await read({ action: 'get', task_id: created.task.id })).result.task).toMatchObject({ content: 'first\nfull detail' });
+      const defaultPage = (await read({ action: 'list' })).result;
+      for (const limit of [0, 51]) {
+        const normalizedPage = await read({ action: 'list', limit });
+        expect(normalizedPage.ok).toBe(true);
+        expect(normalizedPage.result).toEqual(defaultPage);
+      }
       for (const params of [
         { action: 'create', content: 'forbidden', project: other.project.project_id },
         { action: 'create', content: 'forbidden', userId: 'other-account' },
@@ -546,13 +552,14 @@ describe('local_agents/bridge › auth + skills', () => {
         { action: 'list', project: other.project.project_id },
         { action: 'list', userId: 'another-user' },
         { action: 'list', offset: -1 },
-        { action: 'list', limit: 51 },
+        { action: 'list', limit: '51' },
+        { action: 'list', limit: 1.5 },
       ]) expect((await read(params)).ok).toBe(false);
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'review', content: 'first\nfull detail', result_ref: 'artifact-1' });
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'review', content: 'first\nfull detail' });
       expect((await tasks.getTask(TEST_UID, other.project.project_id, foreign.task.id))?.status).toBe('todo');
       expect((await tasks.getTask('other-account', foreignAccount.project.project_id, privateTask.task.id))?.status).toBe('todo');
-      expect((await read({ action: 'complete', task_id: created.task.id, result_ref: 'verified-1' })).ok).toBe(true);
-      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'done', result_ref: 'verified-1' });
+      expect((await read({ action: 'complete', task_id: created.task.id })).ok).toBe(true);
+      expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ status: 'done' });
       expect(await tasks.getTask(TEST_UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
       expect((await read({ action: 'update', task_id: created.task.id, content: 'Edited in CLI\nUpdated detail', owner: '' })).ok).toBe(true);
       expect(await tasks.getTask(TEST_UID, pid, created.task.id)).toMatchObject({ content: 'Edited in CLI\nUpdated detail', status: 'done' });
@@ -1000,9 +1007,18 @@ describe('local_agents/bridge › auth + skills', () => {
       expect(bridge.getConnectorDisplayName('slack')).toBe('Slack');
       expect(bridge.getConnectorDisplayName('unknown-connector')).toBeNull();
       expect(bridgeConnectorMock.resolveVisibleConnectors).toHaveBeenCalledWith(TEST_UID);
+      for (const limit of [0, 51]) {
+        bridgeConnectorMock.resolveVisibleConnectors.mockClear();
+        const normalized = await rpcOnce(bridge.socketPath, {
+          id: 43, token: bridge.token, method: 'connectors.list', params: { limit },
+        });
+        expect(normalized.reply).toMatchObject({ ok: true, result: (listed.reply as any).result });
+        expect(bridgeConnectorMock.resolveVisibleConnectors).toHaveBeenCalledTimes(1);
+      }
       bridgeConnectorMock.resolveVisibleConnectors.mockClear();
       for (const [params, message] of [
-        [{ limit: 51 }, 'limit must be an integer from 1 to 50'],
+        [{ limit: '51' }, 'limit must be an integer from 1 to 50'],
+        [{ limit: 1.5 }, 'limit must be an integer from 1 to 50'],
         [{ offset: -1 }, 'offset must be an integer from 0 to 9007199254740991'],
         [{ unknown: true }, 'unsupported discovery field "unknown"'],
       ] as const) {
@@ -1045,7 +1061,7 @@ describe('local_agents/bridge › auth + skills', () => {
     const bridge = await startTestBridge();
     const rpc = async (method: string, params: object) => (await rpcOnce(bridge.socketPath, { id: 1, token: bridge.token, method, params })).reply as any;
     try {
-      expect(await rpc('connectors.list', { limit: 0 })).toMatchObject({ ok: false });
+      expect(await rpc('connectors.list', { limit: '0' })).toMatchObject({ ok: false });
       expect(await rpc('connectors.list', { tool_name: 'search' })).toMatchObject({ ok: false });
       const compact = await rpc('connectors.list', { connector_id: 'slack' });
       expect(compact.result).toMatchObject({ mode: 'compact', schemas_included: false });

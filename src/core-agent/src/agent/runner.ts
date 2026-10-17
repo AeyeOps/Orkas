@@ -1,6 +1,8 @@
 import { completedRepeatKey } from "./repeat-evidence.js";
+import { projectToolInput, appendInputReceipt } from "../../../../bin/tool-input-compat.cjs";
 import { fileFailureForLog } from "../tools/file-diagnostics.js";
 import { toolInputDiagnostic } from "../providers/tool-input-diagnostics.js";
+import { isPortableThinkingForRecovery } from "../providers/replay-compatibility.js";
 import { createHash, randomBytes } from "node:crypto";
 import type {
   Message,
@@ -88,6 +90,7 @@ import {
   CONTEXT_COMPACTION_SUMMARY_PREFERRED_MAX_TOKENS,
   HISTORY_EXACT_FACTS_HEADING,
   Session,
+  sumMessageTokens,
   boundStructuredSummaryTokens,
   estimateTextTokens,
   mergeUsage,
@@ -124,7 +127,7 @@ const RETRY_MAX_DELAY_MS = 30_000;
 const RETRY_JITTER_RATIO = 0.2;
 const TOOL_HEARTBEAT_TIMEOUT_GRACE_MS = 30_000;
 const LEGACY_COMPACTED_TOOL_USE_INPUT_KEY = "__orkas_compacted_tool_use";
-const STOPPED_RUN_SUMMARY_MAX_TOKENS = 1_200;
+const TOOL_LOOP_CHECKPOINT_INTERVAL = 100;
 export const RUN_CONVERGENCE_SOFT_RATIO = 0.8;
 export const RUN_CONVERGENCE_ELAPSED_MS = 8 * 60 * 1000;
 export const RUN_CONVERGENCE_MIN_TOOL_LOOPS = 8;
@@ -211,7 +214,7 @@ export const TOOL_RESULT_MARKER_RESERVE_TOKENS = 1_000;
  *  margin on every window that can run an agent turn, so they only ever
  *  moved the same line a second time. A per-tool-call marker reserve remains
  *  separate because it scales with the number of results, not the request. */
-const CONTEXT_COMPACTION_TRIGGER_RATIO = 0.82;
+export const CONTEXT_COMPACTION_TRIGGER_RATIO = 0.82;
 /** Context summaries are streamed internally. A candidate may rotate only
  * when it has produced no usable content for 60 s; after the first content
  * event the stream is committed to that candidate. A committed stream may be
@@ -438,6 +441,19 @@ function estimateRequestInputTokens(
 ): number {
   return session.estimateModelTokens()
     + estimateFixedOverheadTokens(systemPrompt, toolDefs, turnEphemeral);
+}
+
+/** Price the actual request view at candidate admission, including scoped
+ * controls already in messages. Reuse Session's block cache and tool schema
+ * cache; never serialize binary media or read/mutate session state. Plaintext
+ * thinking is conservatively included even if a foreign adapter omits it. */
+export function estimateCompletionRequestInputTokens(params: CompletionParams): number {
+  let tokens = sumMessageTokens(params.messages)
+    + estimateFixedOverheadTokens(params.systemPrompt || "", params.tools || []);
+  for (const message of params.messages) for (const block of message.content) {
+    if (block.type === "thinking") tokens += estimateTextTokens(block.thinking);
+  }
+  return tokens;
 }
 
 /** Remaining safe request capacity for this tool-use step. Each call retains
@@ -798,13 +814,15 @@ export function recordToolObservation(
 
 export function runConvergenceSoftToolLoopThreshold(maxToolLoops: number): number {
   const limit = Math.max(1, Math.trunc(maxToolLoops));
+  if (limit >= TOOL_LOOP_CHECKPOINT_INTERVAL) return TOOL_LOOP_CHECKPOINT_INTERVAL;
   if (limit === 1) return 1;
   return Math.max(1, Math.min(limit - 1, Math.floor(limit * RUN_CONVERGENCE_SOFT_RATIO)));
 }
 
 function shouldNudgeToolLoopLimit(toolLoops: number, maxToolLoops: number): boolean {
   const threshold = runConvergenceSoftToolLoopThreshold(maxToolLoops);
-  return toolLoops >= threshold && toolLoops < maxToolLoops;
+  return toolLoops < maxToolLoops
+    && (toolLoops === threshold || toolLoops % TOOL_LOOP_CHECKPOINT_INTERVAL === 0);
 }
 
 type MutableRunTimings = Omit<AgentRunTimings, "otherMs">;
@@ -892,21 +910,13 @@ function observationLines(observations: ToolObservation[], ok: boolean, limit: n
 function buildToolLoopLimitNudge(input: {
   maxToolLoops: number;
   toolLoops: number;
-  toolNames: string[];
-  recentObservations: ToolObservation[];
 }): string {
   const remaining = Math.max(0, input.maxToolLoops - input.toolLoops);
-  const errors = observationLines(input.recentObservations, false, 3);
-  const successes = observationLines(input.recentObservations, true, 3);
   return [
-    `You are approaching the tool loop round limit (${input.toolLoops}/${input.maxToolLoops}; ${remaining} round(s) left).`,
-    "Stop exploratory/retry tool calls now unless one final tool call is strictly necessary.",
-    "Finish the smallest valid deliverable now, verify it once, and then respond.",
-    "If completion is impossible within the remaining budget, summarize current status, completed files/artifacts, the last blocking error, and the concrete next step for the user.",
-    input.toolNames.length ? `Tools used so far: ${input.toolNames.join(", ")}.` : "",
-    successes.length ? `Recent successful results:\n${successes.join("\n")}` : "",
-    errors.length ? `Recent errors:\n${errors.join("\n")}` : "",
-  ].filter(Boolean).join("\n\n");
+    `Tool-round checkpoint: ${input.toolLoops}/${input.maxToolLoops} rounds used; ${remaining} remain before the hard limit.`,
+    "Check completed work, remaining requirements and repeated operations against the user's goal. Continue work that makes progress within the remaining budget; change approach when operations repeat without progress.",
+    "When the task is complete, deliver the verified result. If blocked or unable to finish within the budget, report preserved work, what remains and the blocker.",
+  ].join("\n\n");
 }
 
 function buildSpinConvergenceNudge(input: {
@@ -1009,28 +1019,6 @@ function withRequestScopedControls(messages: Message[], controls: readonly strin
       }],
     },
   ];
-}
-
-function buildToolLoopLimitFallback(input: {
-  maxToolLoops: number;
-  toolLoops: number;
-  toolNames: string[];
-  recentObservations: ToolObservation[];
-  skippedToolNames: string[];
-  turnText?: string;
-}): string {
-  const errors = observationLines(input.recentObservations, false, 5);
-  const successes = observationLines(input.recentObservations, true, 6);
-  const lines = [
-    `Stopped after reaching the tool loop round limit (${input.toolLoops}/${input.maxToolLoops}).`,
-    input.turnText?.trim() ? `Partial model note: ${toolPreview(input.turnText, 400)}` : "",
-    input.skippedToolNames.length ? `Skipped proposed tool(s): ${input.skippedToolNames.join(", ")}.` : "",
-    input.toolNames.length ? `Tools used: ${input.toolNames.join(", ")}.` : "",
-    successes.length ? `Recent successful results:\n${successes.join("\n")}` : "",
-    errors.length ? `Recent errors:\n${errors.join("\n")}` : "",
-    "Next step: review the blocking error or missing output above, then continue with a focused retry instead of broad exploration.",
-  ];
-  return lines.filter(Boolean).join("\n\n");
 }
 
 type ToolUseCall = {
@@ -1160,8 +1148,13 @@ function buildProgressNudge(kind: "no_progress" | "discovery", rounds: number): 
  * metadata to distinguish "the model finished" from "the runner ended it". */
 function stoppedTermination(
   reason: Extract<AgentRunTermination, { status: "stopped" }>["reason"],
+  summaryIncomplete: boolean,
+  toolRoundLimit?: number,
 ): AgentRunTermination {
-  return { status: "stopped", reason };
+  return { status: "stopped", reason, ...(summaryIncomplete ? {
+    summaryIncomplete: true,
+    ...(toolRoundLimit !== undefined ? { toolRoundLimit } : {}),
+  } : {}) };
 }
 
 /**
@@ -1683,6 +1676,9 @@ export class AgentRunner {
     // completed main-loop call; summary/reflection calls never touch it —
     // their requests have a different shape and would misprice this one.
     let requestTokenAnchor: RequestTokenAnchor | null = null;
+    // Carry admission pressure to the next preparation pass, never tool calls
+    // or their arguments. The current round still executes exactly once.
+    let exhaustedResultCallCount = 0;
     // One reactive overflow recovery per overflow EVENT. The pre-call checks
     // can under-measure a request (no anchor before the first call, an
     // invalidated anchor, image bytes); the provider's refusal is then the
@@ -1883,6 +1879,23 @@ export class AgentRunner {
           input_ceiling_tokens: Math.floor(callUsableInputTokens * CONTEXT_COMPACTION_TRIGGER_RATIO),
           window_source: historyModel?.contextWindow ? 'catalog' : 'fallback',
         };
+        const resultCapacityExhausted = exhaustedResultCallCount > 0 && calculateToolResultInlineBudget({
+          requestTokensBeforeResults: anchoredRequestTokens(
+            requestTokenAnchor,
+            estimateRequestInputTokens(this.session, systemPrompt, toolDefs, budgetEphemeral || undefined),
+            this.session.contentEpoch(),
+            this.session.getEstimatorCalibration(),
+          ).tokens,
+          usableInputTokens: callUsableInputTokens,
+          toolCallCount: exhaustedResultCallCount,
+        }) === 0;
+        contextBudgetDiagnostics.result_capacity_exhausted = resultCapacityExhausted ? 1 : 0;
+        // Reuse checkpoint selection and its latest-round protection. Under
+        // observed admission pressure the optional older tail cannot borrow
+        // space needed by results. Tiny windows retain emergency-only policy.
+        const preparationBudget = resultCapacityExhausted && !callContextBudget.windowTooSmall
+          ? { ...callContextBudget, activeProcessTrigger: 0, activeRetainTokens: 0 }
+          : callContextBudget;
 
         const prepareContextStartedAt = Date.now();
         const progressContextEpoch = this.session.contentEpoch();
@@ -1896,16 +1909,15 @@ export class AgentRunner {
             () => { compactionCount++; },
             params.signal,
             { agentAttempt: attempt },
-            callContextBudget,
+            preparationBudget,
             {
               usableInputTokens: callUsableInputTokens,
               fixedOverheadTokens: estimateFixedOverheadTokens(systemPrompt, toolDefs, budgetEphemeral || undefined),
               diagnostics: contextBudgetDiagnostics,
             },
           );
-          // Layered compaction has had its turn. If the request is still over
-          // the ceiling, summarization is not working and the only remaining
-          // lever is dropping raw output outright.
+          // Recheck both request size and exhausted result capacity after the
+          // normal summary attempt before using the existing lossy fallback.
           yield* this.emergencyContextReduction(
             systemPrompt,
             toolDefs,
@@ -1914,7 +1926,9 @@ export class AgentRunner {
             compactionControl,
             requestTokenAnchor,
             contextBudgetDiagnostics,
+            exhaustedResultCallCount,
           );
+          exhaustedResultCallCount = 0;
         } finally {
           if (this.session.contentEpoch() !== progressContextEpoch) resetProgressEvidence();
           // Cancellation can interrupt a summary before this call returns.
@@ -2067,6 +2081,8 @@ export class AgentRunner {
               type: "provider_fallback",
               reason: ev.reason,
               providerId: ev.providerId,
+              ...(ev.toProviderId ? { toProviderId: ev.toProviderId } : {}),
+              ...(ev.skipped ? { skipped: true } : {}),
               ...(ev.candidateIndex !== undefined ? { candidateIndex: ev.candidateIndex } : {}),
               ...(ev.candidateCount !== undefined ? { candidateCount: ev.candidateCount } : {}),
               ...(ev.fromModel ? { fromModel: ev.fromModel } : {}),
@@ -2181,12 +2197,13 @@ export class AgentRunner {
         let recoveryReplayToCommit: MessageContent[][] | undefined;
         const containsToolCall = result.content.some((item) => item.type === "tool_use");
         const truncated = result.stopReason === "max_tokens";
-        // No calls from a truncated response have run. Keep only its complete
-        // text, never partial arguments or native replay/signatures that could
-        // resurrect those proposals. Earlier committed tool receipts stay put.
+        // No calls from a truncated response have run. Keep prose and original
+        // portable reasoning, never arguments or opaque/native replay that
+        // could resurrect those proposals. Earlier committed receipts stay put.
         const recoverableContent = truncated && containsToolCall
           ? result.content.flatMap((item): MessageContent[] => item.type === "text"
-              ? [{ type: "text", text: item.text }] : [])
+              ? [{ type: "text", text: item.text }]
+              : isPortableThinkingForRecovery(item) ? [item] : [])
           : result.content;
         const partialOutput = recoverableOutputDraft(recoverableContent)
           ?? { text: "", content: [] };
@@ -2217,6 +2234,7 @@ export class AgentRunner {
         if (truncated || (continuingOutput && !containsToolCall)) {
           const prior = outputContinuationDraft;
           const signedReplay = prior?.replayContents
+            || (truncated && containsToolCall && partialOutput.content.some(item => item.type === "thinking"))
             || [...(prior?.content ?? []), ...partialOutput.content].some(item =>
               item.googleNativeReplay || (item.type === "text" && item.textSignature));
           if (signedReplay) {
@@ -2510,16 +2528,8 @@ export class AgentRunner {
             });
             yield { type: "tool_end", id: call.id, name: call.name, result: skippedMessage, skipped: true, isError: true, durationMs: 0 };
           }
-          const fallbackText = buildToolLoopLimitFallback({
-            maxToolLoops,
-            toolLoops,
-            toolNames: [...toolNamesSet],
-            recentObservations: recentToolObservations,
-            skippedToolNames: (toolCalls as ReadonlyArray<ToolUseCall>).map((c) => c.name),
-            turnText,
-          });
           const limitSummaryStartedAt = Date.now();
-          const summary = await this.summarizeStoppedRun({
+          const summary = yield* this.summarizeStoppedRun({
             provider,
             modelId,
             systemPrompt,
@@ -2531,23 +2541,11 @@ export class AgentRunner {
               recentObservations: recentToolObservations,
               skippedToolNames: (toolCalls as ReadonlyArray<ToolUseCall>).map((c) => c.name),
             }),
-            fallbackText,
             logScope: "tool_loop_limit",
+            onUsage: usage => { lastUsage = mergeUsage(lastUsage, usage); },
           });
           const limitSummaryDurationMs = Math.max(0, Date.now() - limitSummaryStartedAt);
           timings.providerMs += limitSummaryDurationMs;
-          yield {
-            type: "provider_call",
-            durationMs: limitSummaryDurationMs,
-            outcome: summary.providerCallOutcome,
-            model: summary.model || result.model,
-            ...(summary.providerStopReason ? { stopReason: summary.providerStopReason } : {}),
-            ...(summary.providerTextChars ? { textChars: summary.providerTextChars } : {}),
-            ...(summary.usage ? { usage: summary.usage } : {}),
-          };
-          if (summary.usage) {
-            lastUsage = mergeUsage(lastUsage, summary.usage);
-          }
           const final: AgentRunResult = {
             text: summary.text,
             content: summary.content,
@@ -2561,7 +2559,7 @@ export class AgentRunner {
               compactionCount,
               timings: finalizedRunTimings(startTime, timings),
               ...convergenceMeta(),
-              termination: stoppedTermination("tool_loop_limit"),
+              termination: stoppedTermination("tool_loop_limit", summary.incomplete, maxToolLoops),
               toolNames: [...toolNamesSet],
               skillsLoaded: [...skillsLoadedSet],
               transientToolErrors: transientToolErrors || undefined,
@@ -2605,6 +2603,7 @@ export class AgentRunner {
           usableInputTokens,
           toolCallCount: toolCalls.length,
         });
+        exhaustedResultCallCount = inlineResultTokensThisRound === 0 ? toolCalls.length : 0;
         const toolState: ToolContext["state"] = {
           ...this.toolContextState,
           commandSessionEnabled: this.activeTools().some((tool) => tool.name === "process_session"),
@@ -2799,7 +2798,7 @@ export class AgentRunner {
               log.warn("Tool stalled", toolFailureForLog(call, toolResult, this.session.getSessionId(), diagnosticCorrelation));
             } else if (outcome.err) {
               const isTransient = isRetryableError(outcome.err);
-              log.error(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}); details withheld`);
+              log.warn(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}); details withheld`);
               if (isTransient) transientToolErrors++;
               else permanentToolErrors++;
             } else if (toolResult.isError && !outcome.recoverable) {
@@ -2940,7 +2939,7 @@ export class AgentRunner {
                 log.warn("Tool stalled", toolFailureForLog(call, c.result, this.session.getSessionId(), diagnosticCorrelation));
               } else if (c.err) {
                 const isTransient = isRetryableError(c.err);
-                log.error(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}); details withheld`);
+                log.warn(`Tool ${call.name} failed (${isTransient ? 'transient' : 'permanent'}); details withheld`);
                 if (isTransient) transientToolErrors++;
                 else permanentToolErrors++;
               } else if (c.result.isError && !c.recoverable) {
@@ -3054,7 +3053,7 @@ export class AgentRunner {
           this.session.getEstimatorCalibration(),
         );
         if (tokensBeforeResolved.tokens > usableInputTokens * CONTEXT_COMPACTION_TRIGGER_RATIO) {
-          log.error("context compaction skipped", {
+          log.warn("context compaction skipped", {
             phase: "context_window",
             sessionId: this.session.getSessionId(),
             model: contextModelId,
@@ -3091,31 +3090,23 @@ export class AgentRunner {
           log.warn("loop_detection: stopped after verified unchanged rounds", {
             ...repeat, evidence: "complete_execution_receipts", executedThisRound: toolUseCalls.length, skippedThisRound: 0,
           });
-          const fallbackText = "Stopped after repeated operations produced no new effect or information, including two rounds after feedback. "
-            + "Completed tool results are retained. Review those results and choose a different next step.";
           const summaryStartedAt = Date.now();
-          const summary = await this.summarizeStoppedRun({
+          const summary = yield* this.summarizeStoppedRun({
             provider, modelId, systemPrompt, params,
             prompt: `This run stopped after ${repeat.rounds} consecutive completed rounds of the same operations with verified unchanged results, including two rounds after feedback. `
               + "No further tools are available. Reply in the user's language with what was completed, what remains, and a concrete next step. "
               + "Use the committed results; do not describe this host stop as successful task completion.",
-            fallbackText, logScope: "repetitive_tool_calls",
+            logScope: "repetitive_tool_calls",
+            onUsage: usage => { lastUsage = mergeUsage(lastUsage, usage); },
           });
           const summaryMs = Math.max(0, Date.now() - summaryStartedAt);
           timings.providerMs += summaryMs;
-          yield { type: "provider_call", durationMs: summaryMs, outcome: summary.providerCallOutcome,
-            model: summary.model || result.model,
-            ...(summary.providerStopReason ? { stopReason: summary.providerStopReason } : {}),
-            ...(summary.providerTextChars ? { textChars: summary.providerTextChars } : {}),
-            ...(summary.usage ? { usage: summary.usage } : {}),
-          };
-          if (summary.usage) lastUsage = mergeUsage(lastUsage, summary.usage);
           const final: AgentRunResult = {
             text: summary.text, content: summary.content,
             meta: { durationMs: Date.now() - startTime, model: summary.model || result.model,
               provider: provider.id, stopReason: summary.stopReason, usage: lastUsage, toolLoops, compactionCount,
               timings: finalizedRunTimings(startTime, timings), ...convergenceMeta(),
-              termination: stoppedTermination("repetitive_tool_calls"), toolNames: [...toolNamesSet], skillsLoaded: [...skillsLoadedSet],
+              termination: stoppedTermination("repetitive_tool_calls", summary.incomplete), toolNames: [...toolNamesSet], skillsLoaded: [...skillsLoadedSet],
               transientToolErrors: transientToolErrors || undefined, permanentToolErrors: permanentToolErrors || undefined,
             },
           };
@@ -3162,15 +3153,13 @@ export class AgentRunner {
           log.warn("loop_detection: nudged the model after repeated identical tool calls");
         }
 
-        if (!toolLoopLimitNudgeSent && shouldNudgeToolLoopLimit(toolLoops, maxToolLoops)) {
+        if (shouldNudgeToolLoopLimit(toolLoops, maxToolLoops)) {
           pendingRequestControls.push(buildToolLoopLimitNudge({
             maxToolLoops,
             toolLoops,
-            toolNames: [...toolNamesSet],
-            recentObservations: recentToolObservations,
           }));
           toolLoopLimitNudgeSent = true;
-          log.warn("run_convergence: nudged model to finish near limit", {
+          log.info("run_convergence: tool-round checkpoint", {
             elapsedMs: Date.now() - startTime,
             toolLoops,
             maxToolLoops,
@@ -3258,8 +3247,18 @@ export class AgentRunner {
           return;
         }
 
-        if (err instanceof ContextOverflowError
+                if (err instanceof ContextOverflowError
           || (err instanceof Error && err.name === "ContextOverflowError")) {
+          // Candidate admission already checked the unchanged request against
+          // every available window. This is not an upstream estimation miss:
+          // folding Session or retrying would defeat the read-only skip contract.
+          if ((err as ContextOverflowError).admissionChecked) {
+            const e = this.errorResult(startTime, modelId, provider.id, {
+              kind: "context_overflow", message: err.message, code: (err as ContextOverflowError).code,
+            }, lastUsage, toolLoops, compactionCount, false, [...toolNamesSet], [...skillsLoadedSet], transientToolErrors, permanentToolErrors, finalizedRunTimings(startTime, timings), convergenceSignals());
+            yield { type: "done", result: e };
+            return;
+          }
           // Reactive overflow recovery (G.9). The provider refused the
           // request outright, so the pre-call measurements under-priced it —
           // no anchor before a run's first call, image bytes the estimator
@@ -3413,71 +3412,85 @@ export class AgentRunner {
     }
   }
 
-  private async summarizeStoppedRun(opts: {
+  private async *summarizeStoppedRun(opts: {
     provider: LLMProvider;
     modelId: string;
     systemPrompt: string;
     params: AgentRunParams;
     prompt: string;
-    fallbackText: string;
     logScope: "tool_loop_limit" | "discovery_stall" | "repetitive_tool_calls";
-  }): Promise<{
+    onUsage: (usage: Usage) => void;
+  }): AsyncGenerator<AgentRunEvent, {
     text: string;
+    incomplete: boolean;
     content: MessageContent[];
     model?: string;
     stopReason: import("../shared/types.js").StopReason;
-    usage?: import("../shared/types.js").Usage;
-    providerCallOutcome: "completed" | "failed";
-    providerStopReason?: import("../shared/types.js").StopReason;
-    providerTextChars?: number;
   }> {
     opts.params.signal?.throwIfAborted();
     await this.session.flushPending(opts.params.signal);
+    const messages = [...this.session.getMessagesForModel()];
     let completedResult: CompletionResult | undefined;
-    try {
-      const result = await opts.provider.complete({
-        model: opts.modelId,
-        messages: withRequestScopedControls(this.session.getMessagesForModel(), [opts.prompt]),
-        systemPrompt: opts.systemPrompt,
-        maxTokens: STOPPED_RUN_SUMMARY_MAX_TOKENS,
-        signal: opts.params.signal,
-        cacheRetention: opts.params.cacheRetention,
-        sessionId: this.session.getSessionId(),
-        requestMetadata: opts.params.requestMetadata,
-        providerTurnContext: this.session.getProviderTurnContext(),
-        ...(opts.params.thinkingLevel !== undefined ? { reasoning: opts.params.thinkingLevel } : {}),
-      });
+    let text = "";
+    let complete = false;
+    for (let attempt = 0; attempt <= MAX_OUTPUT_CONTINUATION_ATTEMPTS; attempt++) {
       opts.params.signal?.throwIfAborted();
-      completedResult = result;
-      const text = textFromContent(result.content).trim();
-      if (text) {
-        const content: MessageContent[] = [{ type: "text", text }];
-        this.session.addAssistantMessage(content);
-        return {
-          text,
-          content,
-          model: result.model,
-          stopReason: result.stopReason === "tool_use" ? "end_turn" : result.stopReason,
-          usage: result.usage,
-          providerCallOutcome: "completed",
-          providerStopReason: result.stopReason,
-          providerTextChars: text.length,
-        };
+      const startedAt = Date.now();
+      let result: CompletionResult;
+      try {
+        result = await opts.provider.complete({
+          model: opts.modelId,
+          messages: withRequestScopedControls(messages, [opts.prompt, ...(attempt ? [
+            "The preceding status summary reached the output-token limit. Continue the unfinished summary without repeating it. Tool execution remains stopped.",
+          ] : [])]),
+          systemPrompt: opts.systemPrompt,
+          maxTokens: this.config.models.catalog[opts.modelId]?.maxOutputTokens,
+          signal: opts.params.signal,
+          cacheRetention: opts.params.cacheRetention,
+          sessionId: this.session.getSessionId(),
+          requestMetadata: { ...opts.params.requestMetadata, outputLimitSource: "model_default" },
+          providerTurnContext: this.session.getProviderTurnContext(),
+          ...(opts.params.thinkingLevel !== undefined ? { reasoning: opts.params.thinkingLevel } : {}),
+        });
+      } catch (err) {
+        if (opts.params.signal?.aborted) throw err;
+        yield { type: "provider_call", durationMs: Math.max(0, Date.now() - startedAt),
+          outcome: "failed", model: opts.modelId };
+        log.warn(`${opts.logScope}: summary completion failed`, { error: logErrorRef(err) });
+        break;
       }
-    } catch (err) {
-      if (opts.params.signal?.aborted) throw err;
-      log.warn(`${opts.logScope}: summary completion failed`, { error: logErrorRef(err) });
+      completedResult = result;
+      if (result.usage) opts.onUsage(result.usage);
+      const piece = textFromContent(result.content);
+      text = mergeOutputContinuationText(text, piece);
+      yield { type: "provider_call", durationMs: Math.max(0, Date.now() - startedAt),
+        outcome: "completed", model: result.model || opts.modelId, stopReason: result.stopReason,
+        textChars: piece.length, ...(result.usage ? { usage: result.usage } : {}) };
+      opts.params.signal?.throwIfAborted();
+      if (result.stopReason !== "max_tokens") {
+        complete = !!piece.trim();
+        break;
+      }
+      log.warn(`${opts.logScope}: summary output limit reached`, {
+        attempt: attempt + 1, partialChars: text.length,
+        recovery: attempt < MAX_OUTPUT_CONTINUATION_ATTEMPTS ? "continue" : "exhausted",
+      });
+      // Preserve native replay boundaries, but never replay or execute a tool
+      // proposal from the stopped, possibly truncated summary request.
+      const replay = result.content.filter(item => item.type === "text" || item.type === "thinking");
+      if (replay.length) messages.push({ role: "assistant", content: replay });
     }
-    const content: MessageContent[] = [{ type: "text", text: opts.fallbackText }];
-    this.session.addAssistantMessage(content);
+    opts.params.signal?.throwIfAborted();
+    text = text.trim();
+    const content: MessageContent[] = text ? [{ type: "text", text }] : [];
+    // Runtime diagnostics are not assistant prose. The host renders a localized
+    // notice from termination metadata; saved model history keeps only its text.
+    if (content.length) this.session.addAssistantMessage(content);
     return {
-      text: opts.fallbackText,
-      content,
-      model: completedResult?.model || opts.modelId,
-      stopReason: "end_turn",
-      ...(completedResult?.usage ? { usage: completedResult.usage } : {}),
-      providerCallOutcome: completedResult ? "completed" : "failed",
-      ...(completedResult ? { providerStopReason: completedResult.stopReason } : {}),
+      text, content, incomplete: !complete, model: completedResult?.model || opts.modelId,
+      stopReason: complete && completedResult?.stopReason !== "tool_use"
+        ? completedResult!.stopReason
+        : completedResult?.stopReason === "max_tokens" ? "max_tokens" : "end_turn",
     };
   }
 
@@ -3563,6 +3576,7 @@ export class AgentRunner {
     control: CompactionControl,
     anchor: RequestTokenAnchor | null = null,
     diagnostics?: Record<string, number | string>,
+    exhaustedResultCallCount = 0,
   ): AsyncIterable<AgentRunEvent> {
     // Anchored to the previous call's real usage when the anchor is still
     // valid; a fold earlier in this prepare phase bumps the content epoch, so
@@ -3579,7 +3593,12 @@ export class AgentRunner {
       emergency_before_tokens: before.tokens, emergency_after_tokens: before.tokens,
       estimated_input_tokens: before.tokens, estimate_source: before.source, emergency_result: 'not_needed',
     });
-    if (before.tokens <= usableInputTokens * CONTEXT_COMPACTION_TRIGGER_RATIO) return;
+    const resultCapacityExhausted = exhaustedResultCallCount > 0 && calculateToolResultInlineBudget({
+      requestTokensBeforeResults: before.tokens,
+      usableInputTokens,
+      toolCallCount: exhaustedResultCallCount,
+    }) === 0;
+    if (before.tokens <= usableInputTokens * CONTEXT_COMPACTION_TRIGGER_RATIO && !resultCapacityExhausted) return;
 
     const { foldedGroups, archivedTurns } = this.applyDeterministicEmergencyFold();
     if (foldedGroups === 0 && archivedTurns === 0) {
@@ -3589,7 +3608,7 @@ export class AgentRunner {
       // prior summaries and the protected latest tool round. Report it and let
       // the request proceed — the estimator
       // is a heuristic, and a real overflow is still handled downstream.
-      log.error("emergency context reduction found nothing to drop", {
+      log.warn("emergency context reduction found nothing to drop", {
         sessionId: this.session.getSessionId(),
         requestTokens: before.tokens,
         tokenSource: before.source,
@@ -3609,7 +3628,7 @@ export class AgentRunner {
       estimate_source: after.source, emergency_result: 'applied',
     });
     control.readCursor = this.session.workspaceObservationCursor();
-    log.error("emergency context reduction applied", {
+    log.warn("emergency context reduction applied", {
       sessionId: this.session.getSessionId(),
       requestTokensBefore: before.tokens,
       requestTokensBeforeSource: before.source,
@@ -4192,7 +4211,7 @@ export class AgentRunner {
         }
       } catch (err) {
         if (signal?.aborted) return '';
-        log.error("Reflection LLM call failed", { error: logErrorRef(err) });
+        log.warn("Reflection failed", { error: logErrorRef(err) });
         reportFailure({ kind: 'llm_error', error: err });
         return '';
       }
@@ -4285,6 +4304,12 @@ async function runToolWithWatchdog(opts: {
     emitEvent,
   } = opts;
   const abortedToolMessage = "Tool execution aborted: Run aborted";
+  const properties = tool.inputSchema.properties;
+  const projected = projectToolInput(call.input,
+    properties && typeof properties === "object" && !Array.isArray(properties)
+      && (tool.inputSchema.additionalProperties === undefined || tool.inputSchema.additionalProperties === false)
+      ? [...Object.keys(properties), ...(tool.compatibilityInputFields ?? [])]
+      : undefined);
   const stalledToolMessage =
     `Tool execution stalled after ${toolIdleTimeoutMs}ms without substantive progress`;
   const executionErrorMessage =
@@ -4294,6 +4319,7 @@ async function runToolWithWatchdog(opts: {
   const emitToolEnd = (
     result: ToolResult,
     diagnostic?: { errorCode: string; errorSeverity: "error" },
+    executionCancelled = false,
   ) => {
     const displayName = typeof result.displayName === "string"
       ? result.displayName.trim().slice(0, 128)
@@ -4317,12 +4343,13 @@ async function runToolWithWatchdog(opts: {
         ? { programExecution: result.observations.programExecution }
         : {}),
       ...(diagnostic || {}),
+      ...(executionCancelled ? { executionCancelled: true } : {}),
       durationMs: Math.max(0, Date.now() - startedAt),
     });
   };
   const abortResult = (): ToolExecutionOutcome => {
     const result = { content: abortedToolMessage, isError: true };
-    emitToolEnd(result);
+    emitToolEnd(result, undefined, true);
     return { result, aborted: true };
   };
 
@@ -4337,6 +4364,7 @@ async function runToolWithWatchdog(opts: {
   const abortWait = waitForAbort(signal);
   let acceptingProgress = true;
   const toolCtx: ToolContext = {
+    ...(projected.receipt ? { inputReceipt: projected.receipt } : {}),
     workingDir,
     signal: toolAbort.signal,
     state,
@@ -4361,6 +4389,9 @@ async function runToolWithWatchdog(opts: {
     outcome: Omit<ToolExecutionOutcome, "result"> = {},
     diagnostic?: { errorCode: string; errorSeverity: "error" },
   ): Promise<ToolExecutionOutcome> => {
+    if (projected.receipt && result.appliedInputReceipt !== projected.receipt) {
+      result = { ...result, content: appendInputReceipt(result.content, projected.receipt) };
+    }
     const fileFacts = opts.includeFileObservations ? toolFileChangeFacts(result.observations) : undefined;
     let observedContent = result.content;
     if (fileFacts) {
@@ -4390,13 +4421,16 @@ async function runToolWithWatchdog(opts: {
             isError: true,
             observations: observedResult.observations,
           };
-          emitToolEnd(safeResult, { errorCode: "tool_result_persistence_failed", errorSeverity: "error" });
+          emitToolEnd(safeResult, { errorCode: "tool_result_persistence_failed", errorSeverity: "error" },
+            !!signal?.aborted && !isToolResultPersistenceError(err));
           return { result: safeResult, err, ...(signal?.aborted ? { aborted: true } : {}) };
         }
         const safeResult = { content: resultProcessingErrorMessage, isError: true };
         emitToolEnd(safeResult, {
           errorCode: "tool_result_processing_exception",
           errorSeverity: "error",
+
+
         });
         return { result: safeResult, err: new Error(resultProcessingErrorMessage) };
       }
@@ -4408,7 +4442,7 @@ async function runToolWithWatchdog(opts: {
     | { ok: true; result: ToolResult }
     | { ok: false; err: unknown };
   const toolPromise: Promise<ToolCompletion> = Promise.resolve()
-    .then(() => tool.execute(call.input, toolCtx))
+    .then(() => tool.execute(projected.input, toolCtx))
     .then(
       (result) => ({ ok: true as const, result }),
       (err) => ({ ok: false as const, err }),
@@ -4450,6 +4484,7 @@ async function runToolWithWatchdog(opts: {
         {
           errorCode: "tool_execution_exception",
           errorSeverity: "error",
+
         },
       );
     }

@@ -26,7 +26,7 @@ afterEach(async () => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-async function writeAttempt(cid: string, failure: Record<string, unknown>, actorId = 'commander') {
+async function writeAttempt(cid: string, failure: Record<string, unknown>, actorId = 'commander', modelText = 'Authoritative original request') {
   const layout = await import('../../../../src/main/util/project-layout');
   const file = layout.conversationMessageFile(UID, cid);
   const rows = [
@@ -36,7 +36,7 @@ async function writeAttempt(cid: string, failure: Record<string, unknown>, actor
       from: 'user',
       to: [actorId],
       text: 'Visible original request',
-      model_text: 'Authoritative original request',
+      model_text: modelText,
       attachments: ['brief.txt'],
     },
     {
@@ -56,6 +56,29 @@ async function writeAttempt(cid: string, failure: Record<string, unknown>, actor
 }
 
 describe('group_chat failed-turn smart retry', () => {
+  it('preserves the original language request on resume rather than selecting the English recovery prose', async () => {
+    const cid = 'language-resume-cid';
+    const request = 'Inspect the input and reply in Korean.';
+    const config = await import('../../../../src/main/features/config');
+    config.setLanguage('zh');
+    await writeAttempt(cid, {}, 'commander', request);
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const sessions = await import('../../../../src/main/model/core-agent/session-store');
+    const session = await sessions.getSession(state.buildGconvSessionId(cid));
+    session.beginUserTurn([{ type: 'text', text: request }]);
+    session.ensureExecutionPlanAnchor();
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const result = await groupChat.resolveFailedTurnRetry({ userId: UID, cid,
+      failedMessageId: `${cid}-failed`, visibleText: '继续' });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.value.mode).toBe('resume');
+    expect(result.value.enqueue.text).toBe('继续');
+    expect(result.value.enqueue.model_text).toContain(request);
+    expect(result.value.enqueue.model_text).toContain('Preserve the response language established by the original user request');
+    expect(result.value.enqueue.model_text).toContain('If no response language was established, use Chinese (简体中文)');
+  });
+
   it('continues the same actor when its persistent session has recoverable task state', async () => {
     const cid = 'resume-cid';
     await writeAttempt(cid, {});

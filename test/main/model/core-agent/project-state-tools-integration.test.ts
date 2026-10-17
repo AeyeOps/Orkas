@@ -76,14 +76,13 @@ async function setupProjectStateTools() {
         content: patch.content,
         status: patch.status,
         owner_agent: patch.owner,
-        result_ref: patch.result_ref,
       });
       return result.ok
         ? { ok: true, task: projectTasks.taskView(result.task) }
         : { ok: false, error: result.error };
     },
-    async complete(taskId, resultRef) {
-      const result = await projectTasks.completeTask(UID, pid, taskId, resultRef);
+    async complete(taskId) {
+      const result = await projectTasks.completeTask(UID, pid, taskId);
       return result.ok
         ? { ok: true, task: projectTasks.taskView(result.task) }
         : { ok: false, error: result.error };
@@ -158,12 +157,11 @@ describe('project state tools → durable feature stores', () => {
     const completed = await state.tasksTool.execute({
       action: 'complete',
       task_id: taskId,
-      result_ref: 'chat-checkout-result',
     }, ctx);
     expect(completed.isError).toBe(false);
     const finalStatus = JSON.parse((await state.tasksTool.execute({ action: 'list' }, ctx)).content);
     expect(finalStatus.progress).toMatchObject({ total: 1, done: 1, open: 0 });
-    expect(finalStatus.tasks[0]).toMatchObject({ id: taskId, status: 'done', result_ref: 'chat-checkout-result' });
+    expect(finalStatus.tasks[0]).toMatchObject({ id: taskId, status: 'done' });
   });
 
   it('enforces sub-agent project-memory read-only mode against the same real store', async () => {

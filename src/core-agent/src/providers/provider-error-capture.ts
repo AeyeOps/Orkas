@@ -1,5 +1,16 @@
 import { providerErrorFacts } from '../shared/provider-error-facts.js';
 
+function rejectionHasOutput(value: unknown): boolean {
+  if (!value || typeof value !== 'object') return false;
+  const record = value as Record<string, unknown>;
+  return [record, record.response].some(envelope => {
+    if (!envelope || typeof envelope !== 'object') return false;
+    const body = envelope as Record<string, unknown>;
+    return [body.output, body.choices].some(output =>
+      Array.isArray(output) ? output.length > 0 : !!output);
+  });
+}
+
 /** pi-ai flattens SDK errors into display strings. Retain request-local facts
  * before that boundary. Never retain bodies in diagnostics or shared state. */
 export function createProviderErrorCapture(streamProtocol?: 'openai-responses' | 'openai-completions') {
@@ -22,7 +33,7 @@ export function createProviderErrorCapture(streamProtocol?: 'openai-responses' |
         try {
           const response = await next(input, init);
           if (response.status >= 400) {
-            responseFacts = Object.assign(new Error('Provider HTTP error'), { status: response.status });
+            responseFacts = Object.assign(new Error('Provider HTTP error'), { status: response.status, providerRequestRejected: true });
             const detail = await readErrorBody(response, init?.signal, index => { rejectedInputIndex = index; });
             if (detail) Object.assign(responseFacts, { error: detail });
           } else if (streamProtocol && response.body && response.headers.get('content-type')?.toLowerCase().includes('text/event-stream')) {
@@ -32,7 +43,11 @@ export function createProviderErrorCapture(streamProtocol?: 'openai-responses' |
               if (facts.status === undefined && !facts.codes.length) return;
               let cause: object = {};
               for (const code of facts.codes.reverse()) cause = { code, cause };
-              responseFacts = Object.assign(new Error('Provider stream error'), { status: facts.status, cause });
+              responseFacts = Object.assign(new Error('Provider stream error'), { status: facts.status, cause, providerRequestRejected: true });
+            }, error => {
+              // Fetch has already resolved here; retain body-read causes before
+              // SDK flattening without replacing an earlier protocol rejection.
+              if (owner === requestOwner && !responseFacts) original = error;
             });
           }
           return response;
@@ -53,7 +68,7 @@ export function createProviderErrorCapture(streamProtocol?: 'openai-responses' |
       if (facts.status === undefined && !facts.codes.length) return undefined;
       let cause: Error | undefined;
       for (const code of facts.codes.reverse()) cause = Object.assign(new Error('Provider error'), { code, cause });
-      return Object.assign(new Error('Provider error'), { status: facts.status, cause });
+      return Object.assign(new Error('Provider error'), { status: facts.status, cause, providerRequestRejected: true });
     },
   };
 }
@@ -93,6 +108,7 @@ async function readErrorBody(response: Response, signal?: AbortSignal | null, ob
     const rejected = typeof param === 'string' && param.length <= 32 ? /^input\[(\d{1,6})\]\.status$/.exec(param) : null;
     if (rejected) observeIndex?.(Number(rejected[1]));
     const { codes } = providerErrorFacts(body, false);
+    if (rejectionHasOutput(body)) codes.push('PROVIDER_OUTPUT_UNCERTAIN');
     let detail: object = {};
     for (const code of codes.reverse()) detail = { code, cause: detail };
     return detail;
@@ -107,7 +123,7 @@ async function readErrorBody(response: Response, signal?: AbortSignal | null, ob
 /** Observe protocol error envelopes before the SDK flattens them. One reader,
  * unchanged bytes/backpressure, no tee or prefetch. The SDK still owns parsing
  * model output and terminal/cancellation behavior. Oversized frames are unknown. */
-function observeStreamErrors(response: Response, protocol: 'openai-responses' | 'openai-completions', observe: (error: object) => void): Response {
+function observeStreamErrors(response: Response, protocol: 'openai-responses' | 'openai-completions', observe: (error: object) => void, observeReadFailure: (error: unknown) => void): Response {
   const limit = 16 * 1024;
   const reader = response.body!.getReader();
   const frame = new Uint8Array(limit);
@@ -133,7 +149,8 @@ function observeStreamErrors(response: Response, protocol: 'openai-responses' | 
       } else if (protocol === 'openai-completions') error = record.error;
       if (error && typeof error === 'object' && !Array.isArray(error)) {
         terminal = true;
-        observe(error);
+        observe(rejectionHasOutput(record)
+          ? { code: 'PROVIDER_OUTPUT_UNCERTAIN', error } : error);
       }
     } catch { /* Invalid or incomplete protocol envelopes provide no facts. */ }
   };
@@ -160,7 +177,7 @@ function observeStreamErrors(response: Response, protocol: 'openai-responses' | 
   const body = new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
-        const part = await reader.read();
+        const part = await reader.read().catch(error => { observeReadFailure(error); throw error; });
         if (part.done) { controller.close(); reader.releaseLock(); return; }
         inspect(part.value);
         controller.enqueue(part.value);
@@ -182,6 +199,7 @@ function serializedSdkFacts(message?: string): { status?: number; codes: string[
   try {
     const body: unknown = JSON.parse(prefix ? prefix[2] : text);
     const facts = providerErrorFacts(body, false);
+    if (rejectionHasOutput(body)) facts.codes.push('PROVIDER_OUTPUT_UNCERTAIN');
     return { ...facts, status: prefix ? Number(prefix[1]) : facts.status };
   } catch { return { codes: [] }; }
 }

@@ -148,6 +148,10 @@ export type AgentRunTermination = {
     | "discovery_stall"
     | "tool_loop_limit"
     | "repetitive_tool_calls";
+  /** The tools-off handoff could not be completed; the host owns its notice. */
+  summaryIncomplete?: boolean;
+  /** Configured tool-round cap, not the count of proposed/blocked rounds. */
+  toolRoundLimit?: number;
 } | {
   status: "waiting_input";
   reason: "user_action_required";
@@ -241,6 +245,8 @@ export type AgentRunEvent =
       isError?: boolean;
       errorCode?: string;
       errorSeverity?: "recoverable" | "error";
+      /** Cancellation is a lifecycle fact, not an execution exception. */
+      executionCancelled?: boolean;
       durationMs?: number;
       execution?: CommandExecutionObservation;
       fileReadBatch?: ToolObservations["fileReadBatch"];
@@ -296,8 +302,20 @@ export type AgentRunEvent =
   | { type: "images_omitted"; count: number; providerId: string }
   | {
       type: "provider_fallback";
-      reason: "auth" | "no_first_event_timeout" | "server_model_fallback";
+      reason:
+        | "auth"
+        | "balance"
+        | "permission"
+        | "rate_limit"
+        | "unavailable"
+        | "no_first_event_timeout"
+        | "server_model_fallback";
       providerId: string;
+      /** Provider of the candidate the run moves to, when known. */
+      toProviderId?: string;
+      /** The credential was skipped before this run tried it (still cooling
+       *  down, or not usable); nothing failed in this run. */
+      skipped?: boolean;
       candidateIndex?: number;
       candidateCount?: number;
       fromModel?: string;

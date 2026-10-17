@@ -19,6 +19,8 @@ import {
   modelInputFromConfiguredCapabilities,
   modelInputImageLimit,
   resolveConfiguredPiModel,
+  isSelectableModel,
+  resolveModelUpgrade,
   pickLatestGenerations,
 } from '../../../src/main/model/provider_catalog';
 
@@ -132,8 +134,44 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(ids).toEqual(['kimi-k3', 'kimi-k2.7-code']);
   });
 
-  it('kimi-coding catalog exposes only K3 and K2.7', () => {
-    expect((CURATED_MODELS['kimi-coding'] || []).map((m) => m.id)).toEqual(['k3', 'k2p7']);
+  it('offers two recent Kimi Coding generations with native SDK metadata and retains legacy identity', () => {
+    const rows = CURATED_MODELS['kimi-coding'] || [];
+    expect(rows.filter(m => !('hiddenFromPicker' in m && m.hiddenFromPicker)).map(m => m.id))
+      .toEqual(['k3', 'k3-256k', 'kimi-for-coding']);
+    expect(rows.find(m => m.id === 'k2p7')).toMatchObject({ hiddenFromPicker: true });
+    for (const row of rows.filter(m => m.id !== 'k2p7')) {
+      const resolved = resolveConfiguredPiModel({ getPiModel: getBuiltinModel as any }, 'kimi-coding', row.id);
+      expect(resolved).toMatchObject({ templateModelId: row.id, isConfiguredFallback: false,
+        model: { id: row.id, api: 'anthropic-messages', compat: { forceAdaptiveThinking: true } } });
+    }
+    expect(isSelectableModel('kimi-coding', 'k2p7')).toBe(true);
+    expect(resolveModelUpgrade('kimi-coding', 'k2p7')).toMatchObject({ modelId: 'k2p7', upgraded: false });
+  });
+
+  it('resolves kimi-coding K3 as a native pi-ai model', async () => {
+    const { getBuiltinModel } = await import('@earendil-works/pi-ai/providers/all');
+    const catalog = {
+      getPiModel(provider: string, modelId: string) {
+        return (getBuiltinModel as (p: string, m: string) => any)(provider, modelId);
+      },
+    };
+    const resolved = resolveConfiguredPiModel(catalog, 'kimi-coding', 'k3');
+    expect(resolved).toMatchObject({
+      requestedModelId: 'k3',
+      templateModelId: 'k3',
+      isConfiguredFallback: false,
+      needsCustomModel: true,
+      model: {
+        api: 'anthropic-messages',
+        reasoning: true,
+        contextWindow: 1_000_000,
+        maxTokens: 131_072,
+        compat: {
+          allowEmptySignature: true,
+          forceAdaptiveThinking: true,
+        },
+      },
+    });
   });
 
   it('minimax catalog exposes M3 before the M2.7 generation', () => {
@@ -150,7 +188,84 @@ describe('provider_catalog › CURATED_MODELS', () => {
     expect(portalIds).toEqual(directIds);
   });
 
-  it('exposes GPT-6 and the current GPT-5.6 family for OpenAI and OpenAI Codex', () => {
+  it('exposes GLM 5.3 and 5.2 as native runnable Z.AI models', () => {
+    const ids = (CURATED_MODELS.zai || []).map((m) => m.id);
+    expect(ids).toEqual([
+      'glm-5.3',
+      'glm-5.2',
+    ]);
+
+    const catalog = {
+      getPiModel(provider: string, modelId: string) {
+        return (getBuiltinModel as (p: string, m: string) => any)(provider, modelId);
+      },
+    };
+    for (const modelId of ids) {
+      expect(resolveConfiguredPiModel(catalog, 'zai', modelId), modelId).toMatchObject({
+        requestedModelId: modelId,
+        templateModelId: modelId,
+        isConfiguredFallback: false,
+        needsCustomModel: false,
+        model: {
+          id: modelId,
+          provider: 'zai',
+          api: 'openai-completions',
+          contextWindow: 1_000_000,
+          maxTokens: 131_072,
+          reasoning: true,
+          input: ['text'],
+        },
+      });
+    }
+  });
+
+  it.each([
+    ['anthropic', 'claude-haiku-5-5'],
+    ['openrouter', 'anthropic/claude-haiku-5.5'],
+  ])('offers %s Haiku 5.5 with native adaptive thinking and accurate capacity', (provider, modelId) => {
+    expect(isSelectableModel(provider, modelId)).toBe(true);
+    const resolved = resolveConfiguredPiModel({ getPiModel: getBuiltinModel as any }, provider, modelId);
+    expect(resolved).toMatchObject({
+      isConfiguredFallback: false,
+      templateModelId: modelId,
+      model: {
+        id: modelId,
+        api: 'anthropic-messages',
+        reasoning: true,
+        input: ['text', 'image'],
+        contextWindow: 1_000_000,
+        maxTokens: 128_000,
+        compat: { forceAdaptiveThinking: true, supportsTemperature: false },
+        thinkingLevelMap: { low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
+        cost: { input: 0.1, output: 0.5, tiers: [{ inputTokensAbove: 100000, input: 0.5, output: 2.5 }] },
+      },
+    });
+    expect(modelInputImageLimit(provider, modelId, resolved?.model)).toBe(20);
+    expect(resolveModelUpgrade(provider, modelId).upgraded).toBe(false);
+  });
+
+  it('natively resolves every curated Claude and Gemini model', () => {
+    for (const provider of ['anthropic', 'google']) {
+      const modelIds = CURATED_MODELS[provider].map((model) => model.id);
+      expect(modelIds.length).toBeGreaterThan(0);
+      for (const modelId of modelIds) {
+        const resolved = resolveConfiguredPiModel({ getPiModel: getBuiltinModel as any }, provider, modelId);
+        expect(resolved).toMatchObject({
+          requestedModelId: modelId,
+          templateModelId: modelId,
+          isConfiguredFallback: false,
+          model: {
+            id: modelId,
+            provider,
+            api: provider === 'anthropic' ? 'anthropic-messages' : 'google-generative-ai',
+            input: ['text', 'image'],
+          },
+        });
+      }
+    }
+  });
+
+  it('natively resolves GPT-6 tiers and every retained GPT-5.6 tier', () => {
     const expected = ['gpt-6-astra', 'gpt-6.1-sol', 'gpt-6-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna'];
     expect((CURATED_MODELS.openai || []).map((m) => m.id)).toEqual(expected);
     expect((CURATED_MODELS['openai-codex'] || []).map((m) => m.id)).toEqual(expected);
@@ -179,6 +294,7 @@ describe('provider_catalog › CURATED_MODELS', () => {
       'anthropic/claude-fable-5',
       'anthropic/claude-sonnet-5.5',
       'anthropic/claude-sonnet-5',
+      'anthropic/claude-haiku-5.5',
     ]);
   });
 

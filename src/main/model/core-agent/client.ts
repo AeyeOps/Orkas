@@ -21,6 +21,7 @@ import { terminalOutputSnapshot, type TerminalOutput } from '../../util/terminal
  *   - Returned event shapes + final reply accumulation
  */
 
+import { notifyAgentRunFinished, notifyAgentRunStarted } from './run-hooks';
 import { getAgentIdleClock } from '../../util/system-activity';
 import {
   sessionLock, globalSlots, acquireWithAbort,
@@ -1075,8 +1076,10 @@ export function recordModelRawEventForLog(stats: ModelRunLogDiagnostics, ev: unk
       break;
     }
     case 'provider_fallback': {
-      stats.providerFallbackCount += 1;
-      if (e.reason === 'auth') stats.providerFallbackAuthCount += 1;
+      // A credential skipped at run start is a notice, not a fallback that
+      // happened in this run.
+      if (!e.skipped) stats.providerFallbackCount += 1;
+      if (e.reason === 'auth' && !e.skipped) stats.providerFallbackAuthCount += 1;
       if (e.reason === 'no_first_event_timeout') stats.providerFallbackTimeoutCount += 1;
       stats.providerCandidateCount = Math.max(
         stats.providerCandidateCount,
@@ -1592,6 +1595,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     onArtifactCreated,
     onCustomConnectorAdded,
     onAutoTaskSaved,
+    onTodoTaskSaved,
+    onAutoTaskDeleted,
+    onTodoTaskDeleted,
     onSkillAdvertised,
     onSkillInvoked,
     cacheRetention,
@@ -1856,6 +1862,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
     // closure can simply read the outer `let` variable.
     const buildStartedAt = Date.now();
     runnerBuildStarted = true;
+    notifyAgentRunStarted();
     log.info('model turn build start', turnLogContext);
     const built = await buildRunner({
       sessionId,
@@ -1901,6 +1908,9 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       ...(onArtifactCreated ? { onArtifactCreated } : {}),
       ...(onCustomConnectorAdded ? { onCustomConnectorAdded } : {}),
       ...(onAutoTaskSaved ? { onAutoTaskSaved } : {}),
+      ...(onTodoTaskSaved ? { onTodoTaskSaved } : {}),
+      ...(onAutoTaskDeleted ? { onAutoTaskDeleted } : {}),
+      ...(onTodoTaskDeleted ? { onTodoTaskDeleted } : {}),
       ...(onSkillAdvertised ? { onSkillAdvertised } : {}),
       ...(onSkillInvoked ? { onSkillInvoked } : {}),
       onNativeSearchInjected: (info) => {
@@ -2278,6 +2288,7 @@ export async function* streamChatWithModel(opts: ChatOptions): AsyncGenerator<St
       yield errorEvent;
     }
   } finally {
+    if (runnerBuildStarted) notifyAgentRunFinished();
     removeActiveSessionAbort(userId, sessionId, activeAbortEntry);
     if (idleTimer) clearTimeout(idleTimer);
     if (wallTimer) clearTimeout(wallTimer);

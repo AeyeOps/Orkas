@@ -21,7 +21,8 @@ import {
 } from '../../util/project-layout';
 import { readJsonl, rewriteJsonlLine, nowIso, safeId } from '../../storage';
 import { createLogger } from '../../logger';
-import { t } from '../../i18n';
+import { buildHostTurnLanguageDirective, t } from '../../i18n';
+import { resolveLanguageForUser } from '../config';
 import { logErrorRef, logErrorSummary, maskId } from '../../util/log-redact';
 import { fileEditLock } from '../../util/locks';
 
@@ -136,9 +137,6 @@ export interface SendInput {
   /** Host-owned delivery decision for the explicit queue "Send now" action.
    * Analytics attribution must never imply this execution control. */
   steerActiveTurn?: boolean;
-  /** Cross-group ordering for a multi-mention send (D9 serial default).
-   * Renderer composer toggle; absent = serial. See EnqueueParams. */
-  multi_dispatch?: 'serial' | 'parallel';
   /** Renderer-generated id for the optimistic user bubble, echoed back on the
    * persisted record so the renderer can claim that exact bubble instead of
    * guessing by sender+timestamp+text. Two sends can legitimately share those
@@ -282,7 +280,7 @@ export async function send(
 ): Promise<{ ok: boolean; msg?: GroupMessage; error?: string }> {
   const {
     userId, cid, text, title_text, model_text, attachments, use_selections, references,
-    steerActiveTurn, multi_dispatch, commander_mention_display,
+    steerActiveTurn, commander_mention_display,
     client_msg_id,
   } = input;
   if (!safeId(cid)) return { ok: false, error: 'invalid cid' };
@@ -290,24 +288,6 @@ export async function send(
   const hasTitleText = typeof title_text === 'string';
   const titleText = hasTitleText ? title_text.trim() : '';
   await seedReservedActors(userId, cid);
-  // Auto-title: the first real user message in a fresh / unnamed
-  // conversation overwrites the placeholder title so the sidebar item
-  // becomes scannable. Lazy-imported to avoid a chats↔group_chat circular.
-  try {
-    const chats = await import('../chats');
-    const conv = await chats.getConversation(userId, cid);
-    const titleSeed = hasTitleText ? titleText : text;
-    if (titleSeed && conv && !conv.title_manually_set && isPlaceholderTitle(conv.title)) {
-      await chats.updateConversation(
-        userId,
-        cid,
-        { title: chats.autoTitle(titleSeed) },
-        conv.project_id || null,
-      );
-    }
-  } catch (err) {
-    log.warn(`auto-title failed user=${userId} cid=${cid}: ${(err as Error).message}`);
-  }
   try {
     const resolvedReferences = await _resolveMessageReferences(userId, references);
     const msg = await enqueue({
@@ -317,9 +297,6 @@ export async function send(
       ...(commander_mention_display === 'preserve' || commander_mention_display === 'hide_generated_prefix'
         ? { commander_mention_display } : {}),
       ...(steerActiveTurn === true ? { steerActiveTurn: true } : {}),
-      ...(multi_dispatch === 'parallel' || multi_dispatch === 'serial'
-        ? { multiDispatch: multi_dispatch }
-        : {}),
       ...(typeof client_msg_id === 'string' && client_msg_id.trim()
         ? { client_msg_id: client_msg_id.trim() }
         : {}),
@@ -329,8 +306,27 @@ export async function send(
       ...(resolvedReferences.length ? { references: resolvedReferences } : {}),
       ...(steerActiveTurn === true ? { steerActiveTurn: true } : {}),
     });
+    // Auto-title: the first real user message in a fresh / unnamed
+    // conversation overwrites the placeholder title so the sidebar item
+    // becomes scannable. Lazy-imported to avoid a chats↔group_chat circular.
+    try {
+      const chats = await import('../chats');
+      const conv = await chats.getConversation(userId, cid);
+      const titleSeed = hasTitleText ? titleText : text;
+      if (titleSeed && conv && !conv.title_manually_set && isPlaceholderTitle(conv.title)) {
+        const updated = await chats.updateConversation(
+          userId,
+          cid,
+          { title: chats.autoTitle(titleSeed) },
+          conv.project_id || null,
+        );
+      }
+    } catch (err) {
+      log.warn(`auto-title failed user=${userId} cid=${cid}: ${(err as Error).message}`);
+    }
     return { ok: true, msg };
   } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'E_EMPTY_MESSAGE') return { ok: false, error: 'empty message' };
     log.error(`send failed user=${userId} cid=${cid}: ${(err as Error).message}`);
     return { ok: false, error: (err as Error).message };
   }
@@ -680,6 +676,7 @@ export async function resolveFailedTurnRetry(
               '</recovery-evidence>',
               'Original user request (quoted for objective continuity):',
               JSON.stringify(originalModelText),
+              buildHostTurnLanguageDirective(resolveLanguageForUser(userId), true),
             ].join('\n\n')
           : originalModelText,
         forceTo: [actor.id],
@@ -1549,7 +1546,19 @@ export async function deleteMessages(
   if (!existing.size) return { ok: false, deleted: [], error: 'messages not found' };
 
   const deletedAt = nowIso();
-  await _tombstoneMessagesInFile(mainFile, existing, deletedAt);
+  const tombstoned = await _tombstoneMessagesInFile(mainFile, existing, deletedAt);
+  if (tombstoned > 0) {
+    // Remove the deleted text from global search. The rebuild runs on the
+    // serialized index writer; searches drain that queue before querying.
+    try {
+      const search = await import('../search');
+      void search.reindexChatConversation(userId, cid).catch((err) => {
+        log.warn('message delete search reindex failed', { error: logErrorSummary(err) });
+      });
+    } catch (err) {
+      log.warn('message delete search reindex unavailable', { error: logErrorSummary(err) });
+    }
+  }
 
   try {
     const members = await readMembers(userId, cid);

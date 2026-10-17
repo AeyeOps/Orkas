@@ -1,3 +1,4 @@
+import { defaultNumericRange } from '../../../../bin/tool-input-compat.cjs';
 /** Bounded file pages for run-bound Skill resources and retained connector output. */
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -12,7 +13,7 @@ export function bridgeResourceRealpath(file: string): string {
 
 export function readBridgeFilePage(file: string, input: Record<string, unknown>) {
   const offset = input.offset === undefined ? 0 : input.offset;
-  const limit = input.limit === undefined ? BRIDGE_FILE_PAGE_BYTES : input.limit;
+  const limit = input.limit === undefined ? BRIDGE_FILE_PAGE_BYTES : defaultNumericRange(input.limit, BRIDGE_FILE_PAGE_BYTES, 4, BRIDGE_FILE_PAGE_BYTES);
   const encoding = input.encoding === undefined ? 'utf8' : input.encoding;
   if (!Number.isSafeInteger(offset) || (offset as number) < 0) throw new Error('offset must be a non-negative safe integer');
   if (!Number.isSafeInteger(limit) || (limit as number) < 4 || (limit as number) > BRIDGE_FILE_PAGE_BYTES) {

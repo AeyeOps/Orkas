@@ -2,7 +2,7 @@
  * This is a bounded admission check, not a shell interpreter or an OS sandbox.
  * Opaque execution retains conservative matching; host approval stays separate.
  */
-import { tokenize } from "./shell-words.js";
+import { tokenize, literalPosixTokens } from "./shell-words.js";
 
 const DEFAULT_BLOCKED_COMMANDS = [
   "rm -rf /",
@@ -24,7 +24,7 @@ const REDIRECTS = new Set([">", ">>", "2>", "<"]);
 const SEPARATORS = new Set([";", "&&", "||", "&", "|", "|&"]);
 // These commands can reinterpret operands as commands or scripts. Do not infer
 // literal-data safety from the outer command position in these forms.
-const OPAQUE = /^(?:!|su|sudo|doas|ssh|busybox|env|command|builtin|exec|nohup|time|nice|ionice|stdbuf|setsid|xargs|find|eval|source|\.|sh|bash|dash|ksh|zsh|fish|csh|tcsh|cmd|powershell|pwsh|python[0-9.]*|py|node|ruby|perl|php|awk|gawk|if|then|else|elif|while|until|do|for|function)$/;
+const OPAQUE = /^(?:!|su|sudo|doas|ssh|busybox|env|command|builtin|exec|nohup|time|nice|ionice|stdbuf|setsid|xargs|find|eval|alias|trap|source|\.|sh|bash|dash|ksh|zsh|fish|csh|tcsh|cmd|powershell|pwsh|python[0-9.]*|py|node|ruby|perl|php|awk|gawk|if|then|else|elif|while|until|do|for|function)$/;
 
 function name(word: string): string {
   return (word.split(/[\\/]/).pop() || word).toLowerCase().replace(/\.exe$/, "");
@@ -45,14 +45,15 @@ function matchStage(words: string[]): string | null {
   return null;
 }
 
-export function blockedCommand(command: string, custom: readonly string[] = []): string | null {
+export function blockedCommand(command: string, custom: readonly string[] = [], posixLiterals = false): string | null {
   const normalized = command.trim().toLowerCase();
   // User-configured patterns retain their existing substring semantics.
   const customMatch = custom.find(pattern => normalized.includes(pattern.toLowerCase()));
   if (customMatch !== undefined) return customMatch;
 
-  const tokens = tokenize(command);
-  let opaque = /[$`{}#]/.test(command);
+  const literalTokens = posixLiterals ? literalPosixTokens(command) : null;
+  const tokens = literalTokens ?? tokenize(command);
+  let opaque = posixLiterals ? literalTokens === null : /[$`{}#]/.test(command);
   let words: string[] = [];
   let redirect: string | null = null;
   let blocked: string | null = null;

@@ -215,3 +215,12 @@ export function buildLanguageDirectiveText(languageName: string): string {
     '`description_zh` is always Chinese and `description_en` is always English; examples show shape only, not output language.',
   ].join('\n');
 }
+
+/** On-demand language contract for app-generated tasks and internal continuations. */
+export function buildHostTurnLanguageDirectiveText(languageName: string, continuation: boolean): string {
+  const choice = continuation
+    ? 'Preserve the response language established by the original user request, including explicit language requirements. '
+      + `If no response language was established, use ${languageName} (the current application UI language).`
+    : `Respond in ${languageName} (the current application UI language), unless the original user request explicitly specifies another response language.`;
+  return choice + ' The language of these application-generated instructions is not a user language choice.';
+}

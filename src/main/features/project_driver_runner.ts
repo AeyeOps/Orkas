@@ -18,7 +18,8 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
-import { t as translate } from '../i18n';
+import { buildHostTurnLanguageDirective, t as translate } from '../i18n';
+import { resolveLanguageForUser } from './config';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { projectTaskAttachmentsDir, userTaskAttachmentsDir } from '../paths';
@@ -31,6 +32,7 @@ import * as projects from './projects';
 import * as agents from './agents';
 import * as projectTasks from './project_tasks';
 import type { ProjectTask } from './project_tasks';
+import { isCommanderTaskOwner } from './project_task_record';
 import * as driver from './project_driver';
 
 const log = createLogger('project-driver-runner');
@@ -47,11 +49,16 @@ const _dispatchingTasks = new Set<string>();
 
 async function _selectTaskOwner(uid: string, pid: string, task: ProjectTask, cid: string): Promise<boolean> {
   const ownerName = String(task.owner_agent || '').trim();
-  if (!task.owner_agent_id && !ownerName) return true;
-  if (getActiveUserId() !== uid) return false;
   try {
+    if (!task.owner_agent_id && !ownerName) return true;
+    if (getActiveUserId() !== uid) return false;
+    if (isCommanderTaskOwner(task)) {
+      if (getActiveUserId() !== uid) return false;
+      return (await groupChat.setFloor(uid, cid, 'commander')).ok;
+    }
     const bindings = pid ? await projects.getBindings(uid, pid) : null;
-    const candidates = (await agents.listAgentSummaries()).filter((a) => (
+    const summaries = await agents.listAgentSummaries();
+    const candidates = summaries.filter((a) => (
       a.enabled !== false
       && (!bindings || bindings.agents.includes(a.agent_id))
       && (task.owner_agent_id ? a.agent_id === task.owner_agent_id : !!pid && a.name === ownerName)
@@ -193,6 +200,7 @@ function _copyTaskAttachments(uid: string, pid: string, task: ProjectTask, cid: 
  *  roll back the empty conversation on send failure). Returns the new cid so the
  *  caller can lease it; ok:false on any failure. */
 export async function advance(uid: string, pid: string, task: ProjectTask): Promise<{ ok: boolean; cid?: string; conversation?: unknown }> {
+  if (!driver.runsOnCurrentDevice(await driver.readConfig(uid, pid))) return { ok: false };
   const dispatchKey = `${uid}\u0000${pid}\u0000${task.id}`;
   const ownsDispatch = !_dispatchingTasks.has(dispatchKey);
   if (ownsDispatch) _dispatchingTasks.add(dispatchKey);
@@ -231,12 +239,19 @@ export async function advance(uid: string, pid: string, task: ProjectTask): Prom
     }
     const attachments = _copyTaskAttachments(uid, pid, task, cid);
     await _bindTaskBrowserWindow(uid, cid, task.id, 'advance');
+    // Owner selection and browser preparation yield. A synced disable or device
+    // change during those awaits must stop this unsent automatic run.
+    if (!driver.runsOnCurrentDevice(await driver.readConfig(uid, pid))) {
+      await _restoreUnsentStatus(uid, pid, task.id, task.status);
+      await rollback();
+      return { ok: false };
+    }
     const res = await groupChat.send({
       userId: uid,
       cid,
       text: task.content,
       title_text: task.content,
-      model_text: _advanceSeedText(task, pid),
+      model_text: _advanceSeedText(task, pid) + '\n\n' + buildHostTurnLanguageDirective(resolveLanguageForUser(uid)),
       ...(attachments.length ? { attachments } : {}),
     });
     if (!res.ok) {
@@ -297,32 +312,59 @@ function _runSeedText(task: ProjectTask, pid: string): string {
  *  The executor advances the status further via todo_tasks as work finishes. */
 export async function runTaskNow(
   uid: string, pid: string, tid: string,
-): Promise<{ ok: boolean; cid?: string; conversation?: unknown; error?: string }> {
+): Promise<{ ok: boolean; cid?: string; conversation?: unknown; error?: string; reused?: boolean }> {
   const task = await projectTasks.getTask(uid, pid, tid);
   if (!task) return { ok: false, error: 'task_not_found' };
   if (task.status !== 'todo' && task.status !== 'progress' && task.status !== 'review') {
     return { ok: false, error: 'not_runnable' };
   }
 
+  // A to-do that already belongs to a conversation (saved from it, or run
+  // before) runs there, so the work continues with that conversation's plan and
+  // history instead of starting a fresh thread. A conversation that no longer
+  // exists falls back to a new one. A conversation that is still working is
+  // not interrupted: the caller takes the user there instead.
+  const originCid = typeof task.origin_cid === 'string' ? task.origin_cid.trim() : '';
+  let origin: unknown = null;
+  if (originCid) {
+    try { origin = await chats.getConversation(uid, originCid); }
+    catch (err) {
+      origin = null;
+      log.warn(`runTaskNow origin lookup failed uid=${maskId(uid)} pid=${maskId(pid)} tid=${maskId(tid)}`, { error: logErrorSummary(err) });
+    }
+  }
+  if (origin && !busIsQuiescent(uid, originCid)) {
+    return { ok: false, error: 'conversation_busy', cid: originCid, conversation: origin, reused: true };
+  }
+  const reused = !!origin;
+
   const dispatchKey = `${uid}\u0000${pid}\u0000${tid}`;
   const ownsDispatch = !_dispatchingTasks.has(dispatchKey);
   if (ownsDispatch) _dispatchingTasks.add(dispatchKey);
   let cid = '';
   let conversation: unknown;
-  try {
-    const conv = await chats.createConversation(uid, {
-      kind: 'normal',
-      title: task.content,
-      ...(pid ? { projectId: pid } : {}),
-    });
-    cid = conv.conversation_id;
-    conversation = conv;
-  } catch (err) {
-    if (ownsDispatch) _dispatchingTasks.delete(dispatchKey);
-    log.error('runTaskNow conv-create failed', { uid: maskId(uid), pid: maskId(pid), error: logErrorSummary(err) });
-    return { ok: false, error: 'create_failed' };
+  if (reused) {
+    cid = originCid;
+    conversation = origin;
+  } else {
+    try {
+      const conv = await chats.createConversation(uid, {
+        kind: 'normal',
+        title: task.content,
+        ...(pid ? { projectId: pid } : {}),
+      });
+      cid = conv.conversation_id;
+      conversation = conv;
+    } catch (err) {
+      if (ownsDispatch) _dispatchingTasks.delete(dispatchKey);
+      log.error('runTaskNow conv-create failed', { error: logErrorSummary(err) });
+      return { ok: false, error: 'create_failed' };
+    }
   }
+  // Only a conversation created for this run is removed on failure; the user's
+  // original conversation is never deleted.
   const rollback = async (): Promise<void> => {
+    if (reused) return;
     try { await chats.deleteConversation(uid, cid, pid || null); }
     catch (e) { log.warn('runTaskNow rollback failed', { uid: maskId(uid), pid: maskId(pid), cid: maskId(cid), error: logErrorSummary(e) }); }
   };
@@ -349,7 +391,7 @@ export async function runTaskNow(
       cid,
       text: task.content,
       title_text: task.content,
-      model_text: _runSeedText(task, pid),
+      model_text: _runSeedText(task, pid) + '\n\n' + buildHostTurnLanguageDirective(resolveLanguageForUser(uid)),
       ...(attachments.length ? { attachments } : {}),
     });
     if (!res.ok) {
@@ -367,8 +409,8 @@ export async function runTaskNow(
   } finally {
     _dispatchingTasks.delete(dispatchKey);
   }
-  log.info('ran task', { uid: maskId(uid), pid: maskId(pid), cid: maskId(cid), task: maskId(tid) });
-  return { ok: true, cid, conversation };
+  log.info(`ran task uid=${maskId(uid)} pid=${maskId(pid)} cid=${maskId(cid)} task=${maskId(tid)} reused=${reused}`);
+  return { ok: true, cid, conversation, reused };
 }
 
 // Advance notifications — index.ts wires these to a renderer broadcast so a
@@ -430,6 +472,7 @@ async function _advanceProjectIfDueLocked(
 ): Promise<driver.AdvanceReason | 'advanced'> {
   const cfg = await driver.readConfig(uid, pid);
   if (!cfg.enabled) return 'disabled'; // cheapest gate: skip before reading state/backlog
+  if (!driver.runsOnCurrentDevice(cfg)) return 'other_device';
   const state = await driver.readState(uid, pid);
   const tasks = await deps.listTasks(uid, pid);
   // The lease blocks the next advance only while its task is still pending. Once
@@ -448,6 +491,9 @@ async function _advanceProjectIfDueLocked(
   if (decision.advance) {
     // Read `task` before the await — TS resets the union narrowing across it.
     const task = decision.task;
+    const current = await driver.readConfig(uid, pid);
+    if (!current.enabled) return 'disabled';
+    if (!driver.runsOnCurrentDevice(current)) return 'other_device';
     const res = await deps.advance(uid, pid, task);
     await driver.writeState(uid, pid, res.ok && res.cid
       ? { ...nextState, lease_cid: res.cid, lease_at: new Date(now).toISOString(), lease_task_id: task.id }

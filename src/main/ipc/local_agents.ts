@@ -31,7 +31,9 @@ import {
   type LocalCliType,
   type LocalCliEntry,
 } from '../features/local_agents/registry.js';
+import { getCliUpgradeInfo, upgradeLocalCli } from '../features/local_agents/upgrade.js';
 import { getLocalCliRuntimeOptions } from '../features/local_agents/runtime_options.js';
+import { getLocalCliAccountUsage } from '../features/local_agents/account_usage.js';
 import * as agents from '../features/agents.js';
 import * as cliPermissions from '../features/local_agents/cli_permissions.js';
 import * as cliUserInput from '../features/local_agents/cli_user_input.js';
@@ -50,10 +52,8 @@ import { logErrorRef, logPathRef, maskId } from '../util/log-redact.js';
 
 const log = createLogger('ipc:local_agents');
 
-/** Inline-expand cap. The renderer's <pre> can render a few hundred KB
- *  without freezing, but past that the user wants an editor anyway. We
- *  cap reads here AND tell the renderer via `truncated: true` so it
- *  can suggest opening the file directly. */
+/** Each explicit disclosure reads at most 256 KiB; continuation byte cursors
+ * never split UTF-8 characters. Existing head-only callers remain compatible. */
 const READ_TOOL_RESULT_MAX_BYTES = 256 * 1024;
 const TOOL_RESULT_REF_RE = /^[A-Za-z0-9_-]{1,48}\.[a-f0-9]{16,64}$/i;
 
@@ -104,7 +104,42 @@ function maskUnsupported(entries: LocalCliEntry[]): LocalCliEntry[] {
   });
 }
 
+async function upgradeTarget(payload: { type?: unknown; agent_id?: unknown }): Promise<LocalCliType> {
+  if (payload.agent_id !== undefined) {
+    if (!agents.isValidAgentId(payload.agent_id)) throw new Error('invalid agent_id');
+    const agent = await agents.getAgent(String(payload.agent_id));
+    if (agent?.runtime?.kind !== 'cli' || !isLocalCliType(agent.runtime.cli)) throw new Error('invalid CLI Agent');
+    return agent.runtime.cli;
+  }
+  if (!isLocalCliType(payload.type)) throw new Error('invalid CLI type');
+  return payload.type;
+}
+
 export const invokeHandlers = {
+  'localAgents.accountUsage': async (
+    { agent_id, force = false }: { agent_id?: unknown; force?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
+    const agent = await agents.getAgent(String(agent_id));
+    if (!agent || agent.runtime?.kind !== 'cli' || !isLocalCliType(agent.runtime.cli)) {
+      throw new Error('agent is not backed by a supported CLI');
+    }
+    const cli = agent.runtime.cli;
+    const [entries, projectDir] = await Promise.all([
+      detectAll(), agents.getAgentCliProjectDirInfo(ctx.userId, agent.agent_id),
+    ]);
+    const entry = entries.find(candidate => candidate.type === cli);
+    if (!entry) throw new Error('CLI entry not found');
+    return { usage: await getLocalCliAccountUsage(ctx.userId, entry, projectDir?.effective_path || process.cwd(), {
+      force: force === true, customArgs: agent.runtime.custom_args || [],
+    }) };
+  },
+  'localAgents.upgradeInfo': async (payload: { type?: unknown; agent_id?: unknown }) =>
+    getCliUpgradeInfo(await upgradeTarget(payload)),
+  'localAgents.upgrade': async (payload: { type?: unknown; agent_id?: unknown }) =>
+    upgradeLocalCli(await upgradeTarget(payload)),
+
   /**
    * List all known CLI types. Default runs version validation and uses the
    * process-lifetime cache; pass `{ force: true }` to refresh it. The
@@ -154,7 +189,10 @@ export const invokeHandlers = {
     const entry = entries.find(candidate => candidate.type === cli);
     if (!entry) throw new Error('CLI entry not found');
     const cwd = projectDir?.effective_path || process.cwd();
-    const options = await getLocalCliRuntimeOptions(entry, cwd, { force: force === true });
+    const options = await getLocalCliRuntimeOptions(entry, cwd, {
+      force: force === true,
+      customArgs: agent.runtime.custom_args || [],
+    });
     const observedModel = agents.getAgentCliResolvedModelInfo(ctx.userId, agent.agent_id);
     return {
       options: {
@@ -344,8 +382,9 @@ export const invokeHandlers = {
   },
 
   'localAgents.readToolResult': async (
-    { path: legacyPath, ref }: { path?: unknown; ref?: unknown },
+    { path: legacyPath, ref, cursor = 0 }: { path?: unknown; ref?: unknown; cursor?: unknown },
   ) => {
+    if (!Number.isSafeInteger(cursor) || (cursor as number) < 0) return { ok: false as const, error: 'invalid result cursor' };
     const uid = (() => {
       try { return getActiveUserId(); }
       catch { return ''; }
@@ -404,20 +443,33 @@ export const invokeHandlers = {
       return { ok: false as const, error: 'path is outside tool-results scope' };
     }
     try {
-      const stat = fs.statSync(resolved);
-      if (!stat.isFile()) return { ok: false as const, error: 'not a regular file' };
-      const total = stat.size;
-      if (total <= READ_TOOL_RESULT_MAX_BYTES) {
-        const content = fs.readFileSync(resolved, 'utf8');
-        return { ok: true as const, content, truncated: false };
-      }
-      // Oversized — read head only. Buffer-level slice avoids loading
-      // the whole file into memory.
-      const fd = fs.openSync(resolved, 'r');
+      // A FIFO must not block main before descriptor-level type validation.
+      const fd = fs.openSync(resolved, fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
       try {
-        const buf = Buffer.alloc(READ_TOOL_RESULT_MAX_BYTES);
-        fs.readSync(fd, buf, 0, READ_TOOL_RESULT_MAX_BYTES, 0);
-        return { ok: true as const, content: buf.toString('utf8'), truncated: true };
+        const stat = fs.fstatSync(fd);
+        if (!stat.isFile()) return { ok: false as const, error: 'not a regular file' };
+        const position = cursor as number;
+        if (position > stat.size) return { ok: false as const, error: 'invalid result cursor' };
+        const buf = Buffer.alloc(Math.min(READ_TOOL_RESULT_MAX_BYTES, stat.size - position));
+        let read = 0;
+        while (read < buf.length) {
+          const count = fs.readSync(fd, buf, read, buf.length - read, position + read);
+          if (!count) throw new Error('Result page unavailable');
+          read += count;
+        }
+        if (read && (buf[0] & 0xc0) === 0x80) return { ok: false as const, error: 'invalid result cursor' };
+        if (position + read < stat.size) {
+          // Drop only an incomplete trailing character, then reread it whole.
+          let lead = read - 1;
+          while (lead >= 0 && (buf[lead] & 0xc0) === 0x80) lead--;
+          if (lead >= 0) {
+            const byte = buf[lead];
+            const length = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1;
+            if (read - lead < length) read = lead;
+          }
+        }
+        const next_cursor = position + read < stat.size ? position + read : null;
+        return { ok: true as const, content: buf.toString('utf8', 0, read), truncated: next_cursor !== null, next_cursor };
       } finally {
         fs.closeSync(fd);
       }

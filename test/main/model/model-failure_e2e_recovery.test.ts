@@ -49,17 +49,24 @@ describe('explicit model failures through the host runner and real SDK', () => {
       const first = await build();
       const events: any[] = [];
       for await (const event of first.runner.runStream({ message: 'inspect image', images: [{ data: 'cGl4ZWxz', mediaType: 'image/png' }] })) events.push(event);
-      expect(requests).toHaveLength(kind === 'rate-limit' ? 2 : 1);
       expect(JSON.stringify(requests[0])).toContain('image_url');
       expect(events.some(event => event.type === 'retry')).toBe(false);
-      if (kind === 'rate-limit') expect(events.at(-1)).toMatchObject({ type: 'done', result: { text: 'recovered' } });
-      else expect(events.at(-1)).toMatchObject({ type: 'done', result: { meta: { error: { statusCode: 400 } } } });
+      if (kind === 'unsupported-image') {
+        // The public provider policy retains a terminal rejected-image failure.
+        // A new user turn can omit rejected images without rewriting history.
+        expect(requests).toHaveLength(1);
+        expect(events.at(-1)).toMatchObject({ type: 'done' });
+        expect(events.at(-1).result.text).not.toBe('recovered');
+      } else {
+        expect(requests).toHaveLength(2);
+        expect(events.at(-1)).toMatchObject({ type: 'done', result: { text: 'recovered' } });
+        expect(JSON.stringify(requests[1])).toContain('image_url');
+      }
       const next = await build();
       const result = await next.runner.run({ message: 'inspect image', resumeActiveTurn: true });
       expect(result.text).toBe('recovered');
-      expect(requests).toHaveLength(kind === 'rate-limit' ? 3 : 2);
-      if (kind === 'unsupported-image') expect(JSON.stringify(requests[1])).not.toContain('image_url');
-      else expect(JSON.stringify(requests[1])).toContain('image_url');
+      expect(requests).toHaveLength(kind === 'unsupported-image' ? 2 : 3);
+      if (kind === 'unsupported-image') expect(JSON.stringify(requests.at(-1))).not.toContain('image_url');
       expect(history).toEqual(original);
       expect(JSON.stringify(next.failureTrackingScope.getMessages())).toContain('cGl4ZWxz');
     } finally { vi.unstubAllGlobals(); }

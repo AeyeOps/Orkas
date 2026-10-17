@@ -12,7 +12,9 @@ function isScopeName(value) {
 // Device-local reauthorization requests shared by official CLI providers.
 // Preserve the legacy filename/profile reader; empty scope lists require an
 // explicit reauthorize marker. Business calls never log in or replay themselves.
-const MAX_PENDING_SCOPES = 50;
+// The pinned full Feishu domain request contains more than 200 scopes. Keep
+// the existing byte bound as well as a count bound for provider failures.
+const MAX_PENDING_SCOPES = 256;
 const LARK_ACCESS_RECOVERIES = new Set(['check_bot_availability', 'check_app_permissions', 'check_resource_access']);
 const LARK_IDENTITIES = new Set(['user', 'bot', 'unknown']);
 const LARK_PERMISSION_SUBTYPES = new Set(['missing_scope', 'token_scope_insufficient', 'app_scope_not_applied', 'access_denied']);
@@ -31,6 +33,8 @@ function larkAccessIssues(pending) {
         continue;
       }
       const safe = { identity: issue.identity, recovery: issue.recovery,
+        ...(Array.isArray(issue.scopes) && issue.scopes.length <= MAX_PENDING_SCOPES
+          && issue.scopes.every(isScopeName) ? { scopes: issue.scopes } : {}),
         ...(Number.isSafeInteger(issue.code) ? { code: issue.code } : {}),
         ...(LARK_PERMISSION_SUBTYPES.has(issue.subtype) ? { subtype: issue.subtype } : {}) };
       issues.set(`${safe.identity}:${safe.recovery}`, safe);
@@ -53,21 +57,22 @@ function rememberLarkPermissionRequest(error, env, file, prior) {
   const value = { profile: env.ORKAS_LOCAL_CLI_PROFILE, reauthorize: true, revision: randomUUID(),
     scopes: [...new Set([...(prior?.scopes || []), ...(recovery === 'reauthorize' ? scopes : [])])].sort(),
     access_issues: larkAccessIssues(prior), unresolved_access: false };
+  if (prior?.missing_scope_overflow) value.missing_scope_overflow = true;
   if (recovery !== 'reauthorize') {
     value.access_issues = larkAccessIssues({ ...value, access_issues: [...value.access_issues, {
       identity, recovery, code: failure.code, subtype: failure.subtype,
+      ...(scopes.length ? { scopes: scopes.slice(0, MAX_PENDING_SCOPES) } : {}),
     }] });
   }
   if (value.scopes.length > MAX_PENDING_SCOPES) {
     value.scopes = [];
-    value.access_issues = larkAccessIssues({ ...value, access_issues: [...value.access_issues,
-      { identity: 'unknown', recovery: 'check_resource_access' }] });
+    value.missing_scope_overflow = true;
   }
   // Retain the legacy fields for old readers; new readers separate this advisory
   // from user consent. Do not clear either state from a business success.
   value.unresolved_access = value.access_issues.length > 0;
   if (writePermissionRequest(file, value) && error.provider_error) {
-    error.provider_error.recovery = value.scopes.length || recovery !== 'reauthorize'
+    error.provider_error.recovery = value.scopes.length || value.missing_scope_overflow || recovery !== 'reauthorize'
       ? recovery : 'check_resource_access';
   }
 }
@@ -85,6 +90,10 @@ function readPermissionRequest(env) {
     const value = JSON.parse(fs.readFileSync(file, 'utf8'));
     if (value.profile !== env.ORKAS_LOCAL_CLI_PROFILE || !Array.isArray(value.scopes)
         || (!value.scopes.length && value.reauthorize !== true) || value.scopes.length > MAX_PENDING_SCOPES
+        || (value.plan_missing !== undefined && typeof value.plan_missing !== 'boolean')
+        || (value.missing_scope_overflow !== undefined && typeof value.missing_scope_overflow !== 'boolean')
+        || (value.connector_level !== undefined && typeof value.connector_level !== 'boolean')
+        || (value.identity_denied !== undefined && typeof value.identity_denied !== 'boolean')
         || !value.scopes.every(isScopeName)
         || (value.pat_scopes !== undefined && (!Array.isArray(value.pat_scopes)
           || value.pat_scopes.length > MAX_PENDING_SCOPES || !value.pat_scopes.every(isScopeName)))) return null;
@@ -111,6 +120,9 @@ function rememberPermissionRequest(error, env) {
     unresolved_access: prior?.unresolved_access === true || (scopes.length === 0 && patScopes.length === 0) };
   if (patScopes.length || prior?.pat_scopes?.length) value.pat_scopes = [...new Set([...(prior?.pat_scopes || []), ...patScopes])].sort();
   if (failure?.admin_required || prior?.admin_required) value.admin_required = true;
+  if (failure?.connector_level || prior?.connector_level) value.connector_level = true;
+  if (failure?.identity_denied || prior?.identity_denied) value.identity_denied = true;
+  if (prior?.plan_missing) value.plan_missing = true;
   // A large provider scope list must not suppress the recovery entry. Use the
   // normal authorization flow when an explicit request exceeds this bound.
   if (value.scopes.length > MAX_PENDING_SCOPES) value.scopes = [];
@@ -124,7 +136,9 @@ function rememberPermissionRequest(error, env) {
 function writePermissionRequest(file, value) {
   const temp = `${file}.${process.pid}.tmp`;
   try {
-    fs.writeFileSync(temp, JSON.stringify(value), { mode: 0o600, flag: 'wx' });
+    const serialized = JSON.stringify(value);
+    if (Buffer.byteLength(serialized) > 16 * 1024) return false;
+    fs.writeFileSync(temp, serialized, { mode: 0o600, flag: 'wx' });
     fs.renameSync(temp, file);
     return true;
   } catch {
@@ -144,7 +158,7 @@ function recordUserScopeCheck(env, granted, expected, required) {
     let issues = larkAccessIssues(expected);
     if (scopes.length > MAX_PENDING_SCOPES) issues = larkAccessIssues({ scopes: [], unresolved_access: true,
       access_issues: [...issues, { identity: 'unknown', recovery: 'check_resource_access' }] });
-    if (!scopes.length && !issues.length) {
+    if (!scopes.length && !issues.length && !expected?.missing_scope_overflow) {
       clearPermissionRequest(env, expected);
       return;
     }
@@ -153,7 +167,8 @@ function recordUserScopeCheck(env, granted, expected, required) {
     if (!file || (JSON.stringify(expected?.scopes) === JSON.stringify(remaining)
       && JSON.stringify(expected?.access_issues) === JSON.stringify(issues))) return;
     writePermissionRequest(file, { profile: env.ORKAS_LOCAL_CLI_PROFILE, reauthorize: true,
-      revision: randomUUID(), scopes: remaining, access_issues: issues, unresolved_access: issues.length > 0 });
+      revision: randomUUID(), scopes: remaining, access_issues: issues, unresolved_access: issues.length > 0,
+      ...(scopes.length > MAX_PENDING_SCOPES || expected?.missing_scope_overflow ? { missing_scope_overflow: true } : {}) });
     return;
   }
   const unresolved = expected?.unresolved_access === true || (expected && !expected.scopes.length);
@@ -176,11 +191,64 @@ function clearPermissionRequest(env, expected) {
 function recordPatScopeGrant(env, expected, granted) {
   if (JSON.stringify(readPermissionRequest(env)) !== JSON.stringify(expected)) return;
   const remaining = (expected.pat_scopes || []).filter(scope => !granted.includes(scope));
-  if (!remaining.length && !expected.scopes.length && !expected.unresolved_access) {
+  if (!remaining.length && !expected.scopes.length && !expected.unresolved_access
+    && !expected.plan_missing && !expected.missing_scope_overflow) {
     clearPermissionRequest(env, expected);
   } else {
     writePermissionRequest(permissionRequestPath(env), { ...expected, pat_scopes: remaining, revision: randomUUID() });
   }
+}
+
+// The full-domain dry-run is an authoritative PAT check, never a grant or a
+// business action. It does not establish unrelated user OAuth/resource access.
+function recordDingtalkPermissionCheck(env, expected, plan, domains) {
+  if (JSON.stringify(readPermissionRequest(env)) !== JSON.stringify(expected)) return;
+  const value = { ...expected, profile: env.ORKAS_LOCAL_CLI_PROFILE, reauthorize: true,
+    scopes: expected?.scopes || [], revision: randomUUID() };
+  if (!plan.complete) {
+    value.plan_missing = true;
+    value.pat_scopes = [...new Set([...(expected?.pat_scopes || []), ...plan.missing])].sort();
+    if (value.pat_scopes.length > MAX_PENDING_SCOPES) value.pat_scopes = [];
+  } else {
+    delete value.plan_missing;
+    value.pat_scopes = (expected?.pat_scopes || []).filter(scope => !domains.includes(scope.split(/[.:]/)[0]));
+  }
+  if (!value.plan_missing && !value.scopes.length && !value.pat_scopes.length
+    && !value.unresolved_access && !value.admin_required) {
+    clearPermissionRequest(env, expected);
+    return;
+  }
+  const file = permissionRequestPath(env);
+  if (file) writePermissionRequest(file, value);
+}
+
+function recordLarkAppScopeCheck(env, expected, enabled, required = []) {
+  if (JSON.stringify(readPermissionRequest(env)) !== JSON.stringify(expected)) return;
+  const prior = larkAccessIssues(expected);
+  const known = prior.filter(issue => issue.identity === 'user' && issue.recovery === 'check_app_permissions')
+    .flatMap(issue => issue.scopes || []);
+  const missing = [...new Set([...required, ...known])].filter(scope => !enabled.includes(scope)).sort();
+  const issues = prior.filter(issue => !(issue.identity === 'user'
+    && issue.recovery === 'check_app_permissions' && issue.scopes?.length));
+  if (missing.length) issues.push({ identity: 'user', recovery: 'check_app_permissions',
+    ...(missing.length <= MAX_PENDING_SCOPES ? { scopes: missing } : {}) });
+  const value = { ...expected, profile: env.ORKAS_LOCAL_CLI_PROFILE, reauthorize: true,
+    scopes: expected?.scopes || [], access_issues: larkAccessIssues({ scopes: [], access_issues: issues }),
+    unresolved_access: issues.length > 0, revision: randomUUID() };
+  if (JSON.stringify(issues) === JSON.stringify(larkAccessIssues(expected))) return;
+  if (!value.scopes.length && !issues.length && !value.missing_scope_overflow) {
+    clearPermissionRequest(env, expected);
+  } else {
+    writePermissionRequest(permissionRequestPath(env), value);
+  }
+}
+
+function recordWecomIdentityCheck(env, expected) {
+  if (!expected?.identity_denied || JSON.stringify(readPermissionRequest(env)) !== JSON.stringify(expected)) return;
+  const value = { ...expected, revision: randomUUID() };
+  delete value.identity_denied;
+  // Keep unknown task-access evidence independent of the verified identity.
+  writePermissionRequest(permissionRequestPath(env), value);
 }
 
 
@@ -209,7 +277,7 @@ function structuredPermissionFailure(result, provider) {
       // The OAuth channel includes the affected identity; its code alone does
       // not establish that user consent can grant this permission.
       const identity = oauth ? (['user', 'bot', 'tenant'].includes(data?.identity) ? data.identity : undefined) : 'pat';
-      detail = { ...(identity ? { identity } : {}), missing_scopes: [...new Set(candidates.filter(isScopeName))],
+      detail = { connector_level: true, ...(identity ? { identity } : {}), missing_scopes: [...new Set(candidates.filter(isScopeName))],
         ...(payload.code === 'PAT_ORG_POLICY_DENIED' ? { admin_required: true } : {}) };
       break;
     }
@@ -233,4 +301,4 @@ function structuredPermissionFailure(result, provider) {
   }) : null;
 }
 
-module.exports = { isScopeName, readPermissionRequest, rememberPermissionRequest, clearPermissionRequest, recordUserScopeCheck, recordPatScopeGrant, structuredPermissionFailure, larkAccessIssues };
+module.exports = { isScopeName, readPermissionRequest, rememberPermissionRequest, clearPermissionRequest, recordUserScopeCheck, recordPatScopeGrant, recordDingtalkPermissionCheck, recordLarkAppScopeCheck, recordWecomIdentityCheck, structuredPermissionFailure, larkAccessIssues };

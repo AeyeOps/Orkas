@@ -8,6 +8,7 @@ import {
   buildSandboxedShellInvocation,
   buildSandboxEnv,
   decodeProcessOutput,
+  defaultShellForPlatform,
   killProcessTree,
 } from "../sandbox/executor.js";
 import {
@@ -298,7 +299,9 @@ function startProcessSession(command: string, ctx: ToolContext, maxLifetimeMs: u
     };
   }
   const env = buildSandboxEnv((ctx.state?.sandboxEnv ?? {}) as Record<string, string>);
-  const shell = process.env.SHELL || (process.platform === "win32" ? "powershell.exe" : "/bin/bash");
+  const shell = process.platform === "win32"
+    ? defaultShellForPlatform()
+    : (process.env.SHELL || "/bin/bash");
   const allowedDirs = Array.isArray(ctx.state?.sandboxAllowedDirs)
     ? ctx.state.sandboxAllowedDirs.filter(
       (value): value is string => typeof value === "string" && value.length > 0,
@@ -595,6 +598,7 @@ function inspectProcessRead(input: Record<string, unknown>, ctx: ToolContext, in
  * non-model callers, but only this tool is advertised by the builtin registry. */
 export const processSessionTool: AgentTool = defineTool({
   name: "process_session",
+  compatibilityInputFields: [...PROCESS_SESSION_ACTION_FIELDS.start],
   description:
     "Read, send input to, or stop a running shell session. Start commands with bash; use interactive_cli for user-entered secrets or OAuth.",
   inputSchema: {

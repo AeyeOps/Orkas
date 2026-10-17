@@ -159,6 +159,65 @@ describe("SandboxExecutor", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   }, 10000);
 
+  it.runIf(!IS_WINDOWS).each([false, true])("releases escaped-descendant pipes without losing captured output (spooled: %s)", async (spooled) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "sandbox-escaped-pipes-"));
+    const marker = path.join(dir, "owned-pid.json");
+    const pipes = () => process.getActiveResourcesInfo().filter((kind) => kind === "PipeWrap").length;
+    const baseline = pipes();
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let pid = 0;
+    let stop: (() => void) | undefined;
+    let output = "";
+    const stdout = `READY${"x".repeat(256)}`;
+    const stderr = "e".repeat(256);
+    const descendant = `require('fs').writeFileSync(${JSON.stringify(marker)},JSON.stringify({pid:process.pid}));process.stderr.write(${JSON.stringify(stderr)});process.stdout.write(${JSON.stringify(stdout)});setTimeout(()=>process.exit(0),20000)`;
+    const parent = `require('child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{detached:true,stdio:'inherit'});`;
+    try {
+      const result = await new SandboxExecutor({
+        workingDir: dir, timeoutMs: 15_000, maxOutputBytes: spooled ? 16 : 1024,
+        ...(spooled ? { outputSpoolDir: path.join(dir, "spool") } : {}),
+      })
+        .execute(nodeEvalCommand(parent), {
+          onStart(control) { stop = control.stop; },
+          onOutput(bytes) {
+            output += bytes.toString("utf8");
+            if (output.includes("READY")) stop?.();
+          },
+        });
+      pid = JSON.parse(await fs.readFile(marker, "utf8")).pid;
+      expect(result.aborted).toBe(true);
+      expect(result.stdout).toContain("READY");
+      expect(result).toMatchObject({ stdoutBytes: Buffer.byteLength(stdout), stderrBytes: Buffer.byteLength(stderr) });
+      if (spooled) {
+        await expect(fs.readFile(result.stdoutStreamedOutput!.path, "utf8")).resolves.toBe(stdout);
+        await expect(fs.readFile(result.stderrStreamedOutput!.path, "utf8")).resolves.toBe(stderr);
+        expect(result.stdoutStreamedOutput?.sourceTruncated).toBeUndefined();
+        expect(result.stderrStreamedOutput?.sourceTruncated).toBeUndefined();
+      } else {
+        expect(result.stdout).toBe(stdout);
+        expect(result.stderr).toBe(stderr);
+      }
+      // Group cleanup cannot certify an escaped process's exit. Keep that
+      // limitation visible while independently checking host handle release.
+      expect(() => process.kill(pid, 0)).not.toThrow();
+      await expect.poll(pipes, { timeout: 1_000 }).toBe(baseline);
+      expect(warning).toHaveBeenCalledExactlyOnceWith("[sandbox]", "Shell process cleanup was not confirmed", {
+        platform: process.platform, phase: "cleanup_deadline",
+        root_exit_observed: true, stdout_open: true, stderr_open: true,
+      });
+    } finally {
+      warning.mockRestore();
+      if (!pid) {
+        try { pid = JSON.parse(await fs.readFile(marker, "utf8")).pid; } catch { /* No child started. */ }
+      }
+      if (pid) {
+        try { process.kill(pid, "SIGKILL"); } catch { /* Already exited. */ }
+        await waitForProcessExit(pid);
+      }
+      await removeTree(dir);
+    }
+  }, 15_000);
+
   it("blocks dangerous commands", async () => {
     const sandbox = new SandboxExecutor({ workingDir: os.tmpdir() });
     const result = await sandbox.execute("rm -rf /");
@@ -370,7 +429,7 @@ describe("killProcessTree", () => {
 
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     try {
-      callbacks.get("exit")?.(1);
+      callbacks.get("close")?.(1);
       expect(child.kill).toHaveBeenCalledWith("SIGTERM");
       expect(warning).toHaveBeenCalledWith("[sandbox]", "Shell process tree termination failed", {
         platform: "win32", fallback: "direct_child_only",

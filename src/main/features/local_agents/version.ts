@@ -6,18 +6,17 @@
  * version command (defaulting to `<bin> --version`)
  * and extracts the first `[v]MAJOR.MINOR.PATCH` token from stdout/stderr.
  *
- * MIN_VERSIONS is intentionally narrow: only CLIs whose stream-json /
- * ACP shape changed in a known-incompatible way before some version are
- * gated here. Adding entries should be paired with a backend that
- * actually relies on the new shape.
+ * Every registered CLI has a floor tied to the adapter's verified protocol
+ * and mandatory dependencies. Optional parameters retain separate boundaries.
  */
 
 import { spawn } from 'node:child_process';
 import { killProcessTree } from './backends/base.js';
 import { buildCliSpawnEnv, resolveCliCommand } from './spawn-command.js';
+import type { LocalCliType } from './registry.js';
 
-/** Minimum CLI versions; absent entry = no minimum. */
-export const MIN_VERSIONS: Record<string, string> = {
+/** Oldest supported adapter contracts, not model-release dates. */
+export const MIN_VERSIONS: Readonly<Record<LocalCliType, string>> = {
   // claude --output-format stream-json + --print are stable from 2.x.
   claude: '2.0.0',
   // Orkas talks to Codex through the app-server JSON-RPC contract. Keep this
@@ -25,11 +24,21 @@ export const MIN_VERSIONS: Record<string, string> = {
   // catalog in Settings is a separate concern and must not determine CLI
   // compatibility.
   codex: '0.145.0',
-  // Approval-mode dispatch uses OpenCode's stdio ACP transport so native
-  // permission requests can be reviewed in Orkas. This is the oldest release
-  // line validated against that session/resume + permission contract.
+  // OpenCode's run --auto --format json transport, session continuation and
+  // per-run MCP configuration are validated from this release line.
   opencode: '1.18.0',
+  // The native configuration/MCP overlay is verified against 2026.4.11;
+  // see openclaw.ts and the zero-model canaries recorded in 92a3944ff.
+  openclaw: '2026.4.11',
+  // ACP protocolVersion=1 and sessionUpdate envelopes observed with Hermes
+  // 0.9 are the baseline used by _acp.ts, not a claim about earlier releases.
+  hermes: '0.9.0',
 };
+
+/** Anthropic's upstream CHANGELOG.md, 2.1.81: --bare was introduced for
+ * scripted print calls. Older supported versions must not receive it or run
+ * a non-bare catalog probe that could start user hooks/plugins. */
+export const CLAUDE_BARE_MIN_VERSION = '2.1.81';
 
 const VERSION_RE = /v?(\d+)\.(\d+)\.(\d+)/;
 const VERSION_TOKEN_RE = /v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?/;
@@ -56,19 +65,26 @@ export function compareSemver(a: Semver, b: Semver): number {
   return 0;
 }
 
+/** Unknown versions cannot establish support for an optional parameter. */
+export function cliVersionAtLeast(detected: string | null | undefined, minimum: string): boolean {
+  const got = detected ? parseSemver(detected) : null;
+  const min = parseSemver(minimum);
+  return !!got && !!min && (compareSemver(got, min) > 0
+    || (compareSemver(got, min) === 0 && !VERSION_TOKEN_RE.exec(detected || '')?.[4]));
+}
+
 /**
  * Returns null when `detected` meets the minimum for `cli`, or an
- * explanatory string otherwise. Unknown / unparsable inputs return
- * null (no minimum / nothing to gate against) — the goal is to refuse
- * obviously-old binaries, not to be a strict version policy engine.
+ * explanatory string otherwise. Unregistered CLIs have no contract here;
+ * registered CLIs must supply a recognized version before dispatch.
  */
 export function checkMinVersion(cli: string, detected: string | null): string | null {
-  const minRaw = MIN_VERSIONS[cli];
+  const minRaw = Object.prototype.hasOwnProperty.call(MIN_VERSIONS, cli)
+    ? MIN_VERSIONS[cli as LocalCliType] : undefined;
   if (!minRaw) return null;
-  if (!detected) return null;
   const min = parseSemver(minRaw);
-  const got = parseSemver(detected);
-  if (!min || !got) return null;
+  const got = detected ? parseSemver(detected) : null;
+  if (!min || !got) return `${cli} version could not be verified against required minimum ${minRaw}`;
   if (compareSemver(got, min) < 0) {
     return `${cli} ${detected} is below required minimum ${minRaw}`;
   }

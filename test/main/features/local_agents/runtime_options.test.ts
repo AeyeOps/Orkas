@@ -13,6 +13,7 @@ import {
   parseHermesDefaultModel,
   parseOpenCodeModels,
   getLocalCliRuntimeOptions,
+  getLocalCliSupportedFlags,
 } from '../../../../src/main/features/local_agents/runtime_options';
 import type { LocalCliEntry } from '../../../../src/main/features/local_agents/registry';
 
@@ -48,6 +49,25 @@ function entry(type: LocalCliEntry['type'], binPath: string): LocalCliEntry {
 }
 
 describe('local_agents/runtime_options discovery parsing', () => {
+  it('distinguishes the configured Codex default from the catalog recommendation', () => {
+    const catalog = { data: [
+      { id: 'gpt-recommended', isDefault: true },
+      { id: 'gpt-configured', isDefault: false },
+    ] };
+    const result = mapCodexModelList(catalog, { config: {
+      model: 'gpt-configured', model_reasoning_effort: 'high', secret: 'PRIVATE',
+    } });
+    expect(result.default_model).toBe('gpt-configured');
+    expect(result.default_thinking_level).toBe('high');
+    expect(result.models.filter(model => model.is_default).map(model => model.id)).toEqual(['gpt-configured']);
+    expect(JSON.stringify(result)).not.toContain('PRIVATE');
+    // Custom provider/default configuration is not erased just because it is
+    // absent from an account catalog. No new selectable catalog row is invented.
+    const custom = mapCodexModelList(catalog, { config: { model: 'custom/default' } });
+    expect(custom.default_model).toBe('custom/default');
+    expect(custom.models.some(model => model.is_default)).toBe(false);
+    expect(custom.models.map(model => model.id)).toEqual(['gpt-recommended', 'gpt-configured']);
+  });
   it('maps Codex defaults and model-specific effort levels', () => {
     const result = mapCodexModelList({
       data: [
@@ -258,6 +278,158 @@ describe('local_agents/runtime_options discovery parsing', () => {
 });
 
 describe('local_agents/runtime_options process boundary', () => {
+  it.each(['2.0.0', '2.1.80', '2.1.81'])('does not run user hooks to discover models on Claude %s without bare support', async version => {
+    const dir = makeTempDir();
+    const taskProof = path.join(dir, 'unwanted-start');
+    const fake = writeFakeCli(dir, `
+if (process.argv.includes('--help')) {
+  process.stdout.write('Options:\\n  --model <id>\\n');
+  process.exit(0);
+}
+require('node:fs').writeFileSync(${JSON.stringify(taskProof)}, 'hooks started');
+process.exit(2);
+`);
+    const options = await getLocalCliRuntimeOptions({ ...entry('claude', fake), version }, dir);
+    expect(options.models.map(model => model.id)).toEqual(['sonnet', 'opus', 'haiku']);
+    expect(options.can_select_thinking).toBe(false);
+    expect(fs.existsSync(taskProof)).toBe(false);
+  });
+
+  it('requires both the bare version boundary and advertised support for a safe catalog probe', async () => {
+    const dir = makeTempDir();
+    const proof = path.join(dir, 'catalog-start');
+    const fake = writeFakeCli(dir, `
+if (process.argv.includes('--help')) {
+  process.stdout.write('Options:\\n  --model <id>\\n  --bare\\n');
+  process.exit(0);
+}
+require('node:fs').writeFileSync(${JSON.stringify(proof)}, 'catalog started');
+process.exit(2);
+`);
+    await getLocalCliRuntimeOptions({ ...entry('claude', fake), version: '2.1.80' }, dir);
+    expect(fs.existsSync(proof)).toBe(false);
+    await getLocalCliRuntimeOptions({ ...entry('claude', fake), version: '2.1.81' }, dir);
+    expect(fs.existsSync(proof)).toBe(true);
+  });
+
+  it('shares help discovery and refreshes capabilities after a binary version change', async () => {
+    const dir = makeTempDir();
+    const counter = path.join(dir, 'help-count');
+    const fake = writeFakeCli(dir, `
+require('node:fs').appendFileSync(${JSON.stringify(counter)}, '1');
+process.stdout.write('Options:\\n  --model <id>\\n  --effort <level>\\n  --include-hook-events\\n');
+`);
+    const old = { ...entry('claude', fake), version: '2.1.72' };
+    const results = await Promise.all([
+      getLocalCliSupportedFlags(old, dir), getLocalCliSupportedFlags(old, dir),
+    ]);
+    expect(results).toEqual([
+      ['--model', '--effort', '--include-hook-events'],
+      ['--model', '--effort', '--include-hook-events'],
+    ]);
+    expect(fs.readFileSync(counter, 'utf8')).toBe('1');
+    // Downgrade in place: retaining the same path must not retain new flags.
+    writeFakeCli(dir, `require('node:fs').appendFileSync(${JSON.stringify(counter)}, '1'); process.stdout.write('Options:\\n  --model <id>\\n');`);
+    const downgraded = { ...old, version: '2.0.0' };
+    expect(await getLocalCliSupportedFlags(downgraded, dir)).toEqual(['--model']);
+    expect(fs.readFileSync(counter, 'utf8')).toBe('11');
+  });
+
+  // The flag set changes only with the binary: every dispatch used to spawn
+  // `--help` again once 30 s passed or the workspace changed, and one failed
+  // probe was replayed to every dispatch for 30 s.
+  it('keeps help discovery per binary across workspaces and time, and retries a failed probe', async () => {
+    const dir = makeTempDir();
+    const otherWorkspace = makeTempDir();
+    const counter = path.join(dir, 'help-count');
+    const failedOnce = path.join(dir, 'failed-once');
+    const fake = writeFakeCli(dir, `
+const fs = require('node:fs');
+fs.appendFileSync(${JSON.stringify(counter)}, '1');
+if (!fs.existsSync(${JSON.stringify(failedOnce)})) {
+  fs.writeFileSync(${JSON.stringify(failedOnce)}, '1');
+  process.exit(1);
+}
+process.stdout.write('Options:\\n  --model <id>\\n');
+`);
+    const cli = { ...entry('opencode', fake), version: '1.2.3' };
+    const spawns = () => fs.readFileSync(counter, 'utf8').length;
+
+    expect(await getLocalCliSupportedFlags(cli, dir, ['run', '--help'])).toEqual([]);
+    expect(await getLocalCliSupportedFlags(cli, dir, ['run', '--help'])).toEqual(['--model']);
+    expect(spawns()).toBe(2);
+    expect(await getLocalCliSupportedFlags(cli, otherWorkspace, ['run', '--help'])).toEqual(['--model']);
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(Date.now() + 10 * 60_000);
+      expect(await getLocalCliSupportedFlags(cli, dir, ['run', '--help'])).toEqual(['--model']);
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(spawns()).toBe(2);
+  });
+
+  it.each([false, true])('reads effective Codex defaults through native RPC, config rejection=%s', async rejected => {
+    const dir = makeTempDir();
+    const trace = path.join(dir, 'rpc.jsonl');
+    const argvTrace = path.join(dir, 'argv.json');
+    const customArgs = ['-c', 'model="configured-default"'];
+    const fake = writeFakeCli(dir, `
+const fs = require('node:fs');
+fs.writeFileSync(${JSON.stringify(argvTrace)}, JSON.stringify(process.argv.slice(2)));
+let buffer = '';
+process.stdin.on('data', chunk => {
+  buffer += chunk;
+  let index;
+  while ((index = buffer.indexOf('\\n')) >= 0) {
+    const message = JSON.parse(buffer.slice(0, index)); buffer = buffer.slice(index + 1);
+    fs.appendFileSync(${JSON.stringify(trace)}, JSON.stringify(message) + '\\n');
+    const reply = result => process.stdout.write(JSON.stringify({ id: message.id, result }) + '\\n');
+    if (message.method === 'initialize') reply({});
+    else if (message.method === 'model/list') reply({ data: [{ id: 'catalog-default', isDefault: true }] });
+    else if (message.method === 'config/read') {
+      if (${rejected}) process.stdout.write(JSON.stringify({ id: message.id, error: { code: -32601, message: 'unavailable' } }) + '\\n');
+      else reply({ config: { model: 'configured-default', model_reasoning_effort: 'high', secrets: 'PRIVATE_CONFIGURATION' } });
+    } else if (message.method !== 'initialized') {
+      fs.writeFileSync(${JSON.stringify(path.join(dir, 'task-started'))}, 'unexpected task'); process.exit(3);
+    }
+  }
+});
+`);
+    const options = await getLocalCliRuntimeOptions(entry('codex', fake), dir, { customArgs });
+    // A rejected config/read cannot establish the inherited model. Preserve
+    // the catalog, but do not label its recommendation as the active default.
+    expect(options.default_model).toBe(rejected ? null : 'configured-default');
+    expect(options.status).toBe(rejected ? 'partial' : 'ready');
+    expect(JSON.parse(fs.readFileSync(argvTrace, 'utf8'))).toEqual(['app-server', '--listen', 'stdio://', ...customArgs]);
+    expect(JSON.stringify(options)).not.toContain('PRIVATE_CONFIGURATION');
+    const requests = fs.readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+    expect(requests.find(row => row.method === 'config/read').params).toEqual({ cwd: dir, includeLayers: false });
+    expect(requests.map(row => row.method).sort()).toEqual(['config/read', 'initialize', 'initialized', 'model/list']);
+    expect(fs.existsSync(path.join(dir, 'task-started'))).toBe(false);
+  });
+  it.each(['chatgpt', 'apiKey', 'custom'])('lists version-compatible defaults without restricting the %s provider', async account => {
+    const dir = makeTempDir();
+    const trace = path.join(dir, 'catalog-probe.jsonl');
+    const fake = writeFakeCli(dir, `
+const fs = require('node:fs');
+require('node:readline').createInterface({ input: process.stdin }).on('line', line => {
+  const m = JSON.parse(line);
+  fs.appendFileSync(${JSON.stringify(trace)}, m.method + '\\n');
+  const result = m.method === 'config/read' ? { config: { model: 'gpt-6.1-sol', model_provider: '${account === 'custom' ? 'custom' : 'openai'}' } }
+    : m.method === 'account/read' ? { account: { type: '${account}' } }
+    : m.method === 'model/list' ? { data: [{ id: 'gpt-6.1-sol', isDefault: true }, { id: 'gpt-6-sol', defaultReasoningEffort: 'low' }] }
+    : {};
+  if (m.id !== undefined) process.stdout.write(JSON.stringify({ id: m.id, result }) + '\\n');
+});`);
+    const options = await getLocalCliRuntimeOptions({ ...entry('codex', fake), version: '0.156.1' }, dir);
+    expect(options.default_model).toBe(account === 'chatgpt' ? 'gpt-6-sol' : 'gpt-6.1-sol');
+    expect(options.models.map(model => model.id)).toEqual(account === 'chatgpt' ? ['gpt-6-sol'] : ['gpt-6.1-sol', 'gpt-6-sol']);
+    expect(options.models.find(model => model.is_default)?.id).toBe(options.default_model);
+    const methods = fs.readFileSync(trace, 'utf8').trim().split('\n');
+    expect(methods.includes('account/read')).toBe(account !== 'custom');
+    expect(methods.filter(method => ['thread/start', 'thread/resume', 'turn/start'].includes(method))).toEqual([]);
+  });
   it.each(['claude', 'codex'] as const)('accepts an unsupported %s model probe closing without killing its stale PID', async cli => {
     const dir = makeTempDir();
     const fake = writeFakeCli(dir, 'process.exit(2);');
@@ -297,7 +469,7 @@ describe('local_agents/runtime_options process boundary', () => {
 const fs = require('node:fs');
 fs.appendFileSync(${JSON.stringify(counter)}, '1');
 if (process.argv.includes('--help')) {
-  process.stdout.write('Usage: fake --model <id> --effort <level>\\n');
+  process.stdout.write('Usage: fake --model <id> --effort <level> --bare\\n');
   process.exit(0);
 }
 process.exit(2);
@@ -340,7 +512,7 @@ process.exit(2);
     const binPath = writeFakeCli(dir, `
 const args = process.argv.slice(2);
 if (args.includes('--help')) {
-  process.stdout.write('Usage: fake --model <id> --effort <level>\\n');
+  process.stdout.write('Usage: fake --model <id> --effort <level> --bare\\n');
   process.exit(0);
 }
 let buf = '';
@@ -427,4 +599,18 @@ if (args[0] === 'models') {
     expect(serialized).not.toContain('PRIVATE_TOKEN_SHOULD_NOT_ESCAPE');
     expect(serialized).not.toMatch(/stdout|stderr|path/i);
   }, 10_000);
+});
+
+
+describe('task-command help capabilities', () => {
+  it('accepts documented option syntax and excludes prose/other-option descriptions', async () => {
+    const { parseCliHelpFlags } = await import('../../../../src/main/features/local_agents/runtime_options');
+    expect(parseCliHelpFlags([
+      'Usage: cli run --format <format>',
+      '  -m, --model <id>  Select a model; deprecated --old-model is not supported.',
+      '  --effort=<level>  Reasoning level',
+      'This release does not support --variant.',
+      '  See --thinking in the other command.',
+    ].join('\n'))).toEqual(['--format', '--model', '--effort']);
+  });
 });

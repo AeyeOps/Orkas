@@ -9,6 +9,7 @@ const mocks = vi.hoisted(() => ({
   getProjectDir: vi.fn(),
   getRuntimeOptions: vi.fn(),
   getResolvedModel: vi.fn(),
+  getAccountUsage: vi.fn(),
 }));
 
 vi.mock('../../../src/main/features/agents', () => ({
@@ -31,6 +32,9 @@ vi.mock('../../../src/main/features/local_agents/registry', () => ({
 
 vi.mock('../../../src/main/features/local_agents/runtime_options', () => ({
   getLocalCliRuntimeOptions: (...args: unknown[]) => mocks.getRuntimeOptions(...args),
+}));
+vi.mock('../../../src/main/features/local_agents/account_usage', () => ({
+  getLocalCliAccountUsage: (...args: unknown[]) => mocks.getAccountUsage(...args),
 }));
 
 import { invokeHandlers } from '../../../src/main/ipc/local_agents';
@@ -59,6 +63,16 @@ beforeEach(() => {
 });
 
 describe('ipc/localAgents.runtimeOptions', () => {
+  it('scopes allowance queries to the selected Agent and caller account', async () => {
+    const usageHandler = invokeHandlers['localAgents.accountUsage'] as RuntimeOptionsHandler;
+    await expect(usageHandler({ agent_id: '../bad' }, { userId: 'u1' })).rejects.toThrow('invalid agent_id');
+    mocks.agent = { agent_id: 'agent_1', runtime: { kind: 'cli', cli: 'codex' } };
+    mocks.entries = [{ type: 'codex', path: '/trusted/codex', available: true }];
+    mocks.projectDir = { effective_path: '/trusted/project' };
+    mocks.getAccountUsage.mockResolvedValue({ status: 'unavailable', windows: [] });
+    await usageHandler({ agent_id: 'agent_1', path: '/untrusted', cwd: '/untrusted', force: true }, { userId: 'u1' });
+    expect(mocks.getAccountUsage).toHaveBeenCalledWith('u1', mocks.entries[0], '/trusted/project', { force: true, customArgs: [] });
+  });
   it('rejects malformed ids before discovery or Agent lookup', async () => {
     await expect(handler({ agent_id: '../agent' }, { userId: 'u1' }))
       .rejects.toThrow('invalid agent_id');
@@ -91,7 +105,8 @@ describe('ipc/localAgents.runtimeOptions', () => {
       version: '99.0.0',
       available: true,
     };
-    mocks.agent = { agent_id: 'agent_1', runtime: { kind: 'cli', cli: 'codex' } };
+    const customArgs = ['-c', 'model="gpt-configured"'];
+    mocks.agent = { agent_id: 'agent_1', runtime: { kind: 'cli', cli: 'codex', custom_args: customArgs } };
     mocks.entries = [trustedEntry];
     mocks.projectDir = { effective_path: '/trusted/project' };
     mocks.getResolvedModel.mockReturnValue({
@@ -107,6 +122,7 @@ describe('ipc/localAgents.runtimeOptions', () => {
       cli: 'hermes',
       cwd: '/attacker/project',
       path: '/attacker/bin',
+      custom_args: ['-c', 'model="attacker-model"'],
     }, { userId: 'u1' })).resolves.toEqual({
       options: {
         cli: 'codex',
@@ -128,7 +144,7 @@ describe('ipc/localAgents.runtimeOptions', () => {
     expect(mocks.getRuntimeOptions).toHaveBeenCalledWith(
       trustedEntry,
       '/trusted/project',
-      { force: true },
+      { force: true, customArgs },
     );
   });
 

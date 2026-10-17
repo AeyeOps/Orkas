@@ -266,6 +266,95 @@ describe('bash-permissions', () => {
     await p3;
   });
 
+  describe('folder read grants', () => {
+    // 2026-09-21: a user approved 58 Desktop images one by one. A read that is
+    // sensitive only for its personal location can be granted per folder.
+    const desktop = '/Users/test/Desktop';
+    const folderRead = (file: string, folder = file.slice(0, file.lastIndexOf('/'))) => ({
+      folder, realFolder: folder, realPath: file,
+    });
+    const read = (file: string, over: Parameters<typeof ask>[0] = {}) => ask({
+      command: '', operation: 'read_file', subject: file, reasons: ['sensitive_path'],
+      folderRead: folderRead(file), ...over,
+    });
+
+    it('offers the folder, and its grant covers later reads inside it only', async () => {
+      const first = read(`${desktop}/ads/a.png`);
+      expect(permissionPushes()[0].payload).toMatchObject({ can_allow_run: true, read_folder: `${desktop}/ads` });
+      bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+      expect(await first).toBe('allow_run');
+
+      expect(await read(`${desktop}/ads/b.png`)).toBe('allow_run');
+      expect(await read(`${desktop}/ads/2025/c.png`)).toBe('allow_run');
+      expect(permissionPushes()).toHaveLength(1);
+
+      // A sibling folder, a prefix look-alike, and an intrinsic-secret read
+      // (no folderRead) each still ask.
+      const sibling = read(`${desktop}/finance/d.png`);
+      const lookalike = read(`${desktop}/ads-old/e.png`);
+      const secret = ask({ command: '', operation: 'read_file', subject: `${desktop}/ads/.env`, reasons: ['sensitive_path'] });
+      expect(permissionPushes()).toHaveLength(4);
+      for (const push of permissionPushes().slice(1)) bp.respond(push.payload.request_id, 'deny');
+      expect(await sibling).toBe('deny');
+      expect(await lookalike).toBe('deny');
+      expect(await secret).toBe('deny');
+    });
+
+    it('follows the real path, so a link inside the folder cannot carry the grant out', async () => {
+      const first = read(`${desktop}/ads/a.png`);
+      bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+      await first;
+      const link = read(`${desktop}/ads/link.png`, {
+        folderRead: { folder: `${desktop}/ads`, realFolder: `${desktop}/ads`, realPath: '/Users/test/Documents/private/x.png' },
+      });
+      expect(permissionPushes()).toHaveLength(2);
+      bp.respond(permissionPushes()[1].payload.request_id, 'deny');
+      expect(await link).toBe('deny');
+    });
+
+    it('grants nothing for allow_once, and does not widen into the sensitive_path category', async () => {
+      const once = read(`${desktop}/ads/a.png`);
+      bp.respond(permissionPushes()[0].payload.request_id, 'allow_once');
+      expect(await once).toBe('allow_once');
+      const again = read(`${desktop}/ads/b.png`);
+      expect(permissionPushes()).toHaveLength(2);
+      bp.respond(permissionPushes()[1].payload.request_id, 'allow_run');
+      await again;
+
+      const keyRead = ask({ command: '', operation: 'read_file', subject: '/Users/test/.ssh/id_ed25519', reasons: ['sensitive_path'] });
+      expect(permissionPushes()).toHaveLength(3);
+      expect(permissionPushes()[2].payload.read_folder).toBeUndefined();
+      bp.respond(permissionPushes()[2].payload.request_id, 'deny');
+      expect(await keyRead).toBe('deny');
+    });
+
+    it('settles queued reads inside the granted folder and stays within actor, conversation and account', async () => {
+      const first = read(`${desktop}/ads/a.png`);
+      const queuedInside = read(`${desktop}/ads/b.png`);
+      const otherAgent = read(`${desktop}/ads/c.png`, { agentId: 'a2' });
+      bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');
+      expect(await first).toBe('allow_run');
+      expect(await queuedInside).toBe('allow_run');
+      let otherSettled = false;
+      otherAgent.then(() => { otherSettled = true; });
+      await Promise.resolve();
+      expect(otherSettled).toBe(false);
+      bp.respond(permissionPushes()[2].payload.request_id, 'deny');
+      expect(await otherAgent).toBe('deny');
+
+      const otherConversation = read(`${desktop}/ads/d.png`, { cid: 'c2' });
+      expect(permissionPushes()).toHaveLength(4);
+      bp.respond(permissionPushes()[3].payload.request_id, 'deny');
+      expect(await otherConversation).toBe('deny');
+
+      bp.cancelForCid('c1');
+      const afterCancel = read(`${desktop}/ads/e.png`);
+      expect(permissionPushes()).toHaveLength(5);
+      bp.respond(permissionPushes()[4].payload.request_id, 'deny');
+      expect(await afterCancel).toBe('deny');
+    });
+  });
+
   it('cancelForCid clears task grants', async () => {
     const first = ask({ reasons: ['network_egress'] });
     bp.respond(permissionPushes()[0].payload.request_id, 'allow_run');

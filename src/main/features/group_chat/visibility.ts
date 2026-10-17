@@ -157,6 +157,8 @@ export interface GroupMessage {
   /** Mirror of `created_agents` for skills — populated when the commander's
    * final text contained one or more `<skill>` containers. */
   created_skills?: Array<{ skill_id: string; name: string; kind?: 'created' | 'updated' }>;
+  /** Host-observed successful task mutations; display-only, never execution authority. */
+  saved_tasks?: Array<{ kind: 'automation' | 'todo'; task_id: string; project_id: string; title: string }>;
   /** Interactive web-app artifacts produced this turn via `create_artifact`.
    * `id` keys `chat_artifacts/<cid>/<id>/`; `agent_id` is the producing actor
    * (`'commander'` or an agent id) — the renderer routes a user→artifact
@@ -199,15 +201,21 @@ export interface GroupMessage {
    * single-bubble messages. The renderer uses it to finalize the live
    * placeholder at a boundary instead of appending a duplicate bubble. */
   seg?: number;
+  /** Host-owned transcript classification. Raw text remains lossless for
+   * canonical/model history; commentary is also stored in process. Pending
+   * is used only by active display snapshots before a native boundary. */
+  display_phase?: 'pending' | 'commentary' | 'final_answer';
   /** Captured process trail from this actor's turn — progress lines + non-
    * assistant tool/lifecycle events. Stored on the actor's end-of-turn
    * message in the main `<cid>.jsonl` so a history reload can rerender the
    * trail (live UI accumulates it via `process` events; without persistence
    * it vanishes on refresh). Model-history projection ignores it. */
   process?: Array<
-    | { type: 'progress'; text: string }
+    | { type: 'progress'; text: string; event?: { stream: string; data?: unknown } }
     | { type: 'event'; event: { stream: string; data?: unknown } }
   >;
+  /** Renderer projection only; never written into canonical messages. */
+  process_parts?: import('../conversation-process-cache').HistoryProcessPart[];
   /** User-deletion tombstone. The stable id/route shell remains so sync can
    * deterministically prefer the deletion revision over an older copy. */
   deleted_at?: string;

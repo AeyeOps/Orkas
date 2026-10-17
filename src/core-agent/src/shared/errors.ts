@@ -30,7 +30,7 @@ export class RateLimitError extends CoreAgentError {
 }
 
 export class ContextOverflowError extends CoreAgentError {
-  constructor(message: string, cause?: Error) {
+  constructor(message: string, cause?: Error, public readonly admissionChecked = false) {
     super(message, "CONTEXT_OVERFLOW", cause);
     this.name = "ContextOverflowError";
   }
@@ -413,6 +413,15 @@ export function isStorageFullError(err: unknown, includeDisplayText = true): boo
   return false;
 }
 
+const TERMINAL_RECOVERY_CODE_RE = /^(?:CONTEXT_OVERFLOW|context_length_exceeded|OUTPUT_LIMIT|RETRY_EXHAUSTED|SESSION_PERSISTENCE_FAILED|TASK_TOKEN_LIMIT_REACHED|TOOL_RESULT_PERSISTENCE_FAILED|ABORT_ERR|UND_ERR_ABORTED|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|PROVIDER_(?:OUTPUT_UNCERTAIN|NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|EMPTY_NORMAL|EMPTY_SAFETY|EMPTY_UNKNOWN|NETWORK_EXHAUSTED|RETRIES_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED))$/i;
+
+/** Hard runtime barriers also apply when an adapter proves a remote rejection.
+ * Authentication itself is recovered by the credential owner, before Runner. */
+export function isTerminalRecoveryError(err: unknown): boolean {
+  return isProviderSafetyError(err) || isStorageFullError(err, false)
+    || providerErrorFacts(err, false).codes.some(code => TERMINAL_RECOVERY_CODE_RE.test(code));
+}
+
 function hasPermanentFailureSignal(policy: CompiledRetryErrorPolicy, err: unknown): boolean {
   const { codes } = providerErrorFacts(err, false);
   let current = err;
@@ -422,7 +431,7 @@ function hasPermanentFailureSignal(policy: CompiledRetryErrorPolicy, err: unknow
     current = errorCauseOf(current);
   }
   return codes.some(code =>
-    /^(?:AUTH_ERROR|CONTEXT_OVERFLOW|OUTPUT_LIMIT|RETRY_EXHAUSTED|SESSION_PERSISTENCE_FAILED|TASK_TOKEN_LIMIT_REACHED|TOOL_RESULT_PERSISTENCE_FAILED|ABORT_ERR|UND_ERR_ABORTED|ERR_ABORTED|ERR_CANCELED|ERR_CANCELLED|PROVIDER_(?:NO_FIRST_EVENT_TIMEOUT|EMPTY_RESPONSE|EMPTY_NORMAL|EMPTY_SAFETY|EMPTY_UNKNOWN|NETWORK_EXHAUSTED|RETRIES_EXHAUSTED|AUTH_EXHAUSTED|PERMISSION_EXHAUSTED|RATE_LIMIT_EXHAUSTED|BALANCE_EXHAUSTED))$/i.test(code)
+    code === 'AUTH_ERROR' || TERMINAL_RECOVERY_CODE_RE.test(code)
     || policy.permanentCodePatterns.some(pattern => pattern.test(code)));
 }
 

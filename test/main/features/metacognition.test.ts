@@ -69,6 +69,67 @@ describe('metacognition › readContent', () => {
 // ── writeContent ────────────────────────────────────────────────────────
 
 describe('metacognition › writeContent', () => {
+  it.each(['competence', 'strategies'] as const)('merges concurrent same-line %s changes during reflection', async target => {
+    const mod = await loadModule();
+    const base = '## Rules\nUse logs; keep backups.';
+    mod.writeContent('agent-a', target, base);
+    const review = mod.beginMetacognitionReview(TEST_UID, 'agent-a');
+    const file = path.join(metaDir('agent-a'), target === 'competence' ? 'COMPETENCE.md' : 'LEARNING_STRATEGIES.md');
+    try {
+      fs.writeFileSync(file, base.replace('backups', 'snapshots'));
+      const result = mod.writeContent('agent-a', target, base.replace('logs', 'traces'));
+      expect(result.ok).toBe(true);
+      expect(fs.readFileSync(file, 'utf8')).toBe('## Rules\nUse traces; keep snapshots.');
+      expect(review.hasDeferredWrites()).toBe(false);
+    } finally { review.close(); }
+  });
+  it('merges an independent save made after the reflection snapshot', async () => {
+    const mod = await loadModule();
+    const base = '## Rules\nfirst\nseparator\nlast';
+    mod.writeContent('agent-a', 'competence', base);
+    const review = mod.beginMetacognitionReview(TEST_UID, 'agent-a');
+    try {
+      fs.writeFileSync(path.join(metaDir('agent-a'), 'COMPETENCE.md'), base.replace('last', 'new last'));
+      expect(mod.writeContent('agent-a', 'competence', base.replace('first', 'new first')).content)
+        .toBe('## Rules\nnew first\nseparator\nnew last');
+      expect(review.hasDeferredWrites()).toBe(false);
+    } finally { review.close(); }
+  });
+
+  it('does not let an unrelated reader change the reflection replacement baseline', async () => {
+    const mod = await loadModule();
+    mod.writeContent('agent-a', 'competence', '## Rules\nOriginal');
+    const review = mod.beginMetacognitionReview(TEST_UID, 'agent-a');
+    try {
+      fs.writeFileSync(path.join(metaDir('agent-a'), 'COMPETENCE.md'), '## Rules\nNewer');
+      expect(mod.readContent('agent-a', 'competence').content).toBe('## Rules\nNewer');
+      expect(mod.writeContent('agent-a', 'competence', '## Rules\nStale replacement').ok).toBe(false);
+      expect(mod.readContent('agent-a', 'competence').content).toBe('## Rules\nNewer');
+    } finally { review.close(); }
+  });
+
+  it.each(['overlap', 'deleted', 'overflow'] as const)('retains a %s candidate without replacing the newer notes', async scenario => {
+    const mod = await loadModule();
+    const base = scenario === 'overflow' ? '## Rules\n' + 'a'.repeat(2800) + '\nseparator\nlast' : '## Rules\nfirst\nseparator\nlast';
+    mod.writeContent('agent-a', 'competence', base);
+    const review = mod.beginMetacognitionReview(TEST_UID, 'agent-a');
+    const file = path.join(metaDir('agent-a'), 'COMPETENCE.md');
+    const current = scenario === 'overflow' ? base + '\n' + 'b'.repeat(100) : base.replace('first', 'cloud first');
+    const candidate = scenario === 'overflow' ? 'x'.repeat(100) + '\n' + base : base.replace('first', 'local first');
+    try {
+      if (scenario === 'deleted') fs.unlinkSync(file);
+      else fs.writeFileSync(file, current);
+      expect(mod.writeContent('agent-a', 'competence', candidate).ok).toBe(false);
+      expect(review.hasDeferredWrites()).toBe(true);
+      expect(fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null).toBe(scenario === 'deleted' ? null : current);
+      const folders = fs.readdirSync(path.join(tmpDir, TEST_UID, 'local', 'metacognition-drafts'));
+      const folder = path.join(tmpDir, TEST_UID, 'local', 'metacognition-drafts', folders[0]);
+      const draft = JSON.parse(fs.readFileSync(path.join(folder, fs.readdirSync(folder)[0]), 'utf8'));
+      expect(draft.candidate).toBe(candidate);
+      expect(draft.base).toBe(base);
+    } finally { review.close(); }
+  });
+
   it('writes competence file and reads back', async () => {
     const mod = await loadModule();
     const result = mod.writeContent('agent-a', 'competence', '## 擅长\n- Docker');
@@ -118,6 +179,18 @@ describe('metacognition › writeContent', () => {
 // ── Security ────────────────────────────────────────────────────────────
 
 describe('metacognition › security', () => {
+  it.each(['competence', 'strategies'] as const)('preserves Unicode %s and rejects bidi replacement with a precise receipt', async target => {
+    const mod = await loadModule();
+    const content = 'ترجیح می\u200cدهم: 10\u202f000 👩\u200d💻';
+    expect(mod.writeContentForUser(TEST_UID, 'agent-a', target, content).ok).toBe(true);
+    expect(mod.readContentForUser(TEST_UID, 'agent-a', target).content).toBe(content);
+    const result = mod.writeContentForUser(TEST_UID, 'agent-a', target, 'private\u202Etext');
+    expect(result.ok).toBe(false);
+    expect(result.error).toContain('U+202E');
+    expect(result.error).not.toContain('private');
+    expect(mod.readContentForUser(TEST_UID, 'agent-a', target).content).toBe(content);
+  });
+
   it.each(['competence', 'strategies'] as const)('blocks injection without logging private %s content or replacing prior data', async (target) => {
     const logger = await import('../../../src/main/logger');
     const original = logger.createLogger;

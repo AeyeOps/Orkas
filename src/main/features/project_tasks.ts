@@ -44,8 +44,8 @@ import { nowIso, readJson, writeJson } from '../storage';
 import { createLogger } from '../logger';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { taskContent } from '../util/project-task-content';
-import { clampStr, normaliseTask as _normaliseTask, sanitiseTaskAttachmentName as _sanitiseAttachmentName,
-  TASK_RESULT_REF_MAX, TASK_STATUSES as STATUSES } from './project_task_record';
+import { clampStr, isCommanderTaskOwner, normaliseTask as _normaliseTask, sanitiseTaskAttachmentName as _sanitiseAttachmentName,
+  TASK_STATUSES as STATUSES } from './project_task_record';
 import { ALLOWED_EXTENSIONS } from './chat_attachments';
 import * as projects from './projects';
 import * as agents from './agents';
@@ -58,7 +58,6 @@ export type TaskStatus = 'todo' | 'progress' | 'review' | 'done';
 const OPEN_STATUSES: ReadonlySet<TaskStatus> = new Set<TaskStatus>(['todo', 'progress', 'review']);
 
 export const TASK_CONTENT_MAX = 4000;
-export { TASK_RESULT_REF_MAX } from './project_task_record';
 
 export interface ProjectTask {
   id: string;
@@ -71,8 +70,6 @@ export interface ProjectTask {
   /** 'user' or an agent display name. */
   created_by: string;
   depends_on?: string[];
-  /** Pointer to the delivering conversation cid / artifact / file. */
-  result_ref?: string;
   /** Latest successfully dispatched execution conversation; legacy field name. */
   origin_cid?: string;
   /** Filenames under `task_attachments/<id>/`, copied into the conversation the
@@ -185,7 +182,8 @@ async function _readTask(uid: string, pid: string, tid: string): Promise<Project
   const f = _taskFile(uid, pid, tid);
   if (!fs.existsSync(f)) return null;
   try {
-    return _normaliseTask(await readJson(f));
+    const task = _normaliseTask(await readJson(f));
+    return task;
   } catch (err) {
     log.warn('read task', { user: maskId(uid), scope: _scopeLog(pid), tid: maskId(tid), error: logErrorSummary(err) });
     return null;
@@ -244,6 +242,10 @@ async function _resolveOwner(
   const id = typeof input.owner_agent_id === 'string' ? input.owner_agent_id.trim() : '';
   const name = clampStr(input.owner_agent, 200);
   if (!id && !name) return {};
+  if (isCommanderTaskOwner({ owner_agent_id: id, owner_agent: name })) {
+    if (getActiveUserId() !== uid) return 'owner_not_bound';
+    return { owner_agent: 'Commander', owner_agent_id: 'commander' };
+  }
   if (!pid) {
     // The registry is scoped to the active account. Never resolve an owner
     // for a different account through that registry.
@@ -267,6 +269,94 @@ async function _resolveOwner(
 /** List one scope's tasks (directory scan). Empty pid selects the global scope.
  *  Backlog order = created_at asc. Missing project / tasks dir → []. */
 export async function listTasks(uid: string, pid: string): Promise<ProjectTask[]> {
+  return listLocalTasksForMigration(uid, pid);
+}
+
+export interface OpenTaskRow extends ProjectTask {
+  project_id: string;
+  project_name: string;
+}
+
+// The home page repeats the open to-do listing on every visit and, while
+// visible, on task events; to-dos only accumulate. Each file's parsed task is
+// kept against its identity, size and change times, so a listing re-reads
+// only files that changed, whoever wrote them (to-do edits, a synced copy by
+// rename, an in-place conflict rewrite). A done to-do keeps only its marker.
+// Per account, only the scopes and files seen by the latest listing are kept.
+type OpenTaskFile = { signature: string; open: ProjectTask | null };
+const _openTaskFiles = new Map<string, Map<string, Map<string, OpenTaskFile>>>();
+
+async function _openTasksInScope(
+  uid: string, pid: string, previous: Map<string, OpenTaskFile> | undefined, kept: Map<string, OpenTaskFile>,
+): Promise<ProjectTask[]> {
+  if (!(await _scopeExists(uid, pid))) return [];
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(_tasksDir(uid, pid), { withFileTypes: true }); }
+  catch { return []; }
+  const files: Array<{ file: string; tid: string; signature: string }> = [];
+  for (const e of entries) {
+    if (!e.isFile() || !e.name.endsWith('.json')) continue;
+    const tid = e.name.slice(0, -'.json'.length);
+    if (!TASK_ID_RE.test(tid)) continue;
+    const file = _taskFile(uid, pid, tid);
+    let st: fs.Stats;
+    try { st = fs.statSync(file); } catch { continue; }
+    files.push({ file, tid, signature: `${st.dev}:${st.ino}:${st.size}:${st.mtimeMs}:${st.ctimeMs}` });
+  }
+  // Changed files are read together, as the full listing reads them.
+  const known = await Promise.all(files.map(async ({ file, tid, signature }) => {
+    const cached = previous?.get(file);
+    if (cached?.signature === signature) return cached;
+    const task = await _readTask(uid, pid, tid);
+    return { signature, open: task && task.status !== 'done' ? task : null };
+  }));
+  const open: ProjectTask[] = [];
+  known.forEach((entry, i) => {
+    kept.set(files[i].file, entry);
+    if (entry.open) open.push(entry.open);
+  });
+  return open;
+}
+
+/** Unfinished local to-dos across the global scope and every project. */
+export async function listOpenTasks(
+  uid: string,
+  limit: number,
+): Promise<{ tasks: OpenTaskRow[]; total: number }> {
+  const scopes: Array<{ pid: string; name: string }> = [
+    { pid: '', name: '' },
+    ...(await projects.listProjects(uid)).map((project) => ({
+      pid: project.project_id,
+      name: project.name || '',
+    })),
+  ];
+  const rows: OpenTaskRow[] = [];
+  const previousFiles = _openTaskFiles.get(uid);
+  const keptFiles = new Map<string, Map<string, OpenTaskFile>>();
+  for (const scope of scopes) {
+    let tasks: ProjectTask[];
+    try {
+      const kept = new Map<string, OpenTaskFile>();
+      tasks = await _openTasksInScope(uid, scope.pid, previousFiles?.get(scope.pid), kept);
+      keptFiles.set(scope.pid, kept);
+
+    } catch (err) {
+      log.warn(`open to-do scope skipped user=${maskId(uid)} scope=${_scopeLog(scope.pid)}`, { error: logErrorSummary(err) });
+      continue;
+    }
+    for (const task of tasks) {
+      if (task.status === 'done') continue;
+      rows.push({ ...task, project_id: scope.pid, project_name: scope.name });
+    }
+  }
+  _openTaskFiles.set(uid, keptFiles);
+  const touched = (task: ProjectTask) => task.updated_at || task.created_at || '';
+  rows.sort((a, b) => touched(b).localeCompare(touched(a)) || a.id.localeCompare(b.id));
+  return { tasks: rows.slice(0, Math.max(0, limit)), total: rows.length };
+}
+
+/** Local snapshot for the initial owner import; never pulls from Server. */
+export async function listLocalTasksForMigration(uid: string, pid: string): Promise<ProjectTask[]> {
   if (!(await _scopeExists(uid, pid))) return [];
   const dir = _tasksDir(uid, pid);
   let entries: fs.Dirent[];
@@ -278,6 +368,8 @@ export async function listTasks(uid: string, pid: string): Promise<ProjectTask[]
     const tid = e.name.slice(0, -'.json'.length);
     if (TASK_ID_RE.test(tid)) ids.push(tid);
   }
+  // Migration checkpoints must describe the file exactly, without private
+  // display defaults, so shared sync can compare accepted imports on retry.
   const tasks = (await Promise.all(ids.map((tid) => _readTask(uid, pid, tid))))
     .filter((t): t is ProjectTask => t !== null);
   // created_at asc, id asc as a tiebreaker so ordering is DETERMINISTIC across
@@ -318,7 +410,6 @@ export interface ProjectTaskView {
   owner_agent?: string;
   depends_on?: string[];
   attachments?: string[];
-  result_ref?: string;
   origin_cid?: string;
   created_by: string;
   created_at: string;
@@ -333,7 +424,6 @@ export function taskView(t: ProjectTask): ProjectTaskView {
     ...(t.owner_agent ? { owner_agent: t.owner_agent } : {}),
     ...(t.depends_on?.length ? { depends_on: [...t.depends_on] } : {}),
     ...(t.attachments?.length ? { attachments: [...t.attachments] } : {}),
-    ...(t.result_ref ? { result_ref: t.result_ref } : {}),
     ...(t.origin_cid ? { origin_cid: t.origin_cid } : {}),
     created_by: t.created_by,
     created_at: t.created_at,
@@ -416,7 +506,6 @@ export interface UpdateTaskPatch extends TaskContentInput {
   status?: TaskStatus;
   owner_agent?: string;
   owner_agent_id?: string;
-  result_ref?: string;
   /** Execution conversation, replaced only by a successful host dispatch.
    *  Never exposed as a model or renderer input field. Ordinary edits omit it. */
   origin_cid?: string;
@@ -425,7 +514,7 @@ export interface UpdateTaskPatch extends TaskContentInput {
 export async function updateTask(
   uid: string, pid: string, tid: string, patch: UpdateTaskPatch,
   // Host-only optimistic guard: compare and write under the same task lock.
-  options: { expectedStatus?: TaskStatus } = {},
+  options: { expectedStatus?: TaskStatus; expectedAssigneeUid?: string } = {},
 ): Promise<{ ok: true; task: ProjectTask } | { ok: false; error: TaskError }> {
   if (!TASK_ID_RE.test(tid)) return { ok: false, error: 'task_not_found' };
   return withTaskUpdateLock(uid, pid, tid, async () => {
@@ -468,10 +557,6 @@ export async function updateTask(
       if (owner.owner_agent) next.owner_agent = owner.owner_agent;
       if (owner.owner_agent_id) next.owner_agent_id = owner.owner_agent_id;
     }
-    if (patch.result_ref !== undefined) {
-      const ref = clampStr(patch.result_ref, TASK_RESULT_REF_MAX);
-      if (ref) next.result_ref = ref; else delete next.result_ref;
-    }
     if (typeof patch.origin_cid === 'string' && patch.origin_cid.trim()) {
       next.origin_cid = patch.origin_cid.trim();
     }
@@ -482,10 +567,16 @@ export async function updateTask(
   });
 }
 
-/** Record an admitted execution without rolling it back if its backlink fails.
- *  Only dispatch entry points call this; creation and status edits do not. */
+/** Record the conversation a to-do belongs to without rolling anything back if
+ *  the backlink fails. Dispatch entry points call this after an admitted run;
+ *  the `todo_tasks` create handler calls it once for a global to-do saved from
+ *  a conversation, so opening or running it returns there. Status edits do not. */
 export async function recordTaskExecution(uid: string, pid: string, tid: string, cid: string): Promise<void> {
   try {
+    if (!TASK_ID_RE.test(tid) || !cid.trim()) {
+      log.error('task execution association rejected');
+      return;
+    }
     const linked = await updateTask(uid, pid, tid, { origin_cid: cid });
     if (!linked.ok) log.error('task execution association rejected');
   } catch {
@@ -493,11 +584,11 @@ export async function recordTaskExecution(uid: string, pid: string, tid: string,
   }
 }
 
-/** Shortcut: mark done + record an optional result pointer. */
+/** Shortcut: mark done. */
 export async function completeTask(
-  uid: string, pid: string, tid: string, resultRef?: string,
+  uid: string, pid: string, tid: string,
 ): Promise<{ ok: true; task: ProjectTask } | { ok: false; error: TaskError }> {
-  return updateTask(uid, pid, tid, { status: 'done', ...(resultRef ? { result_ref: resultRef } : {}) });
+  return updateTask(uid, pid, tid, { status: 'done' });
 }
 
 /** Human review decision on a task that is awaiting review. `approved` → done,

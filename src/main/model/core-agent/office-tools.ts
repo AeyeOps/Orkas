@@ -814,6 +814,7 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
   };
   return {
     name: 'create_xlsx',
+    compatibilityInputFields: ['sheet', 'rows', 'columns', 'charts'],
     description:
       'Create one editable XLSX from sheets with styled or formula cells, column settings, and native charts bound to cell ranges. Returns the saved path and an optional PNG preview; use edit_office on the returned path for corrections. Name collisions are reported.',
     inputSchema: {

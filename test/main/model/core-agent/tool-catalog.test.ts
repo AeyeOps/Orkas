@@ -527,10 +527,24 @@ describe('tool-catalog', () => {
     // inner_browser.act; browser-tool tests enforce conditional validation.
     // 2026-09-23: long-article input raises inner_browser.text to 100000;
     // native/MCP boundary tests and background Chromium editing pin the limit.
+    // 2026-10-02, requested: web_fetch gains an optional integer `offset`
+    // (minimum 0) to continue a truncated page from the run cache; core-agent
+    // tools.test.ts pins windows, receipts and the compaction boundary.
+    // 2026-10-03, requested: inner_browser adds read_value and act.upload
+    // with bounded file_paths; bash drops the special browser-install flag.
+    // Native/CLI receipts, field secrecy and task upload scope pin the new contract.
+    // 2026-10-03 follow-up, approved: native file selection and screenshots,
+    // frame/options paging, keys/pointer controls, and connector parity.
+    // Browser URL and transfer quotas are removed; owning validation retains task scope.
+    // 2026-10-04, approved: screenshot-scoped root point input and HD clip.
+    // 2026-10-12, requester-approved: create_artifact adds appType.
+    // Tool/schema cases and task-bound artifact cases pin its default and lock.
+    // 2026-10-14, requester-approved: appType cloud becomes web; old stored types
+    // remain readable and owning artifact cases retain the capability boundary.
     expect(
       fingerprint,
       'A model-visible field, enum, bound, default, or required rule changed; review it as a schema change, not description cleanup.',
-    ).toBe('2a7ee706279c294c974bdf3e90bf2e1b4a09f1c3c41b446a1c9d9454b1c104c3');
+    ).toBe('74dd4963f96a37267a8bbb1080994ccba845619bb062ff77fe7f70f298bea84a');
   });
 
   it('keeps the reviewed stable tool corpus within the description budgets', () => {

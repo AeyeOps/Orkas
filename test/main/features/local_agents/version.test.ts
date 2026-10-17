@@ -9,7 +9,10 @@ import {
   detectVersion,
   detectVersionResult,
   MIN_VERSIONS,
+  cliVersionAtLeast,
+  CLAUDE_BARE_MIN_VERSION,
 } from '../../../../src/main/features/local_agents/version';
+import { LOCAL_CLI_TYPES } from '../../../../src/main/features/local_agents/registry';
 
 const isWindows = process.platform === 'win32';
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
@@ -62,8 +65,9 @@ describe('local_agents/version › compareSemver', () => {
 });
 
 describe('local_agents/version › checkMinVersion', () => {
-  it('returns null when CLI has no minimum', () => {
-    expect(checkMinVersion('hermes', '0.0.0')).toBeNull();
+  it('requires a documented floor for every dispatchable CLI', () => {
+    expect(Object.keys(MIN_VERSIONS).sort()).toEqual([...LOCAL_CLI_TYPES].sort());
+    expect(checkMinVersion('unregistered-cli', '0.0.0')).toBeNull();
   });
 
   it('returns null when detected meets/exceeds the minimum', () => {
@@ -83,9 +87,28 @@ describe('local_agents/version › checkMinVersion', () => {
     expect(checkMinVersion('codex', '0.139.0')).toContain('0.145.0');
   });
 
-  it('returns null when detected is missing or unparsable (do not gate on noise)', () => {
-    expect(checkMinVersion('claude', null)).toBeNull();
-    expect(checkMinVersion('claude', 'beta')).toBeNull();
+  it('does not establish a supported contract from a missing or unrecognized version', () => {
+    expect(checkMinVersion('claude', null)).toContain('could not be verified');
+    expect(checkMinVersion('claude', 'beta')).toContain('could not be verified');
+  });
+
+  it.each([
+    ['claude', '1.99.9', '2.0.0'],
+    ['codex', '0.144.9', '0.145.0'],
+    ['opencode', '1.17.9', '1.18.0'],
+    ['openclaw', '2026.4.10', '2026.4.11'],
+    ['hermes', '0.8.9', '0.9.0'],
+  ])('rejects %s below its protocol floor and admits the boundary', (cli, below, floor) => {
+    expect(checkMinVersion(cli, below)).toContain(floor);
+    expect(checkMinVersion(cli, floor)).toBeNull();
+  });
+
+  it('keeps the optional bare probe boundary independent of Claude task support', () => {
+    expect(checkMinVersion('claude', '2.1.80')).toBeNull();
+    expect(cliVersionAtLeast('2.1.80', CLAUDE_BARE_MIN_VERSION)).toBe(false);
+    expect(cliVersionAtLeast('2.1.81', CLAUDE_BARE_MIN_VERSION)).toBe(true);
+    expect(cliVersionAtLeast('2.1.112', CLAUDE_BARE_MIN_VERSION)).toBe(true);
+    expect(cliVersionAtLeast(null, CLAUDE_BARE_MIN_VERSION)).toBe(false);
   });
 });
 

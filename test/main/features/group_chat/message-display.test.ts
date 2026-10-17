@@ -1,5 +1,21 @@
 import { describe, expect, it } from 'vitest';
-import { commanderMentionDisplayText, stripReservedRoutingMentions } from '../../../../src/main/features/group_chat/message-display';
+import { classifyNativeCommentary, normalizeNativeMessageDisplay, commanderMentionDisplayText, stripReservedRoutingMentions } from '../../../../src/main/features/group_chat/message-display';
+
+describe('native transcript classification', () => {
+  it('stores commentary once while preserving the original source and tool order', () => {
+    const record = { id: 'm0', ts: '2026-10-14T00:00:00', from: 'claude', to: ['user'],
+      turn_id: 't', source_message_id: 'u', seg: 0, text: '  ## Complete report\n原文\n',
+      process: [{ type: 'progress' as const, text: 'Read files' }] };
+    const original = JSON.stringify(record);
+    const stored = classifyNativeCommentary(record);
+    expect(stored.text).toBe(record.text);
+    expect(stored.process?.map(item => item.type === 'progress' ? item.text : '')).toEqual([record.text, 'Read files']);
+    expect(classifyNativeCommentary(stored)).toBe(stored);
+    expect(normalizeNativeMessageDisplay(stored)).toBe(stored);
+    expect(JSON.stringify(record)).toBe(original);
+    expect(normalizeNativeMessageDisplay({ ...record, display_phase: 'pending' }).display_phase).toBe('pending');
+  });
+});
 
 describe('Commander mention display provenance', () => {
   it.each([

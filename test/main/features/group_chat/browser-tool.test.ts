@@ -16,6 +16,7 @@ function callbacks(overrides: Partial<BrowserToolCallbacks> = {}): BrowserToolCa
     open: vi.fn(async () => ({ ok: true, active_tab_id: '0123456789ab' })),
     navigate: vi.fn(async () => ({ ok: true })),
     observe: vi.fn(async () => ({ ok: true, page_id: 'page-1', untrusted_content: true })),
+    readValue: vi.fn(async () => ({ ok: true, value: '', untrusted_content: true })),
     act: vi.fn(async () => ({ ok: true, outcome: 'acted' })),
     wait: vi.fn(async () => ({ ok: true, condition: 'loaded' })),
     close: vi.fn(() => ({ ok: true, closed: true })),
@@ -65,9 +66,46 @@ describe('browser model tool', () => {
     const observe = vi.fn(async () => ({ ok: true, page_id: 'page-1', untrusted_content: true }));
     const tool = buildBrowserTool(callbacks({ observe }));
     await run(tool, { operation: 'observe' });
-    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', {});
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 10_000 });
     await run(tool, { operation: 'observe', tab_id: '0123456789ab', scope: 'meta' });
     expect(observe).toHaveBeenLastCalledWith('0123456789ab', 'meta', {});
+  });
+
+  // A full page is sized like a read_files page: what the round has left, at
+  // most the ordinary per-result ceiling. meta carries no page payload.
+  it('sizes a full observation by the inline allowance the tool round has left', async () => {
+    const observe = vi.fn(async () => ({ ok: true }));
+    const tool = buildBrowserTool(callbacks({ observe }));
+    const context = (remainingTokens: number) => ({
+      state: { toolResultInlineLedger: { initialTokens: 40_000, remainingTokens, perResultTokens: 10_000 } },
+    }) as never;
+    await tool.execute({ operation: 'observe' }, context(2_500));
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 2_500 });
+    await tool.execute({ operation: 'observe' }, context(40_000));
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 10_000 });
+    await tool.execute({ operation: 'observe', scope: 'meta' }, context(2_500));
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'meta', {});
+  });
+
+  it('keeps page refs and exact text continuation inline when argument feedback fills the boundary', async () => {
+    const { fitWebAssistObservation } = await import('../../../../src/main/features/web_assist');
+    const { estimateToolResultTokens } = await import('../../../../src/main/util/tool-result-cap');
+    const { appendInputReceipt } = require('../../../../bin/tool-input-compat.cjs');
+    const inputReceipt = { ignored_fields: Array.from({ length: 10 }, (_, i) => `${i}${'x'.repeat(79)}`) };
+    const raw = { ok: true, page_id: 'page-1', text: '界'.repeat(6000), text_offset: 0,
+      elements: Array.from({ length: 80 }, (_, i) => ({ ref: `e${i}`, tag: 'button', label: '格'.repeat(40) })) };
+    const tool = buildBrowserTool(callbacks({ observe: vi.fn(async (_tab, _scope, window) =>
+      fitWebAssistObservation(raw, window!.tokenBudget!)) }));
+    const result = await tool.execute({ operation: 'observe' }, { inputReceipt,
+      state: { toolResultInlineLedger: { initialTokens: 10_000, remainingTokens: 10_000, perResultTokens: 10_000 } } });
+    const delivered = result.appliedInputReceipt === inputReceipt ? result.content : appendInputReceipt(result.content, inputReceipt);
+    expect(estimateToolResultTokens(delivered)).toBeLessThanOrEqual(10_000);
+    const body = JSON.parse(delivered);
+    expect(body.elements).toHaveLength(80);
+    expect(body.ignored_fields).toEqual(inputReceipt.ignored_fields);
+    expect(body.text_next_offset).toBe(body.text.length);
+    expect(body.text_next_offset).toBeGreaterThan(0);
+    expect(body.text_next_offset).toBeLessThan(raw.text.length);
   });
 
   it('passes observe offsets through and refuses ones that are not real positions', async () => {
@@ -75,14 +113,14 @@ describe('browser model tool', () => {
     const tool = buildBrowserTool(callbacks({ observe }));
 
     await run(tool, { operation: 'observe' });
-    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', {});
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { tokenBudget: 10_000 });
 
     await run(tool, { operation: 'observe', text_offset: 6000, element_offset: 80 });
-    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { textOffset: 6000, elementOffset: 80 });
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { textOffset: 6000, elementOffset: 80, tokenBudget: 10_000 });
 
     // Zero is a position; it must survive rather than read as "unset".
     await run(tool, { operation: 'observe', text_offset: 0 });
-    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { textOffset: 0 });
+    expect(observe).toHaveBeenLastCalledWith(undefined, 'full', { textOffset: 0, tokenBudget: 10_000 });
 
     observe.mockClear();
     for (const key of ['text_offset', 'element_offset']) {
@@ -123,44 +161,33 @@ describe('browser model tool', () => {
     expect(createToolSurfaceController(options).isActive('inner_browser')).toBe(false);
   });
 
-  it('passes the executing call signal to protected page actions', async () => {
+  it.each(['act', 'wait'] as const)('passes the executing call signal to %s', async operation => {
     const deps = callbacks();
     const controller = new AbortController();
-    await buildBrowserTool(deps).execute({ operation: 'act', page_id: 'page-1',
+    await buildBrowserTool(deps).execute({ operation, page_id: 'page-1',
       element_ref: 'e1', page_action: 'click' }, { signal: controller.signal } as never);
-    expect(deps.act).toHaveBeenCalledWith({ pageId: 'page-1', elementRef: 'e1', action: 'click' }, controller.signal);
+    if (operation === 'act') expect(deps.act).toHaveBeenCalledWith({ pageId: 'page-1', elementRef: 'e1', action: 'click' }, controller.signal);
+    else expect(deps.wait).toHaveBeenCalledWith({ condition: 'loaded' }, controller.signal);
   });
 
   it('publishes one closed multi-operation contract with explicit trust and safety boundaries', () => {
     const tool = buildBrowserTool(callbacks());
     expect(tool.name).toBe('inner_browser');
-    expect(tool.description).toContain('task Browser tabs shared with the user');
+    expect(tool.description).toContain('task Browser tabs shared with user');
     expect(tool.description).toContain('untrusted data');
-    expect(tool.description).toContain('high-impact actions');
-    expect(tool.description).toContain('Automate non-sensitive form submissions');
-    expect(tool.description).toMatch(/high-impact actions.*host approval or Trusted/);
-    expect(tool.description).toMatch(/Credentials, OTP, card entry, uploads, CAPTCHA and submissions carrying secrets stay user-operated/);
-    expect(tool.description).not.toContain('high-impact actions and sensitive form submissions remain user-operated');
-    expect(tool.inputSchema).toMatchObject({ properties: {
-      page_action: { description: expect.stringContaining('never retry a manual handback') },
-    } });
-    expect(tool.description).not.toContain('final submission/authorization');
-    // This is a calling/selection contract, not evidence of model execution.
-    expect(tool.description).toContain('dynamic pages unsupported by web_fetch');
-    expect(tool.description).toContain('smallest user action at an observed blocker');
-    expect(tool.inputSchema).toMatchObject({ properties: {
-      operation: { description: expect.stringContaining('30 tabs/task; reuse via navigate') },
-      retention: { description: expect.stringContaining('deliverable/handoff prevent eviction') },
-    } });
+    expect(tool.description).toContain('sensitive values are never returned');
+    expect(tool.description).toContain('no browser count/size quotas');
+    expect(tool.description).not.toContain('stay user-operated');
+    expect(JSON.stringify(tool.inputSchema)).not.toContain('choose_files grants external paths');
     expect(tool.inputSchema).toMatchObject({
       type: 'object',
       required: ['operation'],
       additionalProperties: false,
       properties: {
-        operation: { enum: ['tabs', 'open', 'navigate', 'observe', 'act', 'wait', 'close', 'retain'] },
+        operation: { enum: ['tabs', 'open', 'navigate', 'observe', 'read_value', 'options', 'screenshot', 'choose_files', 'act', 'wait', 'close', 'retain'] },
         retention: { enum: ['deliverable', 'handoff', 'temporary'] },
         navigation: { enum: ['goto', 'back', 'forward', 'reload'] },
-        page_action: { enum: ['click', 'fill', 'select', 'check', 'uncheck', 'scroll', 'drag'] },
+        page_action: { enum: ['click', 'fill', 'select', 'check', 'uncheck', 'scroll', 'drag', 'upload', 'press', 'hover', 'double_click', 'right_click'] },
         timeout_ms: { minimum: 250, maximum: 15000 },
       },
     });
@@ -187,6 +214,14 @@ describe('browser model tool', () => {
     });
   });
 
+  it.each(['temporary', 'deliverable', 'handoff'] as const)('preserves the explicit %s policy on open', async retention => {
+    const deps = callbacks();
+    const { body } = await run(buildBrowserTool(deps), { operation: 'open', url: 'https://example.com/', retention });
+    expect(body.ok).toBe(true);
+    expect(deps.open).toHaveBeenCalledExactlyOnceWith({ url: 'https://example.com/', retention });
+    expect(deps.retain).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['tab_id', ['bad', '0123456789AB', '0123456789abc'], { operation: 'observe' }, 'must contain exactly 12 lowercase hexadecimal characters'],
     ['element_ref', ['bad', 'e0', 'e01'], { operation: 'act', page_id: 'page-1', page_action: 'click' }, 'must be "e" followed by a positive integer without leading zeros'],
@@ -205,8 +240,12 @@ describe('browser model tool', () => {
     const deps = callbacks();
     const tool = buildBrowserTool(deps);
     for (const input of [
+      { operation: 'read_value' },
+      { operation: 'read_value', page_id: 'p1' },
+      { operation: 'read_value', page_id: 'p1', element_ref: 'e1', text_offset: -1 },
+      { operation: 'act', page_id: 'p1', element_ref: 'e1', page_action: 'upload' },
       { operation: 'open' },
-      { operation: 'open', url: `https://example.com/${'x'.repeat(2048)}` },
+      { operation: 'open', url: 'https://example.com/', retention: 'forever' },
       { operation: 'navigate', navigation: 'goto' },
       { operation: 'act', page_action: 'click', element_ref: 'e1' },
       { operation: 'act', page_id: 'p1', page_action: 'click' },
@@ -226,6 +265,7 @@ describe('browser model tool', () => {
     expect(deps.wait).not.toHaveBeenCalled();
     expect(deps.close).not.toHaveBeenCalled();
     expect(deps.retain).not.toHaveBeenCalled();
+    expect(deps.readValue).not.toHaveBeenCalled();
   });
 
   it('forwards fresh-snapshot actions, waits, and exact tab closes', async () => {
@@ -247,7 +287,7 @@ describe('browser model tool', () => {
       text: 'Orkas',
     }, undefined);
     await run(tool, { operation: 'wait', wait_condition: 'loaded', timeout_ms: 1200 });
-    expect(deps.wait).toHaveBeenCalledWith({ condition: 'loaded', timeoutMs: 1200 });
+    expect(deps.wait).toHaveBeenCalledWith({ condition: 'loaded', timeoutMs: 1200 }, undefined);
     await run(tool, { operation: 'close', tab_id: '0123456789ab' });
     expect(deps.close).toHaveBeenCalledWith('0123456789ab');
     await run(tool, { operation: 'retain', tab_id: '0123456789ab', retention: 'deliverable' });
@@ -256,6 +296,28 @@ describe('browser model tool', () => {
     expect(deps.retain).toHaveBeenLastCalledWith('0123456789ab', 'handoff');
     await run(tool, { operation: 'retain', tab_id: '0123456789ab', retention: 'temporary' });
     expect(deps.retain).toHaveBeenLastCalledWith('0123456789ab', 'temporary');
+  });
+
+  it('uses the ordinary browser wait default for out-of-range integers and rejects malformed waits', async () => {
+    const deps = callbacks();
+    const tool = buildBrowserTool(deps);
+    for (const timeout_ms of [-1, 0, 249, 15001, 60000]) {
+      expect((await run(tool, { operation: 'wait', timeout_ms })).result.isError).toBeFalsy();
+    }
+    expect(deps.wait.mock.calls).toEqual(Array.from({ length: 5 }, () => [{ condition: 'loaded' }, undefined]));
+    for (const timeout_ms of [1.5, '1000', null]) {
+      expect((await run(tool, { operation: 'wait', timeout_ms })).result.isError).toBe(true);
+    }
+    expect(deps.wait).toHaveBeenCalledTimes(5);
+  });
+
+  it('reads one field window and forwards explicit upload files', async () => {
+    const deps = callbacks();
+    const tool = buildBrowserTool(deps);
+    await run(tool, { operation: 'read_value', page_id: 'p1', element_ref: 'e2', text_offset: 6000 });
+    expect(deps.readValue).toHaveBeenCalledWith({ pageId: 'p1', elementRef: 'e2', textOffset: 6000 }, undefined);
+    await run(tool, { operation: 'act', page_id: 'p1', element_ref: 'e3', page_action: 'upload', file_paths: ['/workspace/logo.webp'] });
+    expect(deps.act).toHaveBeenCalledWith({ pageId: 'p1', elementRef: 'e3', action: 'upload', filePaths: ['/workspace/logo.webp'] }, undefined);
   });
 
   it('marks runtime failures as tool errors without leaking thrown details', async () => {
@@ -276,4 +338,19 @@ describe('browser model tool', () => {
     expect(observe).toHaveBeenCalledTimes(2);
     expect(logger.warn).toHaveBeenCalledTimes(1);
   });
+});
+
+it('forwards screenshot clips and coordinate input without accepting conflicting targets', async () => {
+  const screenshot = vi.fn(async () => ({ content: '{"ok":true}', images: [{ data: 'png', mediaType: 'image/png' as const }] }));
+  const deps = callbacks({ screenshot }); const tool = buildBrowserTool(deps);
+  const input = { operation: 'act', page_id: 'shot-1', page_action: 'click', point: [24.5, 60] };
+  expect((await run(tool, input)).body.ok).toBe(true);
+  expect(deps.act).toHaveBeenCalledExactlyOnceWith({ pageId: 'shot-1', action: 'click', point: [24.5, 60] }, undefined);
+  for (const extras of [{ element_ref: 'e1' }, { page_action: 'fill', text: 'x' }, { point: [1] }, { point: [-1, 3] }, { point: [1, Infinity] }]) {
+    expect((await run(tool, { ...input, ...extras })).result.isError).toBe(true);
+  }
+  expect(deps.act).toHaveBeenCalledTimes(1);
+  const result = await tool.execute({ operation: 'screenshot', clip: [10, 20, 300, 200] }, {} as never);
+  expect(screenshot).toHaveBeenCalledExactlyOnceWith({ clip: [10, 20, 300, 200] }, undefined);
+  expect(result.images).toEqual([{ data: 'png', mediaType: 'image/png' }]);
 });

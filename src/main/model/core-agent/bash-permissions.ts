@@ -9,7 +9,8 @@
  *   2. NO persistent store. A task-scoped grant is memory-only and bounded to
  *      one (user, conversation, agent) plus the risk categories the user saw.
  *      Privilege/security weakening and external-system mutations always stay
- *      exact-command decisions.
+ *      exact-command decisions. A read that is sensitive only for its personal
+ *      location is granted for its folder instead (read-only, same bounds).
  *
  * Never throws: a broken push channel degrades to deny, so a risky command can
  * never silently run because the dialog failed to show. Once the prompt is
@@ -19,12 +20,14 @@
  */
 
 import * as crypto from 'node:crypto';
+import * as path from 'node:path';
 
 import { createLogger } from '../../logger';
 import { maskId } from '../../util/log-redact';
 import { registerUserSwitchHook } from '../../features/user-switch-hooks';
 import type { IrreversibleAction, RiskCategory } from './bash-risk';
 import type { ExternalMutationFinding } from './external-mutation-risk';
+import type { LocationOnlyRead } from '../../features/local_access_policy';
 
 const log = createLogger('bash-permissions');
 
@@ -78,6 +81,9 @@ export interface BashPermissionInfo {
   irreversible?: IrreversibleAction[];
   /** Main-process eligibility decision; stale renderers cannot widen it. */
   can_allow_run: boolean;
+  /** Set when `allow_run` grants reading this folder rather than the risk
+   *  categories: a read sensitive only for its personal location. */
+  read_folder?: string;
   /** Structured, bounded external actions detected inside the command/script. */
   external_mutations?: ExternalMutationFinding[];
   cid: string;
@@ -89,6 +95,7 @@ interface Pending {
   agentId: string;
   reasons: RiskCategory[];
   canAllowRun: boolean;
+  folderRead?: LocationOnlyRead;
   resolve: (d: BashDecision) => void;
   heartbeat?: NodeJS.Timeout;
 }
@@ -96,6 +103,10 @@ interface Pending {
 const _pending = new Map<string, Pending>();
 type RunGrant = { uid: string; cid: string; agentId: string; reasons: Set<RiskCategory> };
 const _runGrants = new Map<string, RunGrant>();
+// 2026-09-21: 58 approvals for the images in two Desktop folders. One grant
+// per folder, read-only, covering real paths so links cannot carry it out.
+type FolderReadGrant = { uid: string; cid: string; realFolders: Set<string> };
+const _folderReadGrants = new Map<string, FolderReadGrant>();
 
 /** Summary and preview have separate bounded purposes. Prioritize uncertainty
  * and actual risk evidence, not the first lines of a possibly long script. */
@@ -154,6 +165,15 @@ function isCoveredByRunGrant(uid: string, cid: string, agentId: string, reasons:
   return !!grant && reasons.every((reason) => grant.reasons.has(reason));
 }
 
+function isCoveredByFolderReadGrant(uid: string, cid: string, agentId: string, read: LocationOnlyRead): boolean {
+  if (!uid || !cid || !agentId) return false;
+  const grant = _folderReadGrants.get(runGrantKey(uid, cid, agentId));
+  return !!grant && [...grant.realFolders].some((folder) => {
+    const rel = path.relative(folder, read.realPath);
+    return rel === '' || (!!rel && rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+  });
+}
+
 // Lazy ipc lookup — avoids a static model→ipc import cycle and degrades
 // cleanly in tests / headless builds.
 type BroadcastOverride = (channel: string, payload: unknown) => void | boolean;
@@ -167,6 +187,7 @@ export function _resetForTest(): void {
   }
   _pending.clear();
   _runGrants.clear();
+  _folderReadGrants.clear();
 }
 
 function _broadcast(channel: string, payload: unknown): boolean {
@@ -201,20 +222,26 @@ export async function requestBashDecision(opts: {
   externalMutations?: ExternalMutationFinding[];
   keyFacts?: BashPermissionFact[];
   workingDirectory?: string;
+  /** A read sensitive only for its personal location; `allow_run` then
+   *  grants reading this folder instead of the risk categories. */
+  folderRead?: LocationOnlyRead;
   onWaiting?: (elapsedMs: number) => void;
 }): Promise<BashDecision> {
   const reasons = [...new Set(opts.reasons)];
   const actorId = grantActorId(opts.agentId, opts.agentName);
-  if (!opts.unresolvedPaths && isCoveredByRunGrant(opts.uid, opts.cid, actorId, reasons)) {
+  const coveredByFolder = !!opts.folderRead && isCoveredByFolderReadGrant(opts.uid, opts.cid, actorId, opts.folderRead);
+  if (coveredByFolder || (!opts.unresolvedPaths && isCoveredByRunGrant(opts.uid, opts.cid, actorId, reasons))) {
     log.info('bash permission covered by task grant', {
       cid: maskId(opts.cid),
       agent_id: maskId(opts.agentId),
       reasons,
+      ...(coveredByFolder ? { scope: 'folder_read' } : {}),
       command_chars: opts.command.length,
     });
     return 'allow_run';
   }
-  const taskGrantEligible = !opts.unresolvedPaths && canAllowRun(opts.uid, opts.cid, actorId, reasons);
+  const folderRead = opts.folderRead && opts.uid && opts.cid && actorId ? opts.folderRead : undefined;
+  const taskGrantEligible = !!folderRead || (!opts.unresolvedPaths && canAllowRun(opts.uid, opts.cid, actorId, reasons));
   const requestId = crypto.randomBytes(8).toString('hex');
   const command = opts.command.length > COMMAND_PREVIEW_MAX
     ? `${opts.command.slice(0, COMMAND_PREVIEW_MAX)}…`
@@ -232,6 +259,7 @@ export async function requestBashDecision(opts: {
     ...(opts.unresolvedPaths ? { unresolved_paths: true } : {}),
     ...(opts.irreversible?.length ? { irreversible: [...new Set(opts.irreversible)] } : {}),
     can_allow_run: taskGrantEligible,
+    ...(folderRead ? { read_folder: folderRead.folder } : {}),
     ...(opts.externalMutations?.length ? { external_mutations: opts.externalMutations.slice(0, 8) } : {}),
     cid: opts.cid,
   };
@@ -259,6 +287,7 @@ export async function requestBashDecision(opts: {
       agentId: actorId,
       reasons,
       canAllowRun: taskGrantEligible,
+      ...(folderRead ? { folderRead } : {}),
       resolve,
     };
     _pending.set(requestId, pending);
@@ -289,6 +318,22 @@ export function respond(requestId: string, decision: BashDecision): boolean {
   if (decision === 'allow_run') {
     if (!pending.canAllowRun) {
       effectiveDecision = 'allow_once';
+    } else if (pending.folderRead) {
+      const key = runGrantKey(pending.uid, pending.cid, pending.agentId);
+      const grant = _folderReadGrants.get(key) ?? { uid: pending.uid, cid: pending.cid, realFolders: new Set<string>() };
+      grant.realFolders.add(pending.folderRead.realFolder);
+      _folderReadGrants.set(key, grant);
+      const covered: string[] = [];
+      for (const [id, queued] of _pending) {
+        if (!queued.folderRead || queued.uid !== pending.uid || queued.cid !== pending.cid
+          || queued.agentId !== pending.agentId
+          || !isCoveredByFolderReadGrant(queued.uid, queued.cid, queued.agentId, queued.folderRead)) continue;
+        _pending.delete(id);
+        if (queued.heartbeat) clearInterval(queued.heartbeat);
+        covered.push(id);
+        queued.resolve('allow_run');
+      }
+      if (covered.length) _broadcast('bash:permission_cancelled', { request_ids: covered, cid: pending.cid, approved: true });
     } else {
       const key = runGrantKey(pending.uid, pending.cid, pending.agentId);
       const grant = _runGrants.get(key) ?? {
@@ -333,6 +378,9 @@ export function cancelForCid(cid: string): void {
   for (const [key, grant] of _runGrants) {
     if (grant.cid === cid) _runGrants.delete(key);
   }
+  for (const [key, grant] of _folderReadGrants) {
+    if (grant.cid === cid) _folderReadGrants.delete(key);
+  }
 }
 
 /** Account-switch boundary: pending dialogs and task grants owned by the
@@ -351,6 +399,9 @@ export function cancelForUid(uid: string): void {
   }
   for (const [key, grant] of _runGrants) {
     if (grant.uid === uid) _runGrants.delete(key);
+  }
+  for (const [key, grant] of _folderReadGrants) {
+    if (grant.uid === uid) _folderReadGrants.delete(key);
   }
 }
 

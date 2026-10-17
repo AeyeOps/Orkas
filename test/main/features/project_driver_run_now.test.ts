@@ -19,11 +19,13 @@ vi.mock('../../../src/main/logger', async (importOriginal) => {
 vi.mock('../../../src/main/features/chats', () => ({
   createConversation: vi.fn(async () => ({ conversation_id: 'c_run' })),
   deleteConversation: vi.fn(async () => {}),
+  // No existing conversation by default: a to-do's link points nowhere.
+  getConversation: vi.fn(async () => null),
 }));
 vi.mock('../../../src/main/features/group_chat', () => ({
   send: vi.fn(async () => ({ ok: true })),
   setFloor: vi.fn(async () => ({ ok: true })),
-  busIsQuiescent: () => true,
+  busIsQuiescent: vi.fn(() => true),
 }));
 vi.mock('../../../src/main/features/users', () => ({
   getActiveUserId: vi.fn(() => 'uRUNNOW'), hasActiveUser: () => true,
@@ -43,6 +45,7 @@ import * as groupChat from '../../../src/main/features/group_chat';
 import * as agents from '../../../src/main/features/agents';
 import * as projects from '../../../src/main/features/projects';
 import * as users from '../../../src/main/features/users';
+import * as config from '../../../src/main/features/config';
 import * as runner from '../../../src/main/features/project_driver_runner';
 import * as projectTasks from '../../../src/main/features/project_tasks';
 import * as driver from '../../../src/main/features/project_driver';
@@ -53,7 +56,7 @@ let prevWs: string | undefined;
 const UID = 'uRUNNOW';
 const PID = 'p_112233445566';
 
-beforeEach(() => {
+beforeEach(async () => {
   driverLogs.length = 0;
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-runnow-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
@@ -66,13 +69,19 @@ beforeEach(() => {
   fs.rmSync(userTasksDir(UID), { recursive: true, force: true });
   vi.mocked(chats.createConversation).mockResolvedValue({ conversation_id: 'c_run' } as never);
   vi.mocked(chats.deleteConversation).mockResolvedValue(undefined as never);
+  vi.mocked(chats.getConversation).mockResolvedValue(null as never);
+  vi.mocked(groupChat.busIsQuiescent).mockReturnValue(true);
   vi.mocked(groupChat.send).mockResolvedValue({ ok: true } as never);
   vi.mocked(groupChat.setFloor).mockResolvedValue({ ok: true } as never);
   vi.mocked(users.getActiveUserId).mockReturnValue(UID);
+  config.setLanguage('en');
   vi.mocked(projects.getBindings).mockResolvedValue({ agents: ['a_owner'], skills: [] } as never);
   vi.mocked(agents.listAgentSummaries).mockResolvedValue([{ agent_id: 'a_owner', name: 'Owner', enabled: true }] as never);
+  await driver.writeConfig(UID, PID, { enabled: true });
+  await driver.writeConfig(UID, '', { enabled: true });
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(projectDir(UID, PID), { recursive: true, force: true });
   fs.rmSync(userTasksDir(UID), { recursive: true, force: true });
@@ -96,7 +105,34 @@ async function seedTask(over: {
 }
 
 describe('project_driver_runner › runTaskNow', () => {
-  it('keeps conversation-creation failures actionable without logging private error text or identities', async () => {
+  it.each([
+    { mode: 'manual', pid: PID, owned: true },
+    { mode: 'manual', pid: PID, owned: false },
+    { mode: 'manual', pid: '', owned: false },
+    { mode: 'automatic', pid: PID, owned: true },
+    { mode: 'automatic', pid: PID, owned: false },
+    { mode: 'automatic', pid: '', owned: false },
+  ])('carries the software language and an explicit user exception for $mode/$pid/owned=$owned', async ({ mode, pid, owned }) => {
+    config.setLanguage('zh-tw');
+    const content = 'Inspect the archive. Please reply in Korean.';
+    const created = await projectTasks.createTask(UID, pid, {
+      title: content, created_by: 'user', ...(owned ? { owner_agent_id: 'a_owner' } : {}),
+    });
+    if (!created.ok) throw new Error('task fixture failed');
+    const result = mode === 'manual'
+      ? await runner.runTaskNow(UID, pid, created.task.id)
+      : await runner.advance(UID, pid, created.task);
+    expect(result.ok).toBe(true);
+    const sent = vi.mocked(groupChat.send).mock.calls[0][0];
+    expect(sent.text).toBe(content);
+    expect(sent.model_text).toContain(content);
+    expect(sent.model_text).toContain('Respond in Traditional Chinese (繁體中文)');
+    expect(sent.model_text).toContain('unless the original user request explicitly specifies another response language');
+    expect((await projectTasks.getTask(UID, pid, created.task.id))?.status).toBe('progress');
+  });
+
+  it.each(['manual', 'automatic'])('preserves a dispatched %s run when association fails without disclosing private diagnostics', async mode => {
+    const tb = await import('../../../src/main/features/group_chat/task_board');
     const task = await seedTask();
     const detail = `${tmpDir}/private-deliverable.txt cannot be created`;
     vi.mocked(chats.createConversation).mockRejectedValueOnce(new Error(detail));
@@ -411,12 +447,12 @@ describe('project_driver_runner › runTaskNow', () => {
     vi.mocked(groupChat.send).mockImplementationOnce(async () => {
       expect((await projectTasks.getTask(UID, pid, created.task.id))?.status).toBe('review');
       expect((await projectTasks.updateTask(UID, pid, created.task.id, { status: 'progress' })).ok).toBe(true);
-      expect((await projectTasks.completeTask(UID, pid, created.task.id, 'verified-delivery')).ok).toBe(true);
+      expect((await projectTasks.completeTask(UID, pid, created.task.id)).ok).toBe(true);
       return { ok: true } as never;
     });
     expect((await runner.runTaskNow(UID, pid, created.task.id)).ok).toBe(true);
     expect(await projectTasks.getTask(UID, pid, created.task.id)).toMatchObject({
-      status: 'done', result_ref: 'verified-delivery', origin_cid: 'c_run', done_at: expect.any(String),
+      status: 'done', origin_cid: 'c_run', done_at: expect.any(String),
     });
   });
 
@@ -475,6 +511,54 @@ describe('project_driver_runner › runTaskNow', () => {
     expect(await run()).toMatchObject({ ok: true, cid: 'c_retry' });
     expect(await projectTasks.getTask(UID, PID, task.id)).toMatchObject({ status: 'progress', origin_cid: 'c_retry' });
     expect(chats.deleteConversation).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('project_driver_runner › runTaskNow in the to-do\'s own conversation', () => {
+  it('runs a to-do in the conversation it belongs to instead of starting a new one', async () => {
+    vi.mocked(chats.getConversation).mockResolvedValue({ conversation_id: 'c_origin', title: 'Novel', project_id: PID } as never);
+    const task = await seedTask({ originCid: 'c_origin' });
+    const res = await runner.runTaskNow(UID, PID, task.id);
+
+    expect(res).toMatchObject({ ok: true, cid: 'c_origin', reused: true });
+    expect(chats.createConversation).not.toHaveBeenCalled();
+    const sendArg = vi.mocked(groupChat.send).mock.calls[0][0] as { cid: string; text: string };
+    expect(sendArg.cid).toBe('c_origin');
+    expect(sendArg.text).toBe('Ship the thing');
+    expect(await projectTasks.getTask(UID, PID, task.id)).toMatchObject({ status: 'progress', origin_cid: 'c_origin' });
+  });
+
+  it('starts a new conversation when the original one no longer exists', async () => {
+    const task = await seedTask({ originCid: 'c_deleted' });
+    const res = await runner.runTaskNow(UID, PID, task.id);
+
+    expect(res).toMatchObject({ ok: true, cid: 'c_run', reused: false });
+    expect(chats.getConversation).toHaveBeenCalledWith(UID, 'c_deleted');
+    expect(chats.createConversation).toHaveBeenCalledTimes(1);
+    expect(await projectTasks.getTask(UID, PID, task.id)).toMatchObject({ origin_cid: 'c_run' });
+  });
+
+  it('never deletes the original conversation when the send fails', async () => {
+    vi.mocked(chats.getConversation).mockResolvedValue({ conversation_id: 'c_origin', project_id: PID } as never);
+    vi.mocked(groupChat.send).mockResolvedValue({ ok: false, error: 'no_model' } as never);
+    const task = await seedTask({ originCid: 'c_origin' });
+    const res = await runner.runTaskNow(UID, PID, task.id);
+
+    expect(res).toMatchObject({ ok: false, error: 'no_model' });
+    expect(chats.deleteConversation).not.toHaveBeenCalled();
+    expect(await projectTasks.getTask(UID, PID, task.id)).toMatchObject({ status: 'todo', origin_cid: 'c_origin' });
+  });
+
+  it('reports a busy original conversation instead of starting a second run', async () => {
+    vi.mocked(chats.getConversation).mockResolvedValue({ conversation_id: 'c_origin', project_id: PID } as never);
+    vi.mocked(groupChat.busIsQuiescent).mockImplementation((_uid: string, cid: string) => cid !== 'c_origin');
+    const task = await seedTask({ originCid: 'c_origin' });
+    const res = await runner.runTaskNow(UID, PID, task.id);
+
+    expect(res).toMatchObject({ ok: false, error: 'conversation_busy', cid: 'c_origin' });
+    expect(groupChat.send).not.toHaveBeenCalled();
+    expect(chats.createConversation).not.toHaveBeenCalled();
+    expect((await projectTasks.getTask(UID, PID, task.id))?.status).toBe('todo');
   });
 });
 

@@ -3,8 +3,9 @@
  * Codex app-server can issue `item/tool/requestUserInput` while a turn is
  * running. Main owns the pending promise, renderer collects bounded answers,
  * and cancellation/user switch/app shutdown always resolves with empty
- * answers so the native process never waits forever. Raw answers are neither
- * logged nor published as LocalEvents.
+ * answers so the native process never waits forever. Non-secret replies use
+ * the conversation owner's history writer; answers never enter run logs or
+ * LocalEvents.
  */
 
 import * as crypto from 'node:crypto';
@@ -31,6 +32,9 @@ interface Pending {
   uid: string;
   runId: string;
   questionIds: string[];
+  questions: LocalCliUserInputQuestion[];
+  saveAnswer?: (text: string, inputId: string) => Promise<void>;
+  responding?: Promise<InputResponseResult>;
   resolve: (response: LocalCliUserInputResponse) => void;
   heartbeat?: NodeJS.Timeout;
   autoResolve?: NodeJS.Timeout;
@@ -41,6 +45,11 @@ interface Pending {
 }
 
 const pending = new Map<string, Pending>();
+type InputResponseResult = { handled: boolean; cancelled?: boolean; save_failed?: boolean };
+// Lost IPC replies may be retried after the native request has resumed. Keep
+// only bounded, account-scoped receipts, never another copy of the answers.
+const savedReceipts = new Map<string, string>();
+const MAX_SAVED_RECEIPTS = 128;
 type BroadcastOverride = (channel: string, payload: unknown) => void | boolean;
 let broadcastOverride: BroadcastOverride | null = null;
 
@@ -122,6 +131,7 @@ export async function requestUserInput(opts: {
   conversationTitle?: string;
   cli: LocalCliType;
   request: LocalCliUserInputRequest;
+  saveAnswer?: Pending['saveAnswer'];
   onWaiting?: (elapsedMs: number) => void;
 }): Promise<LocalCliUserInputResponse> {
   const questions = normalizeQuestions(opts.request.questions, opts.cli === 'claude' ? 4 : MAX_QUESTIONS);
@@ -159,7 +169,10 @@ export async function requestUserInput(opts: {
         });
       }
     };
-    const entry: Pending = { uid: opts.uid, runId: opts.runId, questionIds, resolve, cancel: opts.request.cancel };
+    const entry: Pending = {
+      uid: opts.uid, runId: opts.runId, questionIds, questions, resolve,
+      cancel: opts.request.cancel, saveAnswer: opts.saveAnswer,
+    };
     pending.set(requestId, entry);
     const cancel = () => {
       if (settle(requestId, emptyResponse(questionIds))) {
@@ -192,15 +205,17 @@ export async function requestUserInput(opts: {
   });
 }
 
-export function respond(
+export async function respond(
   requestId: string,
   uid: string,
   rawAnswers: unknown,
   cancelled = false,
-): { handled: boolean; cancelled?: boolean } {
+): Promise<InputResponseResult> {
   const entry = pending.get(requestId);
+  if (!entry && savedReceipts.get(requestId) === uid) return { handled: true, cancelled: false };
   if (!entry || entry.uid !== uid) return { handled: false };
   if (entry.cancelling || entry.cancelUncertain) return { handled: false };
+  if (entry.responding) return entry.responding;
   const record = rawAnswers && typeof rawAnswers === 'object' && !Array.isArray(rawAnswers)
     ? rawAnswers as Record<string, unknown>
     : {};
@@ -212,8 +227,31 @@ export function respond(
       ? []
       : values.slice(0, MAX_OPTIONS).map(item => bounded(item, MAX_ANSWER)).filter(Boolean);
   }
-  settle(requestId, { cancelled, answers });
-  return { handled: true, cancelled };
+  entry.responding = (async (): Promise<InputResponseResult> => {
+    const text = entry.questions
+      .filter(question => question.isSecret !== true)
+      .map(question => `${question.question}\n${answers[question.id].join(', ')}`)
+      .join('\n\n');
+    if (!cancelled && text && entry.saveAnswer) {
+      try { await entry.saveAnswer(text, requestId); }
+      catch (error) {
+        log.warn('history save failed', {
+          request_id: maskId(requestId),
+          error: logErrorSummary(error),
+        });
+        return { handled: false, save_failed: true };
+      }
+    }
+    // A native withdrawal or account switch may have won during the write.
+    if (!settle(requestId, { cancelled, answers })) return { handled: false };
+    if (!cancelled && entry.saveAnswer) {
+      savedReceipts.set(requestId, uid);
+      if (savedReceipts.size > MAX_SAVED_RECEIPTS) savedReceipts.delete(savedReceipts.keys().next().value!);
+    }
+    return { handled: true, cancelled };
+  })();
+  try { return await entry.responding; }
+  finally { entry.responding = undefined; }
 }
 
 /** Keep ownership until the native question is confirmed closed. A retry after
@@ -224,6 +262,10 @@ export async function cancelRequest(requestId: string, uid: string): Promise<{
   const entry = pending.get(requestId);
   if (!entry) return { handled: false, closed: true };
   if (entry.uid !== uid) return { handled: false };
+  if (entry.responding) {
+    await entry.responding;
+    return cancelRequest(requestId, uid);
+  }
   if (!entry.cancel) return { handled: false, cancel_failed: true };
   if (entry.cancelUncertain) return { handled: false, unknown: true };
   if (entry.cancelling) return entry.cancelling;
@@ -255,6 +297,7 @@ export function cancelForRun(runId: string): void {
 }
 
 function cancelForUid(uid: string): void {
+  for (const [requestId, owner] of savedReceipts) if (owner === uid) savedReceipts.delete(requestId);
   const runIds = new Set<string>();
   for (const entry of pending.values()) if (entry.uid === uid) runIds.add(entry.runId);
   for (const runId of runIds) cancelForRun(runId);
@@ -269,5 +312,6 @@ export function _setBroadcastForTest(fn: BroadcastOverride | null): void {
 export function _resetForTest(): void {
   for (const [requestId, entry] of pending) settle(requestId, emptyResponse(entry.questionIds));
   pending.clear();
+  savedReceipts.clear();
   broadcastOverride = null;
 }

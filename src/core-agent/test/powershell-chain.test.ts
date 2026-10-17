@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { scanPowerShell } from "../src/sandbox/powershell-lexical.js";
 import { parsePowerShellChain } from "../src/sandbox/powershell-chain.js";
 import { buildShellInvocation, SandboxExecutor } from "../src/sandbox/executor.js";
 import fs from "node:fs/promises";
@@ -27,6 +28,9 @@ describe("Windows simple command chains", () => {
   it.each([
     "Write-Output '&& ||'", 'Write-Output "&& ||"',
     "Write-Output 'a'' && b'", "Write-Output done # && is a comment",
+    'Write-Output --% literal && second', 'Write-Output “literal && data”',
+    "$s = @'\necho 'left && right'\n'@\nWrite-Output $s",
+    '<# && comment #> Write-Output done',
   ])("leaves literal operators alone: %s", source => {
     expect(parsePowerShellChain(source)).toEqual({ kind: "none" });
     expect(buildShellInvocation("powershell.exe", source, "win32").args.at(-1)).toContain(`\n${source}\n`);
@@ -42,11 +46,30 @@ describe("Windows simple command chains", () => {
     'first && @"\ntext\n"@', 'first && second`\nthird',
     'first && Write-Output @(1)', 'first && [Console]::WriteLine(1)',
     'first && Write-Output "nul\0"', 'first && ' + 'x'.repeat(65_536),
-    'Write-Output --% literal && second', 'Write-Output “literal && data”',
+    'first && Write-Output --% literal && data',
     'first && Write-Output "smart” || hidden “quote"',
     Array(33).fill('first').join(' && '),
   ])("rejects incomplete, compound or oversized chains", source => {
     expect(parsePowerShellChain(source)).toEqual({ kind: "unsupported" });
+  });
+
+  it('retains executable expansion offsets amid literal here-string data', () => {
+    const source = '$s = @"\n\'$(Write-Output "$(head -n 1 fixture.txt)")\' literal && data\n"@';
+    const evidence = scanPowerShell(source);
+    expect(evidence.surface.length).toBe(source.length);
+    expect(evidence.surface.indexOf('head')).toBe(source.indexOf('head'));
+    expect(evidence.operators).toEqual([]);
+    expect(evidence.surface).not.toContain('literal');
+    expect(parsePowerShellChain(source)).toEqual({ kind: 'none' });
+  });
+
+  it.each([
+    'first && Write-Output "$(second || third)"',
+    'first && Write-Output "unterminated',
+    'first && second <# unterminated',
+    'first && node --% literal',
+  ])('does not lower partial, expanded or stop-parsing chains: %s', source => {
+    expect(parsePowerShellChain(source)).toEqual({ kind: 'unsupported' });
   });
 
   it("lowers only the legacy Windows PowerShell invocation", () => {
@@ -93,6 +116,18 @@ describe.runIf(process.platform === "win32")("native Windows PowerShell chain ou
     expect(result.stdout.trim().split(/\s+/).join(' ')).toBe(output);
     expect(result.stderr).toBe('');
     expect(result.exitCode).toBe(code);
+  }, 25_000);
+
+  it.each([
+    ["$s = @'\r\necho 'left && right'\r\n'@\r\nWrite-Output $s", "echo 'left && right'"],
+    ['$s = @"\n"export literal" $(1+2)\n"@\nWrite-Output $s', '"export literal" 3'],
+    ['<# export && literal #> Write-Output “literal && /dev/null” # && comment', 'literal && /dev/null'],
+  ])('executes native data and expansion without lowering literal operators: %s', async (source, output) => {
+    const result = await new SandboxExecutor({ workingDir: os.tmpdir(), shell: 'powershell.exe' }).execute(source);
+    expect(result.stdout.trim()).toBe(output);
+    expect(result.stderr).toBe('');
+    expect(result.exitCode).toBe(0);
+    expect(result.startFailed).toBe(false);
   }, 25_000);
 
   it("clears a recovered native error and preserves literal operators", async () => {

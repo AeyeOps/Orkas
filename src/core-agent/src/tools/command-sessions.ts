@@ -17,6 +17,8 @@ type CommandSession = {
   end: number;
   waiters: Set<() => void>;
   control?: { write(chars: string): void; stop(): void };
+  stopRequested: boolean;
+  stoppedByRequest: boolean;
   result?: ToolResult;
   completion: Promise<void>;
   delivered: boolean;
@@ -29,8 +31,9 @@ export function managedCommandsEnabled(ctx: ToolContext): boolean {
 
 export function commandSessionWait(value: unknown): number | null {
   if (value === undefined) return 10_000;
-  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= 30_000
-    ? value : null;
+  if (typeof value !== "number" || !Number.isInteger(value)) return null;
+  // Out-of-range integers use the omitted-value default, not a clamped wait.
+  return value >= 0 && value <= 30_000 ? value : 10_000;
 }
 
 export function runningCommandSessions(owner: string): number {
@@ -133,6 +136,9 @@ function receipt(session: CommandSession, input: Record<string, unknown>): ToolR
   const status = !result ? "running" : execution?.status === "succeeded" ? "exited"
     : execution?.status === "aborted" || execution?.status === "timed_out" ? "stopped" : "error";
   const firstDelivery = !!result && !session.delivered;
+  // A successful stop is distinct from the command's aborted execution.
+  // Reads still report that execution; genuine failures keep their error flag.
+  const intentionalStop = input.action === "stop" && session.stoppedByRequest && execution?.status === "aborted";
   if (result) session.delivered = true;
   return {
     content: JSON.stringify({
@@ -143,7 +149,7 @@ function receipt(session: CommandSession, input: Record<string, unknown>): ToolR
       ...(execution ? { exit_code: execution.exitCode, execution_status: execution.status,
         stdout_bytes: execution.stdout.bytes, stderr_bytes: execution.stderr.bytes } : {}),
     }),
-    ...(result?.isError ? { isError: true } : {}),
+    ...(result?.isError && !intentionalStop ? { isError: true } : {}),
     ...(firstDelivery && result?.observations ? { observations: result.observations } : {}),
     ...(firstDelivery && result?.streamedOutput ? { streamedOutput: result.streamedOutput } : {}),
   };
@@ -161,18 +167,28 @@ export async function startCommandSession(
   const session: CommandSession = {
     id: randomUUID(), owner: owner(ctx), chunks: [], start: 0, end: 0,
     waiters: new Set(), completion: Promise.resolve(), delivered: false,
+    stopRequested: false, stoppedByRequest: false,
   };
   sessions.set(session.id, session);
   const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
   const terminal = ctx.state.commandSessionTerminal as ((result: ToolResult) => Promise<ToolResult>) | undefined;
+  const callSignal = ctx.signal;
+  const runSignal = ctx.state.commandSessionSignal instanceof AbortSignal ? ctx.state.commandSessionSignal : undefined;
   session.completion = sandbox.execute(command, {
     onStart: (control) => { session.control = control; },
     onOutput: (bytes, stream, env) => append(session, process.platform === "win32"
       ? decodeProcessOutput(bytes, process.platform, env) : decoders[stream].write(bytes)),
   }).then(async (raw) => {
+    // Pin attribution at execution completion, before asynchronous formatting
+    // or host file delivery. An overlapping original cancellation wins.
+    const stoppedByRequest = session.stopRequested && raw.aborted === true
+      && !raw.startFailed && !raw.timedOut && !raw.outputLimitExceeded
+      && (raw.exitCode === null || raw.exitCode === 0 || raw.rootTerminationConfirmed === true)
+      && !callSignal?.aborted && !runSignal?.aborted;
     append(session, decoders.stdout.end() + decoders.stderr.end());
     let result = await format(raw);
     if (terminal) result = await terminal(result);
+    session.stoppedByRequest = stoppedByRequest;
     session.result = result;
   }).catch(() => {
     session.control?.stop();
@@ -181,9 +197,15 @@ export async function startCommandSession(
     notify(session);
     session.timer = setTimeout(() => release(session), RETENTION_MS);
     session.timer.unref();
-    // Bound retained terminal records as well as each output buffer.
+    // Bound retained terminal records as well as each output buffer. Records
+    // already delivered go first: their full output was handed off once, while
+    // an unread result would be lost and could make the model rerun a command.
     const finished = [...sessions.values()].filter((entry) => entry.result);
-    for (const old of finished.slice(0, Math.max(0, finished.length - 32))) release(old);
+    const excess = finished.length - 32;
+    if (excess > 0) {
+      const evictable = [...finished.filter((entry) => entry.delivered), ...finished.filter((entry) => !entry.delivered)];
+      for (const old of evictable.slice(0, excess)) release(old);
+    }
   });
   await wait(session, waitMs, () => !!session.result, ctx.signal);
   if (session.result) {
@@ -215,7 +237,10 @@ export async function continueCommandSession(input: Record<string, unknown>, ctx
     catch { return { content: "E_PROCESS_WRITE: process stdin is closed", isError: true }; }
     return { content: JSON.stringify({ session_id: session.id, status: "running", written_chars: input.chars.length }) };
   } else if (action === "stop") {
-    if (!session.result) { session.control?.stop(); await session.completion; }
+    if (!session.result) {
+      if (session.control) { session.stopRequested = true; session.control.stop(); }
+      await session.completion;
+    }
   }
   return receipt(session, input);
 }

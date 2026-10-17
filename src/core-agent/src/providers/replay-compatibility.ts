@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import type { MessageContent } from '../shared/types.js';
+import type { Message, MessageContent } from '../shared/types.js';
 
 type Origin = NonNullable<MessageContent['replayOrigin']>;
 type Target = { api: string; provider: string; id: string; baseUrl?: string; headers?: Record<string, string>; compat?: unknown };
@@ -54,6 +54,33 @@ function portableChatThinking(content: MessageContent, model: Target): boolean {
     && !!content.thinking && ['reasoning_content', 'reasoning', 'reasoning_text'].includes(content.thinkingSignature ?? '');
 }
 
+/** A truncated tool batch may keep independently replayable plaintext, never
+ * opaque state that could refer to its discarded proposals. Responses JSON
+ * comes from the SDK's completed item event; do not synthesize it from deltas. */
+export function isPortableThinkingForRecovery(content: MessageContent): boolean {
+  if (content.type !== 'thinking' || content.redacted || content.googleNativeReplay) return false;
+  const signature = content.thinkingSignature;
+  if (['reasoning_content', 'reasoning', 'reasoning_text'].includes(signature ?? '')) return !!content.thinking.trim();
+  try {
+    const item = JSON.parse(signature ?? '');
+    if (!item || typeof item !== 'object' || Array.isArray(item) || item.type !== 'reasoning') return false;
+    // Fail closed for encrypted state and unknown provider extensions. Retain
+    // the original item and origin unchanged; ordinary projection owns scope.
+    if (Object.keys(item).some(key => !['type', 'id', 'status', 'summary', 'content', 'encrypted_content', '_orkas_replay'].includes(key))) return false;
+    if (item.encrypted_content != null && item.encrypted_content !== '') return false;
+    if (item.id !== undefined && typeof item.id !== 'string') return false;
+    if (item._orkas_replay !== undefined && typeof item._orkas_replay !== 'string') return false;
+    if (item.status !== undefined && item.status !== 'completed') return false;
+    if (item.summary !== undefined && (!Array.isArray(item.summary) || item.summary.length)) return false;
+    return Array.isArray(item.content) && item.content.length > 0
+      && item.content.every((part: unknown) => !!part && typeof part === 'object'
+        && !Array.isArray(part) && Object.keys(part).every(key => key === 'type' || key === 'text')
+        && (part as { type?: unknown }).type === 'reasoning_text'
+        && typeof (part as { text?: unknown }).text === 'string')
+      && item.content.some((part: { text: string }) => part.text.trim().length > 0);
+  } catch { return false; }
+}
+
 /** pi-ai owns ordinary cross-model conversion. Only merged source blocks and
  * the legacy plaintext Chat contract need per-block projection: pi-ai's source
  * identity is message-wide and would otherwise discard valid sibling state. */
@@ -74,6 +101,35 @@ export function replayMessageSource(content: MessageContent[], model: Target, ta
   // Mark only that transport mismatch foreign; preserve known model identities.
   return { source: !same && source.api === model.api && source.provider === model.provider && source.model === model.id
     ? { ...source, provider: 'orkas-replay-incompatible' } : source, projectBlocks };
+}
+
+/** Mixed messages retain the target identity to preserve signed siblings, so
+ * pi-ai skips its cross-source ID conversion. Repair only foreign Anthropic
+ * IDs that violate its wire grammar; reserve all existing IDs against aliases.
+ * This map is request-local and is shared by calls and receipts. */
+export function mixedReplayToolIds(messages: Message[], model: Target, target: Origin): Map<string, string> {
+  const mapped = new Map<string, string>();
+  if (model.api !== 'anthropic-messages') return mapped;
+  const reserved = new Set(messages.flatMap(m => m.content.flatMap(c =>
+    c.type === 'tool_use' ? [String(c.id || '').trim()] : [])));
+  // Single-source siblings still pass through pi-ai's Anthropic normalization.
+  for (const id of [...reserved]) reserved.add(id.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 64));
+  for (const message of messages) {
+    if (message.role !== 'assistant' || !replayMessageSource(message.content, model, target).projectBlocks) continue;
+    for (const block of message.content) {
+      if (block.type !== 'tool_use' || compatibleReplay(block, target)) continue;
+      const id = String(block.id || '').trim();
+      if (!id || mapped.has(id) || /^[a-zA-Z0-9_-]{1,64}$/.test(id)) continue;
+      let attempt = 0;
+      let candidate: string;
+      do {
+        candidate = 'ork_' + createHash('sha256').update(JSON.stringify([id, attempt++])).digest('hex').slice(0, 60);
+      } while (reserved.has(candidate));
+      mapped.set(id, candidate);
+      reserved.add(candidate);
+    }
+  }
+  return mapped;
 }
 
 /** Project only private protocol state; canonical history stays untouched.

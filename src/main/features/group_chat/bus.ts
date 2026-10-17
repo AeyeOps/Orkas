@@ -27,7 +27,7 @@ import { drainConversationFiling, hasPendingConversationFiling } from '../conver
  */
 
 import { splitMarkdownProseCode } from '../../util/markdown-prose-code';
-import { commanderMentionDisplayText, stripReservedRoutingMentions, type CommanderMentionDisplay } from './message-display';
+import { classifyNativeCommentary, commanderMentionDisplayText, stripReservedRoutingMentions, type CommanderMentionDisplay } from './message-display';
 import type {
   AgentRunSteerMessage,
   AgentTool,
@@ -72,6 +72,7 @@ import {
   setActiveRecipient, setOrchestrationLedger, markOrchestrationInterrupted,
   takeOrchestrationLedgerForAgent, takeOrchestrationLedgerForForm, clearOrchestrationLedger,
   beginAgentHandoff, rollbackAgentHandoff, clearOrchestrationForCancellation,
+  setOrchestrationLedgerIfFree, claimFloorForWaitingTask, releaseWaitingFloor, waitingFloorBinding,
 } from './state';
 import type { StateFile } from './state';
 import { maxToolLoopsForActorKind } from './actor-budgets';
@@ -89,7 +90,6 @@ import {
 } from './visibility';
 import {
   resolveRecipients, parseMentions, buildMention,
-  type SegmentedMentions,
   extractFormFromFinal, computeFormId, ChatFormPayload,
   extractHandbackFromFinal,
   extractPlanInteractionFromFinal, extractAgentFieldBlocks, extractSkillContainers, decodeSubmission,
@@ -112,6 +112,12 @@ import {
 } from '../../util/project-layout';
 import { isPathAllowed } from '../../util/path-sandbox';
 import * as agentsFeat from '../agents';
+import {
+  planUserDispatch,
+  buildAssignmentContext,
+  type DispatchPlanResult,
+  type PlannerCandidate,
+} from './dispatch_planner';
 import * as runtimeContentPublish from '../runtime_content_publish';
 import { indexChatMessageDeferred } from '../search/indexer';
 import * as commanderRuntimeStats from '../commander_runtime_stats';
@@ -120,7 +126,7 @@ import { isAgentEnabled, readDisabledSets } from '../component_enabled';
 import { finalizeProducedFile, recordProducedFile } from '../produced_output_hooks';
 import { selectVisibleProducedFiles } from '../produced_files';
 import { excludeUnchangedInputs } from '../produced_input_guard';
-import { buildLanguageDirective, normalizeLang, t, type Lang } from '../../i18n';
+import { buildHostTurnLanguageDirective, buildLanguageDirective, normalizeLang, t, type Lang } from '../../i18n';
 import { resolveLanguageForUser } from '../config';
 import * as marketplaceFeat from '../marketplace';
 import { readInstalls } from '../marketplace_installs';
@@ -133,7 +139,7 @@ import {
 } from './app_nav';
 import { APP_HEALTH_DOMAINS, collectAppHealth, isAppHealthDomain } from './app_health';
 import { buildConversationBrowserTool } from './browser_tool';
-import { beginBrowserTaskRun, finishBrowserTaskRun } from '../web_assist_lifecycle';
+import { beginBrowserTaskRun, browserTaskRunId, finishBrowserTaskRun } from '../web_assist_lifecycle';
 import { buildConnectorSetupTool } from './connector_setup_tool';
 import { createSkillTurnBuffer, onAgentTurnEnd, onUserMessage } from '../expert_signals/turn_hooks';
 import {
@@ -153,7 +159,6 @@ import {
 } from '../../model/core-agent/skill-registry';
 import { AGENT_DESCRIPTION_ROSTER_MAX_CHARS } from '../../util/skill-description-policy';
 import * as connectorActionConfirm from '../connectors/action_confirm';
-import * as webAssistActionConfirm from '../web_assist_confirm';
 import * as bashPermissions from '../../model/core-agent/bash-permissions';
 import { toolExecutionFactKind } from '../../model/core-agent/tool-catalog';
 import {
@@ -229,6 +234,20 @@ function escapeXmlText(s: string): string {
 function isExistingProducedFile(absPath: string): boolean {
   try {
     return fs.statSync(absPath).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Regular file created at or after `sinceMs`. Creation time, not mtime:
+ * adoption makes a file conversation-owned (later writes overwrite it in
+ * place instead of uniquifying, and it becomes a conversation deliverable),
+ * so a user's existing file edited during the run must stay foreign.
+ * Filesystems without a birth time report 0 and fail closed. */
+function isFileCreatedSince(absPath: string, sinceMs: number): boolean {
+  try {
+    const stat = fs.statSync(absPath);
+    return stat.isFile() && stat.birthtimeMs > 0 && stat.birthtimeMs >= sinceMs;
   } catch {
     return false;
   }
@@ -553,8 +572,8 @@ const SKILL_FILE_BLOCK_SYNTAX_HINT = [
 
 const MAX_PUBLIC_THINKING_SUMMARY_CHARS = 2_048;
 const MAX_WORKER_TURNS = 100; // hard ceiling against runaway loops
-// Per-turn tool-round budgets (commander 120 / named agent 100 / else schema
-// default) live in ./actor-budgets so they are unit-testable and can't drift.
+// Native actor tool-round budgets (500; workers inherit the schema default)
+// live in ./actor-budgets so the shared policy is unit-testable.
 
 type ProcessEvent = { stream: string; data?: unknown };
 type ProcessItem =
@@ -871,6 +890,10 @@ interface QueueItem {
   sourceRecipients: string[];
   /** Choice generation captured when this task entered the queue. */
   floorRevision?: number;
+  /** User choices only; parallel automatic transitions do not invalidate this origin. */
+  floorChoiceRevision?: number;
+  /** `CidState.waitClock` value when this item entered the queue. */
+  enqueueSeq?: number;
   /** Composed runtime payload — what the worker actually feeds the LLM,
    * including the `<msg from=X>...</msg>` wrapper. Built at enqueue time
    * so the queue is a real FIFO of LLM-ready turns, no last-minute
@@ -911,10 +934,17 @@ interface QueueItem {
    * steer leftover that IS claimed as a turn gets a lazily created running
    * task at claim time. */
   taskId?: string;
-  /** In-memory mirror of the board row's `after` chain pointer (§4.8), kept
-   * in lockstep by setConversationTaskAfter so the admission gate never has
-   * to read the async board. */
-  afterTaskId?: string;
+  /** In-memory mirror of the board row's `after` dependencies (D29), kept in
+   * lockstep with the board so the admission gate never has to read the
+   * async board. The task starts only after every listed task settles done. */
+  afterTaskIds?: string[];
+  /** Dependencies the user dropped with "run anyway" after they ended without
+   * `done`; the hand-off tells the task those inputs are missing. */
+  skippedAfterTaskIds?: string[];
+  /** Host-written split note for a planned dispatch (D29): the whole plan,
+   * this task's part, and who receives its result. Consume-time prepend with
+   * the same layering as `predecessorContext`. */
+  assignmentContext?: string;
   /** Predecessor hand-off block built at admission time for an `after`-gated
    * task whose predecessor finished `done` with a persisted result: the
    * predecessor's visible reply (clipped) + produced file paths. Consume-time
@@ -925,8 +955,8 @@ interface QueueItem {
   /** P3: this execution is a commander-owned sub-task created by dispatch_to.
    * Synchronous dispatch skips globalSlots (the parent holds one while awaiting
    * the child's terminal — same parent-holds/child-waits exemption as nested
-   * runs; the named gate + session cap are its bound) and exposes no steer
-   * surface (the user cancels, never co-writes the contract — §4.6.1). */
+   * runs; the named gate + session cap are its bound). User updates can steer
+   * its live turn without replacing the dispatch task or its result waiter. */
   commanderSubtask?: boolean;
   /** Async dispatch does not borrow a waiting Commander model slot. */
   asyncDispatch?: boolean;
@@ -938,6 +968,10 @@ interface QueueItem {
    * active run; any follow-up stays in the ordinary FIFO, matching the prior
    * nested hand-off contract. */
   terminalHandoff?: boolean;
+  /** Automatic floor ownership admitted with this terminal hand-off. */
+  handoffFloorBinding?: string;
+  /** A plain follow-up continues a form wait without submitting its fields. */
+  pendingFormId?: string;
   /** A user-triggered retry of an Agent bubble originally created by
    * synchronous `dispatch_to`. The retry is top-level, so it must create a
    * fresh Commander turn after the Agent reaches a terminal result. */
@@ -1028,6 +1062,25 @@ interface WorkerState {
    * Attached to the final message; the renderer navigates only on user
    * click, so staging has no side effect. */
   pendingAppNavRequests?: AppNavRequest[];
+  pendingSavedTasks?: NonNullable<GroupMessage['saved_tasks']>;
+}
+
+function stageSavedTask(w: WorkerState, turnId: string, task: NonNullable<GroupMessage['saved_tasks']>[number]) {
+  if (!w.running || w.currentTurnId !== turnId) return;
+  const list = w.pendingSavedTasks ||= [];
+  const saved = { ...task, title: task.title.split(/\r?\n/, 1)[0].slice(0, 160) };
+  const index = list.findIndex((item) => item.kind === task.kind
+    && item.task_id === task.task_id && item.project_id === task.project_id);
+  if (index >= 0) list[index] = saved;
+  else if (list.length < 100) list.push(saved);
+}
+
+// A task deleted later in the same turn must not leave its link on the final
+// message (e.g. a duplicate created by a retried call and then removed).
+function unstageSavedTask(w: WorkerState, turnId: string, kind: 'automation' | 'todo', taskId: string, projectId?: string) {
+  if (!w.running || w.currentTurnId !== turnId || !w.pendingSavedTasks) return;
+  w.pendingSavedTasks = w.pendingSavedTasks.filter((item) => !(item.kind === kind && item.task_id === taskId
+    && (projectId === undefined || item.project_id === projectId)));
 }
 
 function stageAppNavRequest(
@@ -1049,6 +1102,7 @@ function stageAppNavRequest(
 }
 
 interface CidState {
+  skillImportPreviews?: Map<string, { sourcePath: string; fingerprint: string; expiresAt: number }>;
   // Read the existing public process trail only when a view is rebuilt. These
   // closures own no second event log and are released with their actor turn.
   liveDisplays?: Map<string, () => GroupMessage[]>;
@@ -1082,6 +1136,15 @@ interface CidState {
    * not survive a restart — the board load reconciles orphaned blocked rows
    * to cancelled. */
   blockedItems: Map<string, QueueItem>;
+  /** In-flight dispatch-planner calls (D29). A whole-conversation Stop
+   * aborts them so no task is created for a stopped send. */
+  planningControllers?: Set<AbortController>;
+  /** Tail of the user-send order (D29). Each ordinary user send waits until
+   * the previous one has dispatched (routing, task rows, floor) — normally
+   * milliseconds, but a planned send holds it while the planner runs, so a
+   * message sent meanwhile neither routes on the stale floor nor queues
+   * ahead of the planned tasks. */
+  userSendTail?: Promise<void>;
   /** Items the admission loop has spliced OUT of `queue` but whose execution
    * is not yet registered in `executions` — the admission-time awaits
    * (sticky-abort state read, predecessor hand-off build) live in that
@@ -1120,6 +1183,12 @@ interface CidState {
     form?: ChatFormPayload;
     errText?: string;
   }>;
+  /** Monotonic clock ordering queued messages against Agents parking on a
+   * question to the user (board timestamps are whole seconds). In memory
+   * only: after a restart every waiting Agent counts as asked before now. */
+  waitClock: number;
+  /** Agent id → `waitClock` value when it last stopped to ask the user. */
+  agentWaitSeq: Map<string, number>;
   /** Per-activation finished-turn counter (runaway backstop). Reset when the
    * conversation goes quiescent or is aborted. */
   turnsThisActivation: number;
@@ -1186,6 +1255,7 @@ interface CidState {
      * The terminal event carries it alongside the actual post-retry result. */
     retryMode?: 'resume' | 'restart';
     uncertainOperationCount?: number;
+
   };
 }
 
@@ -1225,6 +1295,9 @@ export interface TaskTerminalEvent {
   retry_mode?: 'resume' | 'restart';
   uncertain_operation_count?: number;
   failure?: TaskFailureDiagnostic;
+  /** Creation time of the conversation, read once when the run started. Only
+   *  analytics derives a bounded day bucket from it; it is not content. */
+  conversation_created_at?: string;
 }
 
 export type TaskTerminalListener = (event: TaskTerminalEvent) => void;
@@ -1280,6 +1353,8 @@ function getOrInitCid(uid: string, cid: string): CidState {
       abortEpoch: 0,
       taskWaiters: new Map(),
       dispatchResults: new Map(),
+      waitClock: 0,
+      agentWaitSeq: new Map(),
       awaitedChildTasks: 0,
       asyncDispatches: new Set(),
       listeners: new Set(),
@@ -1446,7 +1521,6 @@ function _emitTaskRunTerminal(state: CidState, status: TaskTerminalStatus): void
   // the worker finishes unwinding.
   bashPermissions.cancelForCid(state.cid);
   connectorActionConfirm.cancelForCid(state.cid);
-  webAssistActionConfirm.cancelForCid(state.cid);
   // A tool that filed this conversation under a project could not relocate it
   // from inside the turn: the relocation refuses while a turn holds the session
   // files open. This is the first moment it is allowed to run. A cancelled run
@@ -1732,6 +1806,29 @@ async function appendMain(
   return msgIndex;
 }
 
+/** One persistence boundary for both native RPC and asynchronous CLI replies.
+ * Stable input ids let a failed write acknowledgement retry without another
+ * user message or another CLI dispatch. */
+async function saveCliUserAnswer(
+  uid: string, cid: string, actorId: string, text: string, inputId: string,
+  answer?: NonNullable<GroupMessage['cli_answer']>,
+): Promise<GroupMessage> {
+  const rows = await readJsonl<GroupMessage>(conversationMessageReadFile(uid, cid));
+  const existing = rows.find(row => row.id === inputId);
+  if (existing && (existing.from !== USER_ID || existing.text !== text
+      || existing.to.length !== 1 || existing.to[0] !== actorId)) {
+    throw new Error('CLI answer identity conflict');
+  }
+  const reply: GroupMessage = existing || {
+    id: inputId, ts: nowIso(), from: USER_ID, to: [actorId], text,
+    ...(answer ? { cli_answer: answer } : {}),
+  };
+  if (!existing) await appendMain(uid, cid, reply, { senderKind: 'user', senderId: USER_ID, agentIds: [actorId] });
+  const state = _cids.get(cidKey(uid, cid));
+  if (state) emit(state, { type: 'message', cid, msg: reply });
+  return reply;
+}
+
 /** Persist a native question beside the active reply without settling it. */
 async function publishCliAsyncQuestion(
   uid: string, cid: string, actor: { id: string; kind: ActorKind }, turnId: string,
@@ -1764,19 +1861,8 @@ async function publishCliAsyncQuestion(
       emit(state, { type: 'message', cid, msg: result.record, turn_end: false });
       return result.record;
     },
-    save: async (text, answers, inputId) => {
-      // An index write may fail after the append succeeded. Re-read by the
-      // stable input id before retrying persistence, without re-delivery.
-      const rows = await readJsonl<GroupMessage>(conversationMessageReadFile(uid, cid));
-      const existing = rows.find(row => row.id === inputId);
-      const reply: GroupMessage = existing || {
-        id: inputId, ts: nowIso(), from: USER_ID, to: [actor.id], text,
-        cli_answer: { message_id: message.id, answers: answers.slice() },
-      };
-      if (!existing) await appendMain(uid, cid, reply, { senderKind: 'user', senderId: USER_ID, agentIds: [actor.id] });
-      emit(state, { type: 'message', cid, msg: reply });
-      return reply;
-    },
+    save: (text, answers, inputId) => saveCliUserAnswer(uid, cid, actor.id, text, inputId,
+      { message_id: message.id, answers: answers.slice() }),
   });
   emit(state, { type: 'message', cid, msg: message, turn_end: false });
   if (questions.length) emitTaskIntervention({
@@ -2127,16 +2213,6 @@ export interface EnqueueParams {
    * from ordinary queued sends: ordinary sends queue by default, while
    * the explicit queue "Send now" action may opt into native/CoreAgent steer. */
   steerActiveTurn?: boolean;
-  /** Cross-group ordering for a multi-mention user send whose D9 segmentation
-   * yields two or more mention GROUPS (adjacent mentions = one group).
-   * `serial` (the default when absent) chains every segment task `after` its
-   * predecessor in written order — "@A 做X @B 做Y" runs B after A, matching
-   * the natural reading of one message; misreading parallel intent as serial
-   * only costs wall-clock, while the reverse starts B before A's output
-   * exists. `parallel` keeps the original D9 all-parallel dispatch. The
-   * composer preview bar owns the user-facing toggle. Single-group sends
-   * (pure adjacent mentions) always stay parallel regardless of this flag. */
-  multiDispatch?: 'serial' | 'parallel';
   /** Renderer-generated id for a user send; persisted verbatim so the
    * optimistic bubble can be claimed by identity. See GroupMessage. */
   client_msg_id?: string;
@@ -2170,6 +2246,7 @@ export interface EnqueueParams {
   artifacts?: Array<{ id: string; title: string; agent_id: string }>;
   marketplace_requests?: MarketplaceInstallRequest[];
   app_nav_requests?: AppNavRequest[];
+  saved_tasks?: GroupMessage['saved_tasks'];
   plan_announcement?: boolean;
   /** Override resolved recipients (commander emitting plan announcement
    *  uses this to force `to=[user]`). Otherwise router decides. */
@@ -2185,6 +2262,7 @@ export interface EnqueueParams {
    * first mid-turn message wrongly consumes the placeholder and post-tool
    * process events recreate a new one that ends up stuck. */
   turn_end?: boolean;
+  display_phase?: GroupMessage['display_phase'];
   /** Host-only settlement hint for an explicit user-input boundary. This
    * process reply must not be counted as a completed answer. */
   waitingForInput?: boolean;
@@ -2255,38 +2333,38 @@ export async function enqueue(params: EnqueueParams): Promise<GroupMessage> {
   const { uid, cid, fromActorId, text } = params;
   // Reject before creating task runtime state or writing the old layout.
   assertConversationRelocationReady(uid, cid);
+  const enqueueStartedAtMs = Date.now();
   const state = getOrInitCid(uid, cid);
   if (state.terminating) {
     throw Object.assign(new Error('conversation runtime is terminating'), {
       code: 'E_CONVERSATION_TERMINATING',
     });
   }
-  if (fromActorId === USER_ID && !state.taskRun) {
-    state.taskRun = {
-      runId: genId12(),
-      startedAtMs: Date.now(),
-      status: null,
-      ...(params.failedTurnRetryMode ? {
-        retryMode: params.failedTurnRetryMode,
-        uncertainOperationCount: Math.max(
-          0,
-          Math.min(1_000_000, Math.round(Number(params.retryUncertainOperationCount) || 0)),
-        ),
-      } : {}),
-    };
-    beginBrowserTaskRun(uid, cid, state.taskRun.runId);
-  }
   // Mark in-flight enqueue. `isQuiescent` returns false while >0 so
   // callers waiting for "everything done" don't hit the gap between
   // a sender's running=false and the recipient.queue.push that lives
   // late in this body. Reset in `finally` to cover throws.
   state.pendingEnqueues += 1;
+  // Take the user-send turn synchronously so the order is the call order.
+  // Steer sends fold into a live turn and never wait. Only the facade sends
+  // as the user, never from inside another send, so the chain cannot wait on
+  // itself.
+  let releaseUserSend: (() => void) | undefined;
+  let previousUserSend: Promise<void> | undefined;
+  if (fromActorId === USER_ID && params.steerActiveTurn !== true) {
+    previousUserSend = state.userSendTail;
+    const turn = new Promise<void>((resolve) => { releaseUserSend = resolve; });
+    state.userSendTail = turn;
+    void turn.then(() => { if (state.userSendTail === turn) state.userSendTail = undefined; });
+  }
   try {
     const reflectionWrites = yieldReflectionForTask(uid);
     if (reflectionWrites) await reflectionWrites;
     if (_enqueueAdmissionGateForTest) await _enqueueAdmissionGateForTest();
-    return await _enqueueBody(params, state);
+    if (previousUserSend) await previousUserSend;
+    return await _enqueueBody(params, state, releaseUserSend, enqueueStartedAtMs);
   } finally {
+    releaseUserSend?.();
     state.pendingEnqueues -= 1;
     if (state.pendingEnqueues === 0 && state.pendingEnqueueWaiters.size > 0) {
       const waiters = [...state.pendingEnqueueWaiters];
@@ -2299,24 +2377,14 @@ export async function enqueue(params: EnqueueParams): Promise<GroupMessage> {
   }
 }
 
-async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<GroupMessage> {
+async function _enqueueBody(
+  params: EnqueueParams,
+  state: CidState,
+  /** Releases the user-send turn once this send has dispatched. */
+  onDispatched?: () => void,
+  enqueueStartedAtMs = Date.now(),
+): Promise<GroupMessage> {
   const { uid, cid, fromActorId, text } = params;
-
-  // Reset the sticky `aborted` flag ONLY when the human (user) sends
-  // a fresh message. Worker-emitted enqueues (commander/agent post-turn
-  // replies, including the abort-cleanup status message) must NOT clear
-  // the abort — otherwise a worker's own post-abort message would silently
-  // un-stick the conversation and the next state_changed would flip back
-  // to 'idle'/'running'.
-  if (params.fromActorId === USER_ID) {
-    const cur = await readState(uid, cid);
-    if (cur.status === 'aborted') {
-      await setStatus(uid, cid, 'idle');
-    }
-    // A new user message is a new task → fresh cost-backstop allowance. The
-    // ensuing cascade (commander + nested agents) accumulates against this.
-    resetTaskTokens(cid);
-  }
 
   await seedReservedActors(uid, cid);
   const members = await readMembers(uid, cid);
@@ -2348,6 +2416,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // default to the user and never consult it.
   const initialFloor = await readState(uid, cid);
   let floorRevision = initialFloor.active_recipient_revision || 0;
+  let floorChoiceRevision = initialFloor.active_recipient_choice_revision || 0;
   let floorRecipient = '';
   if (fromKind === 'user') {
     try {
@@ -2374,7 +2443,11 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   let to: string[] = [];
   let unknown: string[] = [];
   let userHadExplicitMention = false;
-  let routePlan: SegmentedMentions | null = null;
+  // Router outcomes for a user send with mentions (D29): empty addressed
+  // requests are rejected, and an orchestrated send goes through the
+  // dispatch planner instead of the per-recipient loop.
+  let routeMentionOnly = false;
+  let plannerCandidates: string[] | null = null;
   let routeOpts: Parameters<typeof resolveRecipients>[0] | undefined;
   const resolvedRawIds = new Map<string, string>();
   if (params.forceTo && params.forceTo.length) {
@@ -2386,7 +2459,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     // so display names containing spaces ("Writing Helper") or mixed case
     // resolve correctly against the user's `@WritingHelper` token.
     const agentNameToId = new Map<string, string>();
-    // Reserved-actor aliases — let agents/commander write `@指挥官` / `@用户`
+    // Reserved-actor aliases — let users write `@指挥官` / `@用户`
     // (Chinese display names) instead of the literal reserved ids. Both
     // English and Chinese forms resolve to the same id. Lowercase keys
     // match router's `_normalizeNameKey`.
@@ -2420,11 +2493,15 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       members: members.actors.filter((actor) => eligibleRecipient(actor.id)),
       agentNameToId,
       agentDisplayNames,
+      hasMessageContent: !!params.attachments?.length || !!params.references?.some((reference) => (
+        !!reference.text?.trim() || !!reference.attachments?.length || !!reference.produced?.length
+      )),
       ...(floorRecipient ? { activeRecipient: floorRecipient } : {}),
       resolveUnknown: (token) => resolvedRawIds.get(token) || null,
     };
     const r = resolveRecipients(routeOpts);
-    routePlan = r.plan || null;
+    routeMentionOnly = r.mentionOnly === true;
+    plannerCandidates = r.plannerCandidates?.length ? r.plannerCandidates.slice() : null;
     to = r.to;
     unknown = r.unknown;
     userHadExplicitMention = fromKind === 'user' && r.hadExplicitMention;
@@ -2447,12 +2524,34 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     const r = resolveRecipients(routeOpts);
     to = r.to;
     unknown = r.unknown;
-    routePlan = r.plan || null;
+    routeMentionOnly = r.mentionOnly === true;
+    plannerCandidates = r.plannerCandidates?.length ? r.plannerCandidates.slice() : null;
     userHadExplicitMention = fromKind === 'user' && r.hadExplicitMention;
+  }
+  if (routeMentionOnly) {
+    throw Object.assign(new Error('empty message'), { code: 'E_EMPTY_MESSAGE' });
+  }
+  // Only an accepted user request starts a run or clears the stopped state.
+  // Worker replies, including abort cleanup, must never clear user Stop.
+  if (fromActorId === USER_ID) {
+    if (!state.taskRun) {
+      state.taskRun = {
+        runId: genId12(), startedAtMs: enqueueStartedAtMs,
+        status: null,
+        ...(params.failedTurnRetryMode ? {
+          retryMode: params.failedTurnRetryMode,
+          uncertainOperationCount: Math.max(0, Math.min(1_000_000,
+            Math.round(Number(params.retryUncertainOperationCount) || 0))),
+        } : {}),
+      };
+      beginBrowserTaskRun(uid, cid, state.taskRun.runId);
+    }
+    if ((await readState(uid, cid)).status === 'aborted') await setStatus(uid, cid, 'idle');
+    resetTaskTokens(cid);
   }
   // Unknown text follows the validated composer target. An empty resolved
   // plan means no description, so it must never trigger a fallback task.
-  if (!to.length && !routePlan && unknown.length && fromKind === 'user') {
+  if (!to.length && !routeMentionOnly && unknown.length && fromKind === 'user') {
     to = [floorRecipient || COMMANDER_ID];
     userHadExplicitMention = false;
   }
@@ -2460,24 +2559,42 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
 
   // Keep the dispatch guard for structured/forced targets as well.
   if (projectAgentIds) to = to.filter((id) => RESERVED_IDS.has(id) || projectAgentIds.has(id));
+  if (plannerCandidates) {
+    plannerCandidates = plannerCandidates.filter((id) => id !== USER_ID && eligibleRecipient(id));
+    if (!plannerCandidates.length) plannerCandidates = null;
+  }
+  // D29: a user-orchestrated send (several actors, or a mention after prose)
+  // is split by the dispatch planner into dependent board tasks. Steer, form
+  // submissions and host-forced targets keep their own delivery contracts.
+  const plannedDispatch = fromKind === 'user' && !!plannerCandidates
+    && params.steerActiveTurn !== true && !params.forceTo?.length && !decodeSubmission(text);
 
   // Default fallback: if nothing resolved (and no force), use sender-default.
   // Mirror router.ts's rule: user → commander; commander/agent → user.
-  if (!to.length && !(routePlan && !routePlan.segments.length)) {
+  if (!to.length && !routeMentionOnly) {
     if (fromKind === 'user') to = [COMMANDER_ID];
     else to = [USER_ID];
   }
 
   // Commit the next default only after this message has entered the queue.
   // A choice made while admission was awaiting IO wins over this send.
+  // The conversation floor follows who actually received work: for a planned
+  // send (D29) that is the plan's assignees, not every actor it mentioned.
+  let floorTargets = to;
   const commitRecipient = async () => {
     if (fromKind !== 'user' || params.forceTo?.length || decodeSubmission(text)) return;
-    const next = to.length === 1 ? to[0] : COMMANDER_ID;
+    const next = floorTargets.length === 1 ? floorTargets[0] : COMMANDER_ID;
     let appliedChoice = false;
     await setActiveRecipient(uid, cid, next,
-      userHadExplicitMention || to.length > 1 ? 'user_selection' : undefined,
-      floorRevision, (applied) => { appliedChoice = true; floorRevision = applied.active_recipient_revision || 0; });
-    if (appliedChoice && floorRecipient && floorRecipient !== next) {
+      userHadExplicitMention || floorTargets.length > 1 ? 'user_selection' : undefined,
+      floorRevision, (applied) => {
+        appliedChoice = true;
+        floorRevision = applied.active_recipient_revision || 0;
+        floorChoiceRevision = applied.active_recipient_choice_revision || 0;
+      });
+    // Switching the reply target to another Agent does not cancel suspended
+    // Commander work. Explicitly returning to Commander interrupts that wait.
+    if (appliedChoice && floorRecipient && floorRecipient !== next && next === COMMANDER_ID) {
       await markOrchestrationInterrupted(uid, cid, text, floorRecipient);
     }
   };
@@ -2562,6 +2679,9 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   const displayText = authoredDisplay === undefined ? undefined : stripReservedRoutingMentions(
     authoredDisplay, new Set([...stripTokens].filter((token) => token !== 'commander' && token !== '指挥官')),
   );
+  // The planner must read who the user addressed, including `@指挥官`, so it
+  // gets the text before the routed-recipient strip below (D29).
+  const plannerText = params.model_text && params.model_text.trim() ? params.model_text : rewrittenText;
   rewrittenText = stripReservedRoutingMentions(rewrittenText, stripTokens);
 
   // Generated-media tools return revisioned URLs, but assistant prose can
@@ -2612,6 +2732,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     ...(params.run_facts ? { run_facts: params.run_facts } : {}),
     ...(params.form ? { form: params.form } : {}),
     ...(params.created_agents && params.created_agents.length ? { created_agents: params.created_agents } : {}),
+    ...(params.saved_tasks?.length ? { saved_tasks: params.saved_tasks } : {}),
     ...(params.created_skills && params.created_skills.length ? { created_skills: params.created_skills } : {}),
     ...(params.artifacts && params.artifacts.length ? { artifacts: params.artifacts } : {}),
     ...(params.marketplace_requests && params.marketplace_requests.length
@@ -2629,6 +2750,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       },
     } : {}),
     ...(params.seg !== undefined ? { seg: params.seg } : {}),
+    ...(params.display_phase ? { display_phase: params.display_phase } : {}),
     ...(params.process && params.process.length ? { process: params.process } : {}),
     ...(params.turn_id ? { turn_id: params.turn_id } : {}),
     ...(params.client_msg_id ? { client_msg_id: params.client_msg_id } : {}),
@@ -2646,8 +2768,11 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // follows the same queued-only visibility rule instead of leaking a
   // "Continue" bubble before admission. A user-authored message addressed
   // only to USER_ID has no Agent work to admit and is persisted immediately.
+  // A planned dispatch (D29) persists at once: planning takes seconds, and
+  // the user must see the message they just sent while it is being split.
   const deferBubble = fromKind === 'user'
     && params.steerActiveTurn !== true
+    && !plannedDispatch
     && to.some((actorId) => actorId !== USER_ID);
 
   let bubblePersisted = false;
@@ -2702,92 +2827,13 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // RE-ENTERS its form-parked task (same task_id back to running) instead of
   // creating a new row. Decoded once; submissions are single-recipient.
   const formSubmission = fromKind === 'user' ? decodeSubmission(persistedText) : null;
-  // Reuse the router's plan: reparsing only the remaining recipients would
-  // lose empty trailing mention boundaries and leak another Agent's text.
-  let segmentPlan = fromKind === 'user' && !params.forceTo
-    && params.steerActiveTurn !== true && routePlan
-    ? { ...routePlan, segments: routePlan.segments.filter((segment) => to.includes(segment.actorId)) }
-    : null;
-  if (segmentPlan && !segmentPlan.segments.length && routePlan!.segments.length) {
-    // Project availability may have replaced every intended recipient with
-    // Commander. Preserve that fallback instead of dropping the instruction.
-    segmentPlan = null;
-  }
-  if (segmentPlan) {
-    // Cross-group ordering (user adjudication 2026-08-23): one message's
-    // written order IS its execution order by default. When the send spans
-    // TWO OR MORE mention groups, `serial` chains every segment task `after`
-    // the previous CREATED one — a single linear chain (D6: no fan-in), so a
-    // multi-member adjacent group followed by another group over-serializes
-    // inside the group rather than starting the next group early. Fail-safe
-    // asymmetry: wrongly-serial costs wall-clock; wrongly-parallel starts a
-    // dependent task before its input exists. A pure adjacent-mention send
-    // (one group) keeps D9 all-parallel semantics — no chain, either mode.
-    const groupCount = segmentPlan.segments.length
-      ? segmentPlan.segments[segmentPlan.segments.length - 1].group + 1 : 0;
-    // D23: the composer exposes the order choice for EVERY multi-segment
-    // send. An explicit 'serial' chains all segments in written order even
-    // when they form one adjacent group (whose default stays all-parallel);
-    // an explicit 'parallel' unchains a multi-group send; absent keeps the
-    // shape defaults (multi-group serial / single-group parallel).
-    const serialChain = params.multiDispatch === 'serial'
-      || (groupCount >= 2 && params.multiDispatch !== 'parallel');
-    let prevTaskId: string | undefined;
-    for (const seg of segmentPlan.segments) {
-      // Roster row preferred (it carries the conversation's name snapshot),
-      // registry-built actor as fallback — membership is a record, not a
-      // dispatch precondition.
-      const actor = refreshed.actors.find((a) => a.id === seg.actorId)
-        || registryActors.get(seg.actorId);
-      if (!actor) {
-        log.warn(`segment recipient ${seg.actorId} unresolved in roster and registry (cid=${cid})`);
-        continue;
-      }
-      if (actor.kind === 'agent' && !isAgentEnabled(uid, actor.id)) {
-        log.warn(`agent ${actor.id} disabled — skipping segment dispatch (cid=${cid})`);
-        continue;
-      }
-      const turnId = genId12();
-      const afterTaskId = serialChain ? prevTaskId : undefined;
-      let boardTaskId: string | undefined;
-      try {
-        const created = await taskBoard.createTask(uid, cid, {
-          admissionPending: true,
-          assignee: actor.id,
-          instruction: seg.instruction,
-          createdBy: 'user',
-          ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
-          sourceMsgId: msgId,
-          turnId,
-          ...(afterTaskId ? { after: afterTaskId } : {}),
-        });
-        boardTaskId = created.task_id;
-        emit(state, { type: 'task_created', cid, task: created });
-      } catch (err) {
-        log.warn(`task-board create failed cid=${cid}: ${(err as Error).message}`);
-      }
-      state.queue.push({
-        actor,
-        turnId,
-        msgId,
-        fromActorId,
-        ...(deferBubble ? { deferredBubble: { persist: persistUserBubble } } : {}),
-        ...(boardTaskId ? { taskId: boardTaskId } : {}),
-        ...(afterTaskId ? { afterTaskId } : {}),
-        sourceText: seg.instruction,
-        sourceMessage: msg,
-        sharedSourceMessage: segmentPlan.segments.length > 1,
-        sourceRecipients: msg.to.slice(),
-        llmPayload: composeLlmTurnPayload(uid, fromActorId, msg, seg.instruction),
-        ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
-        ...(msg.references && msg.references.length ? { references: msg.references.slice() } : {}),
-        ...(msg.use_selections && msg.use_selections.length ? { useSelections: msg.use_selections.slice() } : {}),
-      });
-      // Chain over CREATED rows only: a failed board write degrades to the
-      // previous predecessor instead of breaking the whole chain.
-      if (boardTaskId) prevTaskId = boardTaskId;
-    }
-    log.info(`segmented dispatch cid=${cid} msg=${msgId} tasks=${segmentPlan.segments.length} groups=${groupCount} mode=${serialChain ? 'serial' : 'parallel'}`);
+  if (plannedDispatch && plannerCandidates) {
+    floorTargets = await _dispatchPlannedUserSend(state, {
+      uid, cid, msg, msgId, fromActorId, params, text: plannerText,
+      candidates: plannerCandidates,
+      roster: refreshed.actors,
+      registryActors,
+    });
   } else for (const recipientId of to) {
     if (recipientId === USER_ID) continue;
     if (params.dispatchSignal?.aborted
@@ -2810,6 +2856,12 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
     // (a steer leftover claimed as its own turn is task-ified lazily by the
     // scheduler). Board write failure never blocks message dispatch.
     let boardTaskId: string | undefined;
+    // A reply that continues a planned task (D29) gets its split note again:
+    // the first turn's note never entered the canonical log, and without it
+    // the Agent read the user's whole message ("…then you combine both")
+    // and took the combining step from Commander (2026-10-07 live runs).
+    let continuedAssignment: string | undefined;
+    let pendingFormId: string | undefined;
     if (!params.steerActiveTurn) {
       if (formSubmission && formSubmission.agent_id === actor.id) {
         try {
@@ -2817,9 +2869,26 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
           const waiting = rows.find((t) => t.assignee === actor.id
             && t.status === 'waiting_input'
             && (!t.resume?.form_id || t.resume.form_id === formSubmission.form_id));
-          if (waiting) boardTaskId = waiting.task_id; // resume: no new row; claim flips it to running
+          if (waiting) { // resume: no new row; claim flips it to running
+            boardTaskId = waiting.task_id;
+            continuedAssignment = waiting.assignment_context;
+          }
         } catch (err) {
           log.warn(`form-resume task lookup failed cid=${cid}: ${(err as Error).message}`);
+        }
+      } else if (fromActorId === USER_ID && !formSubmission && actor.kind === 'agent') {
+        // A plain reply to an Agent that stopped to ask the user continues
+        // that same task, so its dependents and its Commander resume stay
+        // attached instead of being cancelled as a superseded row.
+        try {
+          const waiting = await _waitingReplyTask(state, uid, cid, actor.id);
+          if (waiting) {
+            boardTaskId = waiting.task_id;
+            continuedAssignment = waiting.assignment_context;
+            pendingFormId = waiting.resume?.form_id;
+          }
+        } catch (err) {
+          log.warn(`reply-resume task lookup failed cid=${cid}: ${(err as Error).message}`);
         }
       }
       if (!boardTaskId) {
@@ -2857,6 +2926,7 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       turnId,
       msgId,
       fromActorId,
+      enqueueSeq: ++state.waitClock,
       ...(params.steerActiveTurn ? { steerActiveTurn: true } : {}),
       ...(deferBubble ? { deferredBubble: { persist: persistUserBubble } } : {}),
       ...(boardTaskId ? { taskId: boardTaskId } : {}),
@@ -2864,6 +2934,8 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       ...(deferBubble ? { sourceMessage: msg, sharedSourceMessage: to.length > 1 } : {}),
       sourceRecipients: msg.to.slice(),
       llmPayload: composeLlmTurnPayload(uid, fromActorId, msg),
+      ...(continuedAssignment ? { assignmentContext: continuedAssignment } : {}),
+      ...(pendingFormId ? { pendingFormId } : {}),
       ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
       ...(msg.references && msg.references.length ? { references: msg.references.slice() } : {}),
       ...(msg.use_selections && msg.use_selections.length ? { useSelections: msg.use_selections.slice() } : {}),
@@ -2874,7 +2946,9 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
         ? { commanderRetryContinuation: { ...params.commanderRetryContinuation } }
         : {}),
       ...(params.terminalHandoff
-        ? { terminalHandoff: true, outputDelivery: 'final' as const }
+        ? { terminalHandoff: true, outputDelivery: 'final' as const,
+          ...(initialFloor.active_recipient === actor.id && initialFloor.active_recipient_handoff_id
+            ? { handoffFloorBinding: initialFloor.active_recipient_handoff_id } : {}) }
         : {}),
     });
     // A native CLI ingress is event-driven rather than polled at CoreAgent
@@ -2906,10 +2980,15 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
       if (bubbleClock) bubbleClock.state = Date.now();
     }
     for (const item of state.queue) {
-      if (item.msgId === msgId) item.floorRevision = floorRevision;
+      if (item.msgId === msgId) {
+        item.floorRevision = floorRevision;
+        item.floorChoiceRevision = floorChoiceRevision;
+      }
     }
   }
   _scheduleAdmissions(state);
+  // Rows and floor are in place: the next user send may route and queue.
+  onDispatched?.();
 
   // (No shadow-tap on agent → user replies anymore.) The plan_executor's
   // `reconcile` hook in runTurn already wakes commander deterministically
@@ -2922,9 +3001,11 @@ async function _enqueueBody(params: EnqueueParams, state: CidState): Promise<Gro
   // orchestration role at all — letting it stay asleep keeps the chat
   // clean and avoids prompt-driven mistakes (the model second-guessing the
   // agent's form / re-dispatching for "polish").
-  // Edge case: an agent explicitly mentions the commander to escalate
-  // (e.g. `@commander` / `@指挥官`). That message has
-  // commander in `to`, so it goes through the regular dispatch loop above.
+  // An agent never wakes the commander through a prose mention: its
+  // `@commander` / `@指挥官` is display-only (router `parseMentions`). It
+  // returns control through `<handback>` (or a CLI agent through
+  // `orkas_handoff_to_commander`), handled after its turn with one-hop and
+  // loop guards.
 
   // User-driven reconcile: when user enqueues, plan_executor needs a chance
   // to mark a `user`-assignee step as done and dispatch downstream. This is
@@ -3243,7 +3324,9 @@ function composeLlmTurnPayload(
   // the full text, but each recipient's turn input carries only its share.
   const head = `<msg from="${fromActorId}" to="${(msg.to || []).join(',')}">`;
   const tail = '</msg>';
-  return `${head}\n${_referenceContextForModel(uid, msg.references)}${_referenceFilesForModel(uid, msg.references)}${textOverride ?? (msg.model_text || msg.text)}\n${tail}`;
+  const language = fromActorId === USER_ID ? ''
+    : '\n\n' + buildHostTurnLanguageDirective(resolveLanguageForUser(uid), true);
+  return `${head}\n${_referenceContextForModel(uid, msg.references)}${_referenceFilesForModel(uid, msg.references)}${textOverride ?? (msg.model_text || msg.text)}${language}\n${tail}`;
 }
 
 /** Re-address a composed turn payload. Reassignment swaps the item's actor;
@@ -3334,16 +3417,20 @@ function _buildOrchestrationResumeModelText(
     }, null, 2),
     '</orchestration-resume>',
     '',
-    'Continue the suspended commander-owned task from this state. Do not re-ask for information already supplied by the agent or form. If the blocking outcome completed, run any remaining independent agent/tool work or synthesize the final answer. If the agent reported a blocker or out-of-scope result, decide whether to retry, route to a different owner, answer directly with caveats, or ask the user for the smallest missing input.',
+    'Continue the suspended commander-owned task from this state. Do not re-ask for information already supplied by the agent or form. If the blocking outcome completed, run any remaining independent agent/tool work; the agent\'s reply is already visible, so do not restate it, and give a combined answer only when the user asked for one. If the agent reported a blocker or out-of-scope result, decide whether to retry, route to a different owner, answer directly with caveats, or ask the user for the smallest missing input.',
   ].join('\n');
 }
 
 function _defaultResumeInstructionForBlockedForm(agentName: string): string {
-  return `After ${agentName || 'the agent'} receives the required form input and completes, continue the original user goal. Use the agent's completed result, then run any remaining agent/tool work or synthesize the final answer.`;
+  return `After ${agentName || 'the agent'} receives the required form input and completes, continue the original user goal. Use the agent's completed result, then run any remaining agent/tool work; give a combined answer only when the user asked for one.`;
+}
+
+function _defaultResumeInstructionForUserReply(agentName: string): string {
+  return `After ${agentName || 'the agent'} gets the user's reply and finishes, continue the original user goal. Use the agent's completed result, then run any remaining agent/tool work; give a combined answer only when the user asked for one.`;
 }
 
 function _defaultResumeInstructionForRetriedDispatch(agentName: string): string {
-  return `After the retried ${agentName || 'agent'} reaches a terminal result, continue the original user goal as Commander. Use the Agent result, then run any remaining work or synthesize the final answer.`;
+  return `After the retried ${agentName || 'agent'} reaches a terminal result, continue the original user goal as Commander. Use the Agent result, then run any remaining work; give a combined answer only when the user asked for one.`;
 }
 
 async function _setFormWaitLedgerFromWorkerResult(params: {
@@ -3409,16 +3496,132 @@ async function _setFormWaitLedgerFromWorkerResult(params: {
   return true;
 }
 
-/** True when the floor is a microphone the USER handed out (composer chip or an
- *  explicit `@agent`). Only the user takes it back.
- *
- *  A handback dispatches the commander's turn through `forceTo`, so returning
- *  the floor is never required for the commander to answer. Moving it would
- *  only reroute the user's NEXT mention-less message away from the agent they
- *  picked — silently, because the composer chip renders the floor. That is the
- *  on-device 2026-08-24 report: a capability-boundary handback reset a
- *  chip-selected floor, and the following message reached the commander while
- *  the chip still named the agent. */
+/** A dispatched Agent that stopped to ask the user in prose becomes a
+ * suspended hand-off: the user's reply goes to that Agent (its own turn, so
+ * its confirmations count), and Commander resumes after the Agent finishes.
+ * The resume rides on the child task row so parallel waits cannot overwrite
+ * each other; the single state ledger mirrors it while that slot is free. */
+async function _setUserWaitResumeFromWorkerResult(params: {
+  uid: string;
+  cid: string;
+  result: NestedDispatchOutcome;
+  ownerAgentId: string;
+  ownerAgentName?: string;
+  userGoal: string;
+  agentTask: string;
+  resume?: string;
+}): Promise<boolean> {
+  if (!params.result.waitingForUser || params.result.aborted) return false;
+  const agentName = params.ownerAgentName || params.ownerAgentId;
+  const resumeInstruction = params.resume?.trim() || _defaultResumeInstructionForUserReply(agentName);
+  const userGoal = _clipForOrchestration(params.userGoal);
+  const handoffMessage = _clipForOrchestration(params.agentTask);
+  if (params.result.taskId) {
+    try {
+      await taskBoard.setTaskResume(params.uid, params.cid, params.result.taskId, {
+        source_tool: 'dispatch_to',
+        user_goal: userGoal,
+        handoff_message: handoffMessage,
+        resume_instruction: resumeInstruction,
+      });
+    } catch (err) {
+      log.warn(`task resume meta write failed cid=${params.cid}: ${(err as Error).message}`);
+    }
+  }
+  await setOrchestrationLedgerIfFree(params.uid, params.cid, {
+    status: 'waiting_for_agent',
+    blocked_on: 'agent_handoff',
+    source_tool: 'dispatch_to',
+    owner_agent_id: params.ownerAgentId,
+    ...(params.ownerAgentName ? { owner_agent_name: params.ownerAgentName } : {}),
+    user_goal: userGoal,
+    handoff_message: handoffMessage,
+    resume_instruction: resumeInstruction,
+  });
+  return true;
+}
+
+/** Refuse to delegate again to an Agent that is still waiting for the user's
+ * reply to its own question. Its confirmations count only in the user's own
+ * turn, so a Commander-written retry would ask the user again (2026-09-20
+ * report: three confirmation requests for one video plan). Allowed once the
+ * user has spoken to Commander after the Agent asked: that message may be an
+ * answer or a new request, and the delegation then supersedes the wait. */
+async function _waitingAgentDelegationRefusal(
+  state: CidState,
+  agentId: string,
+  agentName: string,
+  commanderItem?: QueueItem,
+): Promise<string | null> {
+  let waiting: boolean;
+  try {
+    waiting = (await taskBoard.listTasks(state.uid, state.cid))
+      .some((row) => row.assignee === agentId && row.status === 'waiting_input');
+  } catch { return null; }
+  if (!waiting) return null;
+  const askedAt = state.agentWaitSeq.get(agentId);
+  if (
+    commanderItem?.fromActorId === USER_ID
+    && (askedAt === undefined || (commanderItem.enqueueSeq ?? 0) > askedAt)
+  ) return null;
+  return [
+    `${agentName} is waiting for the user's reply to its own question.`,
+    'Do not dispatch or hand off to it again: its confirmations count only when the user answers it directly.',
+    'Continue only work that does not depend on it, or end your turn; you will be resumed after it finishes.',
+  ].join(' ');
+}
+
+/** The Agent holds a floor that Commander routed to it (a hand-off, or a free
+ * floor it took while asking the user), as opposed to one the user picked. */
+function _holdsCommanderRoutedFloor(stateFile: StateFile, agentId: string): boolean {
+  return stateFile.active_recipient === agentId && stateFile.active_recipient_source !== 'user_selection';
+}
+
+/** Turn-time reminder for an Agent holding a Commander-routed floor. Shared by
+ * CLI and in-process Agents so both close the routed interaction the same way. */
+function _returnControlProtocol(): string {
+  return [
+    '## Return control to commander',
+    'This conversation is currently routed to you and you hold the user-facing conversation floor.',
+    'When this routed interaction is complete, include the concrete final result and end with `<handback reason="completed_handoff" />` so control returns to the commander.',
+    'Use `<handback reason="completed_handoff" />` only to close this routed interaction. Do not use it as a capability-routing or error signal, and do not combine it with a question or input form.',
+  ].join('\n');
+}
+
+/** Native production tools whose contract-2 results carry `outcome`. */
+const USER_DECISION_TOOLS = new Set(['video_studio']);
+
+/** The turn's last native production result asked for the user's own
+ * decision (`outcome: "need_user"`, e.g. a gate refused a Commander-written
+ * turn). The tool already forces the turn to end with a synthesis; real runs
+ * showed the closing question often lacks the open marker, so this host fact
+ * is the waiting signal. */
+function _lastStudioOutcomeNeedsUser(items: readonly ProcessItem[]): boolean {
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    const event = processItemEvent(items[index]);
+    if (event?.stream !== 'tool' || !event.data || typeof event.data !== 'object') continue;
+    const data = event.data as Record<string, unknown>;
+    if (data.phase !== 'end' || !USER_DECISION_TOOLS.has(String(data.name || ''))) continue;
+    // The mapper retains the complete inline protocol result. A UI preview
+    // can truncate JSON or contain the same literal in an ordinary path error.
+    // Legacy complete previews remain readable; arbitrary prose never controls
+    // the task's waiting state.
+    const raw = typeof data.output === 'string' && data.output
+      ? data.output
+      : String(data.result_preview || '');
+    try {
+      const payload = JSON.parse(raw.split(/\n\n<file-renamed\b/i, 1)[0]) as Record<string, unknown> | null;
+      return !!payload && typeof payload === 'object' && !Array.isArray(payload)
+        && payload.contract_version === 2 && payload.outcome === 'need_user';
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
+
+/** Manual recipient provenance. Implicit completion preserves it; a recognized
+ * explicit transfer may return it at the originating choice revision. */
 function _userOwnsFloor(stateFile: StateFile): boolean {
   return (!!stateFile.active_recipient || !!stateFile.active_recipients?.length)
     && stateFile.active_recipient_source === 'user_selection';
@@ -3431,6 +3634,7 @@ async function _enqueueOrchestrationResumeFromAgent(params: {
   ledger: NonNullable<StateFile['orchestration_ledger']>;
   agentResult: string;
   handbackReason?: HandbackReason | 'legacy_unspecified';
+  taskId?: string;
   terminal?: {
     status: TaskTerminalStatus;
     failure?: TaskFailureDiagnostic;
@@ -3449,7 +3653,8 @@ async function _enqueueOrchestrationResumeFromAgent(params: {
     const cur = floorState.active_recipient || '';
     if ((!cur || cur === params.ledger.owner_agent_id || cur === params.fromActorId)
         && !_userOwnsFloor(floorState)
-        && (!floorState.active_recipient_handoff_id || floorState.active_recipient_handoff_id === params.ledger.id)) {
+        && (!floorState.active_recipient_handoff_id || floorState.active_recipient_handoff_id === params.ledger.id
+          || (!!params.taskId && floorState.active_recipient_handoff_id === waitingFloorBinding(params.taskId)))) {
       await setActiveRecipient(params.state.uid, params.state.cid, COMMANDER_ID, undefined, floorState.active_recipient_revision || 0);
     }
   } catch (err) {
@@ -3812,14 +4017,17 @@ async function _admitLoop(state: CidState): Promise<void> {
         // Commander releases its provider/session watchdog; the execution
         // finalizer below kicks admission again after deregistration.
         if (item.terminalHandoff && _executionForActor(state, COMMANDER_ID)) continue;
-        // `after` chain gate (§4.8): only a DONE predecessor releases the
-        // task. Unfinished (incl. waiting_input) → stay queued. Failed or
-        // cancelled → park as blocked for the user's decision; never
-        // silently release, never silently cascade-cancel.
-        if (item.afterTaskId) {
-          const settled = state.settledTasks.get(item.afterTaskId);
-          if (settled === undefined) continue;
-          if (settled !== 'done') {
+        // `after` dependency gate (§4.8, D29): only when EVERY predecessor is
+        // done is the task released. Any predecessor that ended without done
+        // (failed / stopped / cancelled) parks it as blocked at once — even
+        // while other predecessors still run — for the user's decision; never
+        // silently release, never silently cascade-cancel. Otherwise an
+        // unfinished predecessor (incl. waiting_input) keeps it queued.
+        if (item.afterTaskIds?.length) {
+          const settled = item.afterTaskIds.map((id) => state.settledTasks.get(id));
+          const failed = settled.some((status) => status !== undefined && status !== 'done');
+          if (!failed && settled.some((status) => status === undefined)) continue;
+          if (failed) {
             state.queue.splice(i, 1);
             // Same quiescence latch as the admit path: once the item leaves
             // `queue` the bus looks idle, and the fire-and-forget blocked
@@ -3860,15 +4068,17 @@ async function _admitLoop(state: CidState): Promise<void> {
         state.admittedInFlight += 1;
         const admissionEpoch = state.abortEpoch;
         try {
-          // Predecessor hand-off (§4.8): an `after`-gated task passes the gate
-          // above only once — right here — so this is the single point where
-          // the DONE predecessor's result can be attached before the turn
-          // starts. Build failure degrades to plain admission: start ordering
-          // is already guaranteed by the gate.
-          if (item.afterTaskId && !item.predecessorContext) {
+          // Predecessor hand-off (§4.8, D29): an `after`-gated task passes the
+          // gate above only once — right here — so this is the single point
+          // where every DONE predecessor's result can be attached before the
+          // turn starts. Same-message siblings never appear in each other's
+          // history (it stops at the triggering message), so the hand-off is
+          // the only channel for their results. Build failure degrades to plain
+          // admission: start ordering is already guaranteed by the gate.
+          if ((item.afterTaskIds?.length || item.skippedAfterTaskIds?.length) && !item.predecessorContext) {
             try {
-              const block = await _predecessorResultBlock(state, item.afterTaskId);
-              if (block) item.predecessorContext = block;
+              const context = await _dependencyResultContext(state, item);
+              if (context) item.predecessorContext = context;
             } catch (err) {
               log.warn(`predecessor context build failed cid=${state.cid}: ${(err as Error).message}`);
             }
@@ -3883,7 +4093,7 @@ async function _admitLoop(state: CidState): Promise<void> {
           // user messages skip this read does not cover it (2026-08-24
           // review finding GC-1). Plain user items keep skipping the read:
           // their admission follows their own enqueue immediately.
-          if (item.fromActorId !== USER_ID || item.afterTaskId) {
+          if (item.fromActorId !== USER_ID || item.afterTaskIds?.length || item.skippedAfterTaskIds?.length) {
             let dropWhileAborted = false;
             try {
               dropWhileAborted = (await readState(state.uid, state.cid)).status === 'aborted';
@@ -3995,39 +4205,313 @@ function _admissionSettled(state: CidState): Promise<void> {
   });
 }
 
-/** Build the `<predecessor-task-result>` hand-off block for an admitted
- * `after`-gated task: the DONE predecessor's persisted reply (clipped) plus
- * its produced file paths. The `after` gate only orders STARTS; without this
- * block the successor begins blind because history filtering can omit the
- * predecessor's user-directed reply. Returns '' when the predecessor left
- * no persisted result (silent turn / salvage bubble): start ordering alone is
- * then the whole contract. Same read path as the scheduled-dispatch result
- * reader; the board file is durable before the settling event fires, so the
- * row and its result_msg_id are readable here. */
-async function _predecessorResultBlock(state: CidState, afterTaskId: string): Promise<string> {
+/** The last few visible messages before a planned send, for the planner to
+ * resolve references such as "the plan above". Bounded and clipped; hidden
+ * dispatch records and deleted rows are skipped. */
+async function _recentHistoryForPlanner(uid: string, cid: string, beforeMsgId: string): Promise<string> {
+  try {
+    const rows = await readJsonl<GroupMessage>(conversationMessageReadFile(uid, cid));
+    const index = rows.findIndex((row) => row.id === beforeMsgId);
+    const prior = (index >= 0 ? rows.slice(0, index) : rows)
+      .filter((row) => !row.dispatch && !row.deleted_at && String(row.text || '').trim())
+      .slice(-6);
+    let names = new Map<string, string>();
+    try {
+      const members = await readMembers(uid, cid);
+      names = new Map(members.actors.map((a) => [a.id, a.name || a.id]));
+    } catch { /* raw ids stay readable */ }
+    return prior.map((row) => {
+      const who = row.from === USER_ID ? 'user' : (names.get(row.from) || row.from);
+      return `[${who}] ${_clipForOrchestration(row.text || '', 400).replace(/\s+/g, ' ')}`;
+    }).join('\n');
+  } catch (err) {
+    log.warn(`planner history unavailable cid=${cid}: ${(err as Error).message}`);
+    return '';
+  }
+}
+
+/** D29: split a user-orchestrated send into dependent board tasks with the
+ * dispatch planner, or — when planning fails, times out, or the planner asks
+ * a question — hand the whole message to Commander. Commander step-by-step
+ * orchestration is for uncertain work; a send the user already arranged goes
+ * straight onto the board as the arranged tasks (user decision 2026-10-04).
+ * The user bubble is already persisted (planned sends do not defer), so a
+ * Stop during planning simply creates no task. */
+/** The row a plain user reply to this Agent continues (D30): its newest
+ * waiting_input row that is not already queued. Form replies retain the pending fields. */
+async function _waitingReplyTask(
+  state: CidState,
+  uid: string,
+  cid: string,
+  actorId: string,
+): Promise<taskBoard.ConversationTask | undefined> {
+  const waiting = (await taskBoard.listTasks(uid, cid))
+    .filter((t) => t.assignee === actorId && t.status === 'waiting_input')
+    .sort((a, b) => (Date.parse(b.updated_at || b.created_at) || 0) - (Date.parse(a.updated_at || a.created_at) || 0))[0];
+  return waiting && !state.queue.some((queued) => queued.taskId === waiting.task_id) ? waiting : undefined;
+}
+
+async function _dispatchPlannedUserSend(state: CidState, input: {
+  uid: string;
+  cid: string;
+  msg: GroupMessage;
+  msgId: string;
+  fromActorId: string;
+  params: EnqueueParams;
+  /** The user's text with mentions intact (before the routed-recipient strip). */
+  text: string;
+  candidates: readonly string[];
+  roster: readonly Actor[];
+  registryActors: ReadonlyMap<string, Actor>;
+}): Promise<string[]> {
+  const { uid, cid, msg, msgId, fromActorId, params } = input;
+  const epoch = state.abortEpoch;
+  const stopped = () => state.terminating || state.abortEpoch !== epoch || params.dispatchSignal?.aborted;
+  const commander: Actor = input.roster.find((a) => a.id === COMMANDER_ID)
+    || { kind: 'commander', id: COMMANDER_ID, name: COMMANDER_ID, joined_at: nowIso() };
+  const actorFor = (id: string): Actor | undefined => (id === COMMANDER_ID
+    ? commander
+    : input.roster.find((a) => a.id === id) || input.registryActors.get(id));
+  const nameOf = (id: string) => buildMention(actorFor(id)?.name || id);
+
+  const language = resolveLanguageForUser(uid);
+  const candidates: PlannerCandidate[] = [];
+  for (const id of input.candidates) {
+    if (id === COMMANDER_ID || id === USER_ID) continue;
+    const actor = actorFor(id);
+    if (!actor || (actor.kind === 'agent' && !isAgentEnabled(uid, actor.id))) continue;
+    let description = '';
+    try {
+      const agent = await agentsFeat.getAgent(id);
+      if (agent) description = pickAgentRuntimeDescription(agent, language);
+    } catch { /* the name alone still identifies the actor */ }
+    candidates.push({
+      id, name: actor.name || id, description: _clipForOrchestration(description, 240),
+      isCommander: false, mentioned: true,
+    });
+  }
+  candidates.push({
+    id: COMMANDER_ID,
+    name: commander.name || COMMANDER_ID,
+    description: 'Orchestrator. Takes the parts the user addressed to no named actor, such as "you", a final summary, or a combined deliverable.',
+    isCommander: true,
+    mentioned: input.candidates.includes(COMMANDER_ID),
+  });
+
+  if (stopped()) return [];
+  const controller = new AbortController();
+  (state.planningControllers ??= new Set()).add(controller);
+  let planned: DispatchPlanResult;
+  try {
+    planned = await planUserDispatch({
+      uid, cid, turnId: genId12(),
+      text: input.text,
+      candidates,
+      // Explicit UI quotes are part of this request's context even when the
+      // authored body contains only recipients. Keep the same bounded, inert
+      // representation each assigned actor receives; quoted mentions never
+      // expand the planner's candidate set.
+      recentHistory: [
+        await _recentHistoryForPlanner(uid, cid, msgId),
+        _referenceContextForModel(uid, msg.references),
+      ].filter(Boolean).join('\n\n'),
+      signal: params.dispatchSignal ? AbortSignal.any([controller.signal, params.dispatchSignal]) : controller.signal,
+    });
+  } finally {
+    state.planningControllers?.delete(controller);
+  }
+  const result = planned;
+  if (stopped() || (result.ok === false && result.reason === 'aborted')) {
+    log.info(`planned dispatch dropped after stop cid=${cid} msg=${maskId(msgId)}`);
+    return [];
+  }
+
+  // Who this message engages: the named actors, plus every planned assignee
+  // once a plan exists. A plan that gives Commander a part counts as
+  // addressing Commander, so an Agent handback from the same message does
+  // not wake it a second time.
+  let sourceRecipients = msg.to.slice();
+  const queueItem = async (
+    actor: Actor,
+    instruction: string,
+    assignmentContext: string,
+    after: readonly string[],
+    /** The same split note worded for this task's later turns. */
+    continuationContext?: string,
+    /** A waiting row this item continues instead of creating a new one. */
+    continued?: taskBoard.ConversationTask,
+  ): Promise<string | undefined> => {
+    if (stopped()) return undefined;
+    const turnId = genId12();
+    let taskId: string | undefined = continued?.task_id;
+    if (!continued) try {
+      const created = await taskBoard.createTask(uid, cid, {
+        admissionPending: true,
+        assignee: actor.id,
+        instruction,
+        createdBy: 'user',
+        ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
+        sourceMsgId: msgId,
+        turnId,
+        ...(after.length ? { after } : {}),
+        ...(continuationContext ? { assignmentContext: continuationContext } : {}),
+      });
+      taskId = created.task_id;
+      emit(state, { type: 'task_created', cid, task: created });
+    } catch (err) {
+      log.warn(`task-board create failed cid=${cid}: ${(err as Error).message}`);
+    }
+    // Stop can cross the asynchronous row creation before this item becomes
+    // visible to abort's queue sweep. Cancel that row and never admit it.
+    if (stopped()) {
+      if (taskId) {
+        const changed = await taskBoard.cancelPending(uid, cid, taskId);
+        if (changed) emit(state, { type: 'task_state', cid, task: changed });
+      }
+      return undefined;
+    }
+    state.queue.push({
+      actor,
+      turnId,
+      msgId,
+      fromActorId,
+      enqueueSeq: ++state.waitClock,
+      ...(taskId ? { taskId } : {}),
+      ...(continued?.resume?.form_id ? { pendingFormId: continued.resume.form_id } : {}),
+      // Only dependencies that got a row can gate; a failed board write
+      // degrades to an earlier start rather than a task that never starts.
+      ...(after.length ? { afterTaskIds: after.slice() } : {}),
+      // A continued row keeps the split note it was created with, exactly as
+      // a direct reply does.
+      ...(continued
+        ? (continued.assignment_context ? { assignmentContext: continued.assignment_context } : {})
+        : { assignmentContext }),
+      sourceText: instruction,
+      sourceRecipients: sourceRecipients.slice(),
+      llmPayload: _readdressLlmTurnPayload(composeLlmTurnPayload(uid, fromActorId, msg), [actor.id]),
+      ...(msg.attachments && msg.attachments.length ? { attachments: msg.attachments.slice() } : {}),
+      ...(msg.references && msg.references.length ? { references: msg.references.slice() } : {}),
+      ...(msg.use_selections && msg.use_selections.length ? { useSelections: msg.use_selections.slice() } : {}),
+    });
+    return taskId;
+  };
+
+  if (result.ok === false) {
+    log.warn('planned dispatch fell back to commander', {
+      cid: maskId(cid),
+      message_id: maskId(msgId),
+      reason: result.reason,
+      ...(result.detail ? { detail: result.detail } : {}),
+    });
+    const mentioned = candidates.filter((c) => c.mentioned && !c.isCommander).map((c) => buildMention(c.name));
+    await queueItem(commander, msg.text, [
+      '<task-assignment>',
+      `The host could not split this user message into tasks automatically (${result.reason}). Arrange the work yourself${mentioned.length ? ` among the actors the user named: ${mentioned.join(', ')}` : ''}, keeping each part with the actor the user chose for it.`,
+      ...(result.reason === 'question' && result.question ? [`Open question about the split: ${result.question}`] : []),
+      '</task-assignment>',
+    ].join('\n'), []);
+    return stopped() ? [] : [COMMANDER_ID];
+  }
+
+  const plan = result.plan;
+  sourceRecipients = [...new Set([...msg.to, ...plan.tasks.map((task) => task.assignee)])];
+  const taskIds: Array<string | undefined> = [];
+  let edges = 0;
+  for (let i = 0; i < plan.tasks.length; i += 1) {
+    const task = plan.tasks[i];
+    const actor = actorFor(task.assignee);
+    const after = task.after.map((j) => taskIds[j]).filter((id): id is string => !!id);
+    edges += after.length;
+    if (!actor) {
+      // Validation only admits known candidates; a vanished actor keeps its
+      // slot so later indices still line up.
+      log.warn(`planned task assignee unresolved cid=${cid} assignee=${maskId(task.assignee)}`);
+      taskIds.push(undefined);
+      continue;
+    }
+    // A plan that gives the whole reply to an Agent waiting on the user is
+    // that Agent's reply: it continues the waiting row like a direct reply,
+    // so the row's dependents and Commander resume stay attached (D30).
+    let continued: taskBoard.ConversationTask | undefined;
+    if (plan.tasks.length === 1 && actor.kind === 'agent') {
+      try {
+        continued = await _waitingReplyTask(state, uid, cid, actor.id);
+      } catch (err) {
+        log.warn('reply-resume task lookup failed', { error: logErrorSummary(err) });
+      }
+    }
+    taskIds.push(await queueItem(
+      actor,
+      task.part,
+      buildAssignmentContext(plan, i, nameOf),
+      after,
+      buildAssignmentContext(plan, i, nameOf, true),
+      continued,
+    ));
+    if (stopped()) return [];
+  }
+  log.info(`planned dispatch cid=${cid} msg=${maskId(msgId)} tasks=${plan.tasks.length} edges=${edges} references=${plan.references.length}`);
+  return [...new Set(plan.tasks.map((task) => task.assignee))];
+}
+
+/** Consume-time context placed before a turn's input: a planned dispatch's
+ * split note, then the dependency hand-off. Empty for ordinary turns. */
+function _turnInputPrelude(item: QueueItem): string {
+  return [item.assignmentContext, item.predecessorContext].filter(Boolean).join('\n\n');
+}
+
+/** Build the hand-off for an admitted `after`-gated task (§4.8, D29): one
+ * `<predecessor-task-result>` block per DONE predecessor, in declared order —
+ * its persisted reply (clipped) plus produced file paths — and a note naming
+ * predecessors the user dropped with "run anyway". The `after` gate only
+ * orders STARTS; without these blocks a successor begins blind, because its
+ * history stops at the triggering user message and same-message siblings
+ * reply after it. A fan-in task (e.g. a final synthesis) therefore receives
+ * every input it waited for. A predecessor with no persisted result (silent
+ * turn / salvage bubble) contributes no block: start ordering alone is then
+ * its whole contract. Same read path as the scheduled-dispatch result reader;
+ * the board file is durable before the settling event fires, so rows and
+ * their result_msg_id are readable here. */
+async function _dependencyResultContext(state: CidState, item: QueueItem): Promise<string> {
   const rows = await taskBoard.listTasks(state.uid, state.cid);
-  const prev = rows.find((t) => t.task_id === afterTaskId);
-  if (!prev || prev.status !== 'done' || !prev.result_msg_id) return '';
   // Read helper, not raw layout.messageFile: legacy-layout conversations
   // resolve through its fallback (2026-08-24 review finding GC-2).
   const messages = await readJsonl<GroupMessage>(conversationMessageReadFile(state.uid, state.cid));
-  const resultMsg = messages.find((m) => m.id === prev.result_msg_id);
-  if (!resultMsg) return '';
-  let name = prev.assignee;
+  let names = new Map<string, string>();
   try {
     const members = await readMembers(state.uid, state.cid);
-    name = members.actors.find((a) => a.id === prev.assignee)?.name || prev.assignee;
-  } catch { /* raw id stays readable */ }
-  const text = _clipForOrchestration(resultMsg.text || '', 4000);
-  const produced = (resultMsg.produced || []).filter((p) => typeof p === 'string' && p).slice(0, 40);
-  if (!text && !produced.length) return '';
-  return [
-    `<predecessor-task-result from="${escapeXmlAttr(buildMention(name))}">`,
-    'This earlier task from the same user request finished before yours started; its reply and files are input context for your instruction.',
-    ...(text ? [text] : []),
-    ...(produced.length ? ['Produced files:', ...produced.map((p) => `- ${p}`)] : []),
-    '</predecessor-task-result>',
-  ].join('\n');
+    names = new Map(members.actors.map((a) => [a.id, a.name || a.id]));
+  } catch { /* raw ids stay readable */ }
+  const blocks: string[] = [];
+  for (const id of item.afterTaskIds || []) {
+    const prev = rows.find((t) => t.task_id === id);
+    if (!prev || prev.status !== 'done' || !prev.result_msg_id) continue;
+    const resultMsg = messages.find((m) => m.id === prev.result_msg_id);
+    if (!resultMsg) continue;
+    const text = _clipForOrchestration(resultMsg.text || '', 4000);
+    const produced = (resultMsg.produced || []).filter((p) => typeof p === 'string' && p).slice(0, 40);
+    if (!text && !produced.length) continue;
+    blocks.push([
+      `<predecessor-task-result from="${escapeXmlAttr(buildMention(names.get(prev.assignee) || prev.assignee))}">`,
+      'This earlier task from the same user request finished before yours started; its reply and files are input context for your instruction.',
+      ...(text ? [text] : []),
+      ...(produced.length ? ['Produced files:', ...produced.map((p) => `- ${p}`)] : []),
+      '</predecessor-task-result>',
+    ].join('\n'));
+  }
+  if (item.skippedAfterTaskIds?.length) {
+    blocks.push([
+      '<missing-predecessor-results>',
+      'These earlier tasks from the same user request ended without a result, and the user chose to start your task anyway. Do not invent their output; if it matters, say what is missing.',
+      ...item.skippedAfterTaskIds.map((id) => {
+        const row = rows.find((t) => t.task_id === id);
+        const who = row ? (names.get(row.assignee) || row.assignee) : id;
+        return `- ${buildMention(who)} (${row?.status || 'missing'})`;
+      }),
+      '</missing-predecessor-results>',
+    ].join('\n'));
+  }
+  return blocks.join('\n\n');
 }
 
 /** Cancel the board rows of queue items that will never run (queue drops on
@@ -4720,6 +5204,11 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
         ...(result.errText ? { errText: result.errText } : {}),
       });
     }
+    // Before finishTask fires an awaiting dispatch tool: a delegation check in
+    // that same Commander turn must already see this Agent as waiting.
+    if (actor.kind === 'agent' && result.kind === 'completed' && result.terminalStatus === 'waiting_input') {
+      state.agentWaitSeq.set(actor.id, ++state.waitClock);
+    }
     try {
       const resultMsgId = result.kind === 'completed' ? result.persistedMsg?.id : undefined;
       // A form-parked terminal records its form id so the matching submission
@@ -4772,6 +5261,11 @@ async function runTurn(state: CidState, w: WorkerState, item: QueueItem): Promis
   }
   await _resumeCommanderAfterScheduledHandoff(state, actor, item, result);
   await _resumeCommanderAfterRetriedDispatch(state, actor, item, result);
+  try {
+    await _settleAgentTurnFloor(state, actor, item, result);
+  } catch (err) {
+    log.warn(`agent floor settlement failed cid=${cid} actor=${actor.id}: ${(err as Error).message}`);
+  }
 }
 
 /** Result of one actor turn. `early` = a pre-stream guard already handled the
@@ -4796,13 +5290,141 @@ type ActorTurnResult =
       aborted?: boolean;
       terminalStatus: TaskTerminalStatus;
       failure?: TaskFailureDiagnostic;
+      /** This turn already woke Commander through an explicit handback or a
+       * form redemption; post-turn completion must not resume it again. */
+      orchestrationResumed?: boolean;
+      /** An explicit handback in this turn returned the floor to Commander. */
+      floorReleased?: boolean;
+      /** The Agent ended its routed interaction with an explicit handback. */
+      handedBack?: boolean;
     };
+
+/** Who answers next after an Agent turn. An Agent that stops to ask the user
+ * in prose takes a free floor, so the user's reply is the user's own turn to
+ * that Agent (where its confirmations count). When the interaction completes
+ * (an interactive Agent's explicit handback; any other Agent's ordinary turn
+ * end), the floor it took returns, a suspended Commander task resumes, and a
+ * sibling Agent still waiting for the user gets the floor next. Forms keep
+ * their typed submission contract. */
+async function _settleAgentTurnFloor(
+  state: CidState,
+  actor: Actor,
+  item: QueueItem,
+  result: ActorTurnResult,
+): Promise<void> {
+  if (actor.kind !== 'agent' || item.nested || !item.taskId) return;
+  const failed = result.terminalStatus === 'failed';
+  if ((result.kind === 'completed' && result.aborted) || (result.kind !== 'completed' && !failed)) return;
+  const { uid, cid } = state;
+  const taskId = item.taskId;
+  if (result.terminalStatus === 'waiting_input') {
+    if (await claimFloorForWaitingTask(uid, cid, actor.id, taskId, item.floorChoiceRevision)) await emitStateChanged(state);
+    return;
+  }
+  // A dispatch child reports to the Commander turn that is awaiting it.
+  if ((!failed && result.terminalStatus !== 'completed') || item.commanderSubtask) return;
+  // An interactive Agent's ordinary turn end is not completion: live runs
+  // showed VideoStudio asking for confirmation without the open marker, and
+  // releasing the floor then sent the user's answer back through Commander.
+  // Its routed interaction ends only with an explicit handback (or failure).
+  if (!failed && result.terminalStatus === 'completed' && result.kind === 'completed' && !result.handedBack) {
+    let interactive = true;
+    try { interactive = (await agentsFeat.getAgent(actor.id))?.interactive === true; } catch { /* keep the floor */ }
+    if (interactive && !result.orchestrationResumed) return;
+  }
+  const released = await releaseWaitingFloor(uid, cid, actor.id, taskId, item.floorRevision, item.handoffFloorBinding);
+  let row: taskBoard.ConversationTask | undefined;
+  try {
+    row = (await taskBoard.listTasks(uid, cid)).find((task) => task.task_id === taskId);
+  } catch (err) {
+    log.warn(`completed-agent task read failed cid=${cid}: ${(err as Error).message}`);
+  }
+  let resumed = result.kind === 'completed' && result.orchestrationResumed === true;
+  if (!resumed) {
+    const meta = row?.resume;
+    let ledger: NonNullable<StateFile['orchestration_ledger']> | null = null;
+    if (meta?.resume_instruction && !meta.form_id && meta.source_tool === 'dispatch_to') {
+      await taskBoard.setTaskResume(uid, cid, taskId, { resume_instruction: '' });
+      const mirror = (await readState(uid, cid)).orchestration_ledger;
+      if (mirror?.owner_agent_id === actor.id && mirror.source_tool === 'dispatch_to') {
+        await takeOrchestrationLedgerForAgent(uid, cid, actor.id);
+      }
+      const now = nowIso();
+      ledger = {
+        version: 1,
+        id: genId12(),
+        kind: 'suspended_orchestration',
+        status: 'waiting_for_agent',
+        blocked_on: 'agent_handoff',
+        source_tool: 'dispatch_to',
+        owner_agent_id: actor.id,
+        ...(actor.name ? { owner_agent_name: actor.name } : {}),
+        user_goal: meta.user_goal || '',
+        handoff_message: meta.handoff_message || '',
+        resume_instruction: meta.resume_instruction,
+        created_at: now,
+        updated_at: now,
+      };
+    } else {
+      ledger = await takeOrchestrationLedgerForAgent(uid, cid, actor.id);
+    }
+    if (ledger) {
+      const text = result.kind === 'completed' ? result.text : '';
+      const produced = result.kind === 'completed' ? result.produced : undefined;
+      await _enqueueOrchestrationResumeFromAgent({
+        state,
+        fromActorId: actor.id,
+        fromActorName: actor.name,
+        ledger,
+        taskId,
+        agentResult: failed
+          ? buildWorkerErrorPayload(actor.name || actor.id, text || 'Agent execution failed before producing a completed result.', { produced })
+          : buildWorkerResultPayload(actor.name || actor.id, text, produced),
+        terminal: { status: result.terminalStatus, ...(result.failure ? { failure: result.failure } : {}) },
+      });
+      resumed = true;
+    }
+  }
+  if (released || resumed || (result.kind === 'completed' && result.floorReleased)) {
+    await _passFloorToNextWaitingAgent(state, actor.id, row);
+  }
+  if (released) await emitStateChanged(state);
+}
+
+/** First come, first served: when the Agent holding the floor finishes, the
+ * floor passes to a sibling Agent (same Commander task or same user message)
+ * that is still waiting for the user's reply. Unrelated old questions never
+ * take the floor. */
+async function _passFloorToNextWaitingAgent(
+  state: CidState,
+  releasedAgentId: string,
+  released?: taskBoard.ConversationTask,
+): Promise<void> {
+  if (!released?.parent_task_id && !released?.source_msg_id) return;
+  const { uid, cid } = state;
+  try {
+    if ((await readState(uid, cid)).active_recipient) return;
+    const next = (await taskBoard.listTasks(uid, cid))
+      .filter((row) => row.status === 'waiting_input'
+        && row.assignee !== releasedAgentId
+        && !RESERVED_IDS.has(row.assignee)
+        && ((!!released.parent_task_id && row.parent_task_id === released.parent_task_id)
+          || (!!released.source_msg_id && row.source_msg_id === released.source_msg_id)))
+      .sort((a, b) => (Date.parse(a.updated_at || a.created_at) || 0) - (Date.parse(b.updated_at || b.created_at) || 0))[0];
+    if (next && await claimFloorForWaitingTask(uid, cid, next.assignee, next.task_id)) {
+      await emitStateChanged(state);
+    }
+  } catch (err) {
+    log.warn(`waiting floor hand-over failed cid=${cid}: ${(err as Error).message}`);
+  }
+}
 
 /** A terminal hand-off releases Commander before the Agent starts. Resume is
  * therefore a new top-level Commander turn, never a blocked tool result. An
  * explicit Agent handback normally consumes the ledger inside runActorTurn;
  * this terminal hook owns the cases where no model-authored marker can exist
- * (runtime failure/timeout) and one-shot non-interactive completion. */
+ * (runtime failure/timeout) and one-shot non-interactive completion. An
+ * interactive Agent's completed turn resumes in `_settleAgentTurnFloor`. */
 async function _resumeCommanderAfterScheduledHandoff(
   state: CidState,
   actor: Actor,
@@ -4857,6 +5479,7 @@ async function _resumeCommanderAfterScheduledHandoff(
     fromActorId: actor.id,
     fromActorName: actor.name,
     ledger,
+    taskId: item.taskId,
     agentResult,
     terminal: {
       status: result.terminalStatus,
@@ -4941,6 +5564,7 @@ async function _resumeCommanderAfterRetriedDispatch(
     fromActorId: actor.id,
     fromActorName: actor.name,
     ledger,
+    taskId: item.taskId,
     agentResult,
     terminal: {
       status: result.terminalStatus,
@@ -4958,6 +5582,7 @@ async function runActorTurn(
   item: QueueItem,
   turnStartedAt: number,
 ): Promise<ActorTurnResult> {
+  w.pendingSavedTasks = undefined;
   try {
     return await runActorTurnWithDisplay(state, w, item, turnStartedAt);
   } finally {
@@ -4972,6 +5597,9 @@ async function runActorTurnWithDisplay(
   turnStartedAt: number,
 ): Promise<ActorTurnResult> {
   const { uid, cid, actor } = w;
+  // Freeze before any host/module-loading await. Cancellation can finish
+  // this run and admit the next user task before model code registers a receipt.
+
   const { agentExecutionDeadline } = await import('../../util/agent-execution-budget');
   const executionDeadlineAt = agentExecutionDeadline(turnStartedAt);
   // Freeze the conversation owner's language for the entire actor turn.
@@ -5030,8 +5658,10 @@ async function runActorTurnWithDisplay(
   }
   let turnToolExtraRoots: string[] = [];
   let turnSyncConflictResolution: NonNullable<StateFile['sync_conflict_resolution']>['conflicts'] = [];
+  let turnHoldsRoutedFloor = false;
   try {
     const stateFile = await readState(uid, cid);
+    turnHoldsRoutedFloor = actor.kind === 'agent' && _holdsCommanderRoutedFloor(stateFile, actor.id);
     turnToolExtraRoots = Array.isArray(stateFile.tool_extra_roots)
       ? stateFile.tool_extra_roots.filter((r) => typeof r === 'string' && path.isAbsolute(r))
       : [];
@@ -5045,17 +5675,22 @@ async function runActorTurnWithDisplay(
   // conversation-fact source. CLI actors consume the same log through the
   // bounded recovery/delta compiler below instead of this model history path.
   let messageText = item.llmPayload;
-  // Serial-chain hand-off: anchor the admitted task to its predecessor's
-  // result (which reply is THIS task's input + produced paths). Prepended at
-  // consume time like the attachment manifest — llmPayload keeps its <msg>
-  // envelope shape for unwrap readers.
-  if (item.predecessorContext) messageText = `${item.predecessorContext}\n${messageText}`;
+  // Planned-dispatch split note + dependency hand-off: anchor the admitted
+  // task to its part of the plan and to its predecessors' results (which
+  // replies are THIS task's input + produced paths). Prepended at consume
+  // time like the attachment manifest — llmPayload keeps its <msg> envelope
+  // shape for unwrap readers.
+  const prelude = _turnInputPrelude(item);
+  if (prelude) messageText = `${prelude}\n${messageText}`;
   let replayReferences: ChatMessageReference[] = [];
   let conversationHistory: GroupConversationHistory | undefined;
   let preloadedNamedAgent: import('../agents').Agent | null | undefined;
   try {
     if (actor.kind === 'agent') {
       preloadedNamedAgent = await agentsFeat.getAgent(actor.id);
+    }
+    if (turnHoldsRoutedFloor && preloadedNamedAgent && !agentsFeat.isCliAgent(preloadedNamedAgent)) {
+      messageText = `${_returnControlProtocol()}\n${messageText}`;
     }
     if (
       isCommander
@@ -5372,12 +6007,11 @@ async function runActorTurnWithDisplay(
       // Runtime resolution is the source of truth for active-turn ingress.
       // Publish the upgrade only for a top-level worker: nested dispatches use
       // a synthetic queue and intentionally expose no user steer callback.
-      // Commander sub-tasks are likewise not steerable — the task contract
-      // belongs to the commander; the user may only cancel (plan §4.6.1).
+      // Scheduled Commander children share this same live-input boundary;
+      // their original dispatch/result ownership stays with the scheduler.
       // Terminal hand-offs likewise preserve the admitted task boundary: new
       // user input stays in the ordinary FIFO instead of mutating this run.
       w.currentTurnSteerable = !item.nested
-        && !item.commanderSubtask
         && !item.terminalHandoff;
       if (!item.nested) await emitStateChanged(state);
       systemPrompt = await buildAgentInGroupSystemPrompt(uid, agent, workingDir, turnLanguage);
@@ -5555,6 +6189,8 @@ async function runActorTurnWithDisplay(
         ts: localIsoAt(turnStartedAt), turn_id: item.turnId, seg: segState.seg,
         source_message_id: item.msgId,
         text: cliAgent ? cliDisplayText : streamingText.slice(segState.segStart),
+        ...(cliAgent?.runtime?.kind === 'cli' && cliAgent.runtime.cli === 'claude'
+          ? { display_phase: 'pending' as const } : {}),
         process: processItems.slice(segState.processStart),
       },
     ]);
@@ -5584,13 +6220,17 @@ async function runActorTurnWithDisplay(
   // from a visible-dispatch tool BEFORE the dispatched agent runs, so the
   // commander's reasoning since the last flush is persisted as its own `seg`
   // bubble (ts < the agent's), and the post-handback synthesis becomes the next
-  // segment. Empty pre-dispatch text → no bubble, but the text cursor still
-  // advances so later synthesis cannot replay it. `forceTo:[user]` keeps the segment
+  // segment. With neither text nor public commentary there is no bubble, but
+  // the text cursor advances so later synthesis cannot replay it. `forceTo:[user]` keeps the segment
   // from re-dispatching agents named in the prose.
   segState.flush = async () => {
     const text = streamingText.slice(segState.segStart).trim();
     segState.segStart = streamingText.length;
-    if (!text) {
+    const hasCommentary = processItems.slice(segState.processStart).some((item) =>
+      item.type === 'progress' && item.text.trim()
+      && item.event?.stream === 'assistant'
+      && (item.event.data as { phase?: unknown } | undefined)?.phase === 'commentary');
+    if (!text && !hasCommentary) {
       // Nothing to persist, but the dispatch boundary still ends this segment.
       // Advancing the index is what puts the post-handback synthesis in a NEW
       // segment, so the renderer opens it as a fresh row below the dispatched
@@ -5811,7 +6451,15 @@ async function runActorTurnWithDisplay(
         ...(turnProjectId ? { projectId: turnProjectId } : {}),
         signal: w.abortController.signal,
         deadlineAt: executionDeadlineAt,
-        ...(!item.nested && !item.commanderSubtask && !item.terminalHandoff ? {
+        onAutoTaskSaved: (taskId, title) => stageSavedTask(w, item.turnId, {
+          kind: 'automation', task_id: taskId, project_id: turnProjectId || '', title,
+        }),
+        onTodoTaskSaved: (taskId, projectId, content) => stageSavedTask(w, item.turnId, {
+          kind: 'todo', task_id: taskId, project_id: projectId, title: content,
+        }),
+        onAutoTaskDeleted: (taskId) => unstageSavedTask(w, item.turnId, 'automation', taskId),
+        onTodoTaskDeleted: (taskId, projectId) => unstageSavedTask(w, item.turnId, 'todo', taskId, projectId),
+        ...(!item.nested && !item.terminalHandoff ? {
           onActiveRunIngress: (ingress: LocalActiveRunIngress | null) => {
             // Ignore a late callback from a run that has already lost this
             // worker turn. The scheduler may reuse the same WorkerState for
@@ -5836,7 +6484,7 @@ async function runActorTurnWithDisplay(
           },
         } : {}),
         onNativeMessage: (text, meta) => {
-          const message: GroupMessage = {
+          const message = classifyNativeCommentary({
             id: genId12(),
             // A native message is flushed only when the NEXT one starts, so
             // stamping the write time would date every earlier message at the
@@ -5849,11 +6497,15 @@ async function runActorTurnWithDisplay(
             turn_id: item.turnId, seg: segState.seg, text,
             source_message_id: item.msgId,
             process: processItems.slice(segState.processStart),
-          };
+          });
           nativeDisplaySegments.push(message);
           cliDisplayText = '';
           segState.seg += 1;
           segState.processStart = processItems.length;
+          // Announce the authoritative classification before the next token.
+          // Durable message publication still waits for its serialized write.
+          emit(state, { type: 'process', cid, actor: actor.id, turn_id: item.turnId,
+            seg: message.seg, data: { type: 'native-message-finalized', text, phase: 'commentary' } });
           // Capture identity synchronously before the next delta, then serialize
           // storage. This is a message boundary, not a tool/publication boundary.
           cliMessageWrites = cliMessageWrites.then(async () => {
@@ -5995,9 +6647,14 @@ async function runActorTurnWithDisplay(
         } : {}),
         // The retired `<auto-task>` container offered this route from the bus;
         // the tool is the only writer now, so it reports the save instead.
-        onAutoTaskSaved: (taskId: string) => {
-          stageAppNavRequest(w, { surface_id: 'auto', action: 'configure', target_id: taskId });
-        },
+        onAutoTaskSaved: (taskId: string, title: string) => stageSavedTask(w, item.turnId, {
+          kind: 'automation', task_id: taskId, project_id: turnProjectId || '', title,
+        }),
+        onTodoTaskSaved: (taskId: string, projectId: string, content: string) => stageSavedTask(w, item.turnId, {
+          kind: 'todo', task_id: taskId, project_id: projectId, title: content,
+        }),
+        onAutoTaskDeleted: (taskId: string) => unstageSavedTask(w, item.turnId, 'automation', taskId),
+        onTodoTaskDeleted: (taskId: string, projectId: string) => unstageSavedTask(w, item.turnId, 'todo', taskId, projectId),
         onSkillAdvertised: (id, sys) => skillBuffer.recordAdvertised(id, sys),
         onSkillInvoked: (id, sys, trig) => skillBuffer.recordInvoked(id, sys, trig),
         // Top-level group turns (commander / member) keep their large cached
@@ -6022,10 +6679,10 @@ async function runActorTurnWithDisplay(
         // interrupt-steer (G9): on the top-level turn, fold user messages the
         // user sends mid-run into THIS run. Nested sub-runs (dispatched
         // workers) get no steer — the user can't address a worker, and their
-        // synthetic queue is empty anyway. Commander sub-tasks get no steer
-        // either: the user cancels, never co-writes the contract (§4.6.1).
+        // synthetic queue is empty anyway. Scheduled Commander children use
+        // the shared user queue while retaining their dispatch result waiter.
         // Terminal hand-offs also keep their admitted contract immutable.
-        ...(item.nested || item.commanderSubtask || item.terminalHandoff ? {} : {
+        ...(item.nested || item.terminalHandoff ? {} : {
           richSteerEnabled: true,
           runtimeReadOnlyRoots,
           drainSteer: () => drainSteerInto(w, actor, {
@@ -6273,6 +6930,10 @@ async function runActorTurnWithDisplay(
     agentResult: string;
     userGoal: string;
   } | null = null;
+  /** An explicit handback in this turn returned the floor to Commander. */
+  let handbackReleasedFloor = false;
+  /** The Agent closed its routed interaction with an explicit handback. */
+  let explicitHandback = false;
   const createdAgents: Array<{ agent_id: string; name: string; kind: 'created' | 'updated' }> = [];
   let appliedAgentMutationCount = 0;
   const createdSkills: Array<{ skill_id: string; name: string; kind: 'created' | 'updated' }> = [
@@ -6295,6 +6956,18 @@ async function runActorTurnWithDisplay(
       planInteraction = pi.status;
     }
   }
+
+  // A reply that still asks the user to answer has not finished its routed
+  // interaction, whatever closing marker it also carries: an open plan marker,
+  // a runtime waiting stop, or a native gate that refused for want of the
+  // user's own decision. Live 2026-10-07 runs on the managed default model
+  // ended a "reply 继续" question with `<handback />`; honoring it woke
+  // Commander early and spent the hand-off's resume, so the follow-up step
+  // never ran once the Agent really finished.
+  const askingUserThisTurn = planInteraction === 'open'
+    || ((agentRunTimingData?.terminal_status === 'waiting_input'
+      || (actor.kind === 'agent' && _lastStudioOutcomeNeedsUser(processItems)))
+      && !errText && !turnFailureKind);
 
   if (actor.kind === 'agent' && (workingText || cliCommanderHandoff)) {
     // Parse both control blocks before changing floor / ledger state. A malformed
@@ -6358,7 +7031,8 @@ async function runActorTurnWithDisplay(
     // A handback marker salvaged from an aborted partial response must not move
     // the conversation floor or consume/wake orchestration state. User Stop is
     // the terminal control path for that turn.
-    if (handbackRequested && !form && !aborted) {
+    if (handbackRequested && !form && !aborted && !errText && !turnFailureKind && !askingUserThisTurn) {
+      explicitHandback = hb.handback;
       try {
         const floorState = await readState(uid, cid);
         const cur = floorState.active_recipient || '';
@@ -6381,9 +7055,10 @@ async function runActorTurnWithDisplay(
           // longer matches there is no orchestration to resume, and a fallback
           // wake would be the very extra turn this guard exists to prevent.
           if (ledger) {
-            if (cur === actor.id && !_userOwnsFloor(floorState)
+            if (cur === actor.id && (!_userOwnsFloor(floorState) || !!bridgeHandoff || !!hb.reason)
               && (item.floorRevision === undefined || item.floorRevision === (floorState.active_recipient_revision || 0))) {
               await setActiveRecipient(uid, cid, COMMANDER_ID, undefined, floorState.active_recipient_revision || 0);
+              handbackReleasedFloor = true;
             }
             resumeAfterHandback = {
               ledger,
@@ -6402,12 +7077,12 @@ async function runActorTurnWithDisplay(
             // Direct handback is deliberately one hop only. Commander-originated
             // and nested agent turns can return a normal tool result, but cannot
             // enqueue another commander turn and form an automatic routing loop.
-            // One hop is also all the floor concedes: a user-owned floor stays
-            // with its agent, so the commander answers THIS turn and the user's
-            // next mention-less message returns to the agent they picked.
-            if (cur === actor.id && !_userOwnsFloor(floorState)
+            // A recognized capability transfer returns the reply target too.
+            // A later user choice still wins through the captured revision.
+            if (cur === actor.id && (!_userOwnsFloor(floorState) || !!bridgeHandoff || !!hb.reason)
               && (item.floorRevision === undefined || item.floorRevision === (floorState.active_recipient_revision || 0))) {
               await setActiveRecipient(uid, cid, COMMANDER_ID, undefined, floorState.active_recipient_revision || 0);
+              handbackReleasedFloor = true;
             }
             directHandbackAfterTurn = {
               agentResult: handbackResult,
@@ -6416,7 +7091,7 @@ async function runActorTurnWithDisplay(
           } else if (
             hb.handback
             && cur === actor.id
-            && !_userOwnsFloor(floorState)
+            && (!_userOwnsFloor(floorState) || !!hb.reason)
               && (item.floorRevision === undefined || item.floorRevision === (floorState.active_recipient_revision || 0))
           ) {
             // A floor-only interactive handoff has no resume ledger. Its
@@ -6424,11 +7099,14 @@ async function runActorTurnWithDisplay(
             // direct user-selected Agent's bare/completed marker is stripped
             // without fabricating a capability-boundary Commander wake.
             await setActiveRecipient(uid, cid, COMMANDER_ID, undefined, floorState.active_recipient_revision || 0);
+            handbackReleasedFloor = true;
           }
         }
       } catch (err) { log.warn(`handback floor reset failed cid=${cid}: ${(err as Error).message}`); }
     } else if (handbackRequested && form) {
       log.warn(`ignored handback combined with form cid=${cid} actor=${actor.id}`);
+    } else if (handbackRequested && askingUserThisTurn && !aborted) {
+      log.warn(`ignored handback combined with a question to the user cid=${cid} actor=${actor.id}`);
     }
     if (submittedForm) {
       try {
@@ -6861,9 +7539,14 @@ async function runActorTurnWithDisplay(
   // inputs (VideoStudio HTML -> final MP4 is the critical case). Explicitly
   // published outputs are different: VideoStudio snapshot contact sheets are
   // review artifacts the user must see before approving the next stage.
-  const runtimeWaitingForInput = agentRunTimingData?.terminal_status === 'waiting_input'
+  const runtimeWaitingForInput = (agentRunTimingData?.terminal_status === 'waiting_input'
+    // A native gate that refused for want of the user's own decision ends the
+    // turn waiting for the user even when the model omits the open marker.
+    || (actor.kind === 'agent' && _lastStudioOutcomeNeedsUser(processItems)))
     && !errText && !turnFailureKind;
-  const isNonFinalStage = item.outputDelivery === 'process' || planInteraction === 'open' || !!form || runtimeWaitingForInput;
+  // Explaining a pending form is not a submission or completion of its task.
+  const pendingFormWait = !!item.pendingFormId && !explicitHandback;
+  const isNonFinalStage = pendingFormWait || item.outputDelivery === 'process' || planInteraction === 'open' || !!form || runtimeWaitingForInput;
   const visibleProduced = isNonFinalStage && !outputsPublicationDeclared ? [] : produced;
 
   // ── Single hand-off to plan_executor ─────────────────────────────────
@@ -6934,7 +7617,9 @@ async function runActorTurnWithDisplay(
     w.marketplaceSearchResults = undefined;
     w.pendingAppNavRequests = undefined;
   }
-  if ((turnMarketplaceRequests.length > 0 || turnAppNavRequests.length > 0) && outcome.kind === 'silent') {
+  const turnSavedTasks = w.pendingSavedTasks?.slice() || [];
+  w.pendingSavedTasks = undefined;
+  if ((turnMarketplaceRequests.length > 0 || turnAppNavRequests.length > 0 || turnSavedTasks.length > 0) && outcome.kind === 'silent') {
     outcome = { kind: 'persist', text: '' };
   }
 
@@ -7030,10 +7715,10 @@ async function runActorTurnWithDisplay(
   const runtimeStopped = String(agentRunTimingData?.terminal_status || '') === 'stopped';
   const actorRunStatus: AgentRunStatus = aborted
     ? 'cancelled'
-    : (form || planInteraction === 'open' || runtimeWaitingForInput)
-      ? 'waiting_input'
-      : (errText || turnFailureKind || outcomeFailureKind)
-        ? 'error'
+    : (errText || turnFailureKind || outcomeFailureKind)
+      ? 'error'
+      : (form || pendingFormWait || planInteraction === 'open' || runtimeWaitingForInput)
+        ? 'waiting_input'
         : runtimeStopped
           ? 'stopped'
           : 'success';
@@ -7102,6 +7787,7 @@ async function runActorTurnWithDisplay(
         : {}),
       ...(turnMarketplaceRequests.length ? { marketplace_requests: turnMarketplaceRequests } : {}),
       ...(turnAppNavRequests.length ? { app_nav_requests: turnAppNavRequests } : {}),
+      ...(turnSavedTasks.length ? { saved_tasks: turnSavedTasks } : {}),
       ...(tailProcessItems.length ? { process: tailProcessItems } : {}),
       // Segment this reply closes. Always present, including for turns that
       // were never split — an unsplit turn is simply segment 0. The renderer
@@ -7114,6 +7800,8 @@ async function runActorTurnWithDisplay(
       // this flag, mid-turn tool-emitted messages (plan_executor's
       // dispatch) would also wrongly consume the placeholder.
       turn_end: true,
+      ...(cliAgent?.runtime?.kind === 'cli' && cliAgent.runtime.cli === 'claude'
+        ? { display_phase: 'final_answer' as const } : {}),
       turn_id: item.turnId,
       source_message_id: item.msgId,
       // The parsed prose marker must survive visible-reply classification;
@@ -7230,6 +7918,7 @@ async function runActorTurnWithDisplay(
       fromActorId: actor.id,
       fromActorName: actor.name,
       ledger: resumeAfterHandback.ledger,
+      taskId: item.taskId,
       agentResult: resumeAfterHandback.agentResult,
       handbackReason: resumeAfterHandback.handbackReason,
     });
@@ -7240,6 +7929,7 @@ async function runActorTurnWithDisplay(
       fromActorId: actor.id,
       fromActorName: actor.name,
       ledger: resumeAfterForm.ledger,
+      taskId: item.taskId,
       agentResult: resumeAfterForm.agentResult,
       handbackReason: resumeAfterForm.handbackReason,
     });
@@ -7310,10 +8000,10 @@ async function runActorTurnWithDisplay(
 
   const terminalStatus: TaskTerminalStatus = aborted
     ? 'cancelled'
-    : (form || planInteraction === 'open' || runtimeWaitingForInput)
-      ? 'waiting_input'
-      : actorRunStatus === 'error'
-        ? 'failed'
+    : actorRunStatus === 'error'
+      ? 'failed'
+      : actorRunStatus === 'waiting_input'
+        ? 'waiting_input'
         : actorRunStatus === 'stopped'
           ? 'stopped'
           : 'completed';
@@ -7341,6 +8031,11 @@ async function runActorTurnWithDisplay(
     aborted,
     terminalStatus,
     ...(failure ? { failure } : {}),
+    ...(!aborted && (resumeAfterHandback || resumeAfterForm || directHandbackAfterTurn)
+      ? { orchestrationResumed: true }
+      : {}),
+    ...(handbackReleasedFloor ? { floorReleased: true } : {}),
+    ...(explicitHandback ? { handedBack: true } : {}),
   };
 }
 
@@ -7734,12 +8429,15 @@ function buildWorkerResultPayload(
   text: string,
   produced?: string[],
   form?: ChatFormPayload,
+  waitingForUserAgentId?: string,
 ): string {
   const files = produced && produced.length
     ? `\n<files>\n${produced.join('\n')}\n</files>` : '';
   const blocked = form
     ? `\n<blocked-on-form form_id="${escapeXmlAttr(form.form_id)}" agent_id="${escapeXmlAttr(form.agent_id)}" />`
-    : '';
+    : waitingForUserAgentId
+      ? `\n<blocked-on-user agent_id="${escapeXmlAttr(waitingForUserAgentId)}" />`
+      : '';
   return [
     `<worker-result from="${escapeXmlAttr(workerName)}">`,
     text && text.trim() ? text : '(no textual reply)',
@@ -7798,6 +8496,9 @@ interface NestedDispatchOutcome {
   form?: ChatFormPayload;
   /** Board row of a SCHEDULED child (P3). Absent on nested runs. */
   taskId?: string;
+  /** The child stopped to ask the user in prose (its task is waiting_input
+   * without a form). Host-observed settlement, never parsed from the reply. */
+  waitingForUser?: boolean;
 }
 
 /** G8d step 3: run a sub-actor's turn IN-PROCESS, synchronously, inside the
@@ -8031,6 +8732,7 @@ async function runScheduledDispatch(
      * visible); default 'process' for dispatch_to (commander synthesises). */
     outputDelivery?: 'final' | 'process';
     onScheduled?: (taskId: string) => void;
+    floorChoiceRevision?: number;
   } = {},
 ): Promise<NestedDispatchOutcome> {
   const admissionEpoch = state.abortEpoch;
@@ -8112,6 +8814,7 @@ async function runScheduledDispatch(
     fromActorId: COMMANDER_ID,
     taskId,
     commanderSubtask: true,
+    ...(opts.floorChoiceRevision !== undefined ? { floorChoiceRevision: opts.floorChoiceRevision } : {}),
     ...(opts.onScheduled ? { asyncDispatch: true } : {}),
     sourceText: task,
     sourceRecipients: [actor.id],
@@ -8188,11 +8891,13 @@ async function runScheduledDispatch(
   const form = stashed?.form ?? resultMsg?.form;
   const text = stashed ? stashed.text : (resultMsg?.text || '');
   const produced = stashed?.produced?.length ? stashed.produced : resultMsg?.produced;
+  const waitingForUser = status === 'waiting_input' && !form;
   return {
-    payload: buildWorkerResultPayload(name, text, produced, form),
+    payload: buildWorkerResultPayload(name, text, produced, form, waitingForUser ? actor.id : undefined),
     aborted: false,
     taskId,
     ...(form ? { form } : {}),
+    ...(waitingForUser ? { waitingForUser: true } : {}),
   };
 }
 
@@ -8413,6 +9118,7 @@ function _currentTurnAuthorizesImportPath(
 
 function _skillImportFailuresForModel(failures: skillsFeat.ImportFailure[] | undefined) {
   return (failures || []).map((failure) => ({
+    name: failure.sourceName,
     ...(failure.skillId ? { skill_id: failure.skillId } : {}),
     error: failure.error,
     rules: failure.report?.violations.map((violation) => violation.rule) || [],
@@ -8459,6 +9165,7 @@ async function buildCommanderExtraTools(
 ): Promise<AgentTool[]> {
   const { uid, cid } = w;
   const tools: AgentTool[] = [buildConversationBrowserTool(uid, cid)];
+  const browserRunId = browserTaskRunId(uid, cid);
   const backlogTaskSchema = currentProjectId ? {
     todo_task_id: {
       type: 'string',
@@ -8491,21 +9198,35 @@ async function buildCommanderExtraTools(
     description: [
       'Import Skills from a local directory or ZIP while preserving package files.',
       'Use only on the user\'s import request. Supply an exact current-turn source, or the unique unchanged source the user supplied earlier in this conversation.',
-      'The package must contain SKILL.md; each Skill is validated independently and rejected items are rolled back.',
+      'Multiple Skills return a preview before selection; installed does not imply runtime compatibility.',
     ].join(' '),
     inputSchema: {
       type: 'object',
       properties: {
         source_path: {
-          type: 'string',
-          description: 'Exact absolute directory or .zip path supplied by the user in this conversation.',
+          type: 'string', description: 'Exact user-supplied directory or ZIP. Omit when continuing a preview.',
         },
+        action: { type: 'string', enum: ['preview', 'import'], description: 'Preview without writes, or import (default). Multiple Skills require selection from a preview.' },
+        preview_id: { type: 'string', description: 'Preview from this conversation; required for selection or all.' },
+        selection: { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 10, description: '1–10 preview keys selected by the user; excludes all.' },
+        all: { type: 'boolean', description: 'Only when the user explicitly chooses all Skills. Imports up to ten per call.' },
+        offset: { type: 'integer', minimum: 0, description: 'Zero-based preview page or all-import continuation; use next_offset.' },
       },
-      required: ['source_path'],
       additionalProperties: false,
     },
     async execute(input) {
-      const sourcePath = String(input?.source_path || '').trim();
+      const action = input?.action ?? 'import';
+      if (typeof action !== 'string' || !['preview', 'import'].includes(action)) return _toolError('action must be preview or import');
+      const previews = state.skillImportPreviews ??= new Map();
+      for (const [key, value] of previews) if (value.expiresAt <= Date.now()) previews.delete(key);
+      const preview = typeof input?.preview_id === 'string' ? previews.get(input.preview_id) : undefined;
+      if (input?.preview_id && !preview) return _toolError('Preview expired or belongs to another conversation. Preview the source again.');
+      if ((input?.selection !== undefined || input?.all === true) && !preview) return _toolError('Preview the source before selecting Skills.');
+      if (input?.selection !== undefined && (!Array.isArray(input.selection) || input.selection.some((key: unknown) => typeof key !== 'string'))) return _toolError('selection must contain preview keys');
+      const selection = input?.selection as string[] | undefined;
+      const offset = typeof input?.offset === 'number' && Number.isSafeInteger(input.offset) && input.offset >= 0 ? input.offset : 0;
+      const sourcePath = String(input?.source_path || preview?.sourcePath || '').trim();
+      if (preview && sourcePath !== preview.sourcePath) return _toolError('The preview belongs to a different source.');
       if (!sourcePath) return _toolError('`source_path` is required');
       if (!path.isAbsolute(sourcePath)) {
         return {
@@ -8517,7 +9238,7 @@ async function buildCommanderExtraTools(
           isError: true,
         };
       }
-      if (!_currentTurnAuthorizesImportPath(
+      if (!preview && !_currentTurnAuthorizesImportPath(
         currentTurnPayload, sourcePath, currentTurnAttachmentPaths,
       )) {
         const authorization = await historicalSkillImportAuthorization(uid, cid, currentTurnMessageId, sourcePath)
@@ -8539,7 +9260,25 @@ async function buildCommanderExtraTools(
         }
       }
 
-      const result = await skillsFeat.importSkillPackageFromPath(sourcePath);
+      if (getActiveUserId() !== uid) return _toolError('The active account changed.');
+      const result = await skillsFeat.importSkillPackageFromPath(sourcePath, {
+        preview: action === 'preview', selection, all: input?.all === true,
+        offset, expectedFingerprint: preview?.fingerprint, signal: w.abortController?.signal,
+      });
+      if (result.preview) {
+        const previewId = preview ? input.preview_id : genId12();
+        if (!preview) {
+          while (previews.size >= 4) previews.delete(previews.keys().next().value!);
+          previews.set(previewId, { sourcePath, fingerprint: result.preview.fingerprint, expiresAt: Date.now() + 30 * 60_000 });
+        }
+        const candidates = result.preview.candidates;
+        return _toolJson({ ok: true, status: 'selection_required', preview_id: previewId,
+          total: candidates.length, candidates: candidates.slice(offset, offset + 20),
+          next_offset: offset + 20 < candidates.length ? offset + 20 : null,
+          unsupported_components: result.preview.unsupported,
+          instruction: 'Recommend a small relevant selection and ask the user to choose; import all only on explicit request. Preview is not installation or runtime verification.',
+        });
+      }
       const imported = (result.skills || (result.skill ? [result.skill] : []))
         .map((skill) => ({ skill_id: skill.id, name: skill.name || skill.id }));
       const failures = _skillImportFailuresForModel(result.failures);
@@ -8549,6 +9288,7 @@ async function buildCommanderExtraTools(
             ok: false,
             code: 'skill_package_import_failed',
             error: result.error || 'Skill package import failed',
+            next_offset: result.nextOffset ?? null,
             ...(failures.length ? { failures } : {}),
           }),
           isError: true,
@@ -8561,7 +9301,9 @@ async function buildCommanderExtraTools(
         installed: imported,
         partial: failures.length > 0,
         ...(failures.length ? { failures } : {}),
-        instruction: 'Report the imported Skill names. Do not re-emit unchanged package files.',
+        next_offset: result.nextOffset ?? null,
+        runtime_verified: false,
+        instruction: 'Report installed Skills separately from runtime verification and unsupported plugin components. Do not re-emit unchanged package files.',
       });
     },
   });
@@ -8832,7 +9574,7 @@ async function buildCommanderExtraTools(
     executionTimeoutOwner: 'executor',
     description: [
       'NON-TERMINAL delegation: run one named agent and return its full result to the commander; asynchronous execution returns an admission receipt first.',
-      'Use only when the commander must consume that result for another dispatch, a tool call, or synthesis across at least two distinct results; delivering, formatting, approving, or summarizing one agent result is not a next action, so use hand_off_to instead.',
+      'Use only when the commander must consume that result for another dispatch or a tool call, run independent outcomes in parallel, or build a combined deliverable the user asked for; delivering, formatting, approving, listing, or summarizing results the user can already see is not a next action, so use hand_off_to instead.',
     ].join(' '),
     inputSchema: {
       type: 'object',
@@ -8852,7 +9594,7 @@ async function buildCommanderExtraTools(
         },
         resume: {
           type: 'string',
-          description: 'Optional. What the commander should do after this agent blocks on a form, receives the user input, and completes.',
+          description: 'Optional. What the commander should do after this agent stops for the user\'s input (a form or a question), receives it, and completes.',
         },
       },
       required: ['to', 'message'],
@@ -8890,6 +9632,10 @@ async function buildCommanderExtraTools(
       // this tool's result; the agent persists its own visible bubble and the
       // commander then synthesises. The commander stays in the loop.
       const dispatchAgent = await agentsFeat.getAgent(resolvedId);
+      const waitingRefusal = await _waitingAgentDelegationRefusal(
+        state, resolvedId, dispatchAgent?.name || resolvedId, w.item,
+      );
+      if (waitingRefusal) return _toolError(waitingRefusal);
       const dispatchActor: Actor = { kind: 'agent', id: resolvedId, name: dispatchAgent?.name || resolvedId, joined_at: nowIso() };
       // Flush the commander's pre-dispatch reasoning as its own bubble first, so
       // this visible agent's reply lands AFTER it and the synthesis opens a fresh
@@ -8901,6 +9647,7 @@ async function buildCommanderExtraTools(
         const dispatchResult = await runScheduledDispatch(
           state, parentSignal, dispatchActor, message, {
             ...(onScheduled ? { onScheduled } : {}),
+            floorChoiceRevision: w.item?.floorChoiceRevision,
             ...(backlog.task ? { backlogTask: backlog.task } : {}),
             attachments: currentTurnAttachments,
             sourceContext: {
@@ -8926,6 +9673,19 @@ async function buildCommanderExtraTools(
           });
         } catch (err) {
           log.warn(`dispatch_to form ledger set failed cid=${cid}: ${(err as Error).message}`);
+        }
+        try {
+          await _setUserWaitResumeFromWorkerResult({
+            uid, cid,
+            result: dispatchResult,
+            ownerAgentId: resolvedId,
+            ownerAgentName: dispatchAgent?.name || resolvedId,
+            userGoal: _unwrapLlmTurnPayload(currentTurnPayload) || currentTurnPayload,
+            agentTask: message,
+            resume,
+          });
+        } catch (err) {
+          log.warn(`dispatch_to user-wait resume set failed cid=${cid}: ${(err as Error).message}`);
         }
         return dispatchResult;
       };
@@ -8992,7 +9752,7 @@ async function buildCommanderExtraTools(
         message: { type: 'string', description: 'Current execution contract sent verbatim: action, expected result, acceptance criteria, and new constraints. Omit canonical conversation history already provided to named agents.' },
         resume: {
           type: 'string',
-          description: 'Optional. Use only when this hand-off blocks a broader commander-owned task; say what the commander should do after this agent completes or finishes collecting user input.',
+          description: 'Required when requested work remains after this agent finishes: a step using its result, another interactive outcome, or a combined deliverable. State the commander\'s next step. Omit it when only presenting agent replies again; they are already visible.',
         },
       },
       required: ['to', 'message'],
@@ -9012,6 +9772,10 @@ async function buildCommanderExtraTools(
       const backlog = await resolveBacklogTask(input?.todo_task_id);
       if (backlog.error) return _toolError(backlog.error);
       const handoffAgent = await agentsFeat.getAgent(resolvedId);
+      const waitingRefusal = await _waitingAgentDelegationRefusal(
+        state, resolvedId, handoffAgent?.name || resolvedId, w.item,
+      );
+      if (waitingRefusal) return _toolError(waitingRefusal);
       // Flush the commander's pre-hand-off narration as its own bubble first.
       await onVisibleDispatch?.();
       // Terminal hand-off is a managed top-level queue transition, not a
@@ -9030,9 +9794,8 @@ async function buildCommanderExtraTools(
         admission = await beginAgentHandoff(uid, cid, {
           ownerAgentId: resolvedId,
           ownerAgentName: handoffAgent?.name || resolvedId,
-          interactive: handoffAgent?.interactive === true
-            && (w.item?.sourceRecipients.length || 0) === 1 && !otherWaitingAgent,
-          expectedFloorRevision: w.item?.floorRevision ?? 0,
+          claimFloor: (w.item?.sourceRecipients.length || 0) === 1 && !otherWaitingAgent,
+          expectedChoiceRevision: w.item?.floorChoiceRevision ?? 0,
           userGoal: _unwrapLlmTurnPayload(currentTurnPayload) || currentTurnPayload,
           handoffMessage: message,
           ...(resume ? { resumeInstruction: resume } : {}),
@@ -9158,15 +9921,16 @@ async function buildCommanderExtraTools(
         label,
       });
     },
-    async observePage(connectorId) {
+    async observePage(connectorId, tokenBudget) {
       const webAssist = await import('../web_assist');
-      return webAssist.observeControlledWebAssist(uid, cid, connectorId);
+      return webAssist.observeControlledWebAssist(uid, cid, connectorId, tokenBudget);
     },
-    async actPage(connectorId, input) {
+    async actPage(connectorId, input, signal) {
       const webAssist = await import('../web_assist');
+      const lifetime = { signal, isActive: () => !!browserRunId && browserTaskRunId(uid, cid) === browserRunId };
       const pageAction = String(input.page_action || '');
       if (['back', 'forward', 'reload', 'close'].includes(pageAction)) {
-        return webAssist.navigateControlledWebAssist(uid, cid, connectorId, pageAction);
+        return webAssist.navigateControlledWebAssist(uid, cid, connectorId, pageAction, lifetime);
       }
       return webAssist.actOnControlledWebAssist(uid, cid, connectorId, {
         pageId: input.page_id,
@@ -9174,15 +9938,20 @@ async function buildCommanderExtraTools(
         action: pageAction,
         text: input.text,
         direction: input.direction,
-      });
+        filePaths: input.file_paths,
+        values: input.values as string[] | undefined,
+        keys: input.keys as string | undefined,
+        dragDeltaX: input.drag_delta_x,
+        dragDeltaY: input.drag_delta_y,
+      }, lifetime);
     },
-    async waitPage(connectorId, input) {
+    async waitPage(connectorId, input, signal) {
       const webAssist = await import('../web_assist');
       return webAssist.waitForControlledWebAssist(uid, cid, connectorId, {
         condition: input.wait_condition,
         text: input.text,
         timeoutMs: input.timeout_ms,
-      });
+      }, { signal, isActive: () => !!browserRunId && browserTaskRunId(uid, cid) === browserRunId });
     },
   }));
 
@@ -9283,6 +10052,7 @@ export async function abort(uid: string, cid: string): Promise<void> {
   let abortedModelSessions = 0;
   if (state) {
     state.abortEpoch += 1;
+    for (const controller of state.planningControllers || []) controller.abort();
     _recordTaskRunOutcome(state, 'cancelled');
     // Queued board rows will never run — cancel them now. Each RUNNING
     // task's terminal comes from its own turn observing the abort
@@ -9325,7 +10095,6 @@ export async function abort(uid: string, cid: string): Promise<void> {
   }
   // Abandon any pending custom-connector install confirmation for this
   // conversation — the agent that requested it is being stopped.
-  webAssistActionConfirm.cancelForCid(cid);
   try {
     const installConfirm = await import('../connectors/install_confirm');
     installConfirm.cancelForCid(cid);
@@ -9501,8 +10270,9 @@ export async function sendConversationTaskNow(
   }
 
   item.steerActiveTurn = true;
-  const hadAfter = Boolean(item.afterTaskId);
-  delete item.afterTaskId;
+  const hadAfter = Boolean(item.afterTaskIds?.length);
+  delete item.afterTaskIds;
+  delete item.skippedAfterTaskIds;
   if (hadAfter) {
     try {
       const cleared = await taskBoard.setTaskAfter(uid, cid, taskId, null);
@@ -9516,6 +10286,38 @@ export async function sendConversationTaskNow(
   if (live.currentTurnIngress) _scheduleCliSteerDrain(state, live);
   log.info(`task send-now user=${uid} cid=${cid} task=${maskId(taskId)} actor=${maskId(item.actor.id)} turn=${maskId(live.currentTurnId)}`);
   return { ok: true, turn_id: live.currentTurnId };
+}
+
+async function _releaseCancelledTaskFloor(
+  uid: string,
+  cid: string,
+  taskId: string,
+  actorId: string,
+  state?: CidState,
+  item?: QueueItem,
+): Promise<void> {
+  const row = (await taskBoard.listTasks(uid, cid)).find((task) => task.task_id === taskId);
+  // A form can settle before its WorkerState is removed. Cancelling in that
+  // window must close the already-waiting row; aborting a completed run cannot.
+  if (row?.status === 'waiting_input') {
+    const cancelled = await taskBoard.cancelPending(uid, cid, taskId);
+    if (state && cancelled) emit(state, { type: 'task_state', cid, task: cancelled });
+  }
+  // Stop discards this task's continuation without waking Commander. Another
+  // task's resume and a newer user selection are independent ownership.
+  if (row?.resume?.form_id) {
+    await takeOrchestrationLedgerForForm(uid, cid, actorId, row.resume.form_id);
+  } else if (item?.handoffFloorBinding) {
+    await takeOrchestrationLedgerForAgent(uid, cid, actorId, item.handoffFloorBinding);
+  }
+  // The task binding is cancellation authority even if this same execution
+  // just rebound its hand-off to a form wait and advanced the floor revision.
+  const released = await releaseWaitingFloor(uid, cid, actorId, taskId,
+    undefined, item?.handoffFloorBinding);
+  if (state && released) {
+    await _passFloorToNextWaitingAgent(state, actorId, row);
+    await emitStateChanged(state);
+  }
 }
 
 /** Cancel one board task without touching the rest of the conversation.
@@ -9544,6 +10346,7 @@ export async function cancelConversationTask(
       const [item] = state.queue.splice(idx, 1);
       const changed = await taskBoard.cancelPending(uid, cid, taskId);
       if (changed) emit(state, { type: 'task_state', cid, task: changed });
+      await _releaseCancelledTaskFloor(uid, cid, taskId, item.actor.id, state, item);
       emit(state, { type: 'turn_silent', cid, actor: item.actor.id, turn_id: item.turnId });
       log.info(`task cancel user=${uid} cid=${cid} task=${maskId(taskId)} scope=queued`);
       _scheduleAdmissions(state);
@@ -9564,12 +10367,14 @@ export async function cancelConversationTask(
       } catch (err) {
         log.warn(`task cancel session abort failed cid=${cid}: ${(err as Error).message}`);
       }
+      await _releaseCancelledTaskFloor(uid, cid, taskId, w.actor.id, state, w.item);
       log.info(`task cancel user=${uid} cid=${cid} task=${maskId(taskId)} scope=running actor=${maskId(w.actor.id)}`);
       return { ok: true, scope: 'running' };
     }
   }
   const changed = await taskBoard.cancelPending(uid, cid, taskId);
   if (changed) {
+    await _releaseCancelledTaskFloor(uid, cid, taskId, changed.assignee, state);
     if (state) {
       // A cancelled blocked row also drops its parked execution payload.
       const blockedItem = state.blockedItems.get(taskId);
@@ -9586,10 +10391,10 @@ export async function cancelConversationTask(
 }
 
 
-/** Set or clear a queued task's `after` chain pointer (§4.8) and mirror it
- * onto the in-memory queue item the admission gate reads. Clearing (or
- * re-pointing at an already-done predecessor) may free the task, so kick
- * admission. */
+/** Set a queued task's dependencies to one predecessor, or clear them (§4.8,
+ * legacy single-id IPC), and mirror the result onto the in-memory queue item
+ * the admission gate reads. Clearing (or re-pointing at an already-done
+ * predecessor) may free the task, so kick admission. */
 export async function setConversationTaskAfter(
   uid: string,
   cid: string,
@@ -9602,8 +10407,8 @@ export async function setConversationTaskAfter(
   if (state) {
     const item = state.queue.find((it) => it.taskId === taskId);
     if (item) {
-      if (afterTaskId) item.afterTaskId = afterTaskId;
-      else delete item.afterTaskId;
+      if (res.task.after?.length) item.afterTaskIds = res.task.after.slice();
+      else delete item.afterTaskIds;
     }
     emit(state, { type: 'task_state', cid, task: res.task });
     _scheduleAdmissions(state);
@@ -9612,8 +10417,10 @@ export async function setConversationTaskAfter(
   return { ok: true };
 }
 
-/** "Run anyway": requeue a blocked task, dropping its dependency pointer
- * (§4.8 user decision). The parked execution payload rejoins the pending
+/** "Run anyway": requeue a blocked task (§4.8 user decision), dropping only
+ * the predecessors that ended without done; unfinished ones keep gating, so
+ * the task still waits for inputs that can arrive (D29). The dropped ones are
+ * named in its hand-off. The parked execution payload rejoins the pending
  * list in ordinary admission order. */
 export async function resumeBlockedTask(
   uid: string,
@@ -9626,7 +10433,13 @@ export async function resumeBlockedTask(
   const changed = await taskBoard.requeueBlocked(uid, cid, taskId);
   if (!changed) return { ok: false, error: 'not_blocked' };
   state.blockedItems.delete(taskId);
-  delete item.afterTaskId;
+  const remaining = changed.after || [];
+  const dropped = (item.afterTaskIds || []).filter((id) => !remaining.includes(id));
+  if (remaining.length) item.afterTaskIds = remaining.slice();
+  else delete item.afterTaskIds;
+  if (dropped.length) {
+    item.skippedAfterTaskIds = [...new Set([...(item.skippedAfterTaskIds || []), ...dropped])];
+  }
   state.queue.push(item);
   emit(state, { type: 'task_state', cid, task: changed });
   _scheduleAdmissions(state);
@@ -9912,6 +10725,10 @@ async function _runCliAgentTurn(opts: {
   onActiveRunIngress?: (ingress: LocalActiveRunIngress | null) => void;
   onProcess: (data: Record<string, unknown>) => void;
   onNativeMessage: (text: string, meta: { startedAtMs: number }) => Promise<void>;
+  onAutoTaskSaved?: (taskId: string, title: string) => void;
+  onTodoTaskSaved?: (taskId: string, projectId: string, content: string) => void;
+  onAutoTaskDeleted?: (taskId: string) => void;
+  onTodoTaskDeleted?: (taskId: string, projectId: string) => void;
 }): Promise<{
   text: string;
   error?: string;
@@ -10087,6 +10904,10 @@ async function _runCliAgentTurn(opts: {
   let backendSessionId: string | undefined;
   let resolvedCliModel = '';
   const produced = new Set<string>();
+  // Native shell commands (scripts, screenshots, exports) write files without
+  // a Write/Edit tool event. An explicit declaration may adopt such a file
+  // only when it was created during this run, never an existing workspace file.
+  const cliRunStartedAtMs = Date.now();
   let declaredOutputs: string[] | undefined;
   const inlineGeneratedImages = new Set<string>();
   const inlineRemoteMedia = new Map<string, {
@@ -10123,8 +10944,17 @@ async function _runCliAgentTurn(opts: {
     signal: opts.signal,
     deadlineAt: opts.deadlineAt,
     onActiveRunIngress: opts.onActiveRunIngress,
+    saveUserInput: async (text, inputId) => {
+      await saveCliUserAnswer(opts.uid, opts.cid, opts.actor.id, text, inputId);
+    },
+    onAutoTaskSaved: opts.onAutoTaskSaved,
+    onTodoTaskSaved: opts.onTodoTaskSaved,
+    onAutoTaskDeleted: opts.onAutoTaskDeleted,
+    onTodoTaskDeleted: opts.onTodoTaskDeleted,
     onOutputsPublished: (paths) => {
-      declaredOutputs = paths.filter((p) => produced.has(p) && isExistingProducedFile(p));
+      declaredOutputs = paths.filter((p) => (produced.has(p) && isExistingProducedFile(p))
+        || isFileCreatedSince(p, cliRunStartedAtMs));
+      for (const p of declaredOutputs) produced.add(p);
       return [...declaredOutputs];
     },
     onEvent: e => {
@@ -10476,6 +11306,10 @@ async function _runCliAgentTurn(opts: {
       published: publishedOutputs,
     };
   }
+  if (result.cliError === 'model_unsupported' || result.cliError === 'parameter_unsupported') {
+    return { text: '', error: result.error, produced: Array.from(produced),
+      failureKind: 'dependency', failureCode: result.cliError };
+  }
   if (result.status === 'failed' || result.status === 'timeout') {
     const vars = { name: opts.agent.name || runtime.cli, cli: runtime.cli };
     const cliError = runner.sanitizePublicCliError(result.error);
@@ -10607,11 +11441,13 @@ function _resolveCliTaskBody(
   if (!submission) {
     const unwrapped = _unwrapLlmTurnPayload(item.llmPayload) ?? item.llmPayload;
     const body = _stripLeadingRecipientMention(unwrapped.trim(), agent.name || '', agent.agent_id).trim();
-    // Serial-chain hand-off for CLI runtimes: the canonical-delta compiler
-    // does carry other actors' replies, but the block ANCHORS which reply is
-    // this task's input and hands over the produced paths explicitly — and it
-    // survives the delta cursor paths that can omit the predecessor's reply.
-    return item.predecessorContext ? `${item.predecessorContext}\n\n${body}` : body;
+    // Split note + dependency hand-off for CLI runtimes: the canonical-delta
+    // compiler does carry other actors' replies, but the blocks ANCHOR this
+    // task's part and which replies are its input, hand over the produced
+    // paths explicitly, and survive the delta cursor paths that can omit a
+    // predecessor's reply.
+    const prelude = _turnInputPrelude(item);
+    return prelude ? `${prelude}\n\n${body}` : body;
   }
 
   let originalTask = '';
@@ -10698,7 +11534,9 @@ async function _buildCliContextPlan(
       projectsFeat.formatProjectInstructionsForSystemPrompt(uid, projectId),
     ].filter((block) => block && block.trim()).join('\n\n');
     turnContext.push(
-      memoryFeat.formatProjectMemoryForReadOnlyTurn(uid, projectId, localCliSupportsAgentMemory(cli)),
+      // Every bridge-capable CLI receives project-memory writes in a project
+      // dispatch, so the heading follows the bridge, not Agent-memory projection.
+      memoryFeat.formatProjectMemoryForReadOnlyTurn(uid, projectId, localCliCapabilities(cli).orkasBridge),
     );
   }
 
@@ -10709,17 +11547,7 @@ async function _buildCliContextPlan(
   let runtimeProtocol = '';
   try {
     const stateFile = await readState(uid, cid);
-    if (
-      stateFile.active_recipient === agent.agent_id
-      && stateFile.active_recipient_source !== 'user_selection'
-    ) {
-      runtimeProtocol = [
-        '## Return control to commander',
-        'This conversation is currently routed to you and you hold the user-facing conversation floor.',
-        'When this routed interaction is complete, include the concrete final result and end with `<handback reason="completed_handoff" />` so control returns to the commander.',
-        'Use `<handback reason="completed_handoff" />` only to close this routed interaction. Do not use it as a capability-routing or error signal, and do not combine it with a question or input form.',
-      ].join('\n');
-    }
+    if (_holdsCommanderRoutedFloor(stateFile, agent.agent_id)) runtimeProtocol = _returnControlProtocol();
   } catch (err) {
     log.warn(`cli handback state unavailable cid=${cid} agent=${agent.agent_id}: ${(err as Error).message}`);
   }

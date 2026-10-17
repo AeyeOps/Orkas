@@ -143,8 +143,10 @@ export interface StateFile {
    *  single source of truth for "who the user is talking to", mirrored to the
    *  renderer for free since `state_changed` carries the whole StateFile. */
   active_recipient?: string;
-  /** Monotonic choice generation; async handoffs must match their origin. */
+  /** Monotonic floor generation for snapshot ordering and stale release guards. */
   active_recipient_revision?: number;
+  /** Explicit user-choice generation; automatic waits/releases do not advance it. */
+  active_recipient_choice_revision?: number;
   active_recipient_handoff_id?: string;
   /** Legacy multi-recipient defaults are read as Commander and removed on write. */
   active_recipients?: string[];
@@ -446,7 +448,7 @@ async function readCloudState(
 ): Promise<StateFile> {
   const file = conversationLayout(uid, cid, projectIdHint).stateFile;
   if (!fs.existsSync(file)) {
-    return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [] };
+    return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [], active_recipient_choice_revision: 0 };
   }
   try {
     const data: any = await readJson(file);
@@ -460,6 +462,10 @@ async function readCloudState(
         version: 1,
         ...(typeof data.active_recipient_handoff_id === 'string' ? { active_recipient_handoff_id: data.active_recipient_handoff_id } : {}),
         active_recipient_revision: Number.isSafeInteger(data.active_recipient_revision) ? data.active_recipient_revision : 0,
+        // Legacy files conservatively treat their last floor change as a choice.
+        active_recipient_choice_revision: Number.isSafeInteger(data.active_recipient_choice_revision)
+          ? data.active_recipient_choice_revision
+          : Number.isSafeInteger(data.active_recipient_revision) ? data.active_recipient_revision : 0,
         status: (data.status as GroupStatus) || 'idle',
         last_active_at: typeof data.last_active_at === 'string' ? data.last_active_at : nowIso(),
         in_flight: Array.isArray(data.in_flight) ? data.in_flight.filter((s: unknown) => typeof s === 'string') : [],
@@ -514,7 +520,7 @@ async function readCloudState(
   } catch (err) {
     log.warn(`read state failed user=${uid} cid=${cid}: ${(err as Error).message}`);
   }
-  return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [] };
+  return { version: 1, status: 'idle', last_active_at: nowIso(), in_flight: [], active_recipient_choice_revision: 0 };
 }
 
 async function writeStateRaw(uid: string, cid: string, s: StateFile): Promise<void> {
@@ -738,6 +744,9 @@ export async function setActiveRecipients(
       delete s.active_recipient;
       delete s.active_recipient_source;
     }
+    if (source === 'user_selection') {
+      s.active_recipient_choice_revision = (s.active_recipient_choice_revision || 0) + 1;
+    }
     if (source || previous !== next) {
       s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
       delete s.active_recipient_handoff_id;
@@ -758,25 +767,113 @@ export async function setOrchestrationLedger(
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
     const now = nowIso();
-    s.orchestration_ledger = {
-      version: 1,
-      id: ledger.id || genId12(),
-      kind: 'suspended_orchestration',
-      status: ledger.status || 'waiting_for_agent',
-      blocked_on: ledger.blocked_on,
-      ...(ledger.source_tool ? { source_tool: ledger.source_tool } : {}),
-      owner_agent_id: ledger.owner_agent_id,
-      ...(ledger.form_id ? { form_id: ledger.form_id } : {}),
-      ...(ledger.owner_agent_name ? { owner_agent_name: ledger.owner_agent_name } : {}),
-      user_goal: _cleanLedgerText(ledger.user_goal),
-      handoff_message: _cleanLedgerText(ledger.handoff_message),
-      resume_instruction: _cleanLedgerText(ledger.resume_instruction),
-      created_at: ledger.created_at || now,
-      updated_at: now,
-    };
+    s.orchestration_ledger = _buildOrchestrationLedger(ledger, now);
     s.last_active_at = now;
     await writeStateRaw(uid, cid, s);
     return s;
+  });
+}
+
+type OrchestrationLedgerInput = Parameters<typeof setOrchestrationLedger>[2];
+
+function _buildOrchestrationLedger(ledger: OrchestrationLedgerInput, now: string): OrchestrationLedger {
+  return {
+    version: 1,
+    id: ledger.id || genId12(),
+    kind: 'suspended_orchestration',
+    status: ledger.status || 'waiting_for_agent',
+    blocked_on: ledger.blocked_on,
+    ...(ledger.source_tool ? { source_tool: ledger.source_tool } : {}),
+    owner_agent_id: ledger.owner_agent_id,
+    ...(ledger.form_id ? { form_id: ledger.form_id } : {}),
+    ...(ledger.owner_agent_name ? { owner_agent_name: ledger.owner_agent_name } : {}),
+    user_goal: _cleanLedgerText(ledger.user_goal),
+    handoff_message: _cleanLedgerText(ledger.handoff_message),
+    resume_instruction: _cleanLedgerText(ledger.resume_instruction),
+    created_at: ledger.created_at || now,
+    updated_at: now,
+  };
+}
+
+/** Record a suspended orchestration only while the single state slot is free
+ * or already belongs to the same Agent. Parallel waits keep their resume on
+ * their own task row; this slot is the compatibility mirror that the
+ * Commander prompt and explicit handbacks read. */
+export async function setOrchestrationLedgerIfFree(
+  uid: string,
+  cid: string,
+  ledger: OrchestrationLedgerInput,
+): Promise<boolean> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (s.orchestration_ledger && s.orchestration_ledger.owner_agent_id !== ledger.owner_agent_id) return false;
+    const now = nowIso();
+    s.orchestration_ledger = _buildOrchestrationLedger(ledger, now);
+    s.last_active_at = now;
+    await writeStateRaw(uid, cid, s);
+    return true;
+  });
+}
+
+/** Floor binding for an Agent task waiting for a user reply or form. */
+export function waitingFloorBinding(taskId: string): string {
+  return `wait:${taskId}`;
+}
+
+/** Give a free floor to a waiting Agent, or bind its existing automatic floor, so the
+ * user's next mention-less reply reaches that Agent instead of Commander.
+ * A floor someone already holds is never taken: the first Agent to ask keeps
+ * it until its task is done. */
+export async function claimFloorForWaitingTask(
+  uid: string,
+  cid: string,
+  agentId: string,
+  taskId: string,
+  expectedChoiceRevision?: number,
+): Promise<boolean> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (expectedChoiceRevision !== undefined
+      && expectedChoiceRevision !== (s.active_recipient_choice_revision || 0)) return false;
+    if (s.active_recipients?.length || (s.active_recipient
+      && (s.active_recipient !== agentId || s.active_recipient_source === 'user_selection'))) return false;
+    if (s.active_recipient_handoff_id === waitingFloorBinding(taskId)) return false;
+    s.active_recipient = agentId;
+    s.active_recipient_source = 'commander_handoff';
+    s.active_recipient_handoff_id = waitingFloorBinding(taskId);
+    s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return true;
+  });
+}
+
+/** Return a floor taken by `claimFloorForWaitingTask` once that task is done.
+ * A floor the user or a hand-off has since re-assigned is left alone. */
+export async function releaseWaitingFloor(
+  uid: string,
+  cid: string,
+  agentId: string,
+  taskId: string,
+  expectedRevision?: number,
+  handoffBinding?: string,
+): Promise<boolean> {
+  return _stateLock(uid, cid).runExclusive(async () => {
+    const s = await readState(uid, cid);
+    if (expectedRevision !== undefined && expectedRevision !== (s.active_recipient_revision || 0)) return false;
+    if (
+      s.active_recipient !== agentId
+      || s.active_recipient_source !== 'commander_handoff'
+      || (s.active_recipient_handoff_id !== waitingFloorBinding(taskId)
+        && (!handoffBinding || s.active_recipient_handoff_id !== handoffBinding))
+    ) return false;
+    delete s.active_recipient;
+    delete s.active_recipient_source;
+    delete s.active_recipient_handoff_id;
+    s.active_recipient_revision = (s.active_recipient_revision || 0) + 1;
+    s.last_active_at = nowIso();
+    await writeStateRaw(uid, cid, s);
+    return true;
   });
 }
 
@@ -791,8 +888,8 @@ export async function beginAgentHandoff(
   params: {
     ownerAgentId: string;
     ownerAgentName?: string;
-    interactive: boolean;
-    expectedFloorRevision?: number;
+    claimFloor: boolean;
+    expectedChoiceRevision?: number;
     userGoal: string;
     handoffMessage: string;
     resumeInstruction?: string;
@@ -812,10 +909,10 @@ export async function beginAgentHandoff(
     const receipt: AgentHandoffAdmission = {
       token,
       ownerAgentId: params.ownerAgentId,
-      floorApplied: params.interactive
+      floorApplied: params.claimFloor
         && !s.active_recipient
-        && (params.expectedFloorRevision === undefined
-          || params.expectedFloorRevision === (s.active_recipient_revision || 0)),
+        && (params.expectedChoiceRevision === undefined
+          || params.expectedChoiceRevision === (s.active_recipient_choice_revision || 0)),
       ledgerApplied: !!params.resumeInstruction?.trim(),
       ...(s.active_recipient ? { previousActiveRecipient: s.active_recipient } : {}),
       ...(s.active_recipients ? { previousActiveRecipients: [...s.active_recipients] } : {}),
@@ -981,11 +1078,13 @@ export async function takeOrchestrationLedgerForAgent(
   uid: string,
   cid: string,
   agentId: string,
+  expectedLedgerId?: string,
 ): Promise<OrchestrationLedger | null> {
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
     const ledger = s.orchestration_ledger;
-    if (!ledger || ledger.owner_agent_id !== agentId || ledger.status !== 'waiting_for_agent') return null;
+    if (!ledger || ledger.owner_agent_id !== agentId || ledger.status !== 'waiting_for_agent'
+      || (expectedLedgerId !== undefined && ledger.id !== expectedLedgerId)) return null;
     delete s.orchestration_ledger;
     s.last_active_at = nowIso();
     await writeStateRaw(uid, cid, s);

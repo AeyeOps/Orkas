@@ -21,9 +21,14 @@ import * as path from 'node:path';
 import { agentCompetenceFile, agentStrategiesFile, agentMetaDir } from '../paths';
 import { writeTextAtomicSync } from '../storage';
 import { createLogger } from '../logger';
-import { scanForInjection } from './memory';
+import { scanForInjection, memoryRejectionError } from './memory';
 import { getActiveUserId } from './users';
 import { getMetacognitionEnabledForUser } from './config';
+import {
+  COMPETENCE_CHAR_LIMIT, STRATEGIES_CHAR_LIMIT, mergeMetacognition,
+  publishMetacognition, readSmallText, retainMetacognitionDraft,
+} from './metacognition-state';
+export { COMPETENCE_CHAR_LIMIT, STRATEGIES_CHAR_LIMIT } from './metacognition-state';
 
 const log = createLogger('metacognition');
 
@@ -31,8 +36,30 @@ const log = createLogger('metacognition');
 export const DEFAULT_AGENT_ID = '_default';
 
 // ── Constants ────────────────────────────────────────────────────────────
-export const COMPETENCE_CHAR_LIMIT = 3000;   // ~1000 tokens
-export const STRATEGIES_CHAR_LIMIT = 4000;   // ~1300 tokens — strategies is a play-library, naturally grows; competence is a self-check, stays small
+type Target = 'competence' | 'strategies';
+type Review = { snapshots: Record<Target, string | null>; deferred: Set<Target>; onDeferred?: (pending: boolean) => void };
+const reviewKey = Symbol.for('orkas.metacognition-reviews');
+const reviewRoot = globalThis as typeof globalThis & { [reviewKey]?: Map<string, Review> };
+const reviews = reviewRoot[reviewKey] ??= new Map<string, Review>();
+const reviewId = (uid: string, agentId: string) => JSON.stringify([uid, normalizeAgentId(agentId)]);
+
+/** The same snapshots feed the unchanged review prompt and guard its writes.
+ * Shared across host adapters; lifecycle is owned by the reflection lease. */
+export function beginMetacognitionReview(uid: string, agentId: string, onDeferred?: (pending: boolean) => void) {
+  const key = reviewId(uid, agentId);
+  if (reviews.has(key)) throw new Error('metacognition review already active');
+  const review: Review = { snapshots: {
+    competence: readSmallText(fileForTargetForUser(uid, agentId, 'competence')),
+    strategies: readSmallText(fileForTargetForUser(uid, agentId, 'strategies')),
+  }, deferred: new Set(), onDeferred };
+  reviews.set(key, review);
+  return {
+    competence: review.snapshots.competence?.trim() ?? '',
+    strategies: review.snapshots.strategies?.trim() ?? '',
+    hasDeferredWrites: () => review.deferred.size > 0,
+    close: () => { if (reviews.get(key) === review) reviews.delete(key); },
+  };
+}
 
 // ── Feature gate (single source of truth) ────────────────────────────────
 // Master switch for metacognition / self-evolution. Two layers ANDed together:
@@ -131,7 +158,7 @@ export function writeContentForUser(
     log.warn('blocked metacognition write', { threat, chars: trimmed.length });
     return {
       ok: false,
-      error: `blocked: suspicious content (${threat})`,
+      error: memoryRejectionError(trimmed, threat),
       content: '',
       usage: { current: 0, limit },
     };
@@ -151,15 +178,37 @@ export function writeContentForUser(
   }
 
   const filePath = fileForTargetForUser(uid, agentId, target);
-  fs.mkdirSync(path.dirname(filePath), { recursive: true });
-  writeTextAtomicSync(filePath, trimmed);
+  const relPath = `cloud/agents/${id}/meta/${target === 'competence' ? 'COMPETENCE' : 'LEARNING_STRATEGIES'}.md`;
+  const review = reviews.get(reviewId(uid, agentId));
+  const current = readSmallText(filePath);
+  const base = review?.snapshots[target] ?? null;
+  const final = review && current !== base
+    ? mergeMetacognition(relPath, base, current ?? '', trimmed)
+    : trimmed;
+  const defer = (): MetacognitionOpResult => {
+    review?.deferred.add(target);
+    review?.onDeferred?.(true);
+    retainMetacognitionDraft(uid, relPath, base, trimmed);
+    return { ok: false, error: 'notes changed during reflection; candidate retained; no update committed',
+      content: '', usage: { current: current?.length ?? 0, limit } };
+  };
+  // A concurrent deletion is an intentional state change, not an empty base.
+  if (final === null || (review && base !== null && current === null)) return defer();
+  const mergedThreat = final === trimmed ? null : scanForInjection(final);
+  if (mergedThreat) return defer();
+  if (!publishMetacognition(uid, relPath, current, final)) return defer();
+  if (review) {
+    review.snapshots[target] = final;
+    review.deferred.delete(target);
+    review.onDeferred?.(review.deferred.size > 0);
+  }
 
-  log.info(`updated ${target} for agent ${id} (${trimmed.length}/${limit} chars)`);
+  log.info(`updated ${target} for agent ${id} (${final.length}/${limit} chars)`);
 
   return {
     ok: true,
-    content: trimmed,
-    usage: { current: trimmed.length, limit },
+    content: final,
+    usage: { current: final.length, limit },
   };
 }
 
