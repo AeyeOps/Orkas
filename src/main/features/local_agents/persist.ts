@@ -31,6 +31,8 @@ export interface RunMeta {
   runId: string;
   agentId: string;
   cid: string;
+  /** Exact persisted trigger; optional for archives written by older builds. */
+  currentMessageId?: string;
   cli: string;
   startedAt: string;
   endedAt?: string;
@@ -70,6 +72,7 @@ export async function start(uid: string, init: Omit<RunMeta, 'runId' | 'startedA
     runId,
     agentId: init.agentId,
     cid: init.cid,
+    ...(init.currentMessageId ? { currentMessageId: init.currentMessageId } : {}),
     cli: init.cli,
     cliPath: init.cliPath,
     startedAt: new Date().toISOString(),

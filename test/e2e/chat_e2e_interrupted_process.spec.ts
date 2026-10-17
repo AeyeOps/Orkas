@@ -1,0 +1,67 @@
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
+import { expect, test } from './fixtures/orkas';
+
+
+for (const [language, width] of [['en', 1280], ['zh', 760]] as const) {
+  test(`opens archived process details after an application interruption (${language})`, async ({ orkas }, testInfo) => {
+    test.setTimeout(120_000);
+    await orkas.invoke('config.setLanguage', { language });
+    const { conversation } = await orkas.invoke<{ conversation: { conversation_id: string } }>(
+      'conversations.create', { title: 'Interrupted submission task' });
+    const cid = conversation.conversation_id;
+    const file = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`);
+    const notice = language === 'zh'
+      ? '应用退出时，上一次回复被中断。已完成的持久化进度仍会保留，请发送消息继续。'
+      : 'The previous response was interrupted when the app exited. Durable progress was kept; send a message to continue.';
+    writeFileSync(file, [
+      { id: 'user-1', from: 'user', to: ['commander'], ts: '2026-10-17T01:00:00Z', text: 'Continue the submissions.' },
+      { id: 'async-question', from: 'commander', to: ['user'], ts: '2026-10-17T02:02:00Z', text: 'Continue with the original target?' },
+      { id: 'steering-user', from: 'user', to: ['commander'], ts: '2026-10-17T02:47:00Z', text: 'Continue the original target.' },
+      { id: 'interruption-1', from: 'commander', to: ['user'], ts: '2026-10-17T12:14:00Z', text: notice,
+        system_kind: 'reply_interrupted' },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const archive = path.join(orkas.workspaceRoot, 'account-e2e', 'local', 'file_cache', 'local-agent-runs', '123456abcdef');
+    mkdirSync(archive, { recursive: true });
+    writeFileSync(path.join(archive, 'meta.json'), JSON.stringify({ runId: '123456abcdef', cid,
+      agentId: 'commander', cli: 'codex', currentMessageId: 'user-1',
+      startedAt: '2026-10-17T01:00:03.973Z', endedAt: '2026-10-17T12:13:55.849Z' }));
+    writeFileSync(path.join(archive, 'events.jsonl'), [
+      { type: 'text-delta', phase: 'commentary', text: 'Checking the saved submission records.' },
+      { type: 'tool-event', phase: 'use', tool: 'bash', callId: 'saved-check', input: { command: 'python submission_queue.py report' } },
+      { type: 'tool-event', phase: 'result', tool: 'bash', callId: 'saved-check', output: 'Confirmed 15 of 50 submissions.' },
+      { type: 'text-delta', phase: 'final_answer', text: 'UNFINISHED ANSWER' },
+    ].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const original = readFileSync(file, 'utf8');
+
+    // Relaunch uses the real history worker, IPC and renderer with an old
+    // interruption row. No model or CLI process is started by viewing history.
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const page = await orkas.relaunch();
+      await page.setViewportSize({ width, height: 800 });
+      await page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
+      const reply = page.locator('#chat-history .chat-message.assistant[data-system-kind="reply_interrupted"]');
+      await expect(reply).toHaveCount(1);
+      await expect(reply).toContainText(notice);
+      const rail = reply.locator('.stream-process');
+      await expect(rail).toBeVisible();
+      await expect(rail.locator('.stream-process-runtime')).toHaveText(language === 'zh' ? '11小时13分52秒' : '11h 13m 52s');
+      await rail.locator('.stream-process-summary').focus();
+      await page.keyboard.press('Enter');
+      await expect(rail).toHaveAttribute('open', '');
+      await expect(rail).toContainText('Checking the saved submission records.');
+      // Tool operations use the shipped nested disclosure inside the rail.
+      await rail.locator('.stream-process-compact-summary').click();
+      const tool = rail.locator('[data-process-call-id="cli:saved-check"]');
+      await expect(tool).toBeVisible();
+      await expect(tool).toContainText('submission_queue.py report');
+      await tool.press('Enter');
+      await expect(tool).toHaveAttribute('aria-expanded', 'true');
+      await expect(rail).toContainText('Confirmed 15 of 50 submissions.');
+      await expect(reply).not.toContainText('UNFINISHED ANSWER');
+      await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+      if (!attempt) await page.screenshot({ path: testInfo.outputPath(`interrupted-process-${language}.png`) });
+    }
+    expect(readFileSync(file, 'utf8')).toBe(original);
+  });
+}

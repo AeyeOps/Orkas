@@ -835,7 +835,9 @@ export async function pruneOrphans(
   const wsRoot = opts?.workspacePath ? path.resolve(opts.workspacePath) : '';
 
   for (const e of items) {
-    if (!e.isDirectory()) continue;
+    // This owner writes only 16-hex extraction entries. Other features share
+    // file_cache (notably local-agent-runs) and own their own retention.
+    if (!e.isDirectory() || !/^[a-f0-9]{16}$/.test(e.name)) continue;
     const dir = path.join(root, e.name);
     const meta = readMeta(dir);
     const reason =

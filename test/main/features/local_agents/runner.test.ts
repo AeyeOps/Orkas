@@ -490,7 +490,7 @@ describe('local_agents/runner', () => {
     const runner = await loadRunner();
     const events: any[] = [];
     const result = await runner.run({
-      uid: TEST_UID, cid: 'c', agentId: 'agent-x',
+      uid: TEST_UID, cid: 'c', agentId: 'agent-x', currentMessageId: 'persisted-user-trigger',
       cli: 'claude', prompt: 'do work', cwd: tmpDir,
       signal: new AbortController().signal,
       onEvent: e => events.push(e),
@@ -509,6 +509,7 @@ describe('local_agents/runner', () => {
     expect(fs.readFileSync(path.join(dir, 'output.txt'), 'utf8')).toBe('hello world');
     const meta = JSON.parse(fs.readFileSync(path.join(dir, 'meta.json'), 'utf8'));
     expect(meta.status).toBe('completed');
+    expect(meta.currentMessageId).toBe('persisted-user-trigger');
     expect(meta.cli).toBe('claude');
     expect(meta.cliPath).toBe('/fake/claude');
     expect(meta.endedAt).toBeTruthy();

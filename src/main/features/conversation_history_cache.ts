@@ -27,10 +27,11 @@ import { readJson, readJsonlPageWithOffsets, readJsonlWindow, readJsonlWindowAtM
 import type { JsonlPage, JsonlRecordWithOffset, JsonlWindow } from '../storage';
 import type { GroupMessage } from './group_chat/visibility';
 import { normalizeNativeMessageDisplay } from './group_chat/message-display';
+import { restoreInterruptedCliHistory } from './local_agents/interrupted-history';
 import { DEFER_PROCESS_ITEMS, PROCESS_PAGE_REBUILD, PROCESS_PAGE_BYTES, processTextChunks, storeProcessPages, processSummary, readProcessPage, processPageReference } from './conversation-process-cache';
 
 const log = createLogger('conversation-history-cache');
-const CACHE_VERSION = 6;
+const CACHE_VERSION = 8;
 const MAX_INLINE_PROCESS_OUTPUT_BYTES = 1024;
 const MAX_FAILURE_OUTPUT_PREVIEW_CHARS = 600;
 const SOURCE_TAIL_FINGERPRINT_BYTES = 4 * 1024;
@@ -121,7 +122,7 @@ function cachePaths(userId: string, sourceFile: string): CachePaths {
     entryDir,
     // Never parse an older, potentially hundreds-of-megabytes projection just
     // to discover its version. A new filename makes invalidation cheap.
-    latestPageFile: path.join(entryDir, 'latest-page-v6.json'),
+    latestPageFile: path.join(entryDir, 'latest-page-v8.json'),
     toolResultsDir: path.join(entryDir, 'tool-results'),
   };
 }
@@ -377,8 +378,18 @@ function projectHistoryRecord(userId: string, sourceFile: string, record: GroupM
   return projectConversationHistoryRecord(record, toolResultsDir);
 }
 
-function projectHistoryRecords(userId: string, sourceFile: string, records: GroupMessage[]): GroupMessage[] {
-  return records.map(record => projectHistoryRecord(userId, sourceFile, record));
+async function projectHistoryRecords(userId: string, sourceFile: string, records: GroupMessage[], before: number | null): Promise<GroupMessage[]> {
+  const projected = records.map(record => projectHistoryRecord(userId, sourceFile, record));
+  return restoreInterruptedProcessRecords(userId, sourceFile, projected, before);
+}
+
+function restoreInterruptedProcessRecords(userId: string, sourceFile: string, projected: GroupMessage[], before: number | null): Promise<GroupMessage[]> {
+  const { entryDir, toolResultsDir } = cachePaths(userId, sourceFile);
+  return restoreInterruptedCliHistory(userId, sourceFile, projected, before, items => {
+    const visible = items.map(item => projectProcessItem(item, toolResultsDir))
+      .filter(item => item !== null) as NonNullable<GroupMessage['process']>;
+    return visible.length ? storeProcessPages(entryDir, visible) : undefined;
+  });
 }
 
 export async function readConversationProcessPage(
@@ -520,10 +531,11 @@ async function coldLatestPage(
   const startedAt = Date.now();
   const page = await readJsonlPageWithOffsets<GroupMessage>(sourceFile, wanted, identity.size);
   const readFinishedAt = Date.now();
-  const projected = projectHistoryRecords(
+  const projected = await projectHistoryRecords(
     userId,
     sourceFile,
     page.entries.map(({ record }) => record),
+    page.entries[0]?.start ?? null,
   );
   const projectedAt = Date.now();
   const source = await snapshotWithHash(sourceFile, identity);
@@ -567,10 +579,11 @@ async function extendLatestPage(
     cached.source.size,
     identity.size,
   );
-  const projected = projectHistoryRecords(
+  const projected = await projectHistoryRecords(
     userId,
     sourceFile,
     appended.map(({ record }) => record),
+    appended[0]?.start ?? null,
   );
   const capacity = Math.max(wanted, cached.records.length);
   const merged = cached.records.concat(
@@ -614,6 +627,8 @@ async function buildLatestPage(
       await writeJson(files.latestPageFile, next);
       await fsp.rm(path.join(files.entryDir, 'latest-page.json'), { force: true });
       await fsp.rm(path.join(files.entryDir, 'latest-page-v5.json'), { force: true });
+      await fsp.rm(path.join(files.entryDir, 'latest-page-v6.json'), { force: true });
+      await fsp.rm(path.join(files.entryDir, 'latest-page-v7.json'), { force: true });
       return next;
     }
     // A message landed while the page was being projected. Keep the valid
@@ -655,10 +670,11 @@ async function latestPage(
   // Stabilization/cache failures must not make history unavailable.
   const page = await readJsonlPageWithOffsets<GroupMessage>(sourceFile, wanted);
   return {
-    records: projectHistoryRecords(
+    records: await projectHistoryRecords(
       userId,
       sourceFile,
       page.entries.map(({ record }) => record),
+      page.entries[0]?.start ?? null,
     ),
     nextCursor: page.nextCursor,
   };
@@ -681,10 +697,11 @@ export async function readConversationHistoryPage(
   }
   const page = await readJsonlPageWithOffsets<GroupMessage>(sourceFile, wanted, before ?? undefined);
   return {
-    records: projectHistoryRecords(
+    records: await projectHistoryRecords(
       userId,
       sourceFile,
       page.entries.map(({ record }) => record),
+      page.entries[0]?.start ?? null,
     ),
     nextCursor: page.nextCursor,
   };
@@ -706,8 +723,9 @@ export async function readConversationHistoryWindow(
   userId: string, sourceFile: string, start: number, limit = 10, after = 0,
 ): Promise<JsonlWindow<GroupMessage>> {
   if (isMainThread) return historyRequest({ kind: 'window', userId, sourceFile, start, limit, after });
-  return readJsonlWindow<GroupMessage>(sourceFile, start, limit,
+  const window = await readJsonlWindow<GroupMessage>(sourceFile, start, limit,
     record => projectHistoryRecord(userId, sourceFile, record), after);
+  return { ...window, records: await restoreInterruptedProcessRecords(userId, sourceFile, window.records, window.previousCursor) };
 }
 
 /** Project the page holding a message id. The worker finds it and reads the
@@ -716,9 +734,11 @@ export async function readConversationHistoryWindowAtMessage(
   userId: string, sourceFile: string, messageId: string, limit = 10,
 ): Promise<(JsonlWindow<GroupMessage> & { start: number; index: number }) | null> {
   if (isMainThread) return historyRequest({ kind: 'window-at-message', userId, sourceFile, messageId, limit });
-  return readJsonlWindowAtMatch<GroupMessage>(sourceFile,
+  const window = await readJsonlWindowAtMatch<GroupMessage>(sourceFile,
     record => String(record?.id || '') === messageId && !record?.deleted_at, limit,
     record => projectHistoryRecord(userId, sourceFile, record));
+  return window ? { ...window,
+    records: await restoreInterruptedProcessRecords(userId, sourceFile, window.records, window.previousCursor) } : null;
 }
 
 /** Active turns have no complete disk snapshot yet. Clone one record at a time

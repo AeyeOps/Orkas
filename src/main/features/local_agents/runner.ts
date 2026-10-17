@@ -1309,6 +1309,7 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
   const handle = await persist.start(opts.uid, {
     agentId: opts.agentId,
     cid: opts.cid,
+    currentMessageId: opts.currentMessageId,
     cli: opts.cli,
     cliPath: entry.path,
     prompt: opts.prompt,

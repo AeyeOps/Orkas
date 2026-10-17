@@ -478,6 +478,21 @@ describe('file_indexer › invalidate + purge + prune', () => {
     expect(fs.readdirSync(userFileCacheRoot()).length).toBe(0);
   });
 
+  it('preserves CLI run archives across startup and workspace-change pruning while removing orphaned extraction entries', async () => {
+    const m = await loadMod();
+    const persist = await import('../../../src/main/features/local_agents/persist');
+    const handle = await persist.start(UID, { agentId: 'codex-agent', cid: 'interrupted-chat', cli: 'codex', prompt: 'Fixture task' });
+    persist.append(handle, { type: 'text-delta', phase: 'commentary', text: 'Saved work in progress.' });
+    const archive = fs.readFileSync(handle.eventsPath, 'utf8');
+    const abs = writeWorkspaceFile('orphan.pdf', makeMinimalPdf(['Orphan']));
+    await m.statFile(UID, abs);
+    fs.unlinkSync(abs);
+    expect((await m.pruneOrphans(UID)).deleted).toBe(1);
+    expect(fs.readFileSync(handle.eventsPath, 'utf8')).toBe(archive);
+    expect((await m.pruneOrphans(UID, { workspacePath: path.join(tmpDir, 'other-workspace') })).deleted).toBe(0);
+    expect(fs.readFileSync(handle.eventsPath, 'utf8')).toBe(archive);
+  });
+
   it('pruneOrphans drops protected-source cache entries without statting the source', async () => {
     process.env.ORKAS_TCC_GUARD_FORCE = '1';
     const home = path.join(tmpDir, 'fake-home');
@@ -486,7 +501,7 @@ describe('file_indexer › invalidate + purge + prune', () => {
     process.env.HOME = home;
     const m = await loadMod();
     const protectedSource = path.join(downloads, 'old.pdf');
-    const cacheDir = path.join(userFileCacheRoot(), 'manual-cache');
+    const cacheDir = path.join(userFileCacheRoot(), crypto.createHash('sha1').update(protectedSource).digest('hex').slice(0, 16));
     fs.mkdirSync(cacheDir, { recursive: true });
     fs.writeFileSync(path.join(cacheDir, 'meta.json'), JSON.stringify({
       absPath: protectedSource,
