@@ -310,7 +310,7 @@ async function _readBindings(uid: string, pid: string): Promise<ProjectBindings>
     const raw: any = await readJson(f);
     return _normaliseBindings(raw);
   } catch (err) {
-    log.warn(`read bindings user=${uid} pid=${pid}: ${(err as Error).message}`);
+    log.warn('read bindings failed', { pid: maskId(pid), error: logErrorSummary(err) });
     return { agents: [] };
   }
 }

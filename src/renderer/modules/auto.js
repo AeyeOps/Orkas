@@ -950,7 +950,7 @@ function _autoRenderList() {
   const groups = _autoGroupTasks(_autoTasks, projects);
   if (!groups.some((group) => group.projectId === _autoActiveScope)) _autoActiveScope = groups[0].projectId;
   const switcher = document.createElement('nav');
-  switcher.className = 'todo-scope-switcher auto-scope-switcher';
+  switcher.className = 'todo-scope-switcher todo-scroll-track auto-scope-switcher';
   switcher.setAttribute('aria-label', t('todo.by_project'));
   for (const group of groups) {
     const name = group.projectId ? (group.name || t('auto.project_unavailable')) : t('auto.global');
@@ -1080,7 +1080,11 @@ function _autoProjectOptions() {
   try {
     if (typeof _projectsCache !== 'undefined' && Array.isArray(_projectsCache)) {
       for (const p of _projectsCache) {
-        if (p && p.project_id) opts.push({ value: p.project_id, label: p.name || p.project_id });
+        if (p && p.project_id) opts.push({
+          value: p.project_id,
+          label: p.name || p.project_id,
+          iconName: typeof window.projectIconName === 'function' ? window.projectIconName(p) : 'folder',
+        });
       }
     }
   } catch (_) { /* ignore */ }

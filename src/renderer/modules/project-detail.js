@@ -1760,7 +1760,12 @@ function _openProjectTodoEditor(task, context = _projectTodoContext(), status = 
       options.push(project);
     }
     _todoEditorProjectSelect.setOptions(
-      options.map((project) => ({ value: project.project_id, label: project.name })),
+      options.map((project) => ({
+        value: project.project_id,
+        label: project.name,
+        iconName: project.project_id
+          ? (typeof projectIconName === 'function' ? projectIconName(project) : 'folder') : '',
+      })),
       { value: context.pid || '' },
     );
     projectInput.dataset.locked = (!context.projects || !!task?.id) ? '1' : '0';
@@ -4811,10 +4816,6 @@ function _initProjectDetailBindings() {
   document.getElementById('project-add-agent-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     _openAddPicker();
-  });
-  document.getElementById('project-action-invite')?.addEventListener('click', (e) => {
-    e.stopPropagation();
-    void _showProjectMemberInviteGate();
   });
   document.getElementById('project-action-rename')?.addEventListener('mousedown', (e) => {
     if (_isProjectDetailRenameMode()) e.preventDefault();

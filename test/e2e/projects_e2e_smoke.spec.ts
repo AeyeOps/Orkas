@@ -64,6 +64,51 @@ async function createProject(orkas: OrkasTestApp, name: string): Promise<void> {
 }
 
 test.describe('projects', () => {
+  test('selects and reveals a project opened outside the sidebar without pinning later scroll', async ({ orkas }, testInfo) => {
+    const page = orkas.page!;
+    let targetId = '';
+    for (let index = 0; index < 24; index += 1) {
+      const result = await orkas.invoke<{ project: { project_id: string } }>('projects.create', {
+        name: `Navigation ${String(index).padStart(2, '0')} long project title`,
+      });
+      targetId = result.project.project_id;
+    }
+    await page.evaluate(() => (window as any).loadProjects(true));
+    try {
+      for (const [locale, width, height] of [['zh', 1440, 900], ['en', 900, 600]] as const) {
+        await page.setViewportSize({ width, height });
+        await page.evaluate((lang) => (window as any).setLang(lang), locale);
+        await page.evaluate(() => {
+          (window as any).setView('settings');
+          const toggle = document.getElementById('projects-section-toggle')!;
+          if (toggle.getAttribute('aria-expanded') === 'true') toggle.click();
+          document.querySelector('.sidebar-conversation-nav')!.scrollTop = 0;
+        });
+        await expect(page.locator('#panel-settings')).toHaveClass(/\bactive\b/);
+        await page.evaluate(pid => (window as any).setView('project', pid), targetId);
+        const row = page.locator(`.project-row[data-pid="${targetId}"]`);
+        await expect(row).toHaveClass(/\bactive\b/);
+        await expect(page.locator('.project-row.active')).toHaveCount(1);
+        await expect(page.locator('#project-detail-title')).toHaveText('Navigation 23 long project title');
+        await expect.poll(async () => row.evaluate(el => {
+          const bounds = el.getBoundingClientRect();
+          const scroll = document.querySelector('.sidebar-conversation-nav')!.getBoundingClientRect();
+          return bounds.top >= scroll.top && bounds.bottom <= scroll.bottom;
+        })).toBe(true);
+        await page.screenshot({ path: testInfo.outputPath(`project-navigation-${locale}.png`) });
+        await page.evaluate(() => {
+          document.querySelector('.sidebar-conversation-nav')!.scrollTop = 0;
+          (window as any).renderProjectsSection();
+        });
+        expect(await page.locator('.sidebar-conversation-nav').evaluate(el => el.scrollTop)).toBe(0);
+        await page.evaluate(() => (window as any).setView('settings'));
+        await expect(page.locator('.project-row.active')).toHaveCount(0);
+      }
+    } finally {
+      await page.evaluate(() => (window as any).setView('new-chat'));
+    }
+  });
+
   test('keeps member invitation visible as a commercial download guide', async ({ orkas }, testInfo) => {
     const projectName = 'E2E Invite Guide';
     if (!orkas.page) throw new Error('Orkas renderer is unavailable');
@@ -112,7 +157,7 @@ test.describe('projects', () => {
     const guidance = await page.evaluate(() => (globalThis as any).t('project.invite_members.commercial_only'));
     const inviteLabel = await page.evaluate(() => (globalThis as any).t('project.menu.invite_members'));
     const headerInvite = page.locator('#panel-project .project-detail-actions').getByRole('button', { name: inviteLabel, exact: true });
-    await expect(headerInvite).toBeVisible();
+    await expect(headerInvite).toHaveCount(0);
     await page.locator('#panel-project').screenshot({ path: testInfo.outputPath('project-member-invite-entry.png') });
     const cancelGuide = async () => {
       const dialog = page.locator('.ui-dialog-overlay:visible');
@@ -126,8 +171,6 @@ test.describe('projects', () => {
       await expect(page.locator('#project-detail-title')).toHaveText(projectName);
       await expect(row).toHaveCount(1);
     };
-    await headerInvite.click();
-    await cancelGuide();
     await row.hover();
     await row.locator('[data-project-menu]').click();
     const invite = page.locator('#project-row-menu [data-action="invite-members"]');
@@ -759,6 +802,7 @@ test.describe('projects', () => {
     const renamedName = 'E2E Header Rename After';
     await createProject(orkas, originalName);
     const page = orkas.page!;
+    await expect(page.locator('#project-action-invite')).toHaveCount(0);
     const more = page.locator('#project-action-more');
     const done = page.locator('#project-action-rename');
     const title = page.locator('#project-detail-title');
