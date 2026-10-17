@@ -14896,11 +14896,12 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 
 .settings-task-notification-permission {
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
+  margin: 0 12px 12px;
   padding: 10px 12px;
+  min-height: 0;
   border: 1px solid rgba(220, 38, 38, 0.24);
-  border-radius: var(--radius-sm);
+  border-radius: 10px;
   background: rgba(220, 38, 38, 0.07);
 }
 .settings-task-notification-permission-text {
@@ -19035,6 +19036,7 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
 
 
 .settings-sheet > .settings-row:not([hidden]) ~ .settings-row { border-top: 1px solid var(--border); }
+.settings-sheet > .settings-row:not([hidden]) ~ .settings-task-notification-permission { border-top: 1px solid rgba(220, 38, 38, 0.24); }
 .settings-row > .btn,
 .settings-row > .toggle-switch { flex: 0 0 auto; }
 .settings-sheet#settings-recycle-body { padding: 12px 18px 14px; }
@@ -19042,12 +19044,6 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
 .settings-mode-opt { padding: 8px 10px; border-radius: 8px; transition: background .12s; }
 .settings-mode-opt input[type="radio"] { accent-color: var(--primary); }
 .settings-mode-label { font-weight: 500; }
-.settings-task-notification-permission {
-  margin: 0 12px 12px;
-  padding: 10px 12px;
-  min-height: 0;
-  border-radius: 10px;
-}
 .settings-form-row > .ai-select,
 .settings-form-row > .form-input { width: 100%; }
 .settings-form-status:empty,
