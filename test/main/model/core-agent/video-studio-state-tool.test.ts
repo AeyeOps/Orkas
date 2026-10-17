@@ -2526,6 +2526,55 @@ describe('VideoStudio production-state tool protocol', () => {
       'turn-draft',
       { draft_ready: true, path: path.join(workspace, 'project', 'render', 'draft.mp4') },
     )).toBe(true);
+    // A draft rendered in this very turn is unseen: the user's message in it
+    // predates the draft, so confirming or exporting stops on the user with
+    // the v2 outcome instead of a plain-text refusal the turn ran past
+    // (2026-10-07 live run).
+    const sameTurnTool = mod.createVideoStudioTool({
+      userId: UID,
+      cid: 'cid-explicit-gates',
+      turnId: 'turn-draft',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: '<msg from="user">确认制作</msg>',
+    });
+    for (const op of ['composition.approve_draft', 'composition.export']) {
+      const sameTurn = await sameTurnTool.execute({
+        op,
+        composition_dir: 'project/composition',
+        ...(op === 'composition.approve_draft'
+          ? { decision_evidence: decisionEvidence('draft', 'approve', '确认制作') }
+          : { output_path: 'project/render/final.mp4' }),
+      }, ctx);
+      expect(sameTurn.isError).toBe(true);
+      expect(parseResult(sameTurn.content)).toMatchObject({
+        errorCode: 'E_GATE_D_APPROVAL_REQUIRED',
+        outcome: 'need_user',
+        next_step_owner: 'user',
+        next_action: 'show_current_artifact_and_request_user_decision',
+      });
+      expect(sameTurn.synthesizeAndEndTurn).toBe(true);
+    }
+    expect((await stateMod.readVideoProductionState(statePath, compositionDir)).draft?.status).toBe('ready');
+    // An unconfirmed draft from an earlier turn keeps the agent-owned path:
+    // the current message may confirm it, so export only says to approve first.
+    const laterExport = await mod.createVideoStudioTool({
+      userId: UID,
+      cid: 'cid-explicit-gates',
+      turnId: 'turn-later-export',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: '<msg from="user">可以，导出吧</msg>',
+    }).execute({
+      op: 'composition.export',
+      composition_dir: 'project/composition',
+      output_path: 'project/render/final.mp4',
+    }, ctx);
+    expect(parseResult(laterExport.content)).toMatchObject({
+      errorCode: 'E_GATE_D_APPROVAL_REQUIRED',
+      outcome: 'continue',
+    });
+    expect(laterExport.synthesizeAndEndTurn).not.toBe(true);
     const wrongGateTool = mod.createVideoStudioTool({
       userId: UID,
       cid: 'cid-explicit-gates',
@@ -3936,6 +3985,104 @@ describe('VideoStudio production-state tool protocol', () => {
     }, ctx);
     expect(stray.isError).toBe(true);
     expect(fs.readdirSync(strayChild)).toEqual([]);
+  });
+
+  it('names the standalone approval when a composition passes its own files as an AUTO parent binding', async () => {
+    // 2026-09-20 (client 1.7.1): a standalone composition passed its own
+    // manifest as plan_path. Every call entered the AUTO child branch and got a
+    // different child-only refusal — "must remain silent", "both required",
+    // "plan.segments must be a non-empty array" — before the model found the
+    // standalone call, and the user was asked to agree a third time.
+    makePlanVisualOnly();
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const ctx = { workingDir: workspace, state: {} } as any;
+    const opts = {
+      userId: UID,
+      cid: 'cid-standalone-own-plan-path',
+      turnId: 'turn-standalone-own-plan-path',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: '<msg from="user" to="79df9cc89f5f">@VideoStudio\n确认，继续制作。</msg>',
+    };
+    const approve = async (extra: Record<string, unknown>) => toolMod
+      .createVideoStudioTool(opts)
+      .execute({ ...compositionInput('composition.approve_plan'), ...extra }, ctx);
+    const ownManifest = 'project/composition/composition-manifest.json';
+
+    // The trace's first shape: plan_path alone, pointing at its own manifest.
+    const onlyPlanPath = await approve({ plan_path: ownManifest });
+    expect(onlyPlanPath.isError).toBe(true);
+    const incomplete = parseResult(String(onlyPlanPath.content));
+    expect(incomplete).toMatchObject({
+      errorCode: 'E_PARENT_COMPOSITION_BINDING_INCOMPLETE',
+      requires_user_decision: false,
+      billable_request_sent: false,
+    });
+    expect(incomplete.message).toContain('omit plan_path and segment_id');
+    expect(incomplete.message).not.toMatch(/silent|narration/);
+
+    // Its later shape: the same file plus an invented segment id.
+    const ownFile = parseResult(String((await approve({
+      plan_path: ownManifest,
+      segment_id: 'saudi-state-transition',
+    })).content));
+    expect(ownFile.errorCode).toBe('E_PARENT_COMPOSITION_BINDING_SELF');
+    expect(ownFile.message).toContain('omit plan_path and segment_id');
+    expect(ownFile.message).not.toContain('plan.segments');
+
+    // The refusals recorded nothing; the standalone call in the same user turn
+    // approves without asking the user again.
+    const standalone = await approve({});
+    expect(standalone.isError, String(standalone.content)).toBe(false);
+    expect(parseResult(String(standalone.content)).approval_inherited).toBe(false);
+  });
+
+  it('refuses an AUTO binding to an unapproved parent, an unknown segment, or an out-of-scope plan before creating the child', async () => {
+    const toolMod = await import('../../../../src/main/model/core-agent/video-studio-tool');
+    const ctx = { workingDir: workspace, state: {} } as any;
+    writeAutoParentPlan();
+    const childDir = path.join(workspace, 'project', 'compositions', 'intro');
+    const inherit = async (extra: Record<string, unknown>) => toolMod.createVideoStudioTool({
+      userId: UID,
+      cid: 'cid-auto-subject',
+      turnId: 'turn-auto-subject',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: '<msg from="user">unrelated later turn</msg>',
+    }).execute({
+      op: 'composition.approve_plan',
+      composition_dir: 'project/compositions/intro',
+      plan_path: 'project/plan.json',
+      segment_id: 'intro',
+      ...extra,
+    }, ctx);
+
+    const unapproved = parseResult(String((await inherit({})).content));
+    expect(unapproved.errorCode).toBe('E_PARENT_COMPOSITION_BINDING_UNAPPROVED');
+    expect(unapproved.message).toContain('omit plan_path and segment_id');
+    expect(fs.existsSync(childDir)).toBe(false);
+
+    await toolMod.createVideoStudioTool({
+      userId: UID,
+      cid: 'cid-auto-subject-parent',
+      turnId: 'turn-auto-subject-parent',
+      agentId: VIDEO_STUDIO_AGENT_ID,
+      agentName: 'VideoStudio',
+      userMessage: approvalSubmission('gate_b_decision', 'approve'),
+    }).execute({ op: 'production.approve_plan', plan_path: 'project/plan.json' }, ctx);
+
+    const unknown = parseResult(String((await inherit({ segment_id: 'outro' })).content));
+    expect(unknown).toMatchObject({
+      errorCode: 'E_PARENT_COMPOSITION_SEGMENT_INVALID',
+      compose_segment_ids: ['intro'],
+    });
+    expect(fs.existsSync(childDir)).toBe(false);
+
+    const outside = parseResult(String((await inherit({
+      plan_path: path.join(root, 'elsewhere', 'plan.json'),
+    })).content));
+    expect(outside.errorCode).toBe('E_PATH_OUT_OF_SCOPE');
+    expect(fs.existsSync(childDir)).toBe(false);
   });
 
   it('tells a narrated AUTO child to name the assembler instead of signing a voice', async () => {

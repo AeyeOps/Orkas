@@ -5,6 +5,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
+import { ELECTRON_MACOS_TASK_POLICY_WARNING_RE } from '../../../../scripts/model-eval-log-policy.mjs';
 
 const require = createRequire(import.meta.url);
 
@@ -18,7 +19,14 @@ describe('rendered PPT text collision evidence', () => {
       const logs = await promisify(execFile)(require('electron'), [
         path.resolve('test/fixtures/office/text-collision-render.cjs'), process.cwd(), output,
       ], { env, timeout: 30_000, maxBuffer: 256 * 1024 });
-      expect(logs.stderr).toBe('');
+      const stderr = logs.stderr.split(/\r?\n/).filter(line => line.trim());
+      const isKnownHostWarning = (line: string) => process.platform === 'darwin'
+        && ELECTRON_MACOS_TASK_POLICY_WARNING_RE.test(line);
+      // Preserve native diagnostics and their owning case. The shared policy
+      // recognizes only these exact macOS task-policy warnings; unknown
+      // stderr still fails this real rendered-geometry scenario.
+      for (const line of stderr.filter(isKnownHostWarning)) console.warn('[native-host-warning]', line);
+      expect(stderr.filter(line => !isKnownHostWarning(line))).toEqual([]);
       expect(logs.stdout.trim()).toBe('');
       const results = JSON.parse(fs.readFileSync(output, 'utf8'));
       expect(results.collision).toMatchObject({ status: 'checked', assessed_text_elements: 2,
@@ -32,7 +40,7 @@ describe('rendered PPT text collision evidence', () => {
       }
       expect(results.hidden.warnings).toHaveLength(1);
       for (const name of ['rotated', 'effect']) {
-        expect(results[name], name).toMatchObject({ status: 'partial', warnings: [] });
+        expect(results[name], JSON.stringify({ name, audit: results[name] })).toMatchObject({ status: 'partial', warnings: [] });
         expect(Object.keys(results[name].skipped).length).toBeGreaterThan(0);
       }
       // Identical painted text may be intentional decoration: report a candidate,

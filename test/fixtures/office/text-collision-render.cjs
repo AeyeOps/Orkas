@@ -40,7 +40,12 @@ app.whenReady().then(async () => {
     for (const [name, body] of Object.entries(cases)) {
       const html = '<!doctype html><style>body{margin:0}.slide{position:relative;width:800px;height:600px}.shape{position:absolute;width:300px;height:60px;white-space:pre-wrap;font:20px/24px monospace}.shape-text{width:100%;height:100%}</style><div class="slide">' + body + '</div>';
       await win.loadURL('data:text/html;base64,' + Buffer.from(html).toString('base64'));
-      await win.webContents.executeJavaScript('document.fonts.ready');
+      // Match production Office capture: settle fonts and layout before the
+      // bounded audit, so cold layout work does not consume its own budget.
+      await win.webContents.executeJavaScript(`(async () => {
+        await document.fonts.ready;
+        await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      })()`);
       results[name] = await win.webContents.executeJavaScript(PPTX_TEXT_COLLISION_SCRIPT);
     }
     fs.writeFileSync(process.argv[3], JSON.stringify(results));

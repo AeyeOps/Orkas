@@ -686,4 +686,30 @@ describe('search/indexer › chat index trust across a clean restart', () => {
     ix = await restart();
     expect(await ix.isChatsIndexCurrent('u1')).toBe(false);
   });
+
+  it('keeps trust across a clean restart after a conversation is deleted in the session', async () => {
+    writeChat('u1', 'c1', [{ from: 'user', ts: 't1', text: 'kept conversation' }]);
+    writeChat('u1', 'c2', [{ from: 'user', ts: 't1', text: 'deleted conversation' }]);
+    let ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(true);
+    fs.rmSync(path.join(tmpDir, 'u1', 'cloud', 'chats', 'c2.jsonl'));
+    moveCatalog('conversation removed');
+    await ix.dropChatConversation('u1', 'c2');
+
+    ix = await restart();
+    expect(await ix.isChatsIndexCurrent('u1')).toBe(true);
+    const search = await import('../../../../src/main/features/search/index');
+    expect(await search.searchChats('u1', 'deleted')).toEqual([]);
+  });
+
+  it('falls back to invalidation and repair when a rewritten conversation cannot be re-read', async () => {
+    writeChat('u1', 'c1', [{ from: 'user', ts: 't1', text: 'present' }]);
+    const ix = await loadIndexer();
+    await ix.reconcileChatsIndex('u1');
+    expect(ix.isChatsIndexTrusted('u1')).toBe(true);
+    await ix.reindexChatConversation('u1', 'missing-conversation');
+    expect(ix.isChatsIndexTrusted('u1')).toBe(false);
+    expect(ix.hasPendingChatRepair('u1')).toBe(true);
+  });
 });

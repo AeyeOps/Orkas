@@ -88,7 +88,9 @@ export type VideoProductionGenerationTransaction = {
   intent_signature?: string;
   output_path: string;
   reserved_output_paths?: string[];
-  status: 'pending' | 'completed' | 'failed';
+  /** `released`: ended before any provider request was sent; kept only in
+   * history and never consumes the paid generation confirmation. */
+  status: 'pending' | 'completed' | 'failed' | 'released';
   started_at: string;
   updated_at: string;
   completed_at?: string;
@@ -1281,6 +1283,39 @@ export async function beginVideoProductionGeneration(input: {
     await writeState(input.statePath, state);
     return { status: 'started' as const, transaction, intent };
   });
+}
+
+/** End a pending attempt that failed before any provider request was sent
+ * (for example a reference upload). Nothing billable happened, so the slot is
+ * freed and the same paid generation confirmation covers the retry; the
+ * released attempt stays in history with its error code. Recording it as
+ * `failed` demanded a new paid confirmation for a request that never left. */
+export async function releaseVideoProductionGeneration(input: {
+  statePath: string;
+  planPath: string;
+  transactionId: string;
+  segmentId: string;
+  kind: VideoProductionGenerationKind;
+  errorCode?: string;
+}): Promise<VideoProductionGenerationTransaction> {
+  const key = transactionKey(input.kind, input.segmentId);
+  let released: VideoProductionGenerationTransaction | undefined;
+  await updateState(input.statePath, input.planPath, (next) => {
+    const transaction = next.transactions[key];
+    if (!transaction || transaction.transaction_id !== input.transactionId || transaction.status !== 'pending') {
+      throw new Error('E_VIDEO_PRODUCTION_GENERATION_TRANSACTION_STALE: transaction no longer owns this segment');
+    }
+    released = {
+      ...transaction,
+      status: 'released',
+      updated_at: new Date().toISOString(),
+      ...(input.errorCode ? { error_code: input.errorCode } : {}),
+    };
+    next.transaction_history = [...next.transaction_history, released].slice(-50);
+    delete next.transactions[key];
+  });
+  if (!released) throw new Error('E_VIDEO_PRODUCTION_GENERATION_TRANSACTION_STALE');
+  return released;
 }
 
 export async function finishVideoProductionGeneration(input: {

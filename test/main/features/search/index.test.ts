@@ -595,7 +595,8 @@ describe('search › searchChats — group-chat shape end-to-end', () => {
       postings: {},
     }));
     const s = await loadSearch();
-    expect(await s.searchChatsWithStatus(TEST_UID, 'recoveredmarker')).toEqual({ results: [], indexComplete: false });
+    // The legacy snapshot is still migrating: this is a first build.
+    expect(await s.searchChatsWithStatus(TEST_UID, 'recoveredmarker')).toEqual({ results: [], indexComplete: false, indexBuilding: true });
     expect(s.__searchTestHooks.hasPendingChatRepair(TEST_UID)).toBe(true);
     await s.reconcileActive();
     expect(await s.searchChats(TEST_UID, 'recoveredmarker')).toMatchObject([
@@ -908,7 +909,8 @@ describe('search › startup reconcile', () => {
     expect(indexer.isChatsIndexTrusted(TEST_UID)).toBe(false);
     expect(fs.existsSync(chatStore.chatStorePath('inactive-user')),
       'an inactive profile must not be scanned at startup').toBe(false);
-    expect(await s.searchChatsWithStatus(TEST_UID, 'fallback token')).toEqual({ results: [], indexComplete: false });
+    // Built once before, so only catch-up is pending: not announced as building.
+    expect(await s.searchChatsWithStatus(TEST_UID, 'fallback token')).toEqual({ results: [], indexComplete: false, indexBuilding: false });
     expect(s.__searchTestHooks.hasPendingChatRepair(TEST_UID)).toBe(true);
     await indexer.reconcileChatsIndex(TEST_UID);
     const results = await s.searchChats(TEST_UID, 'fallback token');

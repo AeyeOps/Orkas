@@ -4,8 +4,10 @@
  * interface:
  *
  *   - 'openai-compatible' (PRIMARY): BYO user TTS API in the OpenAI
- *     `/audio/speech` shape — ElevenLabs / OpenAI / any compatible gateway.
+ *     `/audio/speech` shape — OpenAI / any compatible gateway.
  *     Config = a saved `TtsProfile` (base url, key, model, voice).
+ *   - 'elevenlabs': native `/text-to-speech/:voice_id`, selected only by the
+ *     saved profile's explicit provider id; shares the audio HTTP lifecycle.
  *   - 'doubao': Volcengine V3 TTS (`/api/v3/tts/unidirectional`). NOT OpenAI-
  *     compatible — `X-Api-Key` + `X-Api-Resource-Id` auth (the API-key console
  *     method) and an NDJSON stream of base64 audio chunks. Routed by
@@ -356,32 +358,38 @@ function combineSignal(signal: AbortSignal | undefined, timeoutMs: number): Abor
   return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
-// ── Backend: OpenAI-compatible /audio/speech (BYO) ──────────────────────────
+// ── Backends: binary-audio HTTP (OpenAI-compatible / ElevenLabs BYO) ────────
 
-class OpenAICompatibleTtsBackend implements TtsBackend {
-  readonly id = 'openai-compatible';
-  constructor(private readonly profile: {
-    baseUrl: string;
-    apiKey: string;
-    model: string;
-    provider?: string;
-    voice?: string;
-    format?: string;
-    label?: string;
-  }) {}
+class HttpAudioTtsBackend implements TtsBackend {
+  readonly id: string;
+  constructor(private readonly profile: { provider?: string; baseUrl: string; apiKey: string; model: string; voice?: string; format?: string; label?: string }) {
+    this.id = profile.provider === 'elevenlabs' ? 'elevenlabs' : 'openai-compatible';
+  }
 
   async synthesize(p: TtsParams): Promise<TtsResult> {
     const base = this.profile.baseUrl.replace(/\/+$/, '');
-    const url = `${base}/audio/speech`;
     const voice = p.voice || this.profile.voice;
     const format = (p.format || this.profile.format || 'mp3').toLowerCase();
-    const body: Record<string, unknown> = {
+    let url = `${base}/audio/speech`;
+    let headers: Record<string, string> = { Authorization: `Bearer ${this.profile.apiKey}`, 'Content-Type': 'application/json' };
+    let body: Record<string, unknown> = {
       model: this.profile.model,
       input: p.text,
       ...(voice ? { voice } : {}),
       response_format: format,
       ...(typeof p.speed === 'number' ? { speed: p.speed } : {}),
     };
+    if (this.id === 'elevenlabs') {
+      // Native contract: https://elevenlabs.io/docs/api-reference/text-to-speech/convert
+      // Request PCM 24k for WAV; 44.1k PCM/WAV requires a Pro subscription.
+      const codecs: Record<string, string> = { mp3: 'mp3_44100_128', wav: 'pcm_24000', pcm: 'pcm_24000', opus: 'opus_48000_128' };
+      if (!voice || !Object.hasOwn(codecs, format) || (p.speed !== undefined && (!Number.isFinite(p.speed) || p.speed < 0.7 || p.speed > 1.2))) {
+        return { ok: false, errorCode: 'E_TTS_ARG', message: 'ElevenLabs requires a voice id, mp3/wav/pcm/opus output, and speed between 0.7 and 1.2.', requestDisposition: 'rejected_preflight', chargeStatus: 'not_charged', retryPolicy: 'safe_after_plan_fix' };
+      }
+      url = `${base}/text-to-speech/${encodeURIComponent(voice)}?${new URLSearchParams({ output_format: codecs[format] })}`;
+      headers = { 'xi-api-key': this.profile.apiKey, 'Content-Type': 'application/json' };
+      body = { text: p.text, model_id: this.profile.model, ...(p.speed !== undefined ? { voice_settings: { speed: p.speed } } : {}) };
+    }
 
     p.onProgress?.({ phase: 'tts.request', message: `requesting speech from ${this.profile.label || base}` });
     let resp: Response;
@@ -389,11 +397,8 @@ class OpenAICompatibleTtsBackend implements TtsBackend {
       resp = await fetch(url, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${this.profile.apiKey}`,
-          'Content-Type': 'application/json',
-          ...(this.profile.provider === ORKAS_API_PROVIDER
-            ? orkasApiUsageHeaders(p.usageContext)
-            : {}),
+          ...headers,
+          ...(this.profile.provider === ORKAS_API_PROVIDER ? orkasApiUsageHeaders(p.usageContext) : {}),
         },
         body: JSON.stringify(body),
         signal: combineSignal(p.signal, TTS_TIMEOUT_MS),
@@ -425,7 +430,8 @@ class OpenAICompatibleTtsBackend implements TtsBackend {
     const buf = Buffer.from(await resp.arrayBuffer());
     if (buf.length > MAX_TTS_BYTES) return sentFailure('E_TTS_TOO_LARGE', 'The speech response was too large and was not saved.');
     if (!buf.length) return sentFailure('E_TTS_EMPTY', 'The speech provider returned empty audio.');
-    return persistSynthesizedAudio(this.id, p.outputAbsPath, buf);
+    const audio = this.id === 'elevenlabs' && format === 'wav' ? wrapPcm16MonoWav(buf) : buf;
+    return persistSynthesizedAudio(this.id, p.outputAbsPath, audio);
   }
 }
 
@@ -604,7 +610,7 @@ function resolveTtsBackend(routeRef?: string): TtsBackend {
   const envKey = process.env.ORKAS_TTS_API_KEY;
   const envModel = process.env.ORKAS_TTS_MODEL;
   if (envBase && envKey && envModel && (!routeRef || routeRef === 'env:tts')) {
-    return new OpenAICompatibleTtsBackend({
+    return new HttpAudioTtsBackend({
       baseUrl: envBase, apiKey: envKey, model: envModel,
       ...(process.env.ORKAS_TTS_VOICE ? { voice: process.env.ORKAS_TTS_VOICE } : {}),
       ...(process.env.ORKAS_TTS_FORMAT ? { format: process.env.ORKAS_TTS_FORMAT } : {}),
@@ -624,7 +630,7 @@ function resolveTtsBackend(routeRef?: string): TtsBackend {
         label: p.label,
       });
     }
-    return new OpenAICompatibleTtsBackend(p);
+    return new HttpAudioTtsBackend(p);
   }
   return new UnconfiguredTtsBackend();
 }
@@ -643,6 +649,10 @@ export function configuredTtsBackendId(): string {
 }
 
 export async function generateSpeech(p: TtsParams): Promise<TtsResult> {
+  return generateSpeechWithProvider(p);
+}
+
+async function generateSpeechWithProvider(p: TtsParams): Promise<TtsResult> {
   if (!p.text.trim()) return { ok: false, errorCode: 'E_TTS_ARG', message: 'text is required' };
   const resolved = await resolveTtsSelection({
     ...(p.routeRef ? { routeRef: p.routeRef } : {}),

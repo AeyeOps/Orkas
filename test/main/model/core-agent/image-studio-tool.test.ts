@@ -43,6 +43,7 @@ const electronImage = vi.hoisted(() => {
     image: baseImage,
     baseImage,
     changedImage,
+    scrollingAreas: 0,
     requiredCopyLayouts: [] as Array<{
       copy: string;
       lineGlyphCounts: number[];
@@ -57,8 +58,11 @@ vi.mock('electron', () => ({
     fromPartition: () => ({ webRequest: { onBeforeRequest: vi.fn() } }),
   },
   BrowserWindow: class BrowserWindow {
+    viewport = { width: 0, height: 0 };
+    setContentSize(width: number, height: number) { this.viewport = { width, height }; }
     webContents = {
-      executeJavaScript: vi.fn(async () => electronImage.requiredCopyLayouts),
+      executeJavaScript: vi.fn(async () => ({ viewport: this.viewport,
+        scrollingAreas: electronImage.scrollingAreas, requiredCopyLayouts: electronImage.requiredCopyLayouts })),
       capturePage: vi.fn(async () => electronImage.image),
     };
     loadURL = vi.fn(async () => undefined);
@@ -94,6 +98,7 @@ let previousComfyBaseUrl: string | undefined;
 beforeEach(() => {
   electronImage.image = electronImage.baseImage;
   electronImage.requiredCopyLayouts = [];
+  electronImage.scrollingAreas = 0;
   previousComfyBaseUrl = process.env.ORKAS_COMFYUI_BASE_URL;
   delete process.env.ORKAS_COMFYUI_BASE_URL;
   vi.stubGlobal('fetch', vi.fn(() => { throw new Error('Unexpected network call in ImageStudio integration test'); }));
@@ -193,6 +198,28 @@ describe('image_studio tool', () => {
     expect(result.isError).toBe(true);
     expect(result.images).toBeUndefined();
     expect(JSON.parse(result.content)).toMatchObject({ ok: false });
+  });
+
+  it('keeps a scrolling composition out of delivered files and gives a layout repair handoff', async () => {
+    electronImage.scrollingAreas = 1;
+    const onFileWritten = vi.fn();
+    const onOutputsPublished = vi.fn();
+    const tool = createImageStudioTool({ userId: USER_ID, agentId: IMAGE_STUDIO_AGENT_ID,
+      extraRoots: [root], onFileWritten, onOutputsPublished });
+    const outputPath = path.join(root, 'evidence', 'scrolling.png');
+    const result = await tool.execute({ op: 'project.snapshot', project_dir: projectDir, output_path: outputPath }, { workingDir: root } as any);
+    expect(result.isError).toBe(true);
+    expect(result.images).toBeUndefined();
+    expect(JSON.parse(result.content)).toMatchObject({ ok: false, current_candidate: null,
+      inspection: { blockers: [expect.objectContaining({ code: 'E_IMAGE_LAYOUT_SCROLLING' })] },
+      recovery_context: { next_operation: 'repair_project_then_project.inspect' } });
+    expect(fs.existsSync(outputPath)).toBe(false);
+    expect(onFileWritten).not.toHaveBeenCalled();
+    expect(onOutputsPublished).not.toHaveBeenCalled();
+    const exported = await tool.execute({ op: 'project.export', project_dir: projectDir, output_path: path.join(root, 'final.png') }, { workingDir: root } as any);
+    expect(exported.isError).toBe(true);
+    expect(exported.content).toContain('E_IMAGE_REVIEW_EVIDENCE_REQUIRED');
+    expect(fs.existsSync(path.join(root, 'final.png'))).toBe(false);
   });
 
   it('attaches the passing candidate and declared references in one ordered visual batch', async () => {

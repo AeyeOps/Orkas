@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import type { Metadata, OutputInfo, SharpOptions, PngOptions, JpegOptions, WebpOptions } from 'sharp';
+import type { Metadata, OutputInfo, SharpOptions, PngOptions, JpegOptions, WebpOptions, ResizeOptions, Region } from 'sharp';
 import { PC_ROOT } from '../paths';
 import { createLogger } from '../logger';
 import { bundledNodeExecutable } from './bundled-runtime';
@@ -7,7 +7,9 @@ import { bundledNodeExecutable } from './bundled-runtime';
 interface ImageRequestOptions extends Pick<SharpOptions, 'failOn' | 'limitInputPixels' | 'density'> {
   format?: 'png' | 'jpeg' | 'webp';
   encodeOptions?: PngOptions | JpegOptions | WebpOptions;
-  resize?: { width: number; height: number; fit: 'fill' };
+  resize?: Pick<ResizeOptions, 'width' | 'height' | 'fit' | 'withoutEnlargement'>;
+  composite?: Array<{ input: Buffer }>;
+  extract?: Region;
 }
 
 interface ImageClient {

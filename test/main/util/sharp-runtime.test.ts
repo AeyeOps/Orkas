@@ -1,4 +1,4 @@
-import { fork, type ChildProcess } from 'node:child_process';
+import { fork, spawnSync, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -44,6 +44,29 @@ afterEach(async () => {
 });
 
 describe('isolated bundled-Node image processing', () => {
+  it('masks private screenshot pixels before cropping and resizing in stock Node', async () => {
+    const images = client();
+    const masked = await images.request('encode', input(12, 6), {
+      format: 'png', composite: [{ input: Buffer.from('<svg width="12" height="6"><rect width="6" height="6" fill="black"/></svg>') }],
+    });
+    const cropped = await images.request('encode', masked.data, {
+      format: 'png', extract: { left: 4, top: 0, width: 4, height: 6 },
+    });
+    const resized = await images.request('encode', cropped.data, {
+      format: 'png', resize: { width: 8, height: 12, fit: 'inside', withoutEnlargement: false },
+    });
+    expect(resized.info).toMatchObject({ width: 8, height: 12 });
+    const decoded = spawnSync(node!, ['-e', `const chunks=[];process.stdin.on('data',b=>chunks.push(b));process.stdin.on('end',async()=>{const {data,info}=await require(${JSON.stringify(require.resolve('sharp'))})(Buffer.concat(chunks)).ensureAlpha().raw().toBuffer({resolveWithObject:true});console.log(JSON.stringify({first:[...data.subarray(0,4)],last:[...data.subarray(data.length-4)],width:info.width,height:info.height}));});`], {
+      input: resized.data, encoding: 'utf8', timeout: 10_000,
+      env: { ...process.env, ELECTRON_RUN_AS_NODE: undefined },
+    });
+    expect(decoded.status, decoded.stderr).toBe(0);
+    expect(decoded.stderr).toBe('');
+    expect(JSON.parse(decoded.stdout)).toEqual({ first: [0, 0, 0, 255], last: [20, 40, 60, 255], width: 8, height: 12 });
+    await expect(images.request('encode', masked.data, { format: 'png', extract: { left: 20, top: 0, width: 4, height: 6 } })).rejects.toThrow('E_IMAGE_PROCESS');
+    expect(await images.request('metadata', input())).toMatchObject({ width: 4, height: 3 });
+  });
+
   it('preserves image dimensions and format across concurrent calls in a reused process', async () => {
     expect(node).toBeTruthy();
     const images = client();

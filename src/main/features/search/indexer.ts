@@ -922,7 +922,41 @@ export function dropChatConversation(userId: string, cid: string): Promise<void>
     scheduleChatIndexRepair(userId, 1_000);
     return Promise.resolve();
   }
-  return _queueChatWrite(userId, () => _chatWorker(userId).deleteConversation(cid));
+  return _queueChatWrite(userId, async () => {
+    await _chatWorker(userId).deleteConversation(cid);
+    // Its documents and watermark are gone, so no repair has anything left to
+    // re-read for it; a stale mark would only keep a clean quit from trusting
+    // the index again.
+    if (!_chatReconcileRuns.has(userId)) _dirtyChats.get(userId)?.delete(cid);
+  });
+}
+
+/** Re-read one conversation after an in-place rewrite of existing records
+ * (message tombstones). Appends use indexChatMessage; this keeps an otherwise
+ * current index trusted instead of leaving deleted text searchable until the
+ * next full repair. Any failure falls back to invalidation and idle repair. */
+export function reindexChatConversation(userId: string, cid: string): Promise<void> {
+  if (_chatReconcileRuns.has(userId) || _isMigrating(userId)) {
+    _noteChatChange(userId, cid);
+    _invalidatedChats.add(userId);
+    _currentChatIndexes.delete(userId);
+    scheduleChatIndexRepair(userId, 1_000);
+    return Promise.resolve();
+  }
+  return _queueChatWrite(userId, async () => {
+    const file = _chatJsonlFile(userId, cid);
+    const st = await fsp.stat(file).catch(() => undefined);
+    const worker = _chatWorker(userId);
+    const rebuilt = !!st && await _reindexChatFile(
+      userId, { fileKey: cid, file, mtime: st.mtimeMs, size: st.size }, () => _closing, worker,
+    );
+    if (rebuilt) return;
+    _markChatDirty(userId, cid);
+    _invalidatedChats.add(userId);
+    _currentChatIndexes.delete(userId);
+    await worker.invalidate(cid);
+    scheduleChatIndexRepair(userId);
+  });
 }
 
 // ── Internal handle for query-side reads ─────────────────────────────────

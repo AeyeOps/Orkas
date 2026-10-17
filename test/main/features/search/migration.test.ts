@@ -105,7 +105,8 @@ it('defers new messages without blocking search and catches them up before marki
     // These promises must settle while the source read is still parked.
     await ix.drainDeferredChatWrites();
     expect(store.postingsFor('u1', 'freshmarker')).toHaveLength(0);
-    expect(await search.searchChatsWithStatus('u1', 'freshmarker')).toEqual({ results: [], indexComplete: false });
+    expect(await search.searchChatsWithStatus('u1', 'freshmarker'))
+      .toEqual({ results: [], indexComplete: false, indexBuilding: true });
     expect((await search.searchChatsWithStatus('u1', 'oldmarker')).results).toHaveLength(1);
     expect(fs.existsSync(legacy)).toBe(true);
   } finally { h.release(); }
@@ -144,6 +145,43 @@ it('does not rebuild a cold index on the search path and returns coverage to glo
   expect(page).toMatchObject({ results: [], chat_index_complete: false });
   expect(store.docCount('u1')).toBe(0);
   expect(search.__searchTestHooks.hasPendingChatRepair('u1')).toBe(true);
+});
+
+it('announces a first build and starts its repair from the status check alone', async () => {
+  write('c1', 'firstbuildmarker');
+  const boot = await import('../../../../src/main/util/boot_init');
+  boot.configureBootAdmission({ isRuntimeBusy: () => true });
+  const search = await import('../../../../src/main/features/search');
+  // Opening search reads status only; it must not wait for a typed query.
+  expect(await search.searchIndexStatus('u1')).toEqual({ chat_index_complete: false, chat_index_building: true });
+  expect(search.__searchTestHooks.hasPendingChatRepair('u1')).toBe(true);
+});
+
+it('keeps a once-built index unannounced after a restart and catches it up from the status check', async () => {
+  write('c1', 'keptmarker');
+  let search = await import('../../../../src/main/features/search');
+  const ix = await import('../../../../src/main/features/search/indexer');
+  expect((await ix.reconcileChatsIndex('u1')).complete).toBe(true);
+  expect(await search.searchIndexStatus('u1')).toEqual({ chat_index_complete: true, chat_index_building: false });
+  await search.flushAll();
+  // A conversation arrives while no process trusts the index (a relaunch that
+  // skipped the quit work, a crash, a sync): the next start cannot verify it.
+  write('c2', 'catchupmarker');
+  vi.resetModules();
+  (await import('../../../../src/main/features/users')).activateUser('u1');
+  const boot = await import('../../../../src/main/util/boot_init');
+  boot.configureBootAdmission({ isRuntimeBusy: () => true });
+  search = await import('../../../../src/main/features/search');
+  expect(await search.searchIndexStatus('u1')).toEqual({ chat_index_complete: false, chat_index_building: false });
+  expect(search.__searchTestHooks.hasPendingChatRepair('u1')).toBe(true);
+  // The kept index still answers while the catch-up waits for an idle runtime.
+  expect((await search.searchChats('u1', 'keptmarker')).map(r => r.cid)).toEqual(['c1']);
+  vi.useFakeTimers({ toFake: ['Date'] });
+  vi.setSystemTime(Date.now() + 5_000);
+  boot.configureBootAdmission({ isRuntimeBusy: () => false });
+  await vi.waitFor(async () => expect((await search.searchIndexStatus('u1')).chat_index_complete).toBe(true),
+    { timeout: 4_000 });
+  expect((await search.searchChats('u1', 'catchupmarker')).map(r => r.cid)).toEqual(['c2']);
 });
 
 it('automatically resumes an interrupted startup slice only after the runtime becomes idle', async () => {

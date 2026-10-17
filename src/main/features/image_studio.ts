@@ -6,7 +6,7 @@ import type { NativeImage as ElectronNativeImage } from 'electron';
 
 import { hardenedWebPreferences } from '../util/window-security';
 import { isPathAllowed } from '../util/path-sandbox';
-import { encodeImage } from '../util/sharp-runtime';
+import { encodeImage, imageMetadata } from '../util/sharp-runtime';
 import { isImageStudioGeneration, type ImageStudioGenerationOutput } from './image_studio_provenance';
 import {
   extractCssImports,
@@ -1035,6 +1035,15 @@ export async function normalizeImageStudioSnapshot(
   capturedPng: Buffer,
   canvas: ImageStudioManifest['canvas'],
 ): Promise<Buffer> {
+  const source = await imageMetadata(capturedPng);
+  const scaleX = source.width / canvas.width;
+  const scaleY = source.height / canvas.height;
+  // Display density may scale both axes, with at most one physical pixel of
+  // rounding. A clipped viewport is not a density change and must not stretch.
+  if (!(scaleX > 0 && scaleY > 0)
+    || Math.abs(scaleX - scaleY) > Math.max(1 / canvas.width, 1 / canvas.height)) {
+    throw new Error(`E_IMAGE_STUDIO_CAPTURE_GEOMETRY: Expected a proportional ${canvas.width}x${canvas.height} capture; got ${source.width}x${source.height}.`);
+  }
   const { data } = await encodeImage(capturedPng, {
     resize: { width: canvas.width, height: canvas.height, fit: 'fill' },
     format: 'png',
@@ -1043,7 +1052,7 @@ export async function normalizeImageStudioSnapshot(
 }
 
 async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioManifest, outputAbsPath: string): Promise<{
-  image: ReturnType<typeof analyzeNativeImage>;
+  image?: ReturnType<typeof analyzeNativeImage>;
   layoutBlockers: ImageStudioIssue[];
 }> {
   const electron = await import('electron');
@@ -1058,14 +1067,18 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
     width: manifest.canvas.width,
     height: manifest.canvas.height,
     useContentSize: true,
+    enableLargerThanScreen: true,
     backgroundColor: '#00000000',
     webPreferences: hardenedWebPreferences({ session: ses, backgroundThrottling: false }),
   });
   try {
+    // Constructor centering on Windows/Linux can constrain the viewport to the
+    // display work area. Restore the canvas before loading, as VideoStudio does.
+    win.setContentSize(manifest.canvas.width, manifest.canvas.height);
     const entryAbs = path.resolve(projectDirAbs, manifest.entry || 'index.html');
     await withTimeout(win.loadURL(pathToFileURL(entryAbs).toString()), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_LOAD_TIMEOUT: HTML entry did not finish loading.');
     const requiredCopyLiteral = JSON.stringify(JSON.stringify(manifest.brief.required_copy));
-    const requiredCopyLayouts = await withTimeout(win.webContents.executeJavaScript(`(async () => {
+    const layout = await withTimeout(win.webContents.executeJavaScript(`(async () => {
       if (document.fonts && document.fonts.ready) await document.fonts.ready;
       const images = Array.from(document.images || []);
       await Promise.all(images.map((img) => img.complete ? Promise.resolve() : new Promise((resolve) => {
@@ -1077,7 +1090,25 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
       const visibleText = (element) => Array.from(String(element.innerText || ''))
         .filter((char) => !/\\s/u.test(char));
       const elements = [document.body, ...Array.from(document.body.querySelectorAll('*'))];
-      return requiredCopy.map((copy) => {
+      const root = document.scrollingElement || document.documentElement;
+      const rootStyle = getComputedStyle(document.documentElement);
+      const bodyStyle = getComputedStyle(document.body);
+      const scrolls = (mode, extent, size) => mode === 'scroll'
+        || (mode !== 'hidden' && mode !== 'clip' && extent > size + 1);
+      const rootMode = (axis) => rootStyle[axis] === 'visible' ? bodyStyle[axis] : rootStyle[axis];
+      let scrollingAreas = Number(scrolls(rootMode('overflowX'), root.scrollWidth, innerWidth)
+        || scrolls(rootMode('overflowY'), root.scrollHeight, innerHeight));
+      for (const element of elements) {
+        if (element === document.body || !(element instanceof HTMLElement)) continue;
+        const rect = element.getBoundingClientRect();
+        const style = getComputedStyle(element);
+        if (rect.width <= 0 || rect.height <= 0 || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+        if (['auto', 'scroll'].includes(style.overflowX) && scrolls(style.overflowX, element.scrollWidth, element.clientWidth)
+          || ['auto', 'scroll'].includes(style.overflowY) && scrolls(style.overflowY, element.scrollHeight, element.clientHeight)) {
+          scrollingAreas += 1;
+        }
+      }
+      const requiredCopyLayouts = requiredCopy.map((copy) => {
         const copyChars = Array.from(String(copy)).filter((char) => !/\\s/u.test(char));
         const candidates = elements.filter((element) => {
           const style = getComputedStyle(element);
@@ -1139,7 +1170,17 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
           writingMode: getComputedStyle(element).writingMode || '',
         };
       });
+      return { viewport: { width: innerWidth, height: innerHeight }, scrollingAreas, requiredCopyLayouts };
     })()`, true), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_READY_TIMEOUT: fonts or local images did not become ready.');
+    if (layout.viewport.width !== manifest.canvas.width || layout.viewport.height !== manifest.canvas.height) {
+      throw new Error(`E_IMAGE_STUDIO_VIEWPORT_MISMATCH: Expected a ${manifest.canvas.width}x${manifest.canvas.height} canvas viewport; got ${layout.viewport.width}x${layout.viewport.height}. No image was written.`);
+    }
+    if (layout.scrollingAreas > 0) {
+      return { layoutBlockers: [{
+        code: 'E_IMAGE_LAYOUT_SCROLLING',
+        message: `The image composition has ${layout.scrollingAreas} scrolling area(s). Fit the complete layout inside the declared canvas before taking another snapshot.`,
+      }] };
+    }
     const captured = await withTimeout(win.webContents.capturePage(), IMAGE_STUDIO_LOAD_TIMEOUT_MS, 'E_IMAGE_STUDIO_CAPTURE_TIMEOUT: screenshot capture timed out.');
     const bytes = await normalizeImageStudioSnapshot(captured.toPNG(), manifest.canvas);
     await fs.mkdir(path.dirname(outputAbsPath), { recursive: true });
@@ -1148,7 +1189,7 @@ async function renderHtmlSnapshot(projectDirAbs: string, manifest: ImageStudioMa
     return {
       image: analyzeNativeImage(image),
       layoutBlockers: requiredCopyLayoutIssues(
-        Array.isArray(requiredCopyLayouts) ? requiredCopyLayouts : [],
+        Array.isArray(layout.requiredCopyLayouts) ? layout.requiredCopyLayouts : [],
       ),
     };
   } finally {
@@ -1223,6 +1264,9 @@ export async function snapshotImageStudioProject(input: {
     };
   }
   const rendered = await renderHtmlSnapshot(path.resolve(input.projectDirAbs), inspection.manifest, path.resolve(input.outputAbsPath));
+  if (!rendered.image) {
+    return { ...inspection, ok: false, blockers: [...inspection.blockers, ...rendered.layoutBlockers] };
+  }
   const image = rendered.image;
   const evidencePath = path.resolve(input.outputAbsPath);
   const review = rendered.layoutBlockers.length

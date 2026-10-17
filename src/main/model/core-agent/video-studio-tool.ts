@@ -554,6 +554,24 @@ function missingUserTurnGateResult(
   };
 }
 
+/** Fields of a Gate D refusal for a draft rendered in the current turn: the
+ * user has not seen it, so the next step is theirs (`outcome: need_user`). */
+function draftRenderedThisTurnStop(): Record<string, unknown> {
+  return {
+    current_review_status: 'pending',
+    requires_user_decision: true,
+    user_reconfirmation_required: false,
+    next_step_owner: 'user',
+    interaction_required: true,
+    interaction_mode: 'request_gate_decision',
+    form_policy: 'plain_message_no_form',
+    automatic_recovery_expected: false,
+    same_turn_continuation_required: false,
+    billable_request_sent: false,
+    next_action: 'show_current_artifact_and_request_user_decision',
+  };
+}
+
 /**
  * Ops whose behavior depends on skill-side protocol knowledge (gate decisions,
  * evidence shapes, review verdicts). A skill generation that predates the host
@@ -4638,6 +4656,84 @@ export function parentCompositionAudioFault(rawManifest: unknown): string {
     return `The child carries narration text but declares audio.owner:"${owner}". Use audio.owner:"assembler" — it renders silent exactly like "none" while naming the real owner, so the host stops asking this segment for its own narration audio.`;
   }
   return '';
+}
+
+/** composition.approve_plan inherits a parent approval only for a real AUTO
+ * child: both plan_path and segment_id, plan_path an approved production plan
+ * outside this composition, and segment_id one of its compose segments.
+ * Identify that subject before any child check. On 2026-09-20 a standalone
+ * composition passed its own manifest as plan_path and got three unrelated
+ * child refusals in a row ("must remain silent", "both required", "plan.segments
+ * must be a non-empty array") before the model found the standalone call. */
+async function autoChildSubjectRefusal(input: {
+  op: string;
+  parentPlanRaw: string;
+  parentSegmentId: string;
+  parentPlanAbs: string;
+  parentPlanAllowed: boolean;
+  compositionDirAbs: string;
+  userId: string;
+  projectId?: string;
+}): Promise<Record<string, unknown> | null> {
+  const standalone = 'For this composition\'s own plan, omit plan_path and segment_id; its approval is the user\'s reply to the plan you displayed.';
+  const refusal = (errorCode: string, message: string, extra: Record<string, unknown> = {}) => ({
+    ok: false,
+    op: input.op,
+    errorCode,
+    message,
+    ...extra,
+    requires_user_decision: false,
+    user_reconfirmation_required: false,
+    next_step_owner: 'agent',
+    same_turn_continuation_required: true,
+    interaction_required: false,
+    billable_request_sent: false,
+    next_action: 'retry_composition.approve_plan_as_standalone_or_with_a_valid_parent_binding',
+  });
+  if (!input.parentPlanRaw || !input.parentSegmentId) {
+    return refusal(
+      'E_PARENT_COMPOSITION_BINDING_INCOMPLETE',
+      `AUTO inheritance needs both plan_path (the approved parent production plan) and segment_id (its compose segment); this call has only ${input.parentPlanRaw ? 'plan_path' : 'segment_id'}. ${standalone}`,
+    );
+  }
+  if (!input.parentPlanAllowed) {
+    return refusal('E_PATH_OUT_OF_SCOPE', `plan_path is outside scope: ${input.parentPlanAbs}`);
+  }
+  const relative = path.relative(input.compositionDirAbs, input.parentPlanAbs);
+  if (!relative || (!relative.startsWith('..') && !path.isAbsolute(relative))) {
+    return refusal(
+      'E_PARENT_COMPOSITION_BINDING_SELF',
+      `plan_path ${input.parentPlanRaw} is inside composition_dir, so it is this composition's own file, not a parent production plan. ${standalone}`,
+    );
+  }
+  let parent: Awaited<ReturnType<typeof validateVideoProductionPlanApproval>>;
+  try {
+    parent = await validateVideoProductionPlanApproval({
+      statePath: videoProductionControlStatePath({
+        userId: input.userId,
+        ...(input.projectId ? { projectId: input.projectId } : {}),
+        planPath: input.parentPlanAbs,
+      }),
+      planPath: input.parentPlanAbs,
+    });
+  } catch (err) {
+    return refusal(
+      'E_PARENT_COMPOSITION_BINDING_UNAPPROVED',
+      `plan_path ${input.parentPlanRaw} is not an approved production plan (${(err as Error).message || String(err)}). AUTO inheritance reuses the parent's production.approve_plan approval. ${standalone}`,
+    );
+  }
+  const segments = Array.isArray(parent.identity.plan.segments)
+    ? parent.identity.plan.segments.filter(isIntentRecord)
+    : [];
+  const composeIds = segments.filter((segment) => segment.source === 'compose').map((segment) => String(segment.id));
+  if (!segments.some((segment) => segment.id === input.parentSegmentId)) {
+    return refusal(
+      'E_PARENT_COMPOSITION_SEGMENT_INVALID',
+      `The approved parent EDL has no compose segment named ${input.parentSegmentId}. Its compose segments are: ${composeIds.join(', ') || 'none'}.`,
+      { compose_segment_ids: composeIds },
+    );
+  }
+  return null;
 }
 
 async function validateParentCompositionBinding(input: {
@@ -9217,9 +9313,9 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           enum: [...OPS],
           description: 'Keyframe preview must end the current turn; draft resumes after a later real user reply. No preview-approval op. Retry exhaustion allows one fresh turn to approve one narration materialize call; never reuse an old turn.',
         },
-        plan_path: { type: 'string', description: 'Canonical project/plan.json for production.* operations or AUTO child-composition production-plan inheritance.' },
+        plan_path: { type: 'string', description: 'Canonical project/plan.json for production.* operations. composition.* operations take it only with segment_id, to inherit that approved parent plan\'s compose segment; omit both for a standalone composition.' },
         delivered_video_path: { type: 'string', description: 'Final video for production.status. Direct model output receives a readable-video check and advisory spec differences; locally assembled output also checks timing, canvas, narration, loudness, and captions.' },
-        segment_id: { type: 'string', description: 'Parent EDL segment id for AUTO child-composition production-plan inheritance.' },
+        segment_id: { type: 'string', description: 'Parent EDL compose segment id for AUTO child-composition inheritance; requires plan_path.' },
         composition_dir: { type: 'string', description: 'Directory containing composition-manifest.json and generated index.html; prepare may run before index.html exists.' },
         decision_evidence: {
           type: 'object',
@@ -9830,6 +9926,26 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 } as ToolResult;
               }
             }
+          }
+        }
+        // Whether this approval is an AUTO child is answered before anything
+        // is created or checked as one (including the child directory below).
+        if (op === 'composition.approve_plan') {
+          const subjectSegmentId = String(input.segment_id || '').trim();
+          const subjectPlanRaw = String(input.plan_path || '').trim();
+          if (subjectSegmentId || subjectPlanRaw) {
+            const subjectPlanAbs = subjectPlanRaw ? resolvePath(ctx, opts, subjectPlanRaw, roots) : '';
+            const subjectRefusal = await autoChildSubjectRefusal({
+              op,
+              parentPlanRaw: subjectPlanRaw,
+              parentSegmentId: subjectSegmentId,
+              parentPlanAbs: subjectPlanAbs,
+              parentPlanAllowed: !!subjectPlanAbs && isPathAllowed(subjectPlanAbs, roots),
+              compositionDirAbs,
+              userId: opts.userId,
+              ...(opts.projectId ? { projectId: opts.projectId } : {}),
+            });
+            if (subjectRefusal) return { content: resultContent(subjectRefusal), isError: true } as ToolResult;
           }
         }
         const dirCheck = await inspectInputDir(compositionDirAbs);
@@ -11662,6 +11778,25 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
                 },
               });
             }
+            if (approval.errorCode === 'E_GATE_D_APPROVAL_REQUIRED') {
+              // The draft was rendered in this very turn, so the user has not
+              // seen it and nothing here can confirm it: a stop on the user,
+              // like the other gate refusals. As plain text it carried no
+              // outcome, so the turn ended as an ordinary completion (2026-10-07
+              // live run): the user's confirmation opened a new task row, and a
+              // task waiting on this one could start from the unconfirmed draft.
+              return reviewToolResult({
+                opts,
+                state: stateBefore,
+                result: {
+                  ok: false,
+                  op,
+                  errorCode: approval.errorCode,
+                  message: approval.message,
+                  ...draftRenderedThisTurnStop(),
+                },
+              });
+            }
             return { content: `${approval.errorCode}: ${approval.message}`, isError: true } as ToolResult;
           }
           return {
@@ -11815,11 +11950,18 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
           const gate = await validateVideoStudioGate(gateStatePath, 'draft', compositionDirAbs, opts.turnId || '');
           if (gate.ok === false) {
             const currentState = await readVideoProductionState(gateStatePath, compositionDirAbs);
+            // An unconfirmed draft from an earlier turn may be confirmed by the
+            // current message (approve it, then export); one rendered in this
+            // turn has not been seen yet, so the user owns the next step.
+            const unseenDraft = gate.errorCode === 'E_GATE_D_APPROVAL_REQUIRED'
+              && !!opts.turnId
+              && currentState.draft?.turn_id === opts.turnId;
             const blockedResult = {
               ok: false,
               op,
               errorCode: gate.errorCode,
               message: gate.message,
+              ...(unseenDraft ? draftRenderedThisTurnStop() : {}),
               ...(currentState.current_candidate
                 ? { current_candidate: currentState.current_candidate }
                 : {}),
