@@ -7,11 +7,15 @@ import * as path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const {
+  verifyPhonePasskeyRuntimeDir,
+  requiredRuntimeVerificationEntries,
   verifyFfmpegRuntimeDir,
   verifyRuntimeRoot,
   verifyWhisperRuntimeDir,
   verifyWindowsVcImportClosure,
 } = require('../../../bin/runtime-gate.cjs') as {
+  verifyPhonePasskeyRuntimeDir: (root: string, platform: string, arch: string, options?: Record<string, unknown>) => string;
+  requiredRuntimeVerificationEntries: (platform: string, arch: string) => string[];
   verifyFfmpegRuntimeDir: (root: string, platform: string, arch: string, options?: Record<string, unknown>) => string[];
   verifyRuntimeRoot: (root: string, platform: string, arch: string, options?: {
     allowedKeys?: string[];
@@ -568,5 +572,50 @@ describe('runtime-gate', () => {
     expect(() => verifyWindowsVcImportClosure(app, 'x64')).toThrow(/unresolved application-local VC dependency/);
     fs.writeFileSync(path.join(app, 'vcruntime140.dll'), peExport('__different_symbol'));
     expect(() => verifyWindowsVcImportClosure(app, 'x64')).toThrow(/does not export __CxxFrameHandler3/);
+  });
+});
+
+// A Mac installation must carry a verified helper and the corresponding MPL
+// source/licenses. Windows retains its native OS route and needs no helper.
+describe('phone passkey distribution contract', () => {
+  function fixture() {
+    const root = path.join(tmpDir, 'phone-runtime');
+    const dir = path.join(root, 'phone-passkey/darwin-arm64');
+    fs.mkdirSync(path.join(dir, 'licenses'), { recursive: true });
+    const files = Object.fromEntries(['orkas-phone-passkey', 'NOTICE.txt', 'webauthn-source.tar.gz', 'licenses/OpenSSL-LICENSE.txt'].map(name => {
+      const bytes = Buffer.from(`public fixture ${name}`); fs.writeFileSync(path.join(dir, name), bytes);
+      return [name, { bytes: bytes.length, sha256: crypto.createHash('sha256').update(bytes).digest('hex') }];
+    }));
+    const marker = { schema: 1, protocol: 1, platformKey: 'darwin-arm64', source: 'a'.repeat(64), files };
+    fs.writeFileSync(path.join(dir, '.orkas-phone-passkey.json'), JSON.stringify(marker));
+    return { root, dir, marker };
+  }
+  it('requires Mac helper evidence without adding a Windows runtime requirement', () => {
+    expect(requiredRuntimeVerificationEntries('darwin', 'arm64')).toContain('runtime:phone-passkey:darwin-arm64');
+    expect(requiredRuntimeVerificationEntries('win32', 'x64').some((name: string) => name.includes('phone-passkey'))).toBe(false);
+    const { root, dir } = fixture();
+    expect(verifyPhonePasskeyRuntimeDir(root, 'darwin', 'arm64', { checkArch: false })).toBe(path.join(dir, 'orkas-phone-passkey'));
+  });
+  it('blocks corrupted or incomplete distributable files and rejects path traversal in the inventory', () => {
+    const { root, dir, marker } = fixture();
+    const verify = () => verifyPhonePasskeyRuntimeDir(root, 'darwin', 'arm64', { checkArch: false });
+    fs.writeFileSync(path.join(dir, 'orkas-phone-passkey'), 'tampered');
+    expect(verify).toThrow(/checksum mismatch/);
+    fs.writeFileSync(path.join(dir, 'orkas-phone-passkey'), 'public fixture orkas-phone-passkey');
+    delete (marker.files as any)['webauthn-source.tar.gz'];
+    fs.writeFileSync(path.join(dir, '.orkas-phone-passkey.json'), JSON.stringify(marker));
+    expect(verify).toThrow(/incomplete/);
+    marker.files['webauthn-source.tar.gz'] = { bytes: 0, sha256: 'a'.repeat(64) };
+    const data = fs.readFileSync(path.join(dir, 'webauthn-source.tar.gz'));
+    marker.files['webauthn-source.tar.gz'] = { bytes: data.length, sha256: crypto.createHash('sha256').update(data).digest('hex') };
+    const opensslLicense = marker.files['licenses/OpenSSL-LICENSE.txt'];
+    delete (marker.files as any)['licenses/OpenSSL-LICENSE.txt'];
+    fs.writeFileSync(path.join(dir, '.orkas-phone-passkey.json'), JSON.stringify(marker));
+    expect(verify).toThrow(/incomplete/);
+    marker.files['licenses/OpenSSL-LICENSE.txt'] = opensslLicense;
+    // Keep the intact license/source records so traversal is the isolated failure.
+    (marker.files as any)['../outside'] = { bytes: 0, sha256: 'a'.repeat(64) };
+    fs.writeFileSync(path.join(dir, '.orkas-phone-passkey.json'), JSON.stringify(marker));
+    expect(verify).toThrow(/invalid phone passkey runtime file/);
   });
 });

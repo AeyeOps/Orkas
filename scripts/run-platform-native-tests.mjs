@@ -20,6 +20,7 @@ if (!['win32', 'darwin', 'linux'].includes(process.platform)) {
 // runs after dependency provisioning in the platform-specific Windows and
 // Linux lanes because it requires downloaded FFmpeg, model, and native payloads.
 const commonSuites = [
+  'test/main/util/ensure-dev-dependencies.test.ts',
   'test/main/util/verify-native-dependencies.test.ts',
   'test/main/util/ensure-sqlite-electron-abi.test.ts',
   'test/main/util/inspect-canary-logs.test.ts',
@@ -46,6 +47,7 @@ const commonSuites = [
   'test/main/features/local_agents/base.test.ts',
   'test/main/features/local_agents/spawn-command.test.ts',
   'test/main/features/local_agents/version.test.ts',
+  'test/main/features/local_agents/upgrade.test.ts',
   'test/main/util/bundled-runtime.test.ts',
   'test/main/util/run-skill.test.ts',
   'test/main/features/packages.test.ts',
@@ -54,6 +56,8 @@ const commonSuites = [
   'test/main/features/video_studio_native_qa.test.ts',
   'test/main/features/video_studio_delivery.test.ts',
   'test/main/paths.test.ts',
+  'test/main/install-data-root.test.ts',
+  'test/main/features/web_assist_passkey.test.ts',
 ];
 
 const platformSuites = process.platform === 'win32'

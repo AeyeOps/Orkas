@@ -61,114 +61,149 @@ const EMBEDDING_MODEL_CONTRACT = Object.freeze({
 
 const MAC_LOCALIZED_METADATA_CONTRACT = Object.freeze([
   Object.freeze({
-    directory: 'en.lproj',
+    directory: "en.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: 'Orkas uses the microphone for voice input.',
+      NSBluetoothAlwaysUsageDescription: "Orkas uses Bluetooth to verify that your passkey phone is nearby.",
+      NSMicrophoneUsageDescription: "Orkas uses the microphone for voice input and websites you authorize.",
+      NSCameraUsageDescription: "Orkas lets websites use the camera with your permission.",
     }),
   }),
   Object.freeze({
-    directory: 'ja.lproj',
+    directory: "ja.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: 'Orkas は音声入力にマイクを使用します。',
+      NSBluetoothAlwaysUsageDescription: "Orkas は Bluetooth を使用して、パスキーを保存したスマートフォンが近くにあることを確認します。",
+      NSMicrophoneUsageDescription: "Orkas は音声入力と許可したウェブサイトでマイクを使用します。",
+      NSCameraUsageDescription: "Orkas は許可を得てウェブサイトでカメラを使用します。",
     }),
   }),
   Object.freeze({
-    directory: 'zh-Hans.lproj',
+    directory: "zh-Hans.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: 'Orkas 需要使用麦克风进行语音输入。',
+      NSBluetoothAlwaysUsageDescription: "Orkas 使用蓝牙确认保存通行密钥的手机在附近。",
+      NSMicrophoneUsageDescription: "Orkas 使用麦克风进行语音输入，并供你授权的网站使用。",
+      NSCameraUsageDescription: "Orkas 经你允许后，让网站使用摄像头。",
     }),
   }),
   Object.freeze({
     directory: "es.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas usa el micrófono para la entrada de voz.",
+      NSBluetoothAlwaysUsageDescription: "Orkas usa Bluetooth para comprobar que el teléfono con tu clave de acceso está cerca.",
+      NSMicrophoneUsageDescription: "Orkas usa el micrófono para la entrada de voz y los sitios que autorizas.",
+      NSCameraUsageDescription: "Orkas permite que los sitios usen la cámara con tu permiso.",
     }),
   }),
   Object.freeze({
     directory: "fr.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas utilise le microphone pour la saisie vocale.",
+      NSBluetoothAlwaysUsageDescription: "Orkas utilise le Bluetooth pour vérifier que le téléphone contenant votre clé d’accès est à proximité.",
+      NSMicrophoneUsageDescription: "Orkas utilise le microphone pour la saisie vocale et les sites que vous autorisez.",
+      NSCameraUsageDescription: "Orkas permet aux sites d’utiliser la caméra avec votre autorisation.",
     }),
   }),
   Object.freeze({
     directory: "ko.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas는 음성 입력에 마이크를 사용합니다.",
+      NSBluetoothAlwaysUsageDescription: "Orkas는 Bluetooth로 패스키가 저장된 휴대폰이 근처에 있는지 확인합니다.",
+      NSMicrophoneUsageDescription: "Orkas는 음성 입력과 사용자가 허용한 웹사이트에 마이크를 사용합니다.",
+      NSCameraUsageDescription: "Orkas는 사용자의 허락을 받아 웹사이트에서 카메라를 사용합니다.",
     }),
   }),
   Object.freeze({
     directory: "de.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas verwendet das Mikrofon für die Spracheingabe.",
+      NSBluetoothAlwaysUsageDescription: "Orkas verwendet Bluetooth, um zu prüfen, ob Ihr Telefon mit dem Passkey in der Nähe ist.",
+      NSMicrophoneUsageDescription: "Orkas verwendet das Mikrofon für die Spracheingabe und von Ihnen autorisierte Websites.",
+      NSCameraUsageDescription: "Orkas erlaubt Websites mit Ihrer Zustimmung den Kamerazugriff.",
     }),
   }),
   Object.freeze({
     directory: "ru.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas использует микрофон для голосового ввода.",
+      NSBluetoothAlwaysUsageDescription: "Orkas использует Bluetooth, чтобы убедиться, что телефон с ключом доступа находится рядом.",
+      NSMicrophoneUsageDescription: "Orkas использует микрофон для голосового ввода и сайтов, которым вы дали разрешение.",
+      NSCameraUsageDescription: "Orkas позволяет сайтам использовать камеру с вашего разрешения.",
     }),
   }),
   Object.freeze({
     directory: "it.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas usa il microfono per l’inserimento vocale.",
+      NSBluetoothAlwaysUsageDescription: "Orkas usa Bluetooth per verificare che il telefono con la tua passkey sia nelle vicinanze.",
+      NSMicrophoneUsageDescription: "Orkas usa il microfono per l’inserimento vocale e i siti che autorizzi.",
+      NSCameraUsageDescription: "Orkas consente ai siti di usare la fotocamera con la tua autorizzazione.",
     }),
   }),
   Object.freeze({
     directory: "hi.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas वॉइस इनपुट के लिए माइक्रोफ़ोन का उपयोग करता है।",
+      NSBluetoothAlwaysUsageDescription: "Orkas ब्लूटूथ से पुष्टि करता है कि आपकी पासकी वाला फ़ोन पास में है।",
+      NSMicrophoneUsageDescription: "Orkas वॉइस इनपुट और आपके अनुमति दिए गए वेबसाइटों के लिए माइक्रोफ़ोन का उपयोग करता है।",
+      NSCameraUsageDescription: "Orkas आपकी अनुमति से वेबसाइटों को कैमरा इस्तेमाल करने देता है।",
     }),
   }),
   Object.freeze({
     directory: "id.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas menggunakan mikrofon untuk input suara.",
+      NSBluetoothAlwaysUsageDescription: "Orkas menggunakan Bluetooth untuk memastikan ponsel dengan kunci sandi Anda berada di dekat Anda.",
+      NSMicrophoneUsageDescription: "Orkas menggunakan mikrofon untuk input suara dan situs yang Anda izinkan.",
+      NSCameraUsageDescription: "Orkas mengizinkan situs menggunakan kamera dengan izin Anda.",
     }),
   }),
   Object.freeze({
     directory: "th.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas ใช้ไมโครโฟนสำหรับการป้อนข้อมูลด้วยเสียง",
+      NSBluetoothAlwaysUsageDescription: "Orkas ใช้บลูทูธเพื่อยืนยันว่าโทรศัพท์ที่เก็บพาสคีย์อยู่ใกล้คุณ",
+      NSMicrophoneUsageDescription: "Orkas ใช้ไมโครโฟนสำหรับการป้อนข้อมูลด้วยเสียงและเว็บไซต์ที่คุณอนุญาต",
+      NSCameraUsageDescription: "Orkas ให้เว็บไซต์ใช้กล้องเมื่อคุณอนุญาต",
     }),
   }),
   Object.freeze({
     directory: "tr.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas, sesli giriş için mikrofonu kullanır.",
+      NSBluetoothAlwaysUsageDescription: "Orkas, geçiş anahtarınızın bulunduğu telefonun yakında olduğunu doğrulamak için Bluetooth kullanır.",
+      NSMicrophoneUsageDescription: "Orkas, sesli giriş ve izin verdiğiniz siteler için mikrofonu kullanır.",
+      NSCameraUsageDescription: "Orkas, izninizle sitelerin kamerayı kullanmasına olanak tanır.",
     }),
   }),
   Object.freeze({
     directory: "vi.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas sử dụng micrô để nhập liệu bằng giọng nói.",
+      NSBluetoothAlwaysUsageDescription: "Orkas dùng Bluetooth để xác nhận điện thoại lưu khóa truy cập của bạn ở gần.",
+      NSMicrophoneUsageDescription: "Orkas sử dụng micrô để nhập liệu bằng giọng nói và cho các trang web bạn cho phép.",
+      NSCameraUsageDescription: "Orkas cho phép trang web sử dụng máy ảnh khi bạn đồng ý.",
     }),
   }),
   Object.freeze({
     directory: "zh-Hant.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas 會使用麥克風進行語音輸入。",
+      NSBluetoothAlwaysUsageDescription: "Orkas 使用藍牙確認儲存通行密鑰的手機在附近。",
+      NSMicrophoneUsageDescription: "Orkas 使用麥克風進行語音輸入，並供你授權的網站使用。",
+      NSCameraUsageDescription: "Orkas 經你允許後，讓網站使用攝影機。",
     }),
   }),
   Object.freeze({
     directory: "pt-PT.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "O Orkas utiliza o microfone para a entrada de voz.",
+      NSBluetoothAlwaysUsageDescription: "O Orkas utiliza Bluetooth para confirmar que o telemóvel com a sua chave de acesso está por perto.",
+      NSMicrophoneUsageDescription: "O Orkas utiliza o microfone para a entrada de voz e os sites que autoriza.",
+      NSCameraUsageDescription: "Orkas permite que os sites usem a câmara com a sua permissão.",
     }),
   }),
   Object.freeze({
     directory: "es-419.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "Orkas usa el micrófono para la entrada de voz.",
+      NSBluetoothAlwaysUsageDescription: "Orkas usa Bluetooth para comprobar que el teléfono con tu clave de acceso está cerca.",
+      NSMicrophoneUsageDescription: "Orkas usa el micrófono para la entrada de voz y los sitios que autorizas.",
+      NSCameraUsageDescription: "Orkas permite que los sitios usen la cámara con tu permiso.",
     }),
   }),
   Object.freeze({
     directory: "ar.lproj",
     values: Object.freeze({
-      NSMicrophoneUsageDescription: "يستخدم Orkas الميكروفون للإدخال الصوتي.",
+      NSBluetoothAlwaysUsageDescription: "يستخدم Orkas البلوتوث للتأكد من أن الهاتف الذي يحفظ مفتاح المرور قريب منك.",
+      NSMicrophoneUsageDescription: "يستخدم Orkas الميكروفون للإدخال الصوتي والمواقع التي تسمح لها.",
+      NSCameraUsageDescription: "يسمح Orkas للمواقع باستخدام الكاميرا بإذنك.",
     }),
   }),
-
 ]);
 
 const MAC_LOCALIZED_METADATA_FILTERS = Object.freeze(

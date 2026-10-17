@@ -3,6 +3,7 @@ import { spawnSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 const TEST_NODE = process.env.ORKAS_TEST_NODE || process.execPath;
 
@@ -269,6 +270,209 @@ describe('run-skill.cjs', () => {
       ok: false,
       errors: ['artifact is invalid'],
     });
+  });
+
+  it('initializes an awaiting .mjs entry once and preserves its default-function invocation', () => {
+    writeCustomSkill('await-entry', 'await-entry', 'run');
+    const skillDir = path.join(tmpDir, 'u1', 'cloud', 'skills', 'await-entry');
+    const marker = path.join(skillDir, 'calls.txt');
+    const entry = path.join(skillDir, 'scripts', 'run.mjs');
+    fs.rmSync(path.join(skillDir, 'scripts', 'run.js'));
+    fs.writeFileSync(entry, `
+      import fs from 'node:fs';
+      await Promise.resolve();
+      fs.appendFileSync(${JSON.stringify(marker)}, 'init\\n');
+      async function dispatch({ args, skillId, skillDir }) {
+        fs.appendFileSync(${JSON.stringify(marker)}, 'dispatch\\n');
+        return { args, skillId, skillDir, url: import.meta.url };
+      }
+      if (require.main === module) await dispatch({ args: ['cli'] });
+      export default dispatch;
+    `);
+
+    const args = ['--selftest', 'two words', '中文', ''];
+    const r = runSkill('await-entry', 'run', args);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toEqual({ args, skillId: 'await-entry', skillDir, url: pathToFileURL(fs.realpathSync(entry)).href });
+    expect(fs.readFileSync(marker, 'utf8')).toBe('init\ndispatch\n');
+  });
+
+  it('awaits transitive ESM initialization without duplicating a shared dependency', () => {
+    writeCustomSkill('await-dependency', 'await-dependency', 'run');
+    const skillDir = path.join(tmpDir, 'u1', 'cloud', 'skills', 'await-dependency');
+    const scripts = path.join(skillDir, 'scripts');
+    const marker = path.join(skillDir, 'calls.txt');
+    fs.rmSync(path.join(scripts, 'run.js'));
+    fs.mkdirSync(path.join(scripts, 'nested'));
+    fs.writeFileSync(path.join(scripts, 'nested', 'value.cjs'), 'module.exports = "relative-resource";');
+    fs.writeFileSync(path.join(scripts, 'nested', 'ready.mjs'), `
+      import fs from 'node:fs';
+      fs.appendFileSync(${JSON.stringify(marker)}, 'init\\n');
+      export const value = await Promise.resolve(require('./value.cjs'));
+      export const directory = __dirname;
+    `);
+    fs.writeFileSync(path.join(scripts, 'run.mjs'), `
+      import { value, directory } from './nested/ready.mjs';
+      export default async () => {
+        const again = await import('./nested/ready.mjs');
+        return { value, directory, same: value === again.value };
+      };
+    `);
+
+    const r = runSkill('await-dependency', 'run');
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toEqual({ value: 'relative-resource', directory: fs.realpathSync(path.join(scripts, 'nested')), same: true });
+    expect(fs.readFileSync(marker, 'utf8')).toBe('init\n');
+  });
+
+  it('preserves legacy require and import identity for a synchronous .mjs dependency', () => {
+    writeCustomSkill('legacy-dependency', 'legacy-dependency', 'run');
+    const scripts = path.join(tmpDir, 'u1', 'cloud', 'skills', 'legacy-dependency', 'scripts');
+    const marker = path.join(scripts, 'calls.txt');
+    fs.rmSync(path.join(scripts, 'run.js'));
+    fs.writeFileSync(path.join(scripts, 'helper.mjs'), `
+      require('node:fs').appendFileSync(${JSON.stringify(marker)}, 'init\\n');
+      export const value = {};
+    `);
+    fs.writeFileSync(path.join(scripts, 'run.mjs'), `
+      import { value } from './helper.mjs';
+      export default async () => ({ same: value === require('./helper.mjs').value });
+    `);
+
+    const r = runSkill('legacy-dependency', 'run');
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toEqual({ same: true });
+    expect(fs.readFileSync(marker, 'utf8')).toBe('init\n');
+  });
+
+  it('does not replay initialization or call the default entry after an ESM load failure', () => {
+    writeCustomSkill('failed-initialization', 'failed-initialization', 'run');
+    const scripts = path.join(tmpDir, 'u1', 'cloud', 'skills', 'failed-initialization', 'scripts');
+    const marker = path.join(scripts, 'calls.txt');
+    fs.rmSync(path.join(scripts, 'run.js'));
+    fs.writeFileSync(path.join(scripts, 'ready.mjs'), `
+      import fs from 'node:fs';
+      fs.appendFileSync(${JSON.stringify(marker)}, 'init\\n');
+      await Promise.resolve();
+      throw new Error('fixture initialization failed');
+    `);
+    fs.writeFileSync(path.join(scripts, 'run.mjs'), `
+      import './ready.mjs';
+      export default async () => {
+        require('node:fs').appendFileSync(${JSON.stringify(marker)}, 'dispatch\\n');
+      };
+    `);
+
+    const r = runSkill('failed-initialization', 'run');
+    expect(r.status).toBe(71);
+    expect(r.stdout).toBe('');
+    expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, error: expect.stringContaining('fixture initialization failed') });
+    expect(fs.readFileSync(marker, 'utf8')).toBe('init\n');
+  });
+
+  it('preserves authored require bindings and resolves ESM packages from the PC fallback', () => {
+    writeCustomSkill('esm-packages', 'esm-packages', 'run');
+    const skillDir = path.join(tmpDir, 'u1', 'cloud', 'skills', 'esm-packages');
+    const scripts = path.join(skillDir, 'scripts');
+    fs.rmSync(path.join(scripts, 'run.js'));
+    fs.writeFileSync(path.join(scripts, 'run.mjs'), `
+      import { z } from 'zod';
+      import { createRequire } from 'node:module';
+      const require = createRequire(import.meta.url);
+      const __orkas_skill_cjs = 'authored';
+      const value = await Promise.resolve(z.string().parse('esm-ready'));
+      export default async () => ({ value, authored: __orkas_skill_cjs,
+        exists: require('node:fs').existsSync(__filename) });
+    `);
+    const r = runSkill('esm-packages', 'run');
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toEqual({ value: 'esm-ready', authored: 'authored', exists: true });
+  });
+
+  it('retains CommonJS-style .mjs entries and dependency return shapes', () => {
+    writeCustomSkill('cjs-mjs', 'cjs-mjs', 'run');
+    const scripts = path.join(tmpDir, 'u1', 'cloud', 'skills', 'cjs-mjs', 'scripts');
+    fs.rmSync(path.join(scripts, 'run.js'));
+    fs.writeFileSync(path.join(scripts, 'helper.mjs'), `
+      globalThis.__legacyHelperLoads = (globalThis.__legacyHelperLoads || 0) + 1;
+      module.exports = () => "legacy-cjs";
+    `);
+    fs.writeFileSync(path.join(scripts, 'run.mjs'), `
+      globalThis.__legacyEntryLoads = (globalThis.__legacyEntryLoads || 0) + 1;
+      module.exports = async ({ args }) => ({ value: require('./helper.mjs')(), args,
+        entryLoads: globalThis.__legacyEntryLoads, helperLoads: globalThis.__legacyHelperLoads });
+    `);
+    const r = runSkill('cjs-mjs', 'run', ['--selftest']);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toEqual({ value: 'legacy-cjs', args: ['--selftest'], entryLoads: 1, helperLoads: 1 });
+
+    fs.writeFileSync(path.join(scripts, 'inspect.mjs'), `
+      import helper from './helper.mjs';
+      export default async () => ({ same: helper === require('./helper.mjs'), value: helper(),
+        helperLoads: globalThis.__legacyHelperLoads });
+    `);
+    const inspected = runSkill('cjs-mjs', 'inspect');
+    expect(inspected.status, inspected.stderr).toBe(0);
+    expect(inspected.stderr).toBe('');
+    expect(JSON.parse(inspected.stdout)).toEqual({ same: true, value: 'legacy-cjs', helperLoads: 1 });
+
+    fs.writeFileSync(path.join(scripts, 'named-default.mjs'), 'exports.default = async ({ args }) => ({ args });');
+    const namedDefault = runSkill('cjs-mjs', 'named-default', ['--selftest']);
+    expect(namedDefault.status, namedDefault.stderr).toBe(0);
+    expect(namedDefault.stderr).toBe('');
+    expect(JSON.parse(namedDefault.stdout)).toEqual({ args: ['--selftest'] });
+  });
+
+  it('does not substitute the PC package for a broken package installed beside an ESM Skill', () => {
+    writeCustomSkill('broken-esm-package', 'broken-esm-package', 'run');
+    const skillDir = path.join(tmpDir, 'u1', 'cloud', 'skills', 'broken-esm-package');
+    const scripts = path.join(skillDir, 'scripts');
+    fs.rmSync(path.join(scripts, 'run.js'));
+    const dependency = path.join(skillDir, 'node_modules', 'zod');
+    fs.mkdirSync(dependency, { recursive: true });
+    fs.writeFileSync(path.join(dependency, 'package.json'), JSON.stringify({ name: 'zod', exports: './missing.mjs' }));
+    fs.writeFileSync(path.join(scripts, 'run.mjs'), "import { z } from 'zod'; export default async () => ({ value: z.string().parse('wrong-copy') });");
+    const r = runSkill('broken-esm-package', 'run');
+    expect(r.status).toBe(71);
+    expect(r.stdout).toBe('');
+    expect(JSON.parse(r.stderr)).toMatchObject({ ok: false, error: expect.stringContaining('missing.mjs') });
+  });
+
+  it('retains relative TypeScript dependency resolution and transformation for .mjs entries', () => {
+    writeCustomSkill('esm-ts-dependency', 'esm-ts-dependency', 'run');
+    const scripts = path.join(tmpDir, 'u1', 'cloud', 'skills', 'esm-ts-dependency', 'scripts');
+    fs.rmSync(path.join(scripts, 'run.js'));
+    fs.writeFileSync(path.join(scripts, 'helper.ts'), `
+      enum Mode { Ready = 'typed-ready' }
+      export const value: string = Mode.Ready;
+    `);
+    fs.writeFileSync(path.join(scripts, 'run.mjs'), `
+      import { value } from './helper';
+      export default async () => ({ value, same: value === require('./helper.ts').value });
+    `);
+    const r = runSkill('esm-ts-dependency', 'run');
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stderr).toBe('');
+    expect(JSON.parse(r.stdout)).toEqual({ value: 'typed-ready', same: true });
+  });
+
+  it('does not report success when ESM initialization remains unsettled without active handles', () => {
+    writeCustomSkill('unsettled-esm', 'unsettled-esm', 'run');
+    const scripts = path.join(tmpDir, 'u1', 'cloud', 'skills', 'unsettled-esm', 'scripts');
+    fs.rmSync(path.join(scripts, 'run.js'));
+    fs.writeFileSync(path.join(scripts, 'run.mjs'), `
+      await new Promise(() => {});
+      export default async () => ({ dispatched: true });
+    `);
+    const r = runSkill('unsettled-esm', 'run');
+    expect(r.status).toBe(71);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toBe('');
   });
 
   it('does not infer failure from module-specific fields without ok false', () => {

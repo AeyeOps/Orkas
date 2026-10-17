@@ -13,6 +13,7 @@ describe('embedded browser launch proxy policy', () => {
     const setProxy = vi.fn();
     const policy = prepareBrowserProxy({ setProxy }, { NO_PROXY: 'example.com' });
     expect(policy.ready).toBeUndefined();
+    expect(policy.diagnostic()).toEqual({ browser_proxy_policy: 'system', browser_proxy_setup: 'ready' });
     expect(setProxy).not.toHaveBeenCalled();
   });
 
@@ -41,14 +42,32 @@ describe('embedded browser launch proxy policy', () => {
     let applied!: () => void;
     const setProxy = vi.fn(() => new Promise<void>(resolve => { applied = resolve; }));
     const policy = prepareBrowserProxy({ setProxy }, { HTTP_PROXY: 'http://proxy.test' });
+    expect(policy.diagnostic()).toEqual({ browser_proxy_policy: 'fixed_servers', browser_proxy_setup: 'pending' });
     const released = vi.fn();
     void policy.ready!.then(released);
     await Promise.resolve();
     expect(released).not.toHaveBeenCalled();
     applied();
     expect(await policy.ready).toBe(true);
+    expect(policy.diagnostic()).toEqual({ browser_proxy_policy: 'fixed_servers', browser_proxy_setup: 'ready' });
     expect(released).toHaveBeenCalledWith(true);
     expect(warnings).not.toHaveBeenCalled();
+  });
+
+  it('preserves system IPv4/IPv6 CIDR exceptions and the mandatory loopback bypasses', async () => {
+    const ranges = ['10.0.0.0/8', '192.168.0.0/16', '172.16.0.0/12', '2001:db8::/32', '0.0.0.0/0', '2001:db8::1/128'];
+    const setProxy = vi.fn().mockResolvedValue(undefined);
+    const policy = prepareBrowserProxy({ setProxy }, { HTTP_PROXY: 'http://proxy.test:8080', NO_PROXY: ranges.join(',') });
+    expect(await policy.ready).toBe(true);
+    expect(setProxy.mock.calls[0][0].proxyBypassRules.split(',')).toEqual([...ranges, 'localhost', '.localhost', '127.0.0.1', '[::1]', 'local', '.local']);
+    expect(setProxy.mock.calls[0][0].proxyRules).toBe('http=http://proxy.test:8080;https=http://proxy.test:8080');
+    expect(warnings).not.toHaveBeenCalled();
+  });
+
+  it.each(['999.1.1.1/8', '10.0.0.0/33', '10.0.0.0/-1', '10.0.0.0/8.0', '2001:db8::/129', 'example.com/8', '10.0.0.0/8;*', '10.0.0.0/8:80'])('retains fail-closed admission for malformed CIDR %s', async range => {
+    const setProxy = vi.fn();
+    expect(await prepareBrowserProxy({ setProxy }, { HTTP_PROXY: 'http://proxy.test', NO_PROXY: range }).ready).toBe(false);
+    expect(setProxy).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -71,9 +90,11 @@ describe('embedded browser launch proxy policy', () => {
     vi.useFakeTimers();
     const rejected = prepareBrowserProxy({ setProxy: vi.fn().mockRejectedValue(new Error('private provider error')) }, { HTTP_PROXY: 'http://proxy.test' });
     expect(await rejected.ready).toBe(false);
+    expect(rejected.diagnostic()).toEqual({ browser_proxy_policy: 'fixed_servers', browser_proxy_setup: 'failed' });
     const stalled = prepareBrowserProxy({ setProxy: () => new Promise(() => {}) }, { HTTP_PROXY: 'http://proxy.test' });
     await vi.advanceTimersByTimeAsync(60_000);
     expect(await stalled.ready).toBe(false);
+    expect(stalled.diagnostic()).toEqual({ browser_proxy_policy: 'fixed_servers', browser_proxy_setup: 'failed' });
     expect(warnings.mock.calls).toEqual(Array(2).fill(['browser proxy setup failed; browser requests remain blocked']));
     expect(vi.getTimerCount()).toBe(0);
   });

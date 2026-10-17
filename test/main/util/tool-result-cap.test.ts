@@ -6,6 +6,7 @@ import type { AgentTool, ToolContext, ToolResult } from '#core-agent';
 import { MAX_PER_RESULT_INLINE_TOKENS, MAX_VERBATIM_DOCUMENT_INLINE_TOKENS } from '../../../src/core-agent/src/agent/context-budget';
 import {
   capToolResult,
+  withRetrievalBudget,
   ToolResultPersistenceError,
   DEFAULT_INLINE_RESULT_TOKENS,
   DEFAULT_LOCAL_TOOL_RESULTS_MAX_BYTES,
@@ -15,6 +16,7 @@ import {
   buildPersistedOutputMarkerFromPreview,
   buildStructureOutline,
   estimateToolResultTokens,
+  inlineResultTokenBudget,
   maybeSpillToolResult,
   persistToolResult,
   sweepToolResults,
@@ -72,6 +74,41 @@ describe('tool-result-cap configuration', () => {
     for (const text of fixtures) {
       expect(estimateToolResultTokens(text), JSON.stringify(text.slice(0, 24))).toBe(estimateTextTokens(text));
     }
+  });
+});
+
+describe('retrieval envelope receipt admission', () => {
+  it.each([0, 10, 300])('keeps ignored-field feedback inside a %i-token remaining budget', async budget => {
+    const dir = makeTmpDir();
+    try {
+      const ledger = { remainingTokens: budget, initialTokens: budget };
+      const reads = { epoch: 0, readKeys: new Set<string>() };
+      const ctx: ToolContext = { inputReceipt: { ignored_fields: ['future_option'] }, state: {
+        toolResultInlineLedger: ledger, toolResultReadLedger: reads,
+      } };
+      let executed = false;
+      const result = await withRetrievalBudget(ctx, async child => {
+        executed = true;
+        (child.state.toolResultReadLedger as typeof reads).readKeys.add('source:0');
+        return { content: '{"data":"source","next_cursor":6}' };
+      });
+      expect(estimateToolResultTokens(result.content)).toBeLessThanOrEqual(budget);
+      expect(ledger.remainingTokens).toBe(budget - estimateToolResultTokens(result.content));
+      expect(result.appliedInputReceipt).toBe(ctx.inputReceipt);
+      const remaining = ledger.remainingTokens;
+      expect(capToolResult('retrieval', result, ctx, { maxInlineTokens: 10_000, toolResultsDir: dir })).toBe(result);
+      expect(ledger.remainingTokens).toBe(remaining);
+      expect(fs.readdirSync(dir)).toEqual([]);
+      if (budget === 300) {
+        expect(executed).toBe(true);
+        expect(JSON.parse(result.content)).toEqual({ data: 'source', next_cursor: 6, ignored_fields: ['future_option'] });
+        expect(reads.readKeys.has('source:0')).toBe(true);
+      } else {
+        expect(executed).toBe(false);
+        expect(result.isError).toBe(true);
+        expect(reads.readKeys.size).toBe(0);
+      }
+    } finally { cleanup(dir); }
   });
 });
 
@@ -832,5 +869,32 @@ describe('sweepToolResults', () => {
     expect(fs.existsSync(middle)).toBe(true);
     expect(fs.existsSync(newest)).toBe(true);
     expect(stats).toMatchObject({ removedStale: 0, removedForQuota: 1, retainedBytes: 24 });
+  });
+});
+
+// Producers that size their own output (read_files pages, task browser
+// observations) share one rule, so every result fits the allowance the cap
+// will apply instead of spilling to a preview.
+describe('inline result token budget', () => {
+  const ledger = (value: Record<string, number>) => ({
+    [TOOL_RESULT_INLINE_LEDGER_STATE_KEY]: { initialTokens: 50_000, ...value },
+  });
+
+  it('takes the smallest of the fixed ceiling, the runner ceiling and what the round has left', () => {
+    expect(inlineResultTokenBudget(undefined)).toBe(DEFAULT_INLINE_RESULT_TOKENS);
+    expect(inlineResultTokenBudget({})).toBe(DEFAULT_INLINE_RESULT_TOKENS);
+    expect(inlineResultTokenBudget(ledger({ remainingTokens: 50_000 }))).toBe(DEFAULT_INLINE_RESULT_TOKENS);
+    expect(inlineResultTokenBudget(ledger({ remainingTokens: 50_000, perResultTokens: 6_000 }))).toBe(6_000);
+    expect(inlineResultTokenBudget(ledger({ remainingTokens: 2_500.7, perResultTokens: 10_000 }))).toBe(2_500);
+    expect(inlineResultTokenBudget(ledger({ remainingTokens: -40 }))).toBe(0);
+  });
+
+  it('gives a document read whole its own ceiling, still bounded by the round', () => {
+    expect(inlineResultTokenBudget(ledger({
+      remainingTokens: 50_000, perResultTokens: 6_000, verbatimDocumentTokens: 25_000,
+    }), true)).toBe(25_000);
+    expect(inlineResultTokenBudget(ledger({
+      remainingTokens: 4_000, perResultTokens: 6_000, verbatimDocumentTokens: 25_000,
+    }), true)).toBe(4_000);
   });
 });

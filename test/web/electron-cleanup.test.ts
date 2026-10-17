@@ -9,6 +9,7 @@ import { closeElectronFixture, requestElectronQuit } from '../e2e/fixtures/elect
 it('defers graceful quit outside evaluation and waits for the real close event', async () => {
   const app = new EventEmitter() as any;
   app.windows = () => [{}];
+  app.close = vi.fn(async () => {});
   let evaluating = false;
   let requested = false;
   let finished = false;
@@ -35,9 +36,32 @@ it('preserves quit request errors and removes the close observer', async () => {
   expect(app.listenerCount('close')).toBe(0);
 });
 
+it('releases the inspector after deferred quit so the real application can exit', async () => {
+  const app = new EventEmitter() as any;
+  app.windows = () => [{}];
+  let quit!: () => void;
+  const quitting = new Promise<void>(resolve => { quit = resolve; });
+  app.evaluate = async (callback: any) => { callback({ app: { quit } }); };
+  app.close = vi.fn(async () => { await quitting; app.emit('close'); });
+  await requestElectronQuit(app);
+  expect(app.close).toHaveBeenCalledTimes(1);
+  expect(app.listenerCount('close')).toBe(0);
+});
+
+it('preserves inspector detach failures instead of reporting graceful shutdown', async () => {
+  const app = new EventEmitter() as any;
+  const failure = new Error('inspector detach failed');
+  app.windows = () => [{}];
+  app.evaluate = async (callback: any) => { callback({ app: { quit: () => {} } }); };
+  app.close = async () => { throw failure; };
+  await expect(requestElectronQuit(app)).rejects.toBe(failure);
+  expect(app.listenerCount('close')).toBe(0);
+});
+
 it('waits for real close when quitting destroys the inspector before the close event', async () => {
   const app = new EventEmitter() as any;
   app.windows = () => [{}];
+  app.close = vi.fn(async () => {});
   app.evaluate = async () => { throw new Error('electronApplication.evaluate: Execution context was destroyed, most likely because of a navigation.'); };
   let finished = false;
   const completion = requestElectronQuit(app).then(() => { finished = true; });
@@ -58,9 +82,11 @@ it.skipIf(process.platform === 'darwin')('waits for natural shutdown after the f
   child.signalCode = null;
   app.windows = () => [];
   app.process = () => child;
+  app.close = vi.fn(async () => {});
   app.evaluate = vi.fn();
   const completion = requestElectronQuit(app);
   expect(app.evaluate).not.toHaveBeenCalled();
+  expect(app.close).toHaveBeenCalledTimes(1);
   child.exitCode = 0;
   child.emit('exit', 0);
   await expect(completion).resolves.toBeUndefined();
@@ -128,7 +154,7 @@ function createCleanupOwner(app: any) {
     ts.isClassDeclaration(node) && node.name?.text === 'OrkasTestApp');
   if (!owner) throw new Error('Missing fixture owner');
   const members = owner.members.filter(member =>
-    member.name && ['closeCurrentApp', 'appClosePromises'].includes(member.name.getText(file)));
+    member.name && ['closeCurrentApp', 'appClosePromises', 'appTraceStops', 'stopAppTrace', 'prepareForNativeShutdown'].includes(member.name.getText(file)));
   const code = ts.transpileModule(`class CleanupOwner { ${members.map(m => m.getText(file)).join('\n')} }`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022 },
   }).outputText;
@@ -145,6 +171,7 @@ function controlledCleanupApp(closeError?: Error) {
   const tracingGate = new Promise<void>(resolve => { release = resolve; });
   const app = new EventEmitter() as any;
   app.windows = () => [{}];
+  app.close = vi.fn(async () => {});
   app.process = () => ({ exitCode: 0, signalCode: null });
   const stop = vi.fn(() => tracingGate);
   app.context = () => ({ tracing: { stop } });
@@ -167,6 +194,19 @@ it('shares one trace and graceful shutdown when relaunch and teardown overlap', 
   expect(owner.tracePaths).toEqual(['trace-1.zip']);
   expect(owner.electronApp).toBeNull();
   expect(owner.page).toBeNull();
+});
+
+it('exports tracing before native shutdown and reuses that export during teardown', async () => {
+  const { app, stop, release } = controlledCleanupApp();
+  const owner = createCleanupOwner(app);
+  release();
+  await owner.prepareForNativeShutdown();
+  expect(stop).toHaveBeenCalledTimes(1);
+  app.context = () => { throw new Error('Native shutdown disposed the browser context'); };
+  await owner.closeCurrentApp();
+  expect(stop).toHaveBeenCalledTimes(1);
+  expect(owner.tracePaths).toEqual(['trace-1.zip']);
+  expect(app.evaluate).toHaveBeenCalledTimes(1);
 });
 
 it('delivers the same cleanup failure and original cause to both overlapping callers', async () => {

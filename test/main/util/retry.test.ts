@@ -38,6 +38,29 @@ describe('retryAsync', () => {
 });
 
 describe('fetchWithRetry', () => {
+  it.each(['request', 'options'])('cancels the %s signal during HTTP backoff without another attempt', async source => {
+    vi.useFakeTimers();
+    const controller = new AbortController();
+    const fetchMock = vi.fn().mockImplementation(async () => new Response('busy', { status: 503 }));
+    vi.stubGlobal('fetch', fetchMock);
+    let failure: Error | undefined;
+    const work = fetchWithRetry('test:http-cancel', 'https://example.test/api',
+      source === 'request' ? { signal: controller.signal } : undefined,
+      { retries: 2, delaysMs: [10_000], ...(source === 'options' ? { signal: controller.signal } : {}) })
+      .catch(error => { failure = error; });
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      controller.abort(new Error('user cancelled request'));
+      await vi.advanceTimersByTimeAsync(1);
+      expect(failure?.message).toBe('user cancelled request');
+      expect(fetchMock).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      await vi.advanceTimersByTimeAsync(30_000);
+      await work;
+    }
+  });
+
   it('retries retriable HTTP status responses', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(new Response('busy', { status: 503 }))

@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { expectTestLog } from '../../helpers/test-log-analysis';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -104,6 +105,9 @@ describe('add a user-selected local file to conversation attachments', () => {
     ['txt', 'text'], ['pdf', 'pdf'], ['docx', 'docx'], ['xlsx', 'spreadsheet'],
     ['pptx', 'presentation'], ['zip', 'archive'], ['mp4', 'video'],
   ])('copies an unrecorded external %s file and reuses its pending attachment on repeat', async (ext, kind) => {
+    // The two rejected reads/deletes of the original path are asserted below.
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke produced\.readText failed \{ error: 'path is outside the user workspace'/ });
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke workspace\.deletePath failed \{ error: 'path/ });
     const fixtures: Record<string, Buffer> = {
       pdf: makeMinimalPdf(['Selected document']), docx: makeMinimalDocx({ paragraphs: ['Selected document'] }),
       xlsx: makeMinimalXlsx(), pptx: makeMinimalPptx(),
@@ -263,6 +267,8 @@ describe('manual attachment import boundaries', () => {
     ['conversations.attachments.import', { cid: CID }],
     ['autoTasks.attachments.import', { taskId: 'at_12345678' }],
   ])('rejects invalid paths and untrusted senders for %s without copying files', async (channel, target) => {
+    // Each invalid path is asserted to resolve { ok: false } below.
+    expectTestLog({ level: 'error', source: 'ipc', message: new RegExp(`^invoke ${channel.replace(/\./g, '\\.')} failed \\{`) });
     const abs = sourceFile('note.md', '# note\n');
     for (const invalidPath of ['', 'desktop/note.md', abs + '\0']) {
       await expect(invoke(channel, { ...target, path: invalidPath })).resolves.toMatchObject({ ok: false });
@@ -275,6 +281,9 @@ describe('manual attachment import boundaries', () => {
   });
 
   it('reports missing and unsupported scheduled-task selections and allows a corrected retry', async () => {
+    // Both rejections are asserted with their error before the corrected retry.
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke autoTasks\.attachments\.import failed \{ error: 'file not found'/ });
+    expectTestLog({ level: 'error', source: 'ipc', message: /^invoke autoTasks\.attachments\.import failed \{ error: 'unsupported/ });
     const taskId = 'at_12345678';
     const abs = sourceFile('brief.txt', 'restored source', 'downloads');
     const unsupported = sourceFile('program.exe', 'unsupported');

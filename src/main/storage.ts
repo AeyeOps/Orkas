@@ -119,7 +119,8 @@ async function renameWithRetryUsing(
   }
 }
 
-function renameWithRetry(tmp: string, filePath: string, shouldCommit?: () => boolean): Promise<boolean> {
+/** Async rename using the atomic writers' bounded Windows file-lock retries. */
+export function renameWithRetry(tmp: string, filePath: string, shouldCommit?: () => boolean): Promise<boolean> {
   // A guarded publication must not yield between the ownership check and
   // rename. Retry delays stay asynchronous so file locks do not block main.
   return renameWithRetryUsing(tmp, filePath, shouldCommit ? fs.renameSync : fsp.rename, shouldCommit);
@@ -129,11 +130,13 @@ function renameWithRetrySyncUsing(
   tmp: string,
   filePath: string,
   renameFn: (oldPath: string, newPath: string) => void,
-): void {
+  shouldCommit?: () => boolean,
+): boolean {
   for (let attempt = 0; ; attempt++) {
+    if (shouldCommit && !shouldCommit()) return false;
     try {
       renameFn(tmp, filePath);
-      return;
+      return true;
     } catch (err) {
       if (!isRetryableRenameError(err) || attempt >= RENAME_RETRY_DELAYS_MS.length) throw err;
       sleepSync(RENAME_RETRY_DELAYS_MS[attempt]);
@@ -141,9 +144,25 @@ function renameWithRetrySyncUsing(
   }
 }
 
-/** Rename with retry on Windows AV/backup-tool lock errors. */
+/** Guarded small-text publication. Check and rename share one main-process
+ * critical section, including Windows retries; no event-loop yield between them. */
+export function writeTextAtomicGuardedSync(filePath: string, text: string, shouldCommit: () => boolean): boolean {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tmp = atomicTmpPath(filePath);
+  try {
+    fs.writeFileSync(tmp, text, 'utf8');
+    return renameWithRetrySyncUsing(tmp, filePath, fs.renameSync, shouldCommit);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
+}
+
+/** Rename with retry on Windows AV/backup-tool lock errors (EPERM/EACCES/
+ *  EBUSY). Exported for writers that hand-roll tmp+rename with a non-default
+ *  serialization (e.g. sync's compact-JSON index files) — everything else
+ *  should use writeJson/writeJsonSync/writeTextAtomicSync directly. */
 export function renameWithRetrySync(tmp: string, filePath: string): void {
-  return renameWithRetrySyncUsing(tmp, filePath, fs.renameSync);
+  renameWithRetrySyncUsing(tmp, filePath, fs.renameSync);
 }
 
 export const __storageTestHooks = {
@@ -208,8 +227,9 @@ export function writeTextAtomicSync(
   const tmp = atomicTmpPath(filePath);
   // Mode is applied to the tmp file; rename carries it onto the target — used
   // by secret-bearing writers (connectors.json, auth profiles) that need 0600.
-  fs.writeFileSync(tmp, text, { encoding, ...(opts && opts.mode !== undefined ? { mode: opts.mode } : {}) });
   try {
+    // A failed (e.g. disk-full) write must not leave a partial sibling behind.
+    fs.writeFileSync(tmp, text, { encoding, ...(opts && opts.mode !== undefined ? { mode: opts.mode } : {}) });
     renameWithRetrySync(tmp, filePath);
   } catch (err) {
     try { fs.rmSync(tmp, { force: true }); } catch {}
@@ -524,68 +544,132 @@ export async function readJsonlWindow<T = Record<string, any>>(
   projectRecord?: (record: T) => T,
   after = 0,
 ): Promise<JsonlWindow<T>> {
-  const first = Math.max(0, Math.floor(Number(startIndex) || 0));
-  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
   let handle: fs.promises.FileHandle;
   try {
     handle = await fsp.open(filePath, 'r');
   } catch {
     return { records: [], previousCursor: null, followingCursor: null };
   }
+  try {
+    return await _readJsonlWindowFrom(handle, (await handle.stat()).size, startIndex, limit, projectRecord, after);
+  } finally {
+    await handle.close();
+  }
+}
 
+/** Hand each newline-delimited line from `position` to `consume` with its
+ * byte start until it returns true. Lines are assembled from whole chunks
+ * before decoding, so UTF-8 split across reads stays intact. Returns the byte
+ * offset after the last consumed line (`size` after a final unterminated one). */
+async function _scanJsonlLines(
+  handle: fs.promises.FileHandle,
+  size: number,
+  position: number,
+  consume: (line: Buffer, lineStart: number) => boolean,
+): Promise<number> {
+  let lineSegments: Buffer[] = [];
+  let currentRecordStart = position;
+  let done = false;
+  while (position < size && !done) {
+    const bytes = Math.min(JSONL_TAIL_CHUNK_BYTES, size - position);
+    const block = Buffer.allocUnsafe(bytes);
+    const { bytesRead } = await handle.read(block, 0, bytes, position);
+    if (bytesRead <= 0) break;
+    let lineStart = 0;
+    for (let i = block.indexOf(0x0a); i >= 0 && i < bytesRead; i = block.indexOf(0x0a, i + 1)) {
+      const current = block.subarray(lineStart, i);
+      const line = lineSegments.length
+        ? _concatJsonlSegments([...lineSegments, current])
+        : current;
+      done = consume(line, currentRecordStart);
+      lineSegments = [];
+      lineStart = i + 1;
+      currentRecordStart = position + lineStart;
+      if (done) break;
+    }
+    position += bytesRead;
+    if (!done && lineStart < bytesRead) lineSegments.push(block.subarray(lineStart, bytesRead));
+  }
+  if (!done && lineSegments.length) {
+    consume(_concatJsonlSegments(lineSegments), currentRecordStart);
+    currentRecordStart = size;
+  }
+  return currentRecordStart;
+}
+
+async function _readJsonlWindowFrom<T>(
+  handle: fs.promises.FileHandle,
+  size: number,
+  startIndex: number,
+  limit: number,
+  projectRecord: ((record: T) => T) | undefined,
+  after: number,
+): Promise<JsonlWindow<T>> {
+  const first = Math.max(0, Math.floor(Number(startIndex) || 0));
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  const records: T[] = [];
+  let recordIndex = 0;
+  let firstRecordStart = -1;
+  const position = Number.isSafeInteger(after) && after >= 0 ? Math.min(after, size) : 0;
+  const end = await _scanJsonlLines(handle, size, position, (line, recordStart) => {
+    const record = _parseJsonlRecord<T>(line.toString('utf8'));
+    if (record === undefined) return false;
+    if (recordIndex >= first && records.length < wanted) {
+      if (firstRecordStart < 0) firstRecordStart = recordStart;
+      // Project on consumption so a long search window retains only the
+      // display payload, never every raw execution trail at once.
+      records.push(projectRecord ? projectRecord(record) : record);
+    }
+    recordIndex += 1;
+    return records.length >= wanted;
+  });
+  return {
+    records,
+    previousCursor: firstRecordStart > 0 ? firstRecordStart : null,
+    followingCursor: end < size ? end : null,
+  };
+}
+
+/**
+ * Read the `limit`-aligned record page (the same page readJsonlWindow returns
+ * for `floor(index / limit) * limit`) holding the first record `matches`
+ * accepts. One forward pass parses records up to the match and keeps only
+ * the page start; the page itself is then read and projected from that byte
+ * offset on the same handle. Null when no record matches.
+ */
+export async function readJsonlWindowAtMatch<T = Record<string, any>>(
+  filePath: string,
+  matches: (record: T) => boolean,
+  limit = 10,
+  projectRecord?: (record: T) => T,
+): Promise<(JsonlWindow<T> & { start: number; index: number }) | null> {
+  const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  let handle: fs.promises.FileHandle;
+  try {
+    handle = await fsp.open(filePath, 'r');
+  } catch {
+    return null;
+  }
   try {
     const size = (await handle.stat()).size;
-    const records: T[] = [];
     let recordIndex = 0;
-    let position = Number.isSafeInteger(after) && after >= 0 ? Math.min(after, size) : 0;
-    let lineSegments: Buffer[] = [];
-    let currentRecordStart = position;
-    let firstRecordStart = -1;
-    let done = false;
-
-    const consumeLine = (line: Buffer, recordStart: number): boolean => {
+    let index = -1;
+    let pageStart = 0;
+    let pageStartByte = 0;
+    await _scanJsonlLines(handle, size, 0, (line, recordStart) => {
       const record = _parseJsonlRecord<T>(line.toString('utf8'));
       if (record === undefined) return false;
-      if (recordIndex >= first && records.length < wanted) {
-        if (firstRecordStart < 0) firstRecordStart = recordStart;
-        // Project on consumption so a long search window retains only the
-        // display payload, never every raw execution trail at once.
-        records.push(projectRecord ? projectRecord(record) : record);
+      if (recordIndex % wanted === 0) {
+        pageStart = recordIndex;
+        pageStartByte = recordStart;
       }
+      if (matches(record)) index = recordIndex;
       recordIndex += 1;
-      return records.length >= wanted;
-    };
-
-    while (position < size && !done) {
-      const bytes = Math.min(JSONL_TAIL_CHUNK_BYTES, size - position);
-      const block = Buffer.allocUnsafe(bytes);
-      const { bytesRead } = await handle.read(block, 0, bytes, position);
-      if (bytesRead <= 0) break;
-      let lineStart = 0;
-      for (let i = block.indexOf(0x0a); i >= 0 && i < bytesRead; i = block.indexOf(0x0a, i + 1)) {
-        const current = block.subarray(lineStart, i);
-        const line = lineSegments.length
-          ? _concatJsonlSegments([...lineSegments, current])
-          : current;
-        done = consumeLine(line, currentRecordStart);
-        lineSegments = [];
-        lineStart = i + 1;
-        currentRecordStart = position + lineStart;
-        if (done) break;
-      }
-      position += bytesRead;
-      if (!done && lineStart < bytesRead) lineSegments.push(block.subarray(lineStart, bytesRead));
-    }
-    if (!done && lineSegments.length) {
-      consumeLine(_concatJsonlSegments(lineSegments), currentRecordStart);
-      currentRecordStart = size;
-    }
-
-    return {
-      records,
-      previousCursor: firstRecordStart > 0 ? firstRecordStart : null,
-      followingCursor: currentRecordStart < size ? currentRecordStart : null,
-    };
+      return index >= 0;
+    });
+    if (index < 0) return null;
+    const window = await _readJsonlWindowFrom(handle, size, 0, wanted, projectRecord, pageStartByte);
+    return { ...window, start: pageStart, index };
   } finally {
     await handle.close();
   }

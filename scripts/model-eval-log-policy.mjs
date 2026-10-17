@@ -5,12 +5,18 @@ const RUNTIME_LOG_RE = /^\[\d{2}:\d{2}:\d{2}\.\d{3}\]\s+\[(debug|info|warn|error
 const CASE_MARKER_RE = /^\[model-eval-case\]\s+(start|end)\s+(.+)$/;
 const CASE_LOG_RE = /^\[model-eval-case-log ([A-Za-z0-9_./:-]{1,240})\] (.*)$/;
 const REPORT_RE = /^report=(.+)$/;
-const ELECTRON_MACOS_TASK_POLICY_WARNING_RE = /^\[\d+:\d{4}\/\d{6}\.\d+:ERROR:base\/process\/process_mac\.cc:\d+\]\s+task_policy_set\s+TASK_(?:CATEGORY|SUPPRESSION)_POLICY:\s+\(os\/kern\)\s+invalid argument\s+\(4\)$/;
+export const ELECTRON_MACOS_TASK_POLICY_WARNING_RE = /^\[\d+:\d{4}\/\d{6}\.\d+:ERROR:base\/process\/process_mac\.cc:\d+\]\s+task_policy_set\s+TASK_(?:CATEGORY|SUPPRESSION)_POLICY:\s+\(os\/kern\)\s+invalid argument\s+\(4\)$/;
+const ELECTRON_MACOS_SPELLCHECKER_WARNING_RE = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ Electron\[\d+:\d+\] NSSpellServer dataFromCheckingString (?:timed out|succeeded), index is \d+$/;
 /** The one runtime warning whose message can span several lines: AgentRunner
  *  splices a slice of the failed tool's result, newlines included. */
 const TOOL_ERROR_PAYLOAD_RE = /\bTool\s+\S+\s+returned error:/i;
 
 const STDERR_CONTEXT_CONTINUATION_RE = /^(?:\s+|\[\d+\]\s|[}\]]|\(Use\s|<\/?[a-z][\w:.-]*(?:\s[^>]*)?>?\s*$)/i;
+
+/** A partial line held per stream until its newline arrives. A child printing
+ * one unbounded line must not grow the coordinator; the remainder is counted
+ * as a captured but never analyzed line so the coverage gate fails. */
+const MAX_PARTIAL_LINE_CHARS = 8 * 1024 * 1024;
 
 /** Exact progress records emitted by bin/ensure-runtime.cjs, not evidence that
  * dependency preparation succeeded; the launcher still checks its exit status. */
@@ -49,6 +55,8 @@ function findingDetail(code) {
       return "the Electron model-evaluation runner was terminated by an operating-system signal";
     case "electron-macos-task-policy-warning":
       return "Chromium could not apply a non-critical macOS task policy to a child process";
+    case "electron-macos-spellchecker-warning":
+      return "the macOS spellchecking service reported a timeout or recovery requiring review";
     case "unclassified-stderr":
       return "unclassified stderr is treated as a process error until explicitly classified";
     case "log-coverage-gap":
@@ -88,10 +96,15 @@ function aggregateFindings(findings) {
   ));
 }
 
-export function createModelEvalLogCollector(phase) {
+/** `onFinding(finding, line)` lets a caller keep its own bounded, redacted
+ * signature of the analyzed line; the collector itself never retains text. */
+export function createModelEvalLogCollector(phase, { maxLineChars = MAX_PARTIAL_LINE_CHARS, onFinding } = {}) {
   const state = {
     phase,
     buffers: { stdout: "", stderr: "" },
+    overflow: { stdout: false, stderr: false },
+    droppedBytes: 0,
+    droppedLineCount: 0,
     capturedBytes: 0,
     capturedLineCount: 0,
     analyzedLineCount: 0,
@@ -113,9 +126,10 @@ export function createModelEvalLogCollector(phase) {
   const contexts = new Map();
   let context = state;
   let attribution = {};
+  let currentLine;
 
   const addFinding = (severity, code, source) => {
-    state.findings.push({
+    const finding = {
       severity,
       code,
       count: 1,
@@ -123,7 +137,9 @@ export function createModelEvalLogCollector(phase) {
       ...(source ? { source } : {}),
       ...attribution,
       detail: findingDetail(code),
-    });
+    };
+    state.findings.push(finding);
+    onFinding?.(finding, currentLine);
   };
 
   const analyzeLine = (stream, rawLine) => {
@@ -138,6 +154,7 @@ export function createModelEvalLogCollector(phase) {
       : key ? { caseKey: key, attribution: 'legacy-marker' }
       : state.activeCases.size > 1 ? { attribution: 'ambiguous' } : {};
     if (framed) line = framed[2];
+    currentLine = line;
     // Continuation windows belong to one case and stream, not whichever case
     // happened to emit the previous process-wide warning.
     const contextKey = `${stream}:${key ?? '<unattributed>'}`;
@@ -168,9 +185,15 @@ export function createModelEvalLogCollector(phase) {
     if (runtime) {
       context.nodeToolPayloadRemaining = 0;
       context.nodeToolDiagnostic = false;
-      const level = runtime[1].toLowerCase();
+      let level = runtime[1].toLowerCase();
       const source = runtime[2].trim() || "unknown";
       const message = runtime[3];
+      // Electron's console bridge labels Node's process-warning protocol as
+      // error. Preserve its warning classification without excusing ordinary
+      // application errors that merely mention deprecation.
+      const nodeDeprecation = level === "error" && source === "console"
+        && /^\(node:\d+\) \[DEP\d{4}\] DeprecationWarning: /.test(message);
+      if (nodeDeprecation) level = "warn";
       state.classificationCounts.runtime += 1;
       state.levelCounts[level] += 1;
       state.sourceCounts[source] = (state.sourceCounts[source] || 0) + 1;
@@ -179,7 +202,8 @@ export function createModelEvalLogCollector(phase) {
       } else if (level === "warn") {
         addFinding(
           "warning",
-          /tool definition description exceeds soft budget/i.test(message)
+          nodeDeprecation ? "node-deprecation-warning"
+            : /tool definition description exceeds soft budget/i.test(message)
             ? "tool-definition-soft-budget"
             : "runtime-warning",
           source,
@@ -289,6 +313,14 @@ export function createModelEvalLogCollector(phase) {
         addFinding("warning", "electron-macos-task-policy-warning", "electron");
         return;
       }
+      if (ELECTRON_MACOS_SPELLCHECKER_WARNING_RE.test(line)) {
+        state.classificationCounts.processWarning += 1;
+        state.levelCounts.warn += 1;
+        context.stderrContext = undefined;
+        context.stderrPayload = false;
+        addFinding("warning", "electron-macos-spellchecker-warning", "electron");
+        return;
+      }
       if (/model-eval Electron runner failed|failed to start .*runner/i.test(line)) {
         state.classificationCounts.processError += 1;
         state.levelCounts.error += 1;
@@ -325,18 +357,39 @@ export function createModelEvalLogCollector(phase) {
     state.classificationCounts.other += 1;
   };
 
+  // The end of a line that exceeded the cap: captured, never analyzed.
+  const countDroppedLine = (stream) => {
+    state.overflow[stream] = false;
+    state.capturedLineCount += 1;
+    state.streamLineCounts[stream] += 1;
+    state.droppedLineCount += 1;
+  };
+
   const ingest = (stream, chunk) => {
     const text = Buffer.isBuffer(chunk) ? chunk.toString("utf8") : String(chunk);
     state.capturedBytes += Buffer.byteLength(text, "utf8");
     state.buffers[stream] += text;
     const lines = state.buffers[stream].split("\n");
     state.buffers[stream] = lines.pop() || "";
-    for (const line of lines) analyzeLine(stream, line);
+    for (const line of lines) {
+      if (state.overflow[stream]) {
+        state.droppedBytes += Buffer.byteLength(line, "utf8");
+        countDroppedLine(stream);
+        continue;
+      }
+      analyzeLine(stream, line);
+    }
+    if (state.overflow[stream] || state.buffers[stream].length > maxLineChars) {
+      state.droppedBytes += Buffer.byteLength(state.buffers[stream], "utf8");
+      state.buffers[stream] = "";
+      state.overflow[stream] = true;
+    }
   };
 
   const finish = () => {
     for (const stream of ["stdout", "stderr"]) {
-      if (state.buffers[stream].length) analyzeLine(stream, state.buffers[stream]);
+      if (state.overflow[stream]) countDroppedLine(stream);
+      else if (state.buffers[stream].length) analyzeLine(stream, state.buffers[stream]);
       state.buffers[stream] = "";
     }
     const coveragePassed = state.capturedLineCount === state.analyzedLineCount;
@@ -359,6 +412,8 @@ export function createModelEvalLogCollector(phase) {
       capturedBytes: state.capturedBytes,
       capturedLineCount: state.capturedLineCount,
       analyzedLineCount: state.analyzedLineCount,
+      droppedLineCount: state.droppedLineCount,
+      droppedBytes: state.droppedBytes,
       blankLineCount: state.blankLineCount,
       classificationCounts: { ...state.classificationCounts },
       levelCounts: { ...state.levelCounts },
@@ -369,7 +424,7 @@ export function createModelEvalLogCollector(phase) {
     };
   };
 
-  return { ingest, finish, addFinding: (...args) => { attribution = {}; addFinding(...args); } };
+  return { ingest, finish, addFinding: (...args) => { attribution = {}; currentLine = undefined; addFinding(...args); } };
 }
 
 export function mergeModelEvalLogAnalyses(analyses) {
@@ -393,6 +448,8 @@ export function mergeModelEvalLogAnalyses(analyses) {
     capturedBytes: analyses.reduce((sum, item) => sum + item.capturedBytes, 0),
     capturedLineCount,
     analyzedLineCount,
+    droppedLineCount: analyses.reduce((sum, item) => sum + Number(item.droppedLineCount || 0), 0),
+    droppedBytes: analyses.reduce((sum, item) => sum + Number(item.droppedBytes || 0), 0),
     blankLineCount: analyses.reduce((sum, item) => sum + item.blankLineCount, 0),
     classificationCounts: sumObject("classificationCounts"),
     levelCounts: sumObject("levelCounts"),

@@ -1,5 +1,38 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** Keep deterministic evaluator fixtures on the same project interpreter as
+ *  the test suite, including direct npm test invocations. Explicit evaluator
+ *  overrides remain independent of the ordinary Python suite. */
+export function withTestPython(env, repoRoot = fileURLToPath(new URL('../../', import.meta.url)), platform = process.platform) {
+  const result = { ...env };
+  const localPython = platform === 'win32'
+    ? path.join(repoRoot, 'venv', 'Scripts', 'python.exe')
+    : path.join(repoRoot, 'venv', 'bin', 'python');
+  const python = result.ORKAS_TEST_PYTHON || (fs.existsSync(localPython) ? localPython : '');
+  if (python) {
+    result.ORKAS_TEST_PYTHON = python;
+    if (!result.ORKAS_EVAL_PYTHON) result.ORKAS_EVAL_PYTHON = python;
+  }
+  return result;
+}
+
+/** PowerShell 5.1 cannot import PowerShell 7's core modules. Native Windows
+ * lanes may be launched by pwsh, so restore the installed system module root
+ * ahead of inherited user/Core paths without changing the caller environment. */
+export function withWindowsPowerShellModules(env, platform = process.platform) {
+  const result = { ...env };
+  if (platform !== 'win32') return result;
+  const systemRoot = result.SystemRoot || result.WINDIR;
+  if (!systemRoot) return result;
+  const modules = path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules');
+  if (!fs.existsSync(modules)) return result;
+  const key = Object.keys(result).find(name => name.toLowerCase() === 'psmodulepath') || 'PSModulePath';
+  const inherited = String(result[key] || '').split(';').filter(Boolean);
+  result[key] = [modules, ...inherited.filter(entry => path.resolve(entry).toLowerCase() !== path.resolve(modules).toLowerCase())].join(';');
+  return result;
+}
 
 function environmentPathKey(env) {
   return Object.keys(env).find((key) => key.toLowerCase() === 'path') || 'PATH';

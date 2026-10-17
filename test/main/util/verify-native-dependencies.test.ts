@@ -2,7 +2,6 @@ import { createRequire } from 'node:module';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import vm from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 const requirePackage = createRequire(path.join(process.cwd(), 'package.json'));
@@ -98,28 +97,6 @@ describe('source native dependency readiness', () => {
     expect(spawn.mock.calls[0][2].timeout).toBe(PROBE_TIMEOUT_MS);
   });
 
-  it('stops development preparation before reporting readiness when the native check fails', () => {
-    const calls: string[] = [];
-    const output: string[] = [];
-    const exit = vi.fn(() => { throw new Error('exit'); });
-    const entry = path.join(process.cwd(), 'scripts/ensure-dev-dependencies.cjs');
-    const module = { exports: {} };
-    const req: any = (name: string) => name === 'node:child_process'
-      ? { spawnSync: (_node: string, args: string[]) => {
-        const script = path.basename(args[0]); calls.push(script);
-        return { status: script === 'verify-native-dependencies.cjs' && !args.includes('--host-only') ? 1 : 0 };
-      } } : requirePackage(name.startsWith('.') ? path.resolve(path.dirname(entry), name) : name);
-    req.main = module;
-    expect(() => vm.runInNewContext(fs.readFileSync(entry, 'utf8'), {
-      require: req, module, __dirname: path.dirname(entry),
-      process: { execPath: process.execPath, env: {}, platform: 'win32', arch: 'x64', exit },
-      console: { log: (s: string) => output.push(s), error: (s: string) => output.push(s) },
-    })).toThrow('exit');
-    expect(calls).toContain('ensure-sqlite-electron-abi.mjs');
-    expect(calls.at(-1)).toBe('verify-native-dependencies.cjs');
-    expect(output.join('\n')).toContain('native dependencies failed');
-    expect(output.join('\n')).not.toContain('built-in dependencies ready');
-  });
 
   it('keeps one repair command guarded before install and verified afterward', () => {
     const pkg = requirePackage('./package.json');

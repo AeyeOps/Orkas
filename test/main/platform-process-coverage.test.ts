@@ -38,6 +38,10 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
     suite: 'test/main/features/local_agents/base.test.ts',
     evidence: 'killProcessTree',
   },
+  'src/main/features/local_agents/upgrade.ts': {
+    suite: 'test/main/features/local_agents/upgrade.test.ts',
+    evidence: 'runUpgradeCommand',
+  },
   'src/main/features/local_agents/version.ts': {
     suite: 'test/main/features/local_agents/version.test.ts',
     evidence: 'detectVersion',
@@ -61,6 +65,10 @@ const PROCESS_OWNER_SUITE: Record<string, ProcessOwner> = {
   'src/main/features/video_studio.ts': {
     suite: 'test/main/features/video_studio_native_qa.test.ts',
     evidence: 'runVideoProcessForTest',
+  },
+  'src/main/features/web_assist_passkey.ts': {
+    suite: 'test/main/features/web_assist_passkey.test.ts',
+    evidence: 'attachWebAssistPasskeys',
   },
   'src/main/model/core-agent/interactive-cli-sessions.ts': {
     suite: 'test/main/model/local-tools.test.ts',

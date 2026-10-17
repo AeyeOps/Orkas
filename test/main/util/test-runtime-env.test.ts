@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { withWindowsGitOnPath } from '../../../scripts/test-runtime-env.mjs';
+import { withTestPython, withWindowsGitOnPath, withWindowsPowerShellModules } from '../../../scripts/test-runtime-env.mjs';
 
 const temporaryRoots: string[] = [];
 
@@ -21,6 +21,46 @@ function temporaryRoot(): string {
 }
 
 describe('test runtime environment', () => {
+  it.each(['win32', 'darwin', 'linux'])('uses the repository virtual environment for %s fixture subprocesses', platform => {
+    const root = temporaryRoot();
+    const python = platform === 'win32'
+      ? path.join(root, 'venv', 'Scripts', 'python.exe')
+      : path.join(root, 'venv', 'bin', 'python');
+    fs.mkdirSync(path.dirname(python), { recursive: true });
+    fs.writeFileSync(python, '');
+    const caller = { PATH: 'unchanged' };
+    expect(withTestPython(caller, root, platform)).toEqual({
+      PATH: 'unchanged', ORKAS_TEST_PYTHON: python, ORKAS_EVAL_PYTHON: python,
+    });
+    expect(caller).toEqual({ PATH: 'unchanged' });
+  });
+
+  it('preserves explicit interpreter choices and leaves absent runtimes unresolved', () => {
+    const root = temporaryRoot();
+    expect(withTestPython({ ORKAS_TEST_PYTHON: 'project-python' }, root)).toEqual({
+      ORKAS_TEST_PYTHON: 'project-python', ORKAS_EVAL_PYTHON: 'project-python',
+    });
+    const explicit = { ORKAS_TEST_PYTHON: 'project-python', ORKAS_EVAL_PYTHON: 'eval-python' };
+    expect(withTestPython(explicit, root)).toEqual(explicit);
+    expect(withTestPython({ PATH: 'unchanged' }, root)).toEqual({ PATH: 'unchanged' });
+  });
+
+  it('restores Windows PowerShell system modules ahead of inherited pwsh modules without mutating the caller', () => {
+    const systemRoot = temporaryRoot();
+    const modules = path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules');
+    fs.mkdirSync(modules, { recursive: true });
+    const caller = { SystemRoot: systemRoot, PSModulePath: `core-modules;${modules};user-modules` };
+    expect(withWindowsPowerShellModules(caller, 'win32').PSModulePath)
+      .toBe(`${modules};core-modules;user-modules`);
+    expect(caller.PSModulePath).toBe(`core-modules;${modules};user-modules`);
+  });
+
+  it('does not invent module roots or change non-Windows shell environments', () => {
+    const caller = { SystemRoot: temporaryRoot(), PSModulePath: 'core-modules' };
+    expect(withWindowsPowerShellModules(caller, 'win32')).toEqual(caller);
+    expect(withWindowsPowerShellModules(caller, 'darwin')).toEqual(caller);
+  });
+
   it('discovers GitHub Desktop Git when Windows PATH does not expose git', () => {
     const localAppData = temporaryRoot();
     const older = path.join(

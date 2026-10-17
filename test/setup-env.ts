@@ -34,6 +34,11 @@ import * as fs from 'node:fs';
 import { createRequire, syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { installTestLogAnalysis } from './helpers/test-log-analysis';
+
+// Every file's stdout/stderr and console output is classified and attributed
+// to its case or setup/cleanup phase; see ./helpers/test-log-analysis.ts.
+installTestLogAnalysis();
 
 // Unit tests exercise logging through focused opt-in suites. Other cases reset
 // modules and temp workspaces freely, so do not start a worker that can outlive

@@ -230,3 +230,20 @@ describe('i18n › acceptLanguageHeader', () => {
     expect(acceptLanguageHeader('pt').startsWith('pt-BR')).toBe(true);
   });
 });
+
+describe('stopped summary notices', () => {
+  it.each(LOCALES.map(locale => locale.code))('has local copy and interpolates the actual cap in %s', async lang => {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const table = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../src/main/locales', `${lang}.json`), 'utf8'));
+    for (const key of ['model.stopped_tool_limit_summary_incomplete', 'model.stopped_repeat_summary_incomplete', 'model.stopped_summary_incomplete']) {
+      expect(typeof table[key]).toBe('string');
+      expect(table[key].length).toBeGreaterThan(0);
+      const actual = t(key, { limit: 37 }, lang);
+      expect(actual).toBe(table[key].replace('{limit}', '37'));
+      expect(actual).not.toContain('{limit}');
+      if (key.includes('tool_limit')) expect(actual).toContain('37');
+      if (lang !== 'en') expect(actual).not.toBe(t(key, { limit: 37 }, 'en'));
+    }
+  });
+});

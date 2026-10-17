@@ -15,6 +15,7 @@
  * Pure-function util: Node stdlib only, never imports features/ or model/.
  */
 
+import { appendInputReceipt } from '../../../bin/tool-input-compat.cjs';
 import * as fs from 'fs';
 import * as path from 'path';
 import { createHash } from 'crypto';
@@ -57,6 +58,31 @@ export type ToolResultInlineLedger = {
    *  This is also fixed; the shared round ledger still bounds admission. */
   verbatimDocumentTokens?: number;
 };
+
+/** The estimated tokens one result may fill: the fixed per-result ceiling,
+ * the runner's per-result ceiling and what the current tool round has left.
+ * A complete document the model was told to read whole uses its own fixed
+ * ceiling instead of the ordinary one. Without a ledger (CLI bridge, direct
+ * calls) the fixed ceiling applies. Producers size their output with this so
+ * a result stays inline instead of spilling to a preview. */
+export function inlineResultTokenBudget(state: unknown, verbatimDocument = false): number {
+  const value = state && typeof state === 'object'
+    ? (state as Record<string, unknown>)[TOOL_RESULT_INLINE_LEDGER_STATE_KEY]
+    : undefined;
+  const ledger = value && typeof value === 'object'
+    ? value as Partial<ToolResultInlineLedger>
+    : undefined;
+  const skillLimit = ledger?.verbatimDocumentTokens;
+  const candidates = [verbatimDocument && Number.isFinite(skillLimit) && skillLimit! > 0
+    ? skillLimit! : DEFAULT_INLINE_RESULT_TOKENS];
+  if (!verbatimDocument && Number.isFinite(ledger?.perResultTokens)) {
+    candidates.push(Math.max(0, ledger!.perResultTokens!));
+  }
+  if (Number.isFinite(ledger?.remainingTokens)) {
+    candidates.push(Math.max(0, ledger!.remainingTokens!));
+  }
+  return Math.max(0, Math.floor(Math.min(...candidates)));
+}
 
 /** Host-owned storage failure; never a request to re-execute the tool. */
 export class ToolResultPersistenceError extends Error {
@@ -154,19 +180,29 @@ async function executeWithRetrievalBudget(
   const ceiling = Math.min(DEFAULT_INLINE_RESULT_TOKENS, ledger?.perResultTokens ?? DEFAULT_INLINE_RESULT_TOKENS);
   const reserved = Math.max(0, Math.floor(Math.min(ceiling, ledger?.remainingTokens ?? ceiling)));
   if (ledger) ledger.remainingTokens -= reserved;
+  // Reserve the envelope receipt before source selection so continuation
+  // cursors describe exactly the bytes delivered. The final result keeps the
+  // same identity for the admission receipt; it must not be charged twice.
+  const inputReceipt = ctx.inputReceipt;
+  const receiptTokens = inputReceipt
+    ? estimateToolResultTokens(JSON.stringify({ result: null, ...inputReceipt })) + 4
+    : 0;
+  const sourceBudget = Math.max(0, reserved - receiptTokens);
   const previousReads = ctx.state.toolResultReadLedger as { epoch: number; readKeys: Set<string> } | undefined;
-  const reads = { epoch: previousReads?.epoch ?? 0, remainingTokens: reserved,
+  const reads = { epoch: previousReads?.epoch ?? 0, remainingTokens: sourceBudget,
     readKeys: new Set(previousReads?.readKeys ?? []) };
-  const child = { ...ctx, state: { ...ctx.state, [RETRIEVAL_OUTPUT_BUDGET_KEY]: reserved,
+  const child = { ...ctx, state: { ...ctx.state, [RETRIEVAL_OUTPUT_BUDGET_KEY]: sourceBudget,
     toolResultReadLedger: reads } };
   let used = 0;
   try {
-    let result = reserved > 0 ? await execute(child, reserved) : { content: '', isError: true };
+    let result = sourceBudget > 0 ? await execute(child, sourceBudget) : { content: '', isError: true };
+    if (inputReceipt) result = { ...result, content: appendInputReceipt(result.content, inputReceipt), appliedInputReceipt: inputReceipt };
     if (ctx.signal?.aborted) throw ctx.signal.reason ?? new Error('Retrieval aborted.');
     if (estimateToolResultTokens(result.content) > reserved) {
       // Contract failure: do not publish partial source bytes or advance its
       // cursor. In particular, never turn this receipt into a persisted ref.
-      result = { content: boundedRetrievalText('Retrieval output did not fit. No source data was delivered; retry the same source with a narrower range.', reserved), isError: true };
+      result = { content: boundedRetrievalText(appendInputReceipt('Retrieval output did not fit. No source data was delivered; retry the same source with a narrower range.', inputReceipt ?? null), reserved), isError: true,
+        ...(inputReceipt ? { appliedInputReceipt: inputReceipt } : {}) };
     } else if (previousReads) {
       for (const key of reads.readKeys) previousReads.readKeys.add(key);
     }
@@ -305,6 +341,7 @@ export function wrapToolWithCap(tool: AgentTool, opts: WrapOpts): AgentTool {
     name: tool.name,
     description: tool.description,
     inputSchema: tool.inputSchema,
+    ...(tool.compatibilityInputFields ? { compatibilityInputFields: tool.compatibilityInputFields } : {}),
     // Preserve the concurrency flag — without this the wrapper silently makes
     // EVERY capped tool sequential (the runner's G4 partitioner keys on
     // `executionMode === 'parallel'`), defeating parallel reads/search AND

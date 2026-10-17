@@ -42,6 +42,7 @@
  */
 
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 
@@ -148,6 +149,11 @@ export const artifactDir          = (uid: string, cid: string, artifactId: strin
 // `shell.openPath`. See `features/saved_apps.ts`.
 export const userSavedAppsDir = (uid: string) => path.join(userCloudRoot(uid), 'saved_apps');
 export const savedAppDir      = (uid: string, appId: string) => path.join(userSavedAppsDir(uid), appId);
+// Editing snapshots and publishing state are device-local, never sync manifests.
+export const userAppEditsDir = (uid: string) => path.join(userLocalRoot(uid), 'app-edits');
+export const userAppPublishingDir = (uid: string) => path.join(userLocalRoot(uid), 'app-publishing');
+// Durable saved-app delete intents; machine-private so a stopped delete finishes only where it started.
+export const userAppDeletesDir = (uid: string) => path.join(userLocalRoot(uid), 'app-deletes');
 
 // App data in either scope is never served or copied with an immutable bundle.
 export type WebAppStorageScope = 'local' | 'cloud';
@@ -179,6 +185,11 @@ export const userLocalSessionFile   = (uid: string, sessionId: string) => path.j
 // under the owning user's local tree, never enter cloud sync, and are isolated
 // from the app renderer/default Electron session.
 export const userWebAssistProfileDir = (uid: string) => path.join(userLocalRoot(uid), 'web-assist', 'profile');
+// Only reconstructible network caches may live under Electron's sandbox root.
+// Include the full profile identity so separate installs/workspaces never share a cache.
+export const userWebAssistCacheDir = (uid: string, sessionDataDir: string) => path.join(
+  sessionDataDir, 'web-assist-cache', createHash('sha256').update(userWebAssistProfileDir(uid)).digest('hex'),
+);
 export const userWebAssistSessionCookiesFile = (uid: string) => path.join(userLocalRoot(uid), 'web-assist', 'session-cookies.enc');
 
 // Curated knowledge base (the "organized" region of the historical
@@ -259,6 +270,8 @@ export const projectBindingsFile   = (uid: string, pid: string) => path.join(pro
 // outside the shared project's Server/COS file allowlist.
 export const projectPrivateAgentFile = (uid: string, pid: string) =>
   path.join(projectDir(uid, assertProjectSegment(pid)), 'agent_preferences', 'private-agents.json');
+export const projectTaskOwnerPreferencesFile = (uid: string, pid: string) =>
+  path.join(projectDir(uid, assertProjectSegment(pid)), 'agent_preferences', 'task-owners.json');
 /** Guard a project id used as a single path segment for project-scoped
  *  instructions/memory. The pid comes from the conv index / IPC (never
  *  model-supplied), but these paths are written to, so reject traversal /
@@ -344,6 +357,8 @@ export const agentRuntimeStatsFile = (uid: string, agentId: string) => path.join
 // itself.
 export const agentMetaDir        = (uid: string, agentId: string) => path.join(agentDir(uid, agentId), 'meta');
 export const agentCompetenceFile = (uid: string, agentId: string) => path.join(agentMetaDir(uid, agentId), 'COMPETENCE.md');
+// Rejected reflection candidates stay machine-private and outside prompt inputs.
+export const userMetacognitionDraftsDir = (uid: string) => path.join(userLocalRoot(uid), 'metacognition-drafts');
 export const agentStrategiesFile = (uid: string, agentId: string) => path.join(agentMetaDir(uid, agentId), 'LEARNING_STRATEGIES.md');
 
 // Agent self-evolved skill store (System B — written by core-agent's SkillStore;
@@ -698,6 +713,7 @@ export const chatAttachmentDraftDir      = (uid: string, cid: string) => path.jo
 // overwritten versions. Recoverable deletes live in `local/recycle/`, shared
 // with in-app deletes.
 export const userSyncDir          = (uid: string) => path.join(userLocalRoot(uid), 'sync');
+export const userSyncMetacognitionBaselinesDir = (uid: string) => path.join(userSyncDir(uid), 'metacognition-baselines');
 export const userSyncIndexFile    = (uid: string) => path.join(userSyncDir(uid), 'index.json');
 export const userSyncStateFile    = (uid: string) => path.join(userSyncDir(uid), 'state.json');
 export const userSyncConflictsDir = (uid: string) => path.join(userSyncDir(uid), 'conflicts');

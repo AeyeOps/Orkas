@@ -29,9 +29,17 @@ export const EN_FILLER_RE = /^(could you|would you|can you|help me|i'?d like to|
  * cap produced for an all-CJK title, so no existing title gets shorter.
  *
  * The budget covers the kept text; the ellipsis is appended on top, as it was
- * under the character cap.
+ * under the character cap. Raised from 50 so task lists on wide surfaces (the
+ * project task tab) show the request instead of a quarter-width stub; narrow
+ * lists keep clipping by CSS.
  */
-export const TITLE_MAX_UNITS = 50;
+export const TITLE_MAX_UNITS = 100;
+
+/** Stored conversation titles, auto or manual, are capped here rather than by
+ *  the shared 60-unit name limit, so a full auto title keeps its ellipsis and
+ *  a manual title may be as wide as an auto one. Projects, Agents and Skills
+ *  keep the shared limit. */
+export const CONVERSATION_TITLE_MAX_UNITS = TITLE_MAX_UNITS + 1;
 
 /** Cut `text` to the title budget by rendered width, marking the cut with an
  *  ellipsis. Whole grapheme clusters only, so an emoji is never halved. */

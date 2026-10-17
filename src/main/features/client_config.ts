@@ -639,7 +639,7 @@ export const DEFAULT_PROVIDER_MODELS = PUBLIC_PROVIDER_MODELS;
 
 export const DEFAULT_IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapability>> = {
   openai: { model: 'gpt-image-2', api: 'openai', supportsEdit: true },
-  google: { model: 'gemini-3.1-flash-image-preview', api: 'gemini', supportsEdit: true },
+  google: { model: 'gemini-nano-banana-2.1', api: 'gemini', supportsEdit: true },
   doubao: { model: 'doubao-seedream-5-0-lite-260128', api: 'doubao', supportsEdit: true },
 };
 
@@ -708,6 +708,8 @@ function normalizeProviderModels(value: unknown, providerId: string): ProviderMo
     const description = typeof r.description === 'string' ? r.description.trim() : undefined;
     if (r.description !== undefined && (!description || description.length > 500)) return null;
     const recommended = r.recommended === true;
+    const hiddenFromPicker = typeof r.hiddenFromPicker === 'boolean' ? r.hiddenFromPicker : undefined;
+    if (r.hiddenFromPicker !== undefined && hiddenFromPicker === undefined) return null;
     const template = typeof r.template === 'string' && r.template.trim() ? r.template.trim() : undefined;
     const contextWindow = normalizePositiveInteger(r.contextWindow);
     const maxTokens = normalizePositiveInteger(r.maxTokens);
@@ -726,6 +728,7 @@ function normalizeProviderModels(value: unknown, providerId: string): ProviderMo
       name,
       ...(description ? { description } : {}),
       ...(recommended ? { recommended: true } : {}),
+      ...(hiddenFromPicker !== undefined ? { hiddenFromPicker } : {}),
       ...(includedModels ? { includedModels } : {}),
       ...(template ? { template } : {}),
       ...(contextWindow ? { contextWindow } : {}),

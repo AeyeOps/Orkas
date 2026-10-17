@@ -16,7 +16,7 @@ const {
   verifyXlsReaderRoot,
   verifyMacLocalizedMetadataRoot,
 } = require('../bin/packaged-resource-gate.cjs');
-const { verifySourceEntrypointContract } = require('../bin/packaged-entrypoint-gate.cjs');
+const { verifySourceEntrypointContract, verifyBridgeSdkRuntime } = require('../bin/packaged-entrypoint-gate.cjs');
 const { verifyBuiltinExtraResourcesConfig, verifyBuiltinRoot } = require('../bin/builtin-resource-gate.cjs');
 const { verifyOfficeCliRuntimePolicy } = require('../bin/officecli-policy-gate.cjs');
 
@@ -68,6 +68,9 @@ module.exports = async function ensureRuntimeBeforePack(context) {
   verifyOfficeCliRuntimePolicy(pcRoot);
 
   for (const targetArch of arches) {
+    const helper = spawnSync(process.execPath, [path.join(pcRoot, 'scripts', 'build-phone-passkey.cjs'),
+      '--platform', platform, '--arch', targetArch], { cwd: pcRoot, stdio: 'inherit', env: process.env });
+    if (helper.error || helper.status !== 0) throw new Error('Phone passkey runtime provisioning failed');
     const addon = spawnSync(process.execPath, [
       path.join(pcRoot, 'scripts', 'build-notification-permission-addon.cjs'),
       '--platform', platform,
@@ -98,6 +101,7 @@ module.exports = async function ensureRuntimeBeforePack(context) {
   // tree. A new runtime entrypoint or build-only helper cannot enter a package
   // until it is classified in the shared closed-world contract.
   verifySourceEntrypointContract(pcRoot);
+  verifyBridgeSdkRuntime(pcRoot);
 
   const embedding = spawnSync(process.execPath, [
     path.join(pcRoot, 'scripts', 'fetch-embedding-model.mjs'),

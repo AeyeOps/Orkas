@@ -36,7 +36,8 @@ function fixture() {
       setTimeout(() => process.exit(12), 5000);
     }
     console.log('EXEC:' + JSON.stringify({ family: '${family}', args: process.argv.slice(2),
-      electronNode: process.env.ELECTRON_RUN_AS_NODE, outerNode: process.env.ORKAS_TEST_NODE }));
+      electronNode: process.env.ELECTRON_RUN_AS_NODE, outerNode: process.env.ORKAS_TEST_NODE,
+      testPython: process.env.ORKAS_TEST_PYTHON, evalPython: process.env.ORKAS_EVAL_PYTHON }));
     console.error('${family}-diagnostic');
     if (process.env.HOLD_FAMILY !== '${family}') process.exit(Number(process.env.${family === 'js' ? 'JS' : 'RESOURCE'}_EXIT || 0));
   `;
@@ -45,11 +46,30 @@ function fixture() {
   return root;
 }
 
+/** npm and direct Node launchers both use the installed npm CLI. Homebrew
+ * and other split layouts can put npm outside the outer Node's prefix. */
+function npmCli(): string | undefined {
+  const bin = path.dirname(node);
+  const candidates = [
+    process.env.npm_execpath,
+    path.join(bin, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    path.join(bin, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+  ];
+  for (const directory of String(process.env.PATH || '').split(path.delimiter)) {
+    if (!directory) continue;
+    try {
+      const entry = fs.realpathSync(path.join(directory, 'npm'));
+      if (path.basename(entry) === 'npm-cli.js') candidates.push(entry);
+    } catch { /* A PATH entry need not contain npm. */ }
+    candidates.push(path.join(directory, 'node_modules', 'npm', 'bin', 'npm-cli.js'));
+  }
+  return candidates.find((candidate): candidate is string => !!candidate && fs.existsSync(candidate));
+}
+
 function invoke(root: string, args: string[], env: Record<string, string> = {}) {
-  const npm = process.env.npm_execpath;
-  const command = npm ? node : process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  const commandArgs = npm ? [npm, ...args] : args;
-  const result = spawnSync(command, commandArgs, {
+  const npm = npmCli();
+  if (!npm) throw new Error('No npm CLI found on PATH or beside the test Node.');
+  const result = spawnSync(node, [npm, ...args], {
     cwd: root, env: { ...process.env, ...env }, encoding: 'utf8', timeout: 15_000,
   });
   expect(result.error).toBeUndefined();
@@ -61,6 +81,32 @@ function invoke(root: string, args: string[], env: Record<string, string> = {}) 
 }
 
 describe('npm test selection and outcome', () => {
+  it('runs the real npm fixture when a direct Node parent does not export npm_execpath', () => {
+    const previous = process.env.npm_execpath;
+    delete process.env.npm_execpath;
+    try {
+      const result = invoke(fixture(), ['run', 'test:js', '--', 'test/direct.test.ts']);
+      expect(result.status).toBe(0);
+      expect(result.records.map(record => [record.family, record.args])).toEqual([
+        ['js', ['run', 'test/direct.test.ts']],
+      ]);
+    } finally {
+      if (previous === undefined) delete process.env.npm_execpath;
+      else process.env.npm_execpath = previous;
+    }
+  });
+
+  it('shares the configured project Python with fixture subprocesses in both test families', () => {
+    const result = invoke(fixture(), ['test'], {
+      ORKAS_TEST_PYTHON: path.join(os.tmpdir(), 'project-python'), ORKAS_EVAL_PYTHON: '',
+    });
+    expect(result.status).toBe(0);
+    expect(result.records.map(record => [record.family, record.testPython, record.evalPython])).toEqual([
+      ['js', path.join(os.tmpdir(), 'project-python'), path.join(os.tmpdir(), 'project-python')],
+      ['resources', path.join(os.tmpdir(), 'project-python'), path.join(os.tmpdir(), 'project-python')],
+    ]);
+  });
+
   it('passes targeted file/name filters intact to JS without starting the resource suite', () => {
     const args = ['--run', 'test/selected case.test.ts', '--testNamePattern', 'keeps two words'];
     const result = invoke(fixture(), ['test', '--', ...args]);

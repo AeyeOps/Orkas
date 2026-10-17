@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
 import { createServer } from 'node:http';
+import { EventEmitter } from 'node:events';
+import { connect } from 'node:net';
 import {
   _resetProxyRoutingForTests,
   activeProxy,
@@ -9,6 +11,7 @@ import {
   createSystemProxyBinaryFetch,
   createSystemProxyFetch,
   downloadBinaryWithProxyPolicy,
+  fetchUploadWithProxyPolicy,
   envProxyConfig,
   envProxyAppliesToUrl,
   envProxyUrl,
@@ -55,6 +58,86 @@ afterEach(() => {
 });
 
 describe('Electron system-proxy transport failures', () => {
+  it('uploads through the configured environment proxy with byte progress and no system-route lookup', async () => {
+    const {getGlobalDispatcher, setGlobalDispatcher} = await import('undici');
+    const original = getGlobalDispatcher();
+    let received = '', tunnels = 0;
+    const server = createServer((request, response) => {
+      request.setEncoding('utf8'); request.on('data', chunk => { received += chunk; });
+      request.on('end', () => response.end('ok'));
+    });
+    const proxy = createServer();
+    const listen = (value: ReturnType<typeof createServer>) => new Promise<number>(resolve => {
+      value.listen(0, '127.0.0.1', () => resolve((value.address() as import('node:net').AddressInfo).port));
+    });
+    const port = await listen(server);
+    proxy.on('connect', (_request, socket, head) => {
+      tunnels++;
+      const upstream = connect(port, '127.0.0.1', () => {
+        socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+        if(head.length)upstream.write(head);
+        socket.pipe(upstream).pipe(socket);
+      });
+      socket.on('close', () => upstream.destroy()); upstream.on('error', () => socket.destroy());
+    });
+    const proxyPort = await listen(proxy), progress: number[] = [];
+    process.env.HTTP_PROXY = `http://127.0.0.1:${proxyPort}`;
+    const resolveSystem = vi.fn(async () => 'PROXY unused:8080');
+    const body = 'x'.repeat(64 * 1024);
+    try {
+      expect(await installEnvProxyDispatcher()).toBe(true);
+      expect(await installSystemProxyDispatcher(vi.fn(), resolveSystem)).toBe(false);
+      const result = await fetchUploadWithProxyPolicy('http://upload.invalid/chunk', {
+        method: 'POST', body, signal: AbortSignal.timeout(3000),
+      }, sent => progress.push(sent));
+      expect(await result.text()).toBe('ok'); expect(received).toBe(body);
+      expect(progress.some(sent => sent > 0 && sent < body.length)).toBe(true);
+      expect(progress.at(-1)).toBe(body.length);
+      expect(tunnels).toBe(1); expect(resolveSystem).not.toHaveBeenCalled();
+    } finally {
+      const current = getGlobalDispatcher(); setGlobalDispatcher(original); await current.destroy();
+      server.closeAllConnections();
+      await Promise.all([new Promise<void>(resolve => server.close(() => resolve())), new Promise<void>(resolve => proxy.close(() => resolve()))]);
+    }
+  });
+  it.each(['success', 'abort', 'error'] as const)('tracks Chromium upload bytes and disposes polling on %s without a direct fallback', async outcome => {
+    vi.useFakeTimers();
+    const request = Object.assign(new EventEmitter(), {
+      getUploadProgress: vi.fn(() => ({active: true, started: true, current: 4, total: 8})),
+      setHeader: vi.fn(), end: vi.fn(), abort: vi.fn(),
+    });
+    const netRequest = vi.fn(() => request);
+    vi.doMock('electron', () => ({net: {request: netRequest}, session: {defaultSession: {}}}));
+    const progress = vi.fn(), controller = new AbortController();
+    let work: Promise<unknown> | undefined;
+    try {
+      await installSystemProxyDispatcher(vi.fn(), async () => 'SOCKS5 proxy.example:1080');
+      work = fetchUploadWithProxyPolicy('https://upload.example/chunk', {
+        method: 'POST', body: '12345678', headers: {user_id: 'test', session_id: 'test-session'}, signal: controller.signal,
+      }, progress).then(response => response.text(), error => error.message);
+      await vi.waitFor(() => expect(request.end).toHaveBeenCalled());
+      await vi.advanceTimersByTimeAsync(100);
+      expect(progress).toHaveBeenCalledWith(4, 8);
+      expect(request.end).toHaveBeenCalledWith(Buffer.from('12345678'));
+      expect(request.setHeader).toHaveBeenCalledWith('session_id', 'test-session');
+      if (outcome === 'success') {
+        const response = Object.assign(new EventEmitter(), {statusCode: 200, headers: {'Content-Type': ['application/json']}});
+        request.emit('response', response); response.emit('data', Buffer.from('ok')); response.emit('end');
+        expect(await work).toBe('ok');
+      } else if (outcome === 'abort') {
+        controller.abort(new Error('cancelled'));
+        expect(await work).toBe('cancelled'); expect(request.abort).toHaveBeenCalledOnce();
+      } else {
+        request.emit('error', new Error('proxy unavailable'));
+        expect(await work).toBe('proxy unavailable');
+      }
+      const count = progress.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(500);
+      expect(progress).toHaveBeenCalledTimes(count);
+      expect(vi.getTimerCount()).toBe(0);
+      expect(netRequest).toHaveBeenCalledOnce();
+    } finally { controller.abort(); await work; vi.useRealTimers(); vi.doUnmock('electron'); }
+  });
   it('keeps a message-only Chromium proxy failure in the network exhaustion category', () => {
     const rejection = new Error('net::ERR_PROXY_CONNECTION_FAILED');
     expect(classifyTransientNetworkError(rejection)).toBeNull();
