@@ -94,16 +94,21 @@ describe('projects.tasks.listOpen', () => {
     ]);
   });
 
-  it('caps the rows but still reports how many unfinished to-dos exist', async () => {
+  it('returns every open to-do for expansion while preserving bounded legacy requests', async () => {
     const tasks = await import('../../../src/main/features/project_tasks');
-    for (let i = 0; i < 5; i += 1) {
-      const result = await at(`2026-10-0${i + 1}T08:00:00.000Z`, () => tasks.createTask(TEST_UID, '', { content: `Item ${i}` }));
+    for (let i = 0; i < 26; i += 1) {
+      const result = await at(`2026-10-${String(i + 1).padStart(2, '0')}T08:00:00.000Z`, () => tasks.createTask(TEST_UID, '', { content: `Item ${i}` }));
       expect(result.ok).toBe(true);
     }
     const res = await invoke('projects.tasks.listOpen', { limit: 3 });
     expect(res.tasks).toHaveLength(3);
-    expect(res.total).toBe(5);
+    expect(res.total).toBe(26);
     expect(res.tasks[0].updated_at > res.tasks[1].updated_at).toBe(true);
+    expect((await invoke('projects.tasks.listOpen', {})).tasks).toHaveLength(3);
+    expect((await invoke('projects.tasks.listOpen', { limit: 100, all: 'true' })).tasks).toHaveLength(20);
+    const all = await invoke('projects.tasks.listOpen', { all: true });
+    expect(all.total).toBe(26);
+    expect(all.tasks.map((task: any) => task.content)).toEqual(Array.from({ length: 26 }, (_, i) => `Item ${25 - i}`));
   });
 
   // The home page repeats this listing on every visit and, while visible, on

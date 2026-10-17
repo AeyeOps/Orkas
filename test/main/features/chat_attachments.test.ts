@@ -813,6 +813,19 @@ describe('chat_attachments › deleteAttachment', () => {
 });
 
 describe('chat_attachments › purgeByCid', () => {
+  it('removes nested files and empty directories without following symlinks', async () => {
+    const m = await loadMod();
+    const nested = path.join(attDir(), 'folder', 'inner');
+    fs.mkdirSync(nested, { recursive: true });
+    fs.mkdirSync(path.join(nested, 'empty'));
+    fs.writeFileSync(path.join(nested, 'draft.txt'), 'Nested attachment');
+    const outside = path.join(tmpDir, 'outside');
+    fs.mkdirSync(outside); fs.writeFileSync(path.join(outside, 'keep.txt'), 'Keep');
+    fs.symlinkSync(outside, path.join(attDir(), 'link'), process.platform === 'win32' ? 'junction' : 'dir');
+    expect(await m.purgeByCid(UID, CID)).toBeGreaterThan(0);
+    expect(fs.existsSync(attDir())).toBe(false);
+    expect(fs.readFileSync(path.join(outside, 'keep.txt'), 'utf8')).toBe('Keep');
+  });
   it('wipes the entire <cid>/ dir', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, CID, 'a.txt', Buffer.from('x'));

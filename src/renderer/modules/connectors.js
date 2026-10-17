@@ -842,9 +842,8 @@ window.focusConnectorById = async function focusConnectorById(id) {
 // open_app_view/connectors/configure route arrive here. For an unconfigured
 // catalog connector, continue into the same protected setup form as a card click.
 // Healthy/degraded/custom connectors keep the historical focus-only behavior;
-// a reconnectable error re-enters the guided setup path. The home's connect
-// chooser passes `entryPoint='form'`: the user picked the connector there, so
-// it counts as their own connect click rather than a Commander-opened form.
+// a reconnectable error re-enters the guided setup path. Explicit form entries
+// count as user connect clicks rather than Commander-opened forms.
 window.openConnectorSetupById = async function openConnectorSetupById(id, entryPoint = 'agent') {
   const targetId = String(id || '').trim();
   if (!targetId) return false;

@@ -1,10 +1,272 @@
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { test, expect } from './fixtures/orkas';
 
 test.describe('inline historical task cleanup', () => {
+  test('uses sidebar timestamps and retains tasks renamed before preview or confirmation', async ({ orkas }, testInfo) => {
+    const cids: string[] = [];
+    for (const title of ['Old task metadata', 'Rename before preview', 'Rename before confirmation']) {
+      cids.push((await orkas.invoke<any>('conversations.create', { title })).conversation.conversation_id);
+    }
+    const root = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats');
+    const indexFile = path.join(root, '_index.json');
+    const rows = JSON.parse(readFileSync(indexFile, 'utf8'));
+    const old = new Date(Date.now() - 37 * 86400000).toISOString();
+    for (const cid of cids) {
+      const row = rows.find((r: any) => r.conversation_id === cid);
+      row.created_at = old; row.updated_at = old;
+      writeFileSync(path.join(root, cid, 'meta.json'), JSON.stringify(row));
+      writeFileSync(path.join(root, cid, 'state.json'), JSON.stringify({ status: 'idle', in_flight: [], last_active_at: old }));
+      // Real rename IPC below advances metadata without changing these old messages.
+      writeFileSync(path.join(root, `${cid}.jsonl`), [
+        { id: 'reply', from: 'commander', content: 'Preserved response', ts: old },
+        { id: 'request', from: 'user', content: 'Historical request', ts: old },
+      ].map(row => JSON.stringify(row)).join('\n'));
+    }
+    writeFileSync(indexFile, JSON.stringify(rows));
+    const original = cids.map(cid => readFileSync(path.join(root, `${cid}.jsonl`), 'utf8'));
+    const page = await orkas.relaunch();
+    const renamed = await orkas.invoke<any>('conversations.rename', { cid: cids[1], title: 'Updated before preview' });
+    const sidebar = await orkas.invoke<any>('conversations.list', { mode: 'unprojected', offset: 0 });
+    const sidebarTasks = sidebar.conversations.filter((row: any) => cids.includes(row.conversation_id));
+    expect(sidebarTasks[0].conversation_id).toBe(cids[1]);
+    // Legacy timestamps omit a zone; parse in the app's timezone, not the test host's.
+    const renamedAt = await orkas.electronApp!.evaluate((_, ts) => Date.parse(ts), renamed.conversation.updated_at);
+    expect(Date.parse(sidebarTasks[0].last_active_at)).toBe(renamedAt);
+    await page.locator('#settings-btn').click();
+    await page.locator('[data-settings-tab="data"]').click();
+    const section = page.locator('#settings-task-cleanup');
+    await section.getByRole('combobox').click();
+    await page.getByRole('option', { name: 'Over 14 days ago', exact: true }).click();
+    await section.locator('[data-cleanup-action="view"]').click();
+    await expect(section.locator('[data-cleanup-cid]')).toHaveCount(2);
+    await expect(section.locator(`[data-cleanup-cid="${cids[0]}"]`)).toBeEnabled();
+    await expect(section.locator(`[data-cleanup-cid="${cids[1]}"]`)).toHaveCount(0);
+    await section.screenshot({ path: testInfo.outputPath('cleanup-14-day-metadata-age.png') });
+    await section.locator('[data-cleanup-all]').check();
+    await section.locator('[data-cleanup-action="prepare"]').click();
+    await orkas.invoke<any>('conversations.rename', { cid: cids[2], title: 'Updated while confirming' });
+    await section.locator('[data-cleanup-action="confirm"]').click();
+    await expect(section).toContainText('Recycled 1 · Skipped 1 · Failed 0');
+    await expect(section.locator(`[data-cleanup-cid="${cids[0]}"]`)).toHaveCount(0);
+    expect(existsSync(path.join(root, `${cids[0]}.jsonl`))).toBe(false);
+    expect(readFileSync(path.join(root, `${cids[1]}.jsonl`), 'utf8')).toBe(original[1]);
+    expect(readFileSync(path.join(root, `${cids[2]}.jsonl`), 'utf8')).toBe(original[2]);
+    expect((await orkas.invoke<any>('conversations.get', { cid: cids[2] })).conversation.title).toBe('Updated while confirming');
+    const { batches } = await orkas.invoke<any>('recycle.list');
+    expect(batches).toHaveLength(1);
+    expect(await orkas.invoke<any>('recycle.restore', { id: batches[0].id })).toMatchObject({ ok: true, failed: 0, reactivated: 1 });
+    expect(readFileSync(path.join(root, `${cids[0]}.jsonl`), 'utf8')).toBe(original[0]);
+  });
+  test('keeps only failed tasks selected after partial cleanup and cleans them without duplicate skips', async ({ orkas }, testInfo) => {
+    const pid = (await orkas.invoke<any>('projects.create', { name: 'Partial cleanup project' })).project.project_id;
+    const cids: string[] = [];
+    for (const title of ['Completed cleanup', 'Retry cleanup']) {
+      cids.push((await orkas.invoke<any>('conversations.create', { title, projectId: pid })).conversation.conversation_id);
+    }
+    const root = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'projects', pid, 'chats');
+    const indexFile = path.join(root, '_index.json');
+    const rows = JSON.parse(readFileSync(indexFile, 'utf8'));
+    for (const row of rows) {
+      row.created_at = row.updated_at = '2020-01-01T00:00:00Z';
+      writeFileSync(path.join(root, row.conversation_id, 'meta.json'), JSON.stringify(row));
+      writeFileSync(path.join(root, `${row.conversation_id}.jsonl`), JSON.stringify({ from: 'user', content: row.title, ts: row.created_at }) + '\n');
+    }
+    writeFileSync(indexFile, JSON.stringify(rows));
+    const page = await orkas.relaunch();
+    await orkas.electronApp!.evaluate(({ ipcMain }, failedCid) => {
+      const original = (ipcMain as any)._invokeHandlers.get('orkas.invoke');
+      let failed = false;
+      ipcMain.removeHandler('orkas.invoke');
+      ipcMain.handle('orkas.invoke', (event, request) => {
+        if (request.channel === 'conversations.cleanup.remove' && request.payload.cid === failedCid && !failed) {
+          failed = true;
+          return { ok: false, error: 'cleanup_failed' };
+        }
+        return original(event, request);
+      });
+    }, cids[1]);
+    await page.locator('#settings-btn').click();
+    await page.locator('[data-settings-tab="data"]').click();
+    const section = page.locator('#settings-task-cleanup');
+    await section.locator('[data-cleanup-action="view"]').click();
+    await section.locator('[data-cleanup-action="project"]').click();
+    await section.locator('[data-cleanup-project]').check();
+    await section.locator('[data-cleanup-action="prepare"]').click();
+    await section.locator('[data-cleanup-action="confirm"]').click();
+    await expect(section).toContainText('Recycled 1 · Skipped 0 · Failed 1');
+    await expect(section.locator('[data-cleanup-action="prepare"]')).toHaveText('Clean up (1)');
+    await expect(section.locator(`[data-cleanup-cid="${cids[0]}"]`)).toHaveCount(0);
+    await expect(section.locator(`[data-cleanup-cid="${cids[1]}"]`)).toBeChecked();
+    await expect(section.locator('.settings-cleanup-project-head')).toContainText('1 / 1');
+    await section.screenshot({ path: testInfo.outputPath('cleanup-partial-success.png') });
+    await section.locator('[data-cleanup-action="prepare"]').click();
+    await section.locator('[data-cleanup-action="confirm"]').click();
+    await expect(section).toContainText('Recycled 1 · Skipped 0 · Failed 0');
+    await expect(section.locator('[data-cleanup-cid]')).toHaveCount(0);
+    expect((await orkas.invoke<any>('recycle.list')).batches).toHaveLength(2);
+  });
+  test('opens personal and active project history from hover and keyboard actions without changing selection', async ({ orkas }, testInfo) => {
+    const projectId = (await orkas.invoke<any>('projects.create', { name: 'Fixture project' })).project.project_id;
+    const tasks: { cid: string; root: string; projectId: string; title: string }[] = [];
+    const old = '2020-01-01T00:00:00Z';
+    for (const pid of ['', projectId]) {
+      const { conversation } = await orkas.invoke<any>('conversations.create', {
+        title: pid ? '一个很长的项目任务标题，需要查看历史对话来确认任务为何无法选择'.repeat(3) : 'Personal task with a long title '.repeat(5), projectId: pid,
+      });
+      const cid = conversation.conversation_id;
+      const root = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', ...(pid ? ['projects', pid] : []), 'chats');
+      const indexFile = path.join(root, '_index.json');
+      const rows = JSON.parse(readFileSync(indexFile, 'utf8'));
+      const row = rows.find((item: any) => item.conversation_id === cid);
+      row.created_at = old; row.updated_at = old;
+      const dir = path.join(root, cid); mkdirSync(dir, { recursive: true });
+      writeFileSync(indexFile, JSON.stringify(rows));
+      writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(row));
+      writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ version: 1, status: 'idle', in_flight: [], last_active_at: old }));
+      writeFileSync(path.join(root, `${cid}.jsonl`), JSON.stringify({ id: 'source', from: 'user', text: pid ? 'Project history to inspect' : 'Personal history to inspect', ts: old }) + '\n');
+      tasks.push({ cid, root, projectId: pid, title: row.title });
+    }
+    const page = await orkas.relaunch();
+    // Preserve an old queued record to exercise automatic stopping independently
+    // of startup recovery; no model execution is started by this fixture.
+    const blocked = tasks[1];
+    writeFileSync(path.join(blocked.root, blocked.cid, 'tasks.json'), JSON.stringify([
+      { task_id: 'queued', cid: blocked.cid, assignee: 'commander', instruction: 'Fixture only', status: 'queued', created_at: old },
+    ]));
+    await page.evaluate(cid => localStorage.setItem(`draft_${cid}`, JSON.stringify({ text: 'Unsent draft stays intact' })), blocked.cid);
+    const section = page.locator('#settings-task-cleanup');
+    const openSettings = async () => {
+      await page.locator('#settings-btn').click();
+      await page.locator('[data-settings-tab="data"]').click();
+      await expect(section).toContainText('Clean up (0)');
+      if (!await section.locator('[data-cleanup-project]').count()) await section.locator('[data-cleanup-action="view"]').click();
+    };
+    await openSettings();
+    const personalOpen = section.locator(`[data-cleanup-action="open"][data-cleanup-owner="${tasks[0].cid}"]`);
+    await expect(personalOpen).toHaveCount(1);
+    await page.mouse.move(0, 0);
+    await expect(personalOpen).toHaveCSS('opacity', '0');
+    await personalOpen.locator('xpath=ancestor::*[contains(@class,"settings-cleanup-item")]').hover();
+    await expect(personalOpen).toHaveCSS('opacity', '1');
+    await personalOpen.click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/active/);
+    await expect(page.locator('#chat-history')).toContainText('Personal history to inspect');
+    await expect(page.locator('#chat-header-title')).toHaveText(tasks[0].title);
+    await expect(section.locator(`[data-cleanup-cid="${tasks[0].cid}"]`)).not.toBeChecked();
+    const back = page.locator('#chat-cleanup-back');
+    await expect(back).toBeVisible();
+    await back.click();
+    await expect(page.locator('#panel-settings')).toHaveClass(/active/);
+    await expect(section.locator('[data-cleanup-action="view"]')).toHaveText('Collapse');
+    await section.locator('[data-cleanup-action="project"]').click();
+    const projectCheck = section.locator(`[data-cleanup-cid="${blocked.cid}"]`);
+    const projectOpen = section.locator(`[data-cleanup-action="open"][data-cleanup-owner="${blocked.cid}"]`);
+    await expect(projectCheck).toBeEnabled();
+    await expect(section).not.toContainText('Stops on cleanup');
+    await page.mouse.move(0, 0);
+    await expect(projectOpen).toHaveCSS('opacity', '0');
+    await projectOpen.focus();
+    await expect(projectOpen).toHaveCSS('opacity', '1');
+    for (const [lang, width, height] of [['en', 1280, 900], ['zh', 1000, 720], ['zh', 620, 780]] as const) {
+      await page.setViewportSize({ width, height });
+      await page.evaluate(async lang => { await (window as any).setLang(lang); }, lang);
+      await projectOpen.focus();
+      const fits = await projectOpen.evaluate(el => {
+        const row = el.closest('.settings-cleanup-item')!.getBoundingClientRect();
+        const button = el.getBoundingClientRect();
+        const time = el.nextElementSibling!.getBoundingClientRect();
+        return button.left >= row.left && button.right <= time.left && time.right <= row.right;
+      });
+      expect(fits).toBe(true);
+      await section.screenshot({ path: testInfo.outputPath(`cleanup-view-${lang}-${width}.png`) });
+    }
+    await projectCheck.check();
+    const settingsScroll = await section.evaluate(el => el.closest('.settings-body')!.scrollTop);
+    expect(await page.evaluate(cid => window.eval('conversations').some((row: any) => row.conversation_id === cid), blocked.cid)).toBe(false);
+    await projectOpen.press('Enter');
+    await expect(page.locator('#panel-conversation')).toHaveClass(/active/);
+    await expect(page.locator('#chat-history')).toContainText('Project history to inspect');
+    await expect(page.locator('#chat-header-title')).toHaveText(blocked.title);
+    await expect(page.locator('#chat-header-meta')).toContainText('Fixture project');
+    await expect(projectCheck).toBeChecked();
+    await expect(back).toBeVisible();
+    await expect(back).toHaveText('返回');
+    await page.locator('#chat-header').screenshot({ path: testInfo.outputPath('cleanup-return-header-zh.png') });
+    await back.click();
+    await expect(page.locator('#panel-settings')).toHaveClass(/active/);
+    await expect(page.locator('[data-settings-tab="data"]')).toHaveClass(/is-active/);
+    await expect(projectCheck).toBeChecked();
+    await expect(section).toContainText('清理 (1)');
+    expect(await section.evaluate(el => el.closest('.settings-body')!.scrollTop)).toBe(settingsScroll);
+    await page.evaluate(cid => window.eval(`setView('conversation', ${JSON.stringify(cid)})`), tasks[0].cid);
+    await expect(back).toBeHidden();
+    expect(await page.evaluate(cid => localStorage.getItem(`draft_${cid}`), blocked.cid)).toContain('Unsent draft stays intact');
+    for (const task of tasks) expect(existsSync(path.join(task.root, `${task.cid}.jsonl`))).toBe(true);
+  });
+  test('stops a live model turn before recycling and can restore its stopped history', async ({ modelOrkas }, testInfo) => {
+    const app = modelOrkas, page = app.page!;
+    app.setModelMode('controlled-slow');
+    await page.locator('#new-chat-input').fill('Write a short task cleanup fixture.');
+    await page.locator('#new-chat-send-btn').click();
+    await expect.poll(() => app.modelRequests.length).toBeGreaterThan(0);
+    const cid = await page.evaluate(() => window.eval('currentCid'));
+    expect((await app.invoke<any>('groupChat.runtimeStatus', { cid })).processing).toBe(true);
+    const root = path.join(app.workspaceRoot, 'account-e2e', 'cloud', 'chats');
+    const old = '2020-01-01T00:00:00Z';
+    // Age all persisted activity while its real bus/model turn stays live.
+    for (const file of [path.join(root, '_index.json'), path.join(root, cid, 'meta.json'), path.join(root, cid, 'state.json'), path.join(root, cid, 'tasks.json')]) {
+      const data = JSON.parse(readFileSync(file, 'utf8'));
+      const rows = Array.isArray(data) ? data : [data];
+      for (const row of rows) {
+        if (row.conversation_id && row.conversation_id !== cid) continue;
+        for (const field of ['created_at', 'updated_at', 'last_active_at', 'started_at', 'ended_at']) if (row[field]) row[field] = old;
+      }
+      writeFileSync(file, JSON.stringify(data));
+    }
+    const messageFile = path.join(root, `${cid}.jsonl`);
+    writeFileSync(messageFile, readFileSync(messageFile, 'utf8').trim().split('\n')
+      .map(line => JSON.stringify({ ...JSON.parse(line), ts: old })).join('\n') + '\n');
+    await app.electronApp!.evaluate((_, chatsModule) => {
+      (process as any).mainModule.require(chatsModule).invalidateConversationCaches('account-e2e');
+    }, path.resolve(__dirname, '../../src/main/features/chats.ts'));
+    await page.locator('#settings-btn').click();
+    await page.locator('[data-settings-tab="data"]').click();
+    const section = page.locator('#settings-task-cleanup');
+    await section.locator('[data-cleanup-action="view"]').click();
+    await section.locator(`[data-cleanup-cid="${cid}"]`).check();
+    await section.locator('[data-cleanup-action="prepare"]').click();
+    await expect(section).toContainText('Running tasks are stopped automatically before cleanup.');
+    await section.screenshot({ path: testInfo.outputPath('cleanup-stop-confirm.png') });
+    await section.locator('[data-cleanup-action="confirm"]').click();
+    await expect(section).toContainText('Recycled 1');
+    expect(existsSync(path.join(root, `${cid}.jsonl`))).toBe(false);
+    // A polling request can overlap the tombstone commit. Absence is the
+    // required history result until the user explicitly restores this task.
+    const missing = await app.invoke<any>('conversations.history', { cid });
+    expect(missing).toMatchObject({ ok: false, error: 'conversation not found' });
+    await testInfo.attach('deleted-history-receipt', {
+      body: Buffer.from(JSON.stringify({ expectedAbsent: true, code: missing.code, deletedFileAbsent: true })),
+      contentType: 'application/json',
+    });
+    app.releaseControlledModelChunk(); app.finishControlledModelStream();
+    const { batches } = await app.invoke<any>('recycle.list');
+    const batch = batches.find((entry: any) => entry.items.some((item: any) => item.path === `cloud/chats/${cid}.jsonl`));
+    expect(batch).toBeTruthy();
+    expect((await app.invoke<any>('recycle.restore', { id: batch.id })).failed).toBe(0);
+    const history = readFileSync(path.join(root, `${cid}.jsonl`), 'utf8');
+    expect(history).toContain('Write a short task cleanup fixture.');
+    const restored = await app.invoke<any>('conversations.history', { cid });
+    expect(restored.ok).toBe(true);
+    expect(JSON.stringify(restored.history)).toContain('Write a short task cleanup fixture.');
+    expect((await app.invoke<any>('groupChat.runtimeStatus', { cid })).processing).toBe(false);
+  });
   for (const inProject of [false, true]) test(`previews, cancels, excludes, cleans and restores ${inProject ? 'project' : 'personal'} history using real IPC and storage`, async ({ orkas }, testInfo) => {
     const projectId = inProject ? (await orkas.invoke<any>('projects.create', { name: 'Cleanup project' })).project.project_id : '';
+    const { task: automation } = await orkas.invoke<any>('autoTasks.create', {
+      title: 'Keep automation configuration', content: 'Fixture only', enabled: false,
+      schedule: { type: 'daily', hour: 9, minute: 0 }, ...(projectId ? { project_id: projectId } : {}),
+    });
     const dataRoot = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', ...(projectId ? ['projects', projectId] : []));
     const root = path.join(dataRoot, 'chats');
     const cids: string[] = [];
@@ -19,6 +281,7 @@ test.describe('inline historical task cleanup', () => {
       const row = index.find((r: any) => r.conversation_id === cid);
       row.created_at = old; row.updated_at = old;
       if (i === 3) row.pinned_at = old;
+      if (i === 2) row.origin_auto_task_id = automation.id;
       const dir = path.join(root, cid); mkdirSync(dir, { recursive: true });
       writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(row));
       writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ version: 1, status: 'idle', in_flight: [], last_active_at: old }));
@@ -27,27 +290,63 @@ test.describe('inline historical task cleanup', () => {
     }
     const projectBefore = projectId ? readFileSync(path.join(dataRoot, 'project.json'), 'utf8') : '';
     const attachment = (cid: string) => path.join(dataRoot, 'chat_attachments', cid, 'notes.txt');
+    const nestedAttachment = path.join(dataRoot, 'chat_attachments', cids[6], 'folder', 'draft.txt');
+    mkdirSync(path.dirname(nestedAttachment), { recursive: true });
+    writeFileSync(nestedAttachment, 'Nested unsent attachment');
     for (const cid of [cids[0], cids[6]]) {
       mkdirSync(path.dirname(attachment(cid)), { recursive: true });
       writeFileSync(attachment(cid), 'Attachment contents');
     }
     writeFileSync(path.join(root, `${cids[0]}.jsonl`), JSON.stringify({ id: 'source', from: 'user', content: 'Preserved history', attachments: ['notes.txt'], ts: old }) + '\n');
     writeFileSync(indexFile, JSON.stringify(index));
+    let standalone = '';
+    const standaloneRoot = path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats');
+    if (projectId) {
+      standalone = (await orkas.invoke<any>('conversations.create', { title: 'Top-level task' })).conversation.conversation_id;
+      const standaloneIndex = path.join(standaloneRoot, '_index.json');
+      const rows = JSON.parse(readFileSync(standaloneIndex, 'utf8'));
+      const row = rows.find((item: any) => item.conversation_id === standalone);
+      row.created_at = old; row.updated_at = old;
+      writeFileSync(standaloneIndex, JSON.stringify(rows));
+      const dir = path.join(standaloneRoot, standalone); mkdirSync(dir, { recursive: true });
+      writeFileSync(path.join(dir, 'meta.json'), JSON.stringify(row));
+      writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ version: 1, status: 'idle', in_flight: [], last_active_at: old }));
+      writeFileSync(path.join(standaloneRoot, `${standalone}.jsonl`), JSON.stringify({ id: 'personal', from: 'user', content: 'Keep top-level history', ts: old }) + '\n');
+    }
     const page = await orkas.relaunch();
+    // Create the missing-transcript shape after startup's one-time ghost
+    // migration, matching unsent tasks encountered during an active session.
+    rmSync(path.join(root, `${cids[6]}.jsonl`));
     await page.evaluate(([unread, draft, pid]) => {
       localStorage.setItem('task_unread_v1_account-e2e', JSON.stringify({ unread: [{ cid: unread, projectId: pid || null, finishedAt: Date.now(), status: 'completed' }], read: [] }));
       localStorage.setItem(`draft_${draft}`, JSON.stringify({ text: 'Keep this unsent draft' }));
     }, [cids[4], cids[5], projectId]);
     await page.reload();
+    await page.evaluate(cid => {
+      window.eval('_chatAttachments').set(cid, [{ name: 'notes.txt', dataUrl: URL.createObjectURL(new Blob(['Draft preview'])), status: 'ready' }]);
+    }, cids[6]);
     await page.locator('#settings-btn').click();
     await page.locator('[data-settings-tab="data"]').click();
     const section = page.locator('#settings-task-cleanup');
-    await expect(section).toContainText('Selected tasks: 2');
+    await expect(section).toContainText('Clean up (0)');
+    await expect(section.getByRole('combobox')).toContainText('30');
     await expect(page.locator('#settings-section-local h2')).toHaveText('Data directory');
     await expect(page.locator('#settings-section-local .settings-row-title')).toHaveCount(0);
     await section.screenshot({ path: testInfo.outputPath('cleanup-preview.png') });
     await section.locator('[data-cleanup-action="view"]').click();
-    await expect(section.locator('[data-cleanup-cid]')).toHaveCount(2);
+    if (projectId) {
+      await expect(section.locator('[data-cleanup-project]')).toHaveCount(1);
+      await section.locator('[data-cleanup-action="project"]').click();
+      await expect(section.locator('.settings-cleanup-project-toggle [data-ui-icon]')).toHaveCount(2);
+      await expect(section.locator(`.settings-cleanup-list > .settings-cleanup-item [data-cleanup-cid="${standalone}"]`)).toHaveCount(1);
+      await expect(section.locator('.settings-cleanup-project .settings-cleanup-item.is-nested')).toHaveCount(7);
+    } else await expect(section.locator('[data-cleanup-project]')).toHaveCount(0);
+    await expect(section.locator('[data-cleanup-cid]')).toHaveCount(projectId ? 8 : 7);
+    await expect(section.locator('.settings-cleanup-tag').filter({ hasText: 'Automation' })).toHaveCount(1);
+    await section.locator('[data-cleanup-all]').check();
+    if (standalone) await section.locator(`[data-cleanup-cid="${standalone}"]`).uncheck();
+    await expect(section.locator(`[data-cleanup-cid="${cids[3]}"]`)).toBeChecked();
+    await expect(section.locator(`[data-cleanup-cid="${cids[5]}"]`)).toBeChecked();
     await section.locator('[data-cleanup-action="prepare"]').click();
     await expect(section.locator('[data-cleanup-action="confirm"]')).toBeVisible();
     await section.locator('[data-cleanup-action="cancel"]').click();
@@ -55,44 +354,93 @@ test.describe('inline historical task cleanup', () => {
     await section.locator(`[data-cleanup-cid="${cids[1]}"]`).uncheck();
     await section.locator('[data-cleanup-action="prepare"]').click();
     await page.setViewportSize({ width: 1000, height: 900 });
+    expect(await section.locator('[data-cleanup-action="confirm"]').evaluate(el => {
+      const row = el.closest('.settings-row')!.getBoundingClientRect();
+      const button = el.getBoundingClientRect();
+      return button.left >= row.left && button.right <= row.right;
+    })).toBe(true);
     await section.screenshot({ path: testInfo.outputPath('cleanup-en.png') });
     await page.evaluate(async () => { await (window as any).setLang('zh'); });
+    await section.screenshot({ path: testInfo.outputPath('cleanup-zh.png') });
     await page.setViewportSize({ width: 620, height: 780 });
-    await expect(section.locator('[data-cleanup-action="confirm"]')).toHaveText('移入回收站（1）');
-    await expect(section.getByRole('combobox')).toContainText('90 天以前');
+    await expect(section.locator('[data-cleanup-action="confirm"]')).toHaveText('移入回收站（6）');
+    await expect(section.getByRole('combobox')).toContainText('30 天以前');
     const geometry = await section.evaluate(el => ({ width: el.clientWidth, scroll: el.scrollWidth }));
     expect(geometry.scroll).toBeLessThanOrEqual(geometry.width);
     await section.screenshot({ path: testInfo.outputPath('cleanup-zh-narrow.png') });
-    // Hold the real deletion at IPC so the in-flight UI can be inspected
-    // deterministically, then release it to exercise storage and restoration.
+    // Cleanup is maintenance, not task activity. Observe the real old history
+    // throughout deletion so a transient promotion into Recent is not missed.
+    await page.evaluate(async ({ ids, pid }) => {
+      if (pid) await (window as any).loadConversationProject(pid, { reset: true });
+      const recent = document.getElementById('today-list')!;
+      const promoted = new Set<string>();
+      const observer = new MutationObserver(() => {
+        for (const row of recent.querySelectorAll<HTMLElement>('[data-cid]')) {
+          if (ids.includes(row.dataset.cid!)) promoted.add(row.dataset.cid!);
+        }
+      });
+      observer.observe(recent, { childList: true, subtree: true });
+      (window as any).__cleanupRecentObservation = { promoted, observer };
+    }, { ids: cids, pid: projectId });
+    await expect(page.locator('#today-list [data-cid]')).toHaveCount(0);
+    // Hold the second real deletion at IPC to inspect the first completed one.
     await orkas.electronApp!.evaluate(({ ipcMain }) => {
       const original = (ipcMain as any)._invokeHandlers.get('orkas.invoke');
+      let removals = 0;
       ipcMain.removeHandler('orkas.invoke');
       ipcMain.handle('orkas.invoke', async (event, request) => {
-        if (request.channel === 'conversations.cleanup.remove') {
+        if (request.channel === 'conversations.cleanup.remove' && ++removals === 2) {
           ipcMain.removeHandler('orkas.invoke');
           ipcMain.handle('orkas.invoke', original);
           await new Promise<void>(resolve => ipcMain.once('cleanup-test-resume', () => resolve()));
         }
-        return original(event, request);
+        const response = await original(event, request);
+        if (request.channel === 'conversations.cleanup.remove' && removals === 1 && response.status === 'deleted') {
+          (globalThis as any).__cleanupFirstRemovedCid = request.payload.cid;
+        }
+        return response;
       });
     });
     await section.locator('[data-cleanup-action="confirm"]').click();
     try {
       await expect(section.getByRole('status')).toHaveCount(1);
-      await expect(section.getByRole('status')).toContainText('正在清理 0 / 1');
+      await expect(section.getByRole('status')).toContainText('正在清理 1 / 6');
+      const removed = await orkas.electronApp!.evaluate(() => (globalThis as any).__cleanupFirstRemovedCid);
+      expect(cids).toContain(removed);
+      await expect(page.locator(`.conv-item[data-cid="${removed}"]`)).toHaveCount(0);
+      expect(await page.evaluate(cid => window.eval('conversations').some((row: any) => row.conversation_id === cid), removed)).toBe(false);
+      await expect(page.locator('#today-list [data-cid]')).toHaveCount(0);
       await expect(section.locator('[data-cleanup-action="stop"]')).toBeEnabled();
       await section.screenshot({ path: testInfo.outputPath('cleanup-progress-zh.png') });
     } finally {
       await orkas.electronApp!.evaluate(({ ipcMain }) => { ipcMain.emit('cleanup-test-resume'); });
     }
-    await expect(section).toContainText('已移入回收站 1 项');
+    await expect(section).toContainText('已回收 6');
+    expect(await page.evaluate(() => {
+      const { observer, promoted } = (window as any).__cleanupRecentObservation;
+      observer.disconnect();
+      return Array.from(promoted);
+    })).toEqual([]);
     expect(existsSync(path.join(root, `${cids[0]}.jsonl`))).toBe(false);
     expect(existsSync(attachment(cids[0]))).toBe(false);
-    expect(readFileSync(attachment(cids[6]), 'utf8')).toBe('Attachment contents');
-    for (const cid of cids.slice(1)) expect(existsSync(path.join(root, `${cid}.jsonl`))).toBe(true);
+    expect(existsSync(attachment(cids[6]))).toBe(false);
+    expect(existsSync(path.join(root, `${cids[1]}.jsonl`))).toBe(true);
+    for (const cid of cids.slice(2)) expect(existsSync(path.join(root, `${cid}.jsonl`))).toBe(false);
+    expect(await page.evaluate(cid => localStorage.getItem(`draft_${cid}`), cids[5])).toBeNull();
+    expect(await page.evaluate(cid => window.eval('_chatAttachments').has(cid), cids[6])).toBe(false);
+    expect(await page.evaluate(cid => (window as any).TaskUnread.isUnread(cid), cids[4])).toBe(false);
+    if (standalone) expect(existsSync(path.join(standaloneRoot, `${standalone}.jsonl`))).toBe(true);
+    expect((await orkas.invoke<any>('autoTasks.list', { projectId: projectId || null })).tasks.some((task: any) => task.id === automation.id)).toBe(true);
     if (projectId) expect(readFileSync(path.join(dataRoot, 'project.json'), 'utf8')).toBe(projectBefore);
     const { batches } = await orkas.invoke<any>('recycle.list');
+    expect(existsSync(nestedAttachment)).toBe(false);
+    const draftBatch = batches.find((b: any) => b.display_items?.some((item: any) => item.id === cids[6]));
+    expect(draftBatch).toBeTruthy();
+    expect(draftBatch.display_items).toEqual([expect.objectContaining({ category: 'conversation', id: cids[6], title: 'Attachment-only draft' })]);
+    expect(await orkas.invoke<any>('recycle.restore', { id: draftBatch.id })).toMatchObject({ ok: true, failed: 0, reactivated: 1 });
+    expect(readFileSync(nestedAttachment, 'utf8')).toBe('Nested unsent attachment');
+    expect(readFileSync(attachment(cids[6]), 'utf8')).toBe('Attachment contents');
+    expect((await orkas.invoke<any>('conversations.get', { cid: cids[6] })).conversation).toMatchObject({ title: 'Attachment-only draft' });
     const prefix = projectId ? `cloud/projects/${projectId}` : 'cloud';
     const batch = batches.find((b: any) => b.items.some((item: any) => item.path === `${prefix}/chats/${cids[0]}.jsonl`));
     expect(batch).toBeTruthy();

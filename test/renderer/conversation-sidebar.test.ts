@@ -1170,6 +1170,36 @@ describe('conversation history response ordering', () => {
     };
   }
 
+  it.each([null, 'project-old'])('hydrates the title and project of history outside the sidebar slice (%s)', async projectId => {
+    const s = setup();
+    const title = { textContent: '', hidden: false };
+    const meta = { innerHTML: '' };
+    const getElement = s.context.document.getElementById;
+    s.context.document.getElementById = (id: string) => id === 'chat-header-title' ? title
+      : id === 'chat-header-meta' ? meta : getElement(id);
+    s.context.getCommanderProjectIdName = () => 'Archived project';
+    s.context.conversations = [{ conversation_id: 'other', title: 'Unrelated task' }];
+    const loading = s.context.loadConversationHistory('c1');
+    s.resolve(response([question, answer], { conversation: {
+      conversation_id: 'c1', title: 'Original historical task', project_id: projectId,
+      processing: false, created_at: '2020-01-01T00:00:00Z',
+    } }));
+    await loading;
+    expect(title.textContent).toBe('Original historical task');
+    expect(meta.innerHTML.includes('Archived project')).toBe(!!projectId);
+    expect(s.context.conversations.find((row: any) => row.conversation_id === 'other').title).toBe('Unrelated task');
+    expect(s.ids()).toEqual(['u1', 'a1']);
+  });
+  it('does not overwrite a newer cached title with an in-flight historical snapshot', async () => {
+    const s = setup();
+    const loading = s.context.loadConversationHistory('c1');
+    s.context.conversations = [{ conversation_id: 'c1', title: 'Renamed while loading', title_manually_set: true }];
+    s.resolve(response([question, answer], { conversation: {
+      conversation_id: 'c1', title: 'Old snapshot', processing: false,
+    } }));
+    await loading;
+    expect(s.context.conversations[0].title).toBe('Renamed while loading');
+  });
   it.each(['success', 'failure', 'missing'] as const)('ignores an older request after a newer load succeeds: %s', async (outcome) => {
     const s = setup();
     const older = s.context.loadConversationHistory('c1');
@@ -1906,6 +1936,90 @@ describe('conversation sidebar task row actions', () => {
     expect(html).not.toContain('Load more');
     expect(html).not.toContain('data-conv-bucket-toggle');
     expect(html).not.toContain('data-conv-bucket-more');
+  });
+
+  it.each(['startup', 'project', 'unprojected'])('does not resurrect a deleted task from an older %s response, but permits restore', async (mode) => {
+    const context = loadConversationRenderer();
+    const row = { conversation_id: 'removed', project_id: mode === 'project' ? 'p1' : null };
+    context.conversations = [row, { conversation_id: 'keep' }];
+    context.renderConversationList = vi.fn();
+    let release!: (value: any) => void;
+    context.apiFetch = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    const load = () => mode === 'startup' ? context.loadConversations()
+      : mode === 'project' ? context.loadConversationProject('p1', { reset: true })
+        : context.loadUnprojectedConversations({ reset: true });
+    const pending = load();
+    context._removeConversationFromSidebar('removed');
+    release({ json: async () => ({ ok: true, conversations: [row], total: 1, next_offset: null }) });
+    await pending;
+    expect(context.conversations.map((c: any) => c.conversation_id)).toEqual(['keep']);
+    context.apiFetch.mockResolvedValue({ json: async () => ({ ok: true, conversations: [row], total: 1, next_offset: null }) });
+    await load();
+    expect(context.conversations.some((c: any) => c.conversation_id === 'removed')).toBe(true);
+  });
+
+  it('does not repaint unchanged sidebars when cleaning history outside the loaded list', () => {
+    const context = loadConversationRenderer();
+    const current = { conversation_id: 'current', last_active_at: '2026-10-17T01:00:00Z' };
+    context.conversations = [current];
+    context.renderConversationList = vi.fn();
+    context.requestAnimationFrame = vi.fn();
+    for (let i = 0; i < 1000; i++) context._removeConversationFromSidebar(`old-${i}`, { deferRender: true });
+    expect(context.conversations).toEqual([current]);
+    expect(context.renderConversationList).not.toHaveBeenCalled();
+    expect(context.requestAnimationFrame).not.toHaveBeenCalled();
+  });
+
+  it('removes cached history immediately and coalesces a cleanup burst into one sidebar paint', () => {
+    const context = loadConversationRenderer();
+    context.conversations = [{ conversation_id: 'one' }, { conversation_id: 'two' }, { conversation_id: 'keep' }];
+    context.renderConversationList = vi.fn();
+    const frames: Function[] = [];
+    context.requestAnimationFrame = vi.fn((fn: Function) => { frames.push(fn); });
+    context._removeConversationFromSidebar('one', { deferRender: true });
+    context._removeConversationFromSidebar('two', { deferRender: true });
+    expect(context.conversations.map((c: any) => c.conversation_id)).toEqual(['keep']);
+    expect(context.renderConversationList).not.toHaveBeenCalled();
+    expect(frames).toHaveLength(1);
+    frames.shift()!();
+    expect(context.renderConversationList).toHaveBeenCalledTimes(1);
+    context._removeConversationFromSidebar('keep', { deferRender: true });
+    expect(frames).toHaveLength(1);
+    frames.shift()!();
+    expect(context.renderConversationList).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects an older response for deleted offscreen history without repainting the unchanged sidebar', async () => {
+    const context = loadConversationRenderer();
+    const keep = { conversation_id: 'keep' };
+    context.conversations = [keep];
+    context.renderConversationList = vi.fn();
+    let release!: (value: any) => void;
+    context.apiFetch = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    const pending = context.loadConversations();
+    context._removeConversationFromSidebar('offscreen', { deferRender: true });
+    release({ json: async () => ({ ok: true, conversations: [keep, { conversation_id: 'offscreen' }] }) });
+    await pending;
+    expect(context.conversations).toEqual([keep]);
+    expect(context.renderConversationList).not.toHaveBeenCalled();
+  });
+
+  it('refreshes after cleanup even when an older sidebar request is still pending', async () => {
+    const context = loadConversationRenderer();
+    const removed = { conversation_id: 'removed' };
+    const keep = { conversation_id: 'keep' };
+    context.conversations = [removed, keep];
+    context.renderConversationList = vi.fn();
+    let release!: (value: any) => void;
+    context.apiFetch = vi.fn().mockImplementationOnce(() => new Promise(resolve => { release = resolve; }))
+      .mockResolvedValue({ json: async () => ({ ok: true, conversations: [keep] }) });
+    const older = context.loadConversations();
+    context._removeConversationFromSidebar('removed');
+    const fresh = context.loadConversations({ fresh: true });
+    release({ json: async () => ({ ok: true, conversations: [removed, keep] }) });
+    await Promise.all([older, fresh]);
+    expect(context.apiFetch).toHaveBeenCalledTimes(2);
+    expect(context.conversations.map((c: any) => c.conversation_id)).toEqual(['keep']);
   });
 
   it('resets a project list to its first 10 tasks when reopened', async () => {

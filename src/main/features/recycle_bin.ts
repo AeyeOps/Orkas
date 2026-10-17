@@ -1,3 +1,4 @@
+import { bumpRecordSyncVersion } from '../util/record_sync_fields';
 /**
  * Global local recycle bin.
  *
@@ -908,10 +909,14 @@ async function buildRecycleDisplayItems(
   for (const relPath of paths) {
     const editRoot = editConversationRootFromRelPath(relPath);
     if (editRoot) editConversationRoots.set(`${editRoot.kind}:${editRoot.id}`, editRoot);
-    const cid = chatJsonlCid(relPath);
+    const cid = kind === 'conversation' || kind === 'conversations' ? chatCidFromRelPath(relPath) : chatJsonlCid(relPath);
     if (cid) chatRoots.add(cid);
     const projectChat = projectChatJsonlInfo(relPath);
     if (projectChat) projectChatRoots.set(projectChat.cid, projectChat.pid);
+    else if (cid) {
+      const pid = projectIdFromRelPath(relPath);
+      if (pid) projectChatRoots.set(cid, pid);
+    }
     const pid = projectRootDeletedId(relPath);
     if (pid) projectRoots.add(pid);
     const taskId = autoTaskRootDeletedId(relPath);
@@ -1445,18 +1450,26 @@ async function reactivateChatIndexRows(
   relPaths: string[],
   restoredAt: Date,
 ): Promise<string[]> {
-  const cidToRelPath = new Map<string, string>();
-  for (const relPath of relPaths) {
-    const cid = chatJsonlCid(relPath);
-    if (cid) cidToRelPath.set(cid, relPath);
-  }
-  if (cidToRelPath.size === 0) return [];
-
   const metadataRows = new Map<string, Record<string, any>>();
   for (const row of batch.metadata?.chat_index_rows || []) {
     const cid = typeof row.conversation_id === 'string' ? row.conversation_id : '';
     if (safeId(cid)) metadataRows.set(cid, row);
   }
+  const transcripts = new Set(batch.items.map(item => chatJsonlCid(item.path)).filter(Boolean));
+  const cidToRelPath = new Map<string, string>();
+  for (const relPath of relPaths) {
+    const transcriptCid = chatJsonlCid(relPath);
+    if (transcriptCid) cidToRelPath.set(transcriptCid, relPath);
+    else if (relPath.endsWith('/meta.json')) {
+      const cid = chatCidFromRelPath(relPath);
+      const pid = projectIdFromRelPath(relPath);
+      const taskMeta = pid ? `cloud/projects/${pid}/chats/${cid}/meta.json` : `cloud/chats/${cid}/meta.json`;
+      // An unsent task has no transcript to restore. Its restored metadata is
+      // sufficient, but must not hide a failed transcript in a nonempty task.
+      if (cid && relPath === taskMeta && metadataRows.has(cid) && !transcripts.has(cid)) cidToRelPath.set(cid, relPath);
+    }
+  }
+  if (cidToRelPath.size === 0) return [];
   const legacyProjectIds = new Set<string>();
   for (const item of batch.items) {
     const pid = projectIdFromRelPath(item.path);
@@ -1468,9 +1481,9 @@ async function reactivateChatIndexRows(
   const restoredIso = restoredAt.toISOString();
   const buckets = new Map<string, { rows: any[]; rowsByCid: Map<string, any>; changed: boolean }>();
   const bucketFor = async (relPath: string) => {
-    const projectChat = projectChatJsonlInfo(relPath);
-    const indexFile = projectChat
-      ? await resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${projectChat.pid}/chats/_index.json`)
+    const pid = projectIdFromRelPath(relPath);
+    const indexFile = pid
+      ? await resolveCloudRelPath(userCloudRoot(uid), `cloud/projects/${pid}/chats/_index.json`)
       : await resolveCloudRelPath(userCloudRoot(uid), 'cloud/chats/_index.json');
     const existing = buckets.get(indexFile);
     if (existing) return existing;
@@ -1493,14 +1506,14 @@ async function reactivateChatIndexRows(
   };
 
   for (const [cid, relPath] of cidToRelPath) {
-    const projectChat = projectChatJsonlInfo(relPath);
+    const pid = projectIdFromRelPath(relPath);
     const bucket = await bucketFor(relPath);
     const row = bucket.rowsByCid.get(cid);
     const metadataRow = metadataRows.get(cid);
     if (!row && !metadataRow) {
       const restoredRow = await deriveChatIndexRowFromArchive(uid, batch.id, cid, relPath, restoredIso);
       if (!restoredRow) continue;
-      if (projectChat && !restoredRow.project_id) restoredRow.project_id = projectChat.pid;
+      if (pid && !restoredRow.project_id) restoredRow.project_id = pid;
       bucket.rows.unshift(restoredRow);
       bucket.rowsByCid.set(cid, restoredRow);
       reactivated.add(relPath);
@@ -1510,7 +1523,7 @@ async function reactivateChatIndexRows(
 
     if (!row) {
       const restoredRow: Record<string, any> = { ...metadataRow, conversation_id: cid };
-      if (projectChat && !restoredRow.project_id) restoredRow.project_id = projectChat.pid;
+      if (pid && !restoredRow.project_id) restoredRow.project_id = pid;
       delete restoredRow.deleted_at;
       bucket.rows.unshift(restoredRow);
       bucket.rowsByCid.set(cid, restoredRow);
@@ -1526,13 +1539,15 @@ async function reactivateChatIndexRows(
     if (!rowDeleted && !canRepairMetadataProject && !canRepairLegacyProject) continue;
 
     if (rowDeleted && metadataRow) {
+      const revision = Math.max(Number(row._sync_rev) || 0, Number(metadataRow._sync_rev) || 0);
       Object.assign(row, metadataRow);
+      row._sync_rev = revision;
     } else if (canRepairMetadataProject) {
       row.project_id = metadataProjectId;
     } else if (canRepairLegacyProject) {
       row.project_id = legacyProjectId;
     }
-    if (projectChat && !row.project_id) row.project_id = projectChat.pid;
+    if (pid && !row.project_id) row.project_id = pid;
     delete row.deleted_at;
     if (rowDeleted && !metadataRow) row.updated_at = restoredIso;
     reactivated.add(relPath);
@@ -1541,6 +1556,11 @@ async function reactivateChatIndexRows(
 
   for (const [indexFile, bucket] of buckets) {
     if (!bucket.changed) continue;
+    for (const row of bucket.rows) {
+      if (!row.deleted_at && cidToRelPath.has(row.conversation_id)) {
+        bumpRecordSyncVersion(row, row._sync_device_id || '');
+      }
+    }
     await writeJson(indexFile, bucket.rows);
   }
   return Array.from(reactivated);
@@ -1794,6 +1814,17 @@ export async function createAppRecycleBatch(
     const files = await collectCloudEntryFiles(uid, relPath);
     if (files.length) {
       for (const f of files) expanded.add(f);
+    } else if ((opts.kind === 'conversation' || opts.kind === 'conversations') && chatJsonlCid(relPath)) {
+      // Unsent conversations can have metadata/drafts without a transcript.
+      // Freeze existing related files; any later disappearance still fails the
+      // strict archive instead of weakening backup-before-delete protection.
+      const relatedPaths = await expandRecycleRelPaths(uid, [relPath]);
+      // Without the task metadata file, attachments alone cannot reactivate
+      // this conversation on restore. Keep the missing primary path strict.
+      if (!relatedPaths.includes(relPath.slice(0, -'.jsonl'.length) + '/meta.json')) expanded.add(relPath);
+      for (const related of relatedPaths) {
+        if (related !== relPath) expanded.add(related);
+      }
     } else {
       expanded.add(relPath);
     }
@@ -2073,7 +2104,10 @@ export async function deleteRecycleBatch(uid: string, batchId: string): Promise<
 }
 
 export function restoreRecycleBatch(uid: string, batchId: string) {
-  return withEditSnapshotRetention(uid, () => restoreBatch(uid, batchId));
+  return withEditSnapshotRetention(uid, async () => {
+    const chats = await import('./chats');
+    return chats.withConversationLifecycleWrite(uid, () => restoreBatch(uid, batchId));
+  });
 }
 
 async function restoreBatch(

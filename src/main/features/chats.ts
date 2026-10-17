@@ -1,3 +1,4 @@
+import { taskForPath, type TaskOwnership } from './conversation_deletions';
 /**
  * Conversations (per-user) — CRUD + message reads.
  *
@@ -29,6 +30,7 @@ import {
 } from '../paths';
 import {
   conversationLayout,
+  cloudRelForAbs,
   assertConversationRelocationReady,
   setConversationRelocationBlocked,
   chatAttachmentDirForConversation,
@@ -1092,20 +1094,13 @@ async function _repairConversationIndexFromDiskUnlocked(
       await _removeConversationMeta(userId, c.conversation_id);
       continue;
     }
-    const deletedMs = tsMs(c.deleted_at);
-    if (!deletedMs || st.mtimeMs <= deletedMs) {
-      await _removeConversationMeta(userId, c.conversation_id);
-      if (isExpiredIsoTombstone(c.deleted_at)) {
-        try { await fsp.unlink(file); } catch { /* ignore */ }
-        invalidateLineCount(file);
-      }
-      continue;
+    // A sync download has a fresh filesystem mtime too. Only an explicit
+    // restore/recreation may clear the record tombstone.
+    await _removeConversationMeta(userId, c.conversation_id);
+    if (isExpiredIsoTombstone(c.deleted_at)) {
+      try { await fsp.unlink(file); } catch { /* ignore */ }
+      invalidateLineCount(file);
     }
-    delete c.deleted_at;
-    const restoredAt = new Date(Number.isFinite(st.mtimeMs) ? st.mtimeMs : Date.now()).toISOString();
-    if (tsMs(c.updated_at) < tsMs(restoredAt)) c.updated_at = restoredAt;
-    _stampConversationSync(userId, c);
-    resurrected += 1;
   }
   const compacted = pruneExpiredDeletedRecords(items) as Conversation[];
   const expiredTombstoneCount = items.length - compacted.length;
@@ -2360,7 +2355,7 @@ function purgeSession(userId: string, sessionId: string): void {
   deleteSessionFileForUser(userId, sessionId);
 }
 
-async function _purgeDeletedConversationFiles(userId: string, cid: string, removed?: Conversation): Promise<void> {
+async function _purgeDeletedConversationFiles(userId: string, cid: string, ownership: TaskOwnership, removed?: Conversation): Promise<void> {
   // A completed turn may still be materializing remote image/video output in
   // the background. Abort it before removing the message file; attachment
   // purge also holds the writer lock so a response already past abort cannot
@@ -2406,6 +2401,7 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, remov
       const sessionIds = new Set<string>();
       for (const name of names) {
         if (!name.startsWith(gmemberPrefix)) continue;
+        if (taskForPath(ownership, cloudRelForAbs(userId, path.join(sessionsDir, name)))?.cid !== cid) continue;
         // A model-state reset can leave only retained historical outputs.
         const suffix = ['.jsonl', '.tool-results'].find((ext) => name.endsWith(ext));
         if (suffix) sessionIds.add(name.slice(0, -suffix.length));
@@ -2452,11 +2448,18 @@ export async function deleteConversation(
   beforeDelete?: (current: Conversation) => Promise<boolean>,
 ): Promise<boolean> {
   let removed: Conversation | null = null;
+  let ownership: TaskOwnership = new Map();
   const found = await _withConversationIndexStore(userId, async (store) => {
     const target = await store.findTarget(cid, projectIdHint);
     if (!target) return false;
     if (beforeDelete && !await beforeDelete(target.conversation)) return false;
     removed = target.conversation;
+    // Reuse the already loaded root; bulk cleanup must not scan every project's
+    // index twice per task just to disambiguate member-session prefixes.
+    ownership = new Map((await store.readRoot(target.rootKey)).map(row => [
+      `${target.rootKey}/${row.conversation_id}`,
+      { cid: row.conversation_id, projectId: target.rootKey || null },
+    ]));
     if (!isDeletedConversation(target.conversation)) {
       const deletedAt = nowIso();
       const tombstone = _stampConversationSync(userId, {
@@ -2464,6 +2467,8 @@ export async function deleteConversation(
         deleted_at: deletedAt,
         updated_at: deletedAt,
       });
+      // Capture can yield; revalidate the cleanup receipt before committing it.
+      if (beforeDelete && !await beforeDelete(target.conversation)) return false;
       await store.persistTarget(target, tombstone);
     } else {
       try {
@@ -2473,7 +2478,7 @@ export async function deleteConversation(
     return true;
   });
   if (!found || !removed) return false;
-  await _purgeDeletedConversationFiles(userId, cid, removed);
+  await _purgeDeletedConversationFiles(userId, cid, ownership, removed);
   await (await import('./saved_apps')).cleanupEditSnapshots(userId, false, cid);
   return true;
 }
@@ -2956,4 +2961,11 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
   });
   if (swept) log.info(`cleared ${swept} stale running conversations`);
   return { swept };
+}
+
+/** Serialize explicit recycle restoration with ordinary task lifecycle writes. */
+export async function withConversationLifecycleWrite<T>(userId: string, fn: () => Promise<T>): Promise<T> {
+  _invalidateConversationListCache(userId);
+  try { return await _withConversationWrite(userId, fn); }
+  finally { _invalidateConversationListCache(userId); }
 }

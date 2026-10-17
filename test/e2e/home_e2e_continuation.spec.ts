@@ -8,6 +8,70 @@ import { expect, test } from './fixtures/orkas';
 // The empty state's layout is covered by the landing case in
 // composer_e2e_interactions.spec.ts.
 test.describe('Commander home continuation', () => {
+
+  test('expands all remaining work with accurate counts and preserves expansion on refresh', async ({ orkas, appPage }, testInfo) => {
+    await appPage.setViewportSize({ width: 1280, height: 720 });
+    for (let i = 0; i < 11; i += 1) {
+      await orkas.invoke('projects.tasks.create', { content: `Follow-up ${i + 1}: ${'Review the customer feedback and confirm the next step. '.repeat(3)}` });
+    }
+    const records: Array<{ cid: string; entryPoint: string }> = [];
+    for (const [entryPoint, total] of [['automation', 46], ['chat_send', 4]] as const) {
+      for (let i = 0; i < total; i += 1) {
+        const created = await orkas.invoke<{ conversation: { conversation_id: string } }>('conversations.create', { title: `${entryPoint} result ${i + 1}` });
+        records.push({ cid: created.conversation.conversation_id, entryPoint });
+      }
+    }
+    await appPage.evaluate((rows) => {
+      for (const [i, row] of rows.entries()) (window as any)._markConversationUnread(row.cid, {
+        // Legacy unread records have no stored outcome or result body.
+        finishedAt: Date.now() - i * 1000, ...(i < 3 ? { status: 'completed' } : {}), entryPoint: row.entryPoint,
+      });
+    }, records);
+
+    for (const [section, total] of [['todos', 11], ['automations', 46], ['tasks', 4]] as const) {
+      const group = appPage.locator(`.home-group[data-section="${section}"]`);
+      await expect(group.locator('.home-group-count')).toHaveText(String(total));
+      await expect(group.locator('.home-row:visible')).toHaveCount(3);
+      const toggle = group.locator('[data-home-toggle]');
+      await expect(toggle).toHaveText(`Show ${total - 3} more`);
+      await toggle.focus();
+      await appPage.keyboard.press('Enter');
+      await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+      await expect(group.locator('.home-row:visible')).toHaveCount(total);
+      if (section !== 'todos') {
+        await expect(group.locator('.home-row-status.is-completed')).toHaveCount(total);
+        await expect(group.locator('.home-row-status.is-unknown')).toHaveCount(0);
+      }
+      await group.locator('.home-row').last().scrollIntoViewIfNeeded();
+      await expect(group.locator('.home-row').last()).toBeInViewport();
+      if (section === 'automations') await appPage.screenshot({ path: testInfo.outputPath('home-legacy-results-completed-en.png') });
+      await toggle.click();
+      await expect(group.locator('.home-row:visible')).toHaveCount(3);
+      await expect(toggle).toHaveText(`Show ${total - 3} more`);
+    }
+
+    const todos = appPage.locator('.home-group[data-section="todos"]');
+    await todos.locator('[data-home-toggle]').click();
+    await orkas.invoke('projects.tasks.create', { content: 'A follow-up added while the list is expanded' });
+    await expect(todos.locator('.home-group-count')).toHaveText('12');
+    await expect(todos.locator('[data-home-toggle]')).toHaveAttribute('aria-expanded', 'true');
+    await expect(todos.locator('.home-row:visible')).toHaveCount(12);
+    await todos.locator('[data-home-toggle]').click();
+    await todos.scrollIntoViewIfNeeded();
+    await appPage.screenshot({ path: testInfo.outputPath('home-folded-en-1280.png') });
+
+    await appPage.evaluate(async () => (window as any).setLang('zh'));
+    await appPage.setViewportSize({ width: 960, height: 640 });
+    await expect(todos.locator('[data-home-toggle]')).toHaveText('展开其余 9 条');
+    await todos.locator('[data-home-toggle]').click();
+    await todos.scrollIntoViewIfNeeded();
+    await appPage.screenshot({ path: testInfo.outputPath('home-expanded-zh-960.png') });
+    await todos.locator('.home-row').last().scrollIntoViewIfNeeded();
+    await appPage.screenshot({ path: testInfo.outputPath('home-expanded-zh-footer.png') });
+    await todos.locator('[data-home-toggle]').click();
+    await expect(todos.locator('.home-row:visible')).toHaveCount(3);
+  });
+
   test('lists open work below a composer that keeps its place, and drops a run once it is opened', async ({ orkas, appPage }) => {
     await appPage.setViewportSize({ width: 1280, height: 720 });
     const panel = appPage.locator('#panel-new-chat');

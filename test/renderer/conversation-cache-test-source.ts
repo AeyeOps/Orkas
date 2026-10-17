@@ -9,3 +9,5 @@ const parsed = ts.createSourceFile('conversation.js', source, ts.ScriptTarget.La
 const names = new Set(['_replaceConversationSlice', '_appendConversationSlice', '_cacheCreatedConversation']);
 export const conversationCacheSource = parsed.statements.filter(node =>
   ts.isFunctionDeclaration(node) && names.has(node.name?.text || '')).map(node => node.getText(parsed)).join('\n');
+export const conversationRemovalSource = parsed.statements.filter(node =>
+  ts.isFunctionDeclaration(node) && node.name?.text === '_removeConversationFromSidebar').map(node => node.getText(parsed)).join('\n');

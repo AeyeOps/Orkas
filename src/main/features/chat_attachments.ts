@@ -1414,13 +1414,28 @@ export async function purgeByCid(userId: string, cid: string): Promise<number> {
     let count = 0;
     let names: string[] = [];
     try {
-      if (fs.existsSync(dir)) {
-        const entries = fs.readdirSync(dir);
-        names = entries.filter((n) => !n.startsWith('.'));
-        for (const n of entries) {
-          try { fs.unlinkSync(path.join(dir, n)); count++; } catch { /* best-effort */ }
+      const root = await fs.promises.lstat(dir).catch(err => {
+        if (err.code === 'ENOENT') return null;
+        throw err;
+      });
+      if (root) {
+        const pending = root.isDirectory() ? [''] : [];
+        const files: string[] = [];
+        for (let cursor = 0; cursor < pending.length; cursor++) {
+          const parent = pending[cursor];
+          const entries = await fs.promises.readdir(path.join(dir, parent), { withFileTypes: true });
+          for (const entry of entries) {
+            const relative = path.join(parent, entry.name);
+            if (entry.isDirectory()) pending.push(relative);
+            else files.push(relative);
+          }
         }
-        try { fs.rmdirSync(dir); } catch { /* best-effort */ }
+        // rm removes links themselves; neither inventory nor removal follows
+        // a linked directory into another task or an external workspace.
+        await fs.promises.rm(dir, { recursive: true, force: true });
+        count = files.length;
+        names = files.filter(name => !name.split(path.sep).some(part => part.startsWith('.')))
+          .map(name => name.split(path.sep).join('/'));
       }
     } catch (err) { log.warn('attachment purge failed', { cid: maskId(cid), error: logErrorSummary(err) }); }
     try { await purgeFileCacheByCid(userId, safeConvId); }

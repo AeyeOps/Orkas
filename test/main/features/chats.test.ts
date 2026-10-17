@@ -56,6 +56,36 @@ async function loadChats() {
   return import('../../../src/main/features/chats');
 }
 
+describe('local deletion ownership and explicit restoration', () => {
+  it('keeps neighboring task sessions while removing every owned sidecar', async () => {
+    const chats = await loadChats();
+    await chats.createConversation(TEST_UID, { conversationId: 'task-a', title: 'Remove' });
+    await chats.createConversation(TEST_UID, { conversationId: 'task-a-extra', title: 'Keep' });
+    const dir = path.join(tmpDir, TEST_UID, 'cloud', 'sessions');
+    fs.mkdirSync(dir, { recursive: true });
+    const own = ['gmember-task-a-agent-a.jsonl', 'gmember-task-a-agent-a.tool-results'];
+    const neighbor = ['gmember-task-a-extra-agent-a.jsonl', 'gmember-task-a-extra-agent-a.tool-results'];
+    for (const name of [...own, ...neighbor]) fs.writeFileSync(path.join(dir, name), name);
+    expect(await chats.deleteConversation(TEST_UID, 'task-a')).toBe(true);
+    for (const name of own) expect(fs.existsSync(path.join(dir, name)), name).toBe(false);
+    for (const name of neighbor) expect(fs.readFileSync(path.join(dir, name), 'utf8')).toBe(name);
+    expect((await chats.listConversations(TEST_UID)).map(c => c.conversation_id)).toEqual(['task-a-extra']);
+  });
+
+  it('keeps an explicitly deleted task hidden when payload bytes reappear with a newer mtime', async () => {
+    const chats = await loadChats();
+    await chats.createConversation(TEST_UID, { conversationId: 'deleted-local', title: 'Deleted' });
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'chats', 'deleted-local.jsonl');
+    expect(await chats.deleteConversation(TEST_UID, 'deleted-local')).toBe(true);
+    fs.writeFileSync(file, JSON.stringify({ from: 'user', content: 'Reappeared old payload' }) + '\n');
+    const future = new Date(Date.now() + 10000); fs.utimesSync(file, future, future);
+    await chats.repairConversationIndex(TEST_UID);
+    expect(await chats.listConversations(TEST_UID)).toEqual([]);
+    const rows = JSON.parse(fs.readFileSync(path.join(path.dirname(file), '_index.json'), 'utf8'));
+    expect(rows.find((row: any) => row.conversation_id === 'deleted-local').deleted_at).toBeTruthy();
+  });
+});
+
 describe('chats › createConversation', () => {
   it('generates a 12-hex cid and writes it to _index.json', async () => {
     const chats = await loadChats();

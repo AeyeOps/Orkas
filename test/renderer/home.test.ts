@@ -1,6 +1,6 @@
 // Commander home (modules/home.js): which state the New task view shows, how
 // open to-dos and unopened finished runs are grouped, folded and opened, and
-// the shortcuts and connect chooser. jsdom isn't installed, so — like the other
+// the shortcuts and Connectors navigation. jsdom isn't installed, so — like the other
 // renderer tests — the classic script runs in a vm sandbox with a minimal DOM
 // shim and the real zh copy, and assertions read the generated HTML.
 
@@ -153,9 +153,9 @@ describe('Commander home states', () => {
 
     expect(h.state()).toBe('empty');
     expect(h.html()).toBe('');
-    // The context line carries the connect chooser inside the translated sentence.
+    // The context line carries the Connectors link inside the translated sentence.
     expect(h.els['home-explore-context'].innerHTML).toBe(
-      '用 ＋ 分享资料，或<button type="button" class="home-connect-link" data-home-connect="1">连接飞书 / 钉钉 / 邮箱</button>，补充背景，让 Orkas 更了解你。从你愿意分享的内容开始。',
+      '添加资料或<button type="button" class="home-connect-link" data-home-connect="1">连接邮箱/店铺/办公软件等</button>，让 Orkas 更了解你。从你愿意分享的内容开始。',
     );
   });
 
@@ -167,6 +167,8 @@ describe('Commander home states', () => {
           { id: 't1', project_id: 'p1', project_name: '增长', status: 'review', content: '确认定价方案\n附件见对话', updated_at: new Date(Date.now() - 5 * MINUTE).toISOString() },
           { id: 't2', project_id: '', project_name: '', status: 'todo', content: '整理客户访谈', updated_at: new Date(Date.now() - 3 * 60 * MINUTE).toISOString() },
           { id: 't3', project_id: '', project_name: '', status: 'progress', content: '周报', updated_at: '' },
+          { id: 't4', project_id: '', status: 'todo', content: 'Follow-up 4' },
+          { id: 't5', project_id: '', status: 'todo', content: 'Follow-up 5' },
         ],
       },
       unread: [
@@ -218,23 +220,65 @@ describe('Commander home states', () => {
     // More to-dos than rows: the link to the full To-dos page sits in the group header, not below the list.
     expect(html).toContain('重要待办<span class="home-group-count">5</span></h2><button type="button" class="home-text-btn" data-home-action="more_todos" aria-describedby="home-group-todos-title">查看全部 →</button></div>');
     expect(html).not.toContain('home-group-more" data-home-action="more_todos"');
-    expect(html).not.toContain('data-home-toggle="todos"');
+    expect(html).toContain('data-home-toggle="todos"');
     // Run rows: result-specific glyph and action, automation source, fallbacks for old records.
     expect(html).toMatch(/data-home-cid="auto-new"[^>]*data-home-status="failed"[^>]*><span class="home-row-status is-failed"/);
     expect(html).toMatch(/data-home-cid="auto-reply"[^>]*><span class="home-row-status is-completed"/);
     expect(html).toMatch(/data-home-cid="project-task"[^>]*><span class="home-row-status is-waiting_input"/);
-    expect(html).toMatch(/data-home-cid="legacy"[^>]*><span class="home-row-status is-unknown"/);
+    expect(html).toMatch(/data-home-cid="legacy"[^>]*><span class="home-row-status is-completed"/);
     expect(html).toContain(`<span class="home-row-status is-failed" aria-hidden="true">${uiIconHtml('x-circle', 'home-row-status-icon')}</span>`);
     expect(html).toContain('<span class="home-row-title">每周竞品简报</span><span class="home-row-meta"><span class="home-row-source">自动化</span>失败 · 2分钟前</span></span><span class="home-row-action">查看原因');
     expect(html).toContain('<span class="home-row-source">增长 · 项目任务</span>等你输入 · 20分钟前</span></span><span class="home-row-action">去回复');
-    expect(html).toContain('<span class="home-row-title">未命名任务</span><span class="home-row-meta"><span class="home-row-source">全局任务</span>有新结果 · 30分钟前');
+    expect(html).toContain('<span class="home-row-title">未命名任务</span><span class="home-row-meta"><span class="home-row-source">全局任务</span>已完成 · 30分钟前');
     expect(html).not.toContain('deleted-elsewhere');
     expect(html).toContain('全部自动化 →');
   });
 
-  it('shows three runs per group and folds up to twenty more', async () => {
-    const unread = Array.from({ length: 25 }, (_, i) => run(`task-${i}`, 'completed', i + 1, 'chat_send'));
+  it.each(['automations', 'tasks'])('presents missing %s outcomes as completed without overwriting known outcomes or stored records', async (section) => {
+    const outcomes = [
+      [undefined, 'completed', 'check-circle', '已完成', '查看结果'],
+      ['failed', 'failed', 'x-circle', '失败', '查看原因'],
+      ['waiting_input', 'waiting_input', 'message-circle-more', '等你输入', '去回复'],
+      ['stopped', 'stopped', 'stop', '已停止', '查看结果'],
+      ['completed', 'completed', 'check-circle', '已完成', '查看结果'],
+      ['', 'completed', 'check-circle', '已完成', '查看结果'],
+      ['unknown', 'completed', 'check-circle', '已完成', '查看结果'],
+    ];
+    const unread = outcomes.map(([status], i) => ({
+      cid: `result-${i}`, finishedAt: Date.now() - i * MINUTE,
+      ...(status === undefined ? {} : { status }),
+      entryPoint: section === 'automations' ? 'automation' : 'chat_send',
+    }));
     const h = loadHome({
+      unread,
+      // No message bodies or execution results exist in this fixture.
+      conversations: unread.map(({ cid }) => ({ conversation_id: cid, title: cid })),
+    });
+    h.context.homeOnEnter();
+    await h.settle();
+    const html = h.html();
+    outcomes.forEach(([original, displayed, icon, label, action], i) => {
+      const row = html.match(new RegExp(`<button type="button" class="home-row"[^>]*data-home-cid="result-${i}"[^>]*>.*?<\\/button>`))?.[0] || '';
+      expect(row).toContain(`class="home-row-status is-${displayed}" aria-hidden="true">${uiIconHtml(icon, 'home-row-status-icon')}`);
+      expect(row).toContain(`</span>${label} · `);
+      expect(row).toContain(`<span class="home-row-action">${action}`);
+      expect(row).toContain(`data-home-status="${original || 'unknown'}"`);
+    });
+    expect(html).not.toContain('有新结果');
+    expect(h.data()[section].map((row: any) => row.status)).toEqual(outcomes.map(([status]) => status || ''));
+    expect(h.invokes.map(([channel]) => channel)).toEqual(['projects.tasks.listOpen']);
+  });
+
+  it.each([
+    ['todos', 11, '重要待办'],
+    ['todos', 46, '重要待办'],
+    ['automations', 46, '自动化待处理'],
+    ['tasks', 25, '任务待你处理'],
+  ] as const)('expands every remaining %s row and keeps the displayed counts accurate (%i total)', async (section, total, title) => {
+    const unread = section === 'todos' ? [] : Array.from({ length: total }, (_, i) => run(`task-${i}`, 'completed', i + 1, section === 'automations' ? 'automation' : 'chat_send'));
+    const todoRows = Array.from({ length: total }, (_, i) => ({ id: `todo-${i}`, content: `To-do ${i}`, status: 'todo' }));
+    const h = loadHome({
+      ...(section === 'todos' ? { todos: { tasks: todoRows, total } } : {}),
       unread,
       conversations: unread.map((record) => ({ conversation_id: record.cid, title: record.cid, project_id: '' })),
     });
@@ -243,26 +287,38 @@ describe('Commander home states', () => {
 
     const html = h.html();
     const visible = html.split('<div class="home-list-fold"')[0];
-    const fold = html.match(/<div class="home-list-fold" id="home-fold-tasks" hidden>(.*?)<\/div>/)?.[1] || '';
-    expect([...visible.matchAll(/data-home-cid="([^"]+)"/g)].map((m) => m[1])).toEqual(['task-0', 'task-1', 'task-2']);
+    const fold = html.match(new RegExp(`<div class="home-list-fold" id="home-fold-${section}" hidden>(.*?)<\\/div>`))?.[1] || '';
+    expect([...visible.matchAll(/data-home-position="(\d+)"/g)].map((m) => Number(m[1]))).toEqual([1, 2, 3]);
     expect([...fold.matchAll(/data-home-position="(\d+)"/g)].map((m) => Number(m[1])))
-      .toEqual(Array.from({ length: 20 }, (_, i) => i + 4));
-    expect(html).toContain('aria-expanded="false">展开其余 20 条</button>');
-    expect(html).toContain('任务待你处理<span class="home-group-count">25</span>');
+      .toEqual(Array.from({ length: total - 3 }, (_, i) => i + 4));
+    expect(html).toContain(`aria-expanded="false">展开其余 ${total - 3} 条</button>`);
+    expect(html).toContain(`${title}<span class="home-group-count">${total}</span>`);
 
     const foldEl = element({ hidden: true });
-    h.els['home-fold-tasks'] = foldEl;
-    const toggle = element({ dataset: { homeToggle: 'tasks', homeFolded: '20' } });
+    h.els[`home-fold-${section}`] = foldEl;
+    const toggle = element({ dataset: { homeToggle: section, homeFolded: String(total - 3) } });
     h.els['home-groups'].fire('click', click({ '[data-home-toggle]': toggle }));
     expect(foldEl.hidden).toBe(false);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
     expect(toggle.textContent).toBe('收起');
     // A refresh during the visit keeps the group unfolded.
-    expect(vm.runInContext('_homeSectionHtml("tasks")', h.context)).toContain('id="home-fold-tasks">');
+    expect(vm.runInContext(`_homeSectionHtml("${section}")`, h.context)).toContain(`id="home-fold-${section}">`);
 
     h.els['home-groups'].fire('click', click({ '[data-home-toggle]': toggle }));
     expect(foldEl.hidden).toBe(true);
-    expect(toggle.textContent).toBe('展开其余 20 条');
+    expect(toggle.textContent).toBe(`展开其余 ${total - 3} 条`);
+  });
+
+  it.each(['todos', 'automations', 'tasks'])('omits the %s expand control when all three rows fit', async (section) => {
+    const h = loadHome({
+      ...(section === 'todos'
+        ? { todos: { total: 3, tasks: Array.from({ length: 3 }, (_, i) => ({ id: `t${i}`, content: `To-do ${i}` })) } }
+        : { unread: Array.from({ length: 3 }, (_, i) => run(`c${i}`, 'completed', i, section === 'automations' ? 'automation' : 'chat_send')) }),
+    });
+    h.context.homeOnEnter();
+    await h.settle();
+    expect(h.html()).not.toContain('data-home-toggle');
+    expect([...h.html().matchAll(/data-home-position=/g)]).toHaveLength(3);
   });
 
   it('opens a run in its conversation and a to-do on the To-dos page', async () => {
@@ -375,22 +431,21 @@ describe('Commander home states', () => {
   });
 });
 
-describe('Commander home connect chooser', () => {
-  it('marks connected services and opens the picked one in Connectors', async () => {
-    const h = loadHome({ connectors: [
-      { id: 'lark', status: { kind: 'connected' } },
-      { id: 'gmail', status: { kind: 'error' } },
-    ] });
+describe('Commander home Connectors link', () => {
+  it('opens Connectors directly without a chooser or starting setup', async () => {
+    const h = loadHome();
     h.context.homeOnEnter();
     await h.settle();
+    const beforeClick = h.invokes.length;
 
+    h.els['home-explore-context'].fire('click', click({}));
+    expect(h.views).toEqual([]);
+    expect(h.clicks).toEqual([]);
     h.els['home-explore-context'].fire('click', click({ '[data-home-connect]': element() }));
-    await h.settle();
-    expect(h.menus).toHaveLength(1);
-    expect(h.menus[0].map((item: any) => item.label)).toEqual(['飞书 · 已连接', '钉钉', 'Gmail', 'Microsoft 365 邮箱']);
-
-    h.menus[0][2].onClick();
     expect(h.views).toEqual([['connectors', null, { entryPoint: 'home' }]]);
-    expect(h.context.window.openConnectorSetupById).toHaveBeenCalledWith('gmail', 'form');
+    await h.settle();
+    expect(h.invokes).toHaveLength(beforeClick);
+    expect(h.menus).toEqual([]);
+    expect(h.context.window.openConnectorSetupById).not.toHaveBeenCalled();
   });
 });

@@ -1226,7 +1226,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
   'conversations.cleanup.page': async (args, ctx) => {
     if (args.expectedUserId !== ctx.userId) throw new Error('cleanup_account_changed');
-    return taskCleanup.page(ctx.userId, args.token, args.offset);
+    return taskCleanup.page(ctx.userId, args.token, args.offset, { tree: args.tree, projectId: args.projectId });
   },
   'conversations.cleanup.remove': async (args, ctx) => {
     if (args.expectedUserId !== ctx.userId) throw new Error('cleanup_account_changed');
@@ -1434,11 +1434,10 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     };
   },
 
-  // Home page: the most recently updated unfinished to-dos across every scope,
-  // plus the total so the page can link to the full list.
-  'projects.tasks.listOpen': async ({ limit } = {}, ctx) => {
+  // Home page: all unfinished to-dos for expansion, or a bounded preview.
+  'projects.tasks.listOpen': async ({ limit, all } = {}, ctx) => {
     const count = Math.min(20, Math.max(1, Math.round(Number(limit) || 3)));
-    return projectTasks.listOpenTasks(ctx.userId, count);
+    return projectTasks.listOpenTasks(ctx.userId, all === true ? undefined : count);
   },
 
   'projects.tasks.create': async ({ projectId, taskId, content, title, detail, status, owner_agent, owner_agent_id, depends_on } = {}, ctx) => {

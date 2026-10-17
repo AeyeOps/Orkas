@@ -163,11 +163,6 @@
               <div class="quick-panel-head">
                 <span class="quick-panel-title" id="quick-panel-title" data-i18n="new_chat.quick.title">Try one of these tasks — one click to get started</span>
                 <span class="quick-panel-rule" aria-hidden="true"></span>
-                <!-- Opens the marketplace「开源项目」list (wired by modules/oss.js). -->
-                <button type="button" class="quick-panel-more" id="quick-panel-oss-more">
-                  <span data-i18n="new_chat.quick.oss_more">Add more open-source tool capabilities</span>
-                  <span data-ui-icon="chevron-right" data-ui-icon-class="quick-panel-more-arrow" aria-hidden="true"></span>
-                </button>
               </div>
               <div class="quick-grid" id="new-chat-scenario-grid"></div>
             </section>
@@ -192,6 +187,7 @@
                  avatars + counts + 详情 toggle. Filled in by JS lifecycle hook
                  `_refreshChatHeader()` in conversation.js. -->
             <div class="chat-header" id="chat-header">
+              <button type="button" class="btn btn-sm" id="chat-cleanup-back" data-i18n="common.back" hidden>Back</button>
               <div class="chat-header-main">
                 <div class="chat-header-title-row">
                   <h1 class="chat-header-title" id="chat-header-title"></h1>
@@ -1169,7 +1165,7 @@
                     <div class="settings-row">
                       <div class="settings-row-copy">
                         <div class="settings-row-title" data-i18n="settings.cleanup.age">Last active</div>
-                        <div class="settings-row-desc" data-i18n="settings.cleanup.scope">Completed tasks inside and outside projects. Pinned and unread tasks, drafts, and automation runs are kept.</div>
+                        <div class="settings-row-desc" data-i18n="settings.cleanup.scope">Filter all task history by age, then clean up by project or task.</div>
                       </div>
                       <div class="ai-select" id="settings-task-cleanup-age"></div>
                     </div>

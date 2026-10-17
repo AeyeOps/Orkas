@@ -863,9 +863,9 @@ test.describe('new chat composer', () => {
     }
   });
 
-  test('keeps the wider landing scale and puts the OSS entry on the quick-start header', async ({ appPage }) => {
+  test('keeps the wider landing scale without an OSS entry', async ({ appPage }, testInfo) => {
     await expect(appPage.locator('#new-chat-scenarios')).toBeVisible();
-    await expect(appPage.locator('#quick-panel-oss-more')).toBeVisible();
+    await expect(appPage.locator('#quick-panel-oss-more')).toHaveCount(0);
 
     const layout = await appPage.evaluate(() => {
       const rect = (selector: string) => document.querySelector(selector)!.getBoundingClientRect();
@@ -924,15 +924,6 @@ test.describe('new chat composer', () => {
                   && box.top >= card.top && box.bottom <= card.bottom;
               });
           }),
-        // The entry belongs to the header row, not to the grid of runnable tasks.
-        ossEntryOnHeaderRow: (() => {
-          const link = document.querySelector('#quick-panel-oss-more');
-          const title = rect('#quick-panel-title');
-          const grid = rect('.quick-grid');
-          if (!link || link.closest('.quick-grid')) return false;
-          const box = link.getBoundingClientRect();
-          return box.left > title.right && box.bottom <= grid.top + 0.5;
-        })(),
         landingStartsInBounds: header.top >= landing.top,
         flexShrink: landingChildren.map((selector) => getComputedStyle(document.querySelector(selector)!).flexShrink),
       };
@@ -955,7 +946,6 @@ test.describe('new chat composer', () => {
     expect(layout.quickTileSizes).toEqual(Array(9).fill('36x36'));
     expect(layout.quickIconSizes).toEqual(Array(9).fill('18x18'));
     expect(layout.quickCardContentFits).toBe(true);
-    expect(layout.ossEntryOnHeaderRow).toBe(true);
     expect(layout.landingStartsInBounds).toBe(true);
     // The region below the composer is the one block that gives way in a
     // short window (P15).
@@ -989,20 +979,38 @@ test.describe('new chat composer', () => {
     await appPage.setViewportSize({ width: 600, height: 800 });
     const narrowLayout = await appPage.evaluate(() => {
       const landing = document.querySelector('.new-chat-center')!;
-      const more = document.querySelector('#quick-panel-oss-more')!.getBoundingClientRect();
-      const landingRect = landing.getBoundingClientRect();
       return {
         columns: getComputedStyle(document.querySelector('.quick-grid')!).gridTemplateColumns
           .split(' ').length,
         noHorizontalOverflow: landing.scrollWidth <= landing.clientWidth + 1,
-        moreEntryInBounds: more.left >= landingRect.left && more.right <= landingRect.right,
       };
     });
     expect(narrowLayout).toEqual({
       columns: 1,
       noHorizontalOverflow: true,
-      moreEntryInBounds: true,
     });
+    for (const locale of ['en', 'zh']) {
+      await appPage.evaluate(async (lang) => (window as any).setLang(lang), locale);
+      for (const width of [1280, 600]) {
+        await appPage.setViewportSize({ width, height: 800 });
+        await appPage.locator('.home-below').evaluate((element) => { element.scrollTop = 0; });
+        await expect(appPage.locator('#home-explore-context')).toHaveText(locale === 'zh'
+          ? '添加资料或连接邮箱/店铺/办公软件等，让 Orkas 更了解你。从你愿意分享的内容开始。'
+          : "Add materials or connect email, stores, office apps, and more to help Orkas get to know you better. Start with whatever you're comfortable sharing.");
+        await appPage.screenshot({ path: testInfo.outputPath(`home-${locale}-${width}.png`) });
+      }
+    }
+    await appPage.setViewportSize({ width: 1280, height: 800 });
+    await appPage.locator('[data-home-connect]').click();
+    await expect(appPage.locator('#panel-connectors')).toHaveClass(/\bactive\b/);
+    await expect(appPage.locator('#connectors-btn')).toHaveClass(/\bactive\b/);
+    await appPage.screenshot({ path: testInfo.outputPath('home-connectors-tab.png') });
+    await appPage.locator('#new-chat-btn').click();
+    // Wait for the home entry's deferred composer focus before keyboard navigation.
+    await expect(appPage.locator('#new-chat-input')).toBeFocused();
+    await appPage.locator('[data-home-connect]').focus();
+    await appPage.keyboard.press('Enter');
+    await expect(appPage.locator('#panel-connectors')).toHaveClass(/\bactive\b/);
   });
 
   test('prefills a quick scenario and keeps modified Enter as a newline', async ({ appPage }) => {

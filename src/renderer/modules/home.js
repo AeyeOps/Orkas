@@ -15,8 +15,6 @@
 const _homeLog = createLogger('home');
 
 const _HOME_VISIBLE_ROWS = 3;
-// Unread runs folded under the first three; older ones stay in the sidebar.
-const _HOME_MAX_FOLDED_ROWS = 20;
 // Unread runs missing from the sidebar cache are looked up by id, in batches
 // of what `conversations.getMany` accepts, enough to fill both run groups.
 const _HOME_LOOKUP_BATCH = 25;
@@ -24,14 +22,6 @@ const _HOME_LOOKUP_LIMIT = 50;
 const _HOME_REFRESH_DEBOUNCE_MS = 500;
 // A slow first lookup must not keep the greeting and Quick start invisible.
 const _HOME_FIRST_PAINT_FALLBACK_MS = 1500;
-// "Connect Feishu / DingTalk / email": the connectors that hold the user's
-// work context. A legacy Lark connection counts as Feishu.
-const _HOME_CONNECT_TARGETS = [
-  { id: 'feishu', instanceIds: ['feishu', 'lark'] },
-  { id: 'dingtalk', instanceIds: ['dingtalk'] },
-  { id: 'gmail', instanceIds: ['gmail'] },
-  { id: 'm365-mail', instanceIds: ['m365-mail'] },
-];
 
 // 'pending' only until the first visit's lookups settle; later visits keep
 // the last painted state until the new lookup replaces it.
@@ -62,9 +52,9 @@ function _homeIcon(name, className) {
 
 async function _homeLoadTodos() {
   try {
-    const res = await window.orkas.invoke('projects.tasks.listOpen', { limit: _HOME_VISIBLE_ROWS });
+    const res = await window.orkas.invoke('projects.tasks.listOpen', { all: true });
     if (!res || res.ok === false || !Array.isArray(res.tasks)) throw new Error('invalid_response');
-    const tasks = res.tasks.slice(0, _HOME_VISIBLE_ROWS);
+    const tasks = res.tasks;
     return { tasks, total: Math.max(tasks.length, Math.round(Number(res.total) || 0)) };
   } catch (err) {
     _homeLog.warn('open to-dos unavailable for the home', { error_type: _homeErrorType(err) });
@@ -281,6 +271,9 @@ function _homeTodoRowHtml(task, index) {
 }
 
 function _homeRunRowHtml(run, section, index) {
+  // Legacy unread records default to completed for presentation only.
+  const displayStatus = ['completed', 'failed', 'waiting_input', 'stopped'].includes(run.status)
+    ? run.status : 'completed';
   let source = t('new_chat.home.source.global_task');
   if (section === 'automations') source = t('new_chat.home.source.automation');
   else if (run.projectId) source = t('new_chat.home.source.project_task', { project: _homeProjectName(run.projectId) });
@@ -291,11 +284,11 @@ function _homeRunRowHtml(run, section, index) {
       'data-home-status': run.status || 'unknown',
       'data-home-position': index + 1,
     },
-    status: run.status,
+    status: displayStatus,
     title: run.title || t('new_chat.home.untitled'),
     source,
-    details: [_homeResultLabel(run.status), _homeRelativeTime(run.finishedAt)],
-    action: _homeRunActionLabel(run.status),
+    details: [_homeResultLabel(displayStatus), _homeRelativeTime(run.finishedAt)],
+    action: _homeRunActionLabel(displayStatus),
   });
 }
 
@@ -321,8 +314,8 @@ function _homeSectionHtml(section) {
   }
   let fold = '';
   let footer = '';
-  if (!isTodos && items.length > _HOME_VISIBLE_ROWS) {
-    const folded = items.slice(_HOME_VISIBLE_ROWS, _HOME_VISIBLE_ROWS + _HOME_MAX_FOLDED_ROWS);
+  if (items.length > _HOME_VISIBLE_ROWS) {
+    const folded = items.slice(_HOME_VISIBLE_ROWS);
     const expanded = _homeExpanded.has(section);
     const foldId = `home-fold-${section}`;
     fold = `<div class="home-list-fold" id="${foldId}"${expanded ? '' : ' hidden'}>`
@@ -360,7 +353,7 @@ function _homeRender() {
   _homeApplyState(sections.length ? 'populated' : 'empty');
 }
 
-/** The empty state's "share files, or connect Feishu / DingTalk / email" line;
+/** The empty state's "add materials or connect your services" line;
  *  the connect phrase is a button inside the translated sentence. */
 function _homeRenderExploreContext() {
   const el = document.getElementById('home-explore-context');
@@ -457,51 +450,6 @@ function _homeOnGroupsClick(event) {
   else if (row.dataset.homeCid) _homeOpenRun(row);
 }
 
-/** Context menus open below their trigger, or above it near the window bottom. */
-function _homeMenuAnchor(el) {
-  const rect = el.getBoundingClientRect();
-  const below = window.innerHeight - rect.bottom > 320;
-  return { clientX: rect.left, clientY: below ? rect.bottom + 4 : rect.top - 4 };
-}
-
-function _homeConnect(id) {
-  setView('connectors', null, { entryPoint: 'home' });
-  if (typeof window.openConnectorSetupById !== 'function') return;
-  Promise.resolve(window.openConnectorSetupById(id, 'form')).catch((err) => {
-    _homeLog.warn('connector setup from the home failed', { error_type: _homeErrorType(err) });
-  });
-}
-
-async function _homeOpenConnectChooser(button) {
-  if (typeof showContextMenu !== 'function') return;
-  const anchor = _homeMenuAnchor(button);
-  const connected = new Set();
-  try {
-    const res = await window.orkas.invoke('connectors.list', {});
-    for (const inst of (res && Array.isArray(res.instances) ? res.instances : [])) {
-      if (inst && inst.status && inst.status.kind === 'connected') connected.add(inst.id);
-    }
-  } catch (err) {
-    _homeLog.warn('connector states unavailable for the home', { error_type: _homeErrorType(err) });
-  }
-  const items = [];
-  for (const target of _HOME_CONNECT_TARGETS) {
-    let name = target.id;
-    try {
-      const nav = typeof window.loadConnectorNavTarget === 'function'
-        ? await window.loadConnectorNavTarget(target.id)
-        : null;
-      if (nav && nav.name) name = nav.name;
-    } catch (_) {}
-    const isConnected = target.instanceIds.some((id) => connected.has(id));
-    items.push({
-      label: isConnected ? `${name} · ${t('connectors.group.connected')}` : name,
-      onClick: () => _homeConnect(target.id),
-    });
-  }
-  showContextMenu(anchor, items);
-}
-
 // ── Lifecycle ───────────────────────────────────────────────────────────
 
 function _homeBind() {
@@ -512,7 +460,9 @@ function _homeBind() {
     const link = event.target && typeof event.target.closest === 'function'
       ? event.target.closest('[data-home-connect]')
       : null;
-    if (link) void _homeOpenConnectChooser(link);
+    if (link) {
+      setView('connectors', null, { entryPoint: 'home' });
+    }
   });
   window.addEventListener('task-unread-change', homeRefresh);
   window.addEventListener('i18n-change', () => {

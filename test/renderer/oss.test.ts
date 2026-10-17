@@ -102,38 +102,14 @@ function loadOss(opts: LoadOpts = {}) {
 }
 
 describe('oss.js', () => {
-  it('surfaces open source as one localized entry on the quick-start header', () => {
+  it('keeps open-source tools off the home quick-start surface', () => {
     const html = fs.readFileSync(path.join(__dirname, '../../src/renderer/index.html'), 'utf8');
-    const css = fs.readFileSync(path.join(__dirname, '../../src/renderer/style.css'), 'utf8');
     const conversation = fs.readFileSync(path.join(__dirname, '../../src/renderer/modules/conversation.js'), 'utf8');
-    const locales = Object.fromEntries(['en', 'zh', 'ja', 'pt'].map((lang) => [
-      lang,
-      JSON.parse(fs.readFileSync(path.join(__dirname, `../../src/renderer/locales/${lang}.json`), 'utf8')),
-    ]));
-    const zh = locales.zh;
-
-    // Neither the old rail nor a grid card: the entry lives on the header row
-    // beside the quick-start title, so the grid stays a list of runnable tasks.
     expect(html).not.toContain('id="oss-entry"');
     expect(html).not.toContain('id="oss-entry-grid"');
-    expect(html.match(/id="quick-panel-oss-more"/g)).toHaveLength(1);
-    expect(html).toMatch(/quick-panel-rule[\s\S]{0,200}quick-panel-oss-more/);
+    expect(html).not.toContain('id="quick-panel-oss-more"');
     expect(conversation).not.toContain('oss-quick-task-card');
     expect(conversation).not.toContain("_quickStartText('new_chat.quick.task.oss'");
-    expect(css).toContain('.quick-panel-more');
-    expect(css).not.toContain('.quick-thumb-oss');
-    expect(css).not.toContain('.oss-entry {');
-    expect(zh['new_chat.quick.oss_more']).toBe('接入开源工具能力');
-    expect(zh['new_chat.quick.oss']).toBeUndefined();
-    expect(zh['new_chat.quick.task.oss']).toBeUndefined();
-    expect(zh['new_chat.quick.deliver.oss']).toBeUndefined();
-    for (const [lang, messages] of Object.entries(locales)) {
-      expect((messages as any)['new_chat.quick.oss_more'], `${lang} label`).toBeTruthy();
-    }
-    expect(Object.fromEntries(Object.entries(locales).map(([lang, messages]: [string, any]) => [
-      lang,
-      messages['sidebar.new_chat'],
-    ]))).toEqual({ en: 'New Task', zh: '新任务', ja: '新規タスク', pt: 'Nova tarefa' });
   });
 
   it('prefillCommander writes the task, focuses, sets the Commander recipient, and does NOT send', () => {
@@ -186,33 +162,6 @@ describe('oss.js', () => {
     };
     expect(context._ossPromptForComposer(project, existingOssInput))
       .toContain('[describe your task here]');
-  });
-
-  it('opens the marketplace OSS page from the header entry and keeps New Task as the return view', async () => {
-    const { context, calls, invokeCount } = loadOss();
-    let cardClick: Function | null = null;
-    const card = {
-      dataset: {} as Record<string, string>,
-      addEventListener(type: string, fn: Function) { if (type === 'click') cardClick = fn; },
-    };
-    const baseGetElementById = context.document.getElementById;
-    context.document.getElementById = (id: string) => {
-      if (id === 'quick-panel-oss-more') return card;
-      return baseGetElementById(id);
-    };
-
-    context.initOssQuickTask();
-    context.initOssQuickTask();
-    expect(card.dataset.bound).toBe('1');
-    expect(invokeCount()).toBe(0);
-    cardClick!();
-    await Promise.resolve();
-    await Promise.resolve();
-
-    expect(calls.openMarketplace).toEqual([{
-      tab: 'oss',
-      opts: { returnView: 'new-chat', preserveReturnTab: true },
-    }]);
   });
 
   it('loadOssCatalog uses bundled cache first, then refreshes without duplicate calls', async () => {

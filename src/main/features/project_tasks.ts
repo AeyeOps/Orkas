@@ -321,7 +321,7 @@ async function _openTasksInScope(
 /** Unfinished local to-dos across the global scope and every project. */
 export async function listOpenTasks(
   uid: string,
-  limit: number,
+  limit?: number,
 ): Promise<{ tasks: OpenTaskRow[]; total: number }> {
   const scopes: Array<{ pid: string; name: string }> = [
     { pid: '', name: '' },
@@ -352,7 +352,7 @@ export async function listOpenTasks(
   _openTaskFiles.set(uid, keptFiles);
   const touched = (task: ProjectTask) => task.updated_at || task.created_at || '';
   rows.sort((a, b) => touched(b).localeCompare(touched(a)) || a.id.localeCompare(b.id));
-  return { tasks: rows.slice(0, Math.max(0, limit)), total: rows.length };
+  return { tasks: limit === undefined ? rows : rows.slice(0, Math.max(0, limit)), total: rows.length };
 }
 
 /** Local snapshot for the initial owner import; never pulls from Server. */

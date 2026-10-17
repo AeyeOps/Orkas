@@ -388,36 +388,7 @@ function _ossPromptForComposer(p, input) {
   return `${prompt}\n\n${existing}`;
 }
 
-function _openOssMarketplace() {
-  const load = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
-  if (typeof load !== 'function') {
-    _ossLog.warn('Commander OSS quick task failed: marketplace loader unavailable');
-    return;
-  }
-  load('marketplace').then(() => openMarketplace('oss', {
-    returnView: 'new-chat',
-    preserveReturnTab: true,
-  })).catch((err) => {
-    _ossLog.warn('Commander OSS quick task failed to load marketplace', {
-      error: err && err.message ? err.message : String(err || ''),
-    });
-  });
-}
-
-/** Bind the quick-start header's open-source entry — the single path from the
- * landing page into the marketplace「开源项目」list. */
-function initOssQuickTask() {
-  const link = document.getElementById('quick-panel-oss-more');
-  if (!link || link.dataset.bound === '1') return;
-  link.dataset.bound = '1';
-  link.addEventListener('click', _openOssMarketplace);
-}
-
-window.addEventListener('i18n-change', () => {
-  initOssQuickTask();
-});
-
-// Exposed for marketplace.js rendering + conversation.js Quick task init.
+// Exposed for marketplace rendering.
 window.loadOssCatalog = loadOssCatalog;
 window.ossCatalogCacheKey = ossCatalogCacheKey;
 window.OSS_MARKETPLACE_PAGE_SIZE = OSS_MARKETPLACE_PAGE_SIZE;
@@ -434,4 +405,3 @@ window.ossInstallPromptFor = ossInstallPromptFor;
 window.ossOpenRepo = ossOpenRepo;
 window.prefillCommander = prefillCommander;
 window.unresolvedOssTemplatePlaceholder = unresolvedOssTemplatePlaceholder;
-window.initOssQuickTask = initOssQuickTask;

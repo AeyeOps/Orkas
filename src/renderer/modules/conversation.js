@@ -2272,8 +2272,6 @@ function onEnterNewChatView() {
   // Keep the empty-state heading aligned with the current locale.
   _refreshEmptyStateAll();
   _initEmptyStateScenarios();
-  // The open-source marketplace entry is rendered as one Quick task card.
-  if (typeof initOssQuickTask === 'function') initOssQuickTask();
   // Work to pick up (open to-dos, finished runs not yet opened); home.js.
   if (typeof homeOnEnter === 'function') homeOnEnter();
 }
@@ -2534,7 +2532,6 @@ function _refreshQuickStartConfig(row) {
       _setQuickStartItems(items, res && res.source);
       _renderQuickStartScenarios();
       _bindEmptyStateScenarioButtons(row);
-      if (typeof initOssQuickTask === 'function') initOssQuickTask();
     })
     .catch((err) => {
       _convLog.warn('Commander quick-start config load failed; using open defaults', {
@@ -2814,7 +2811,6 @@ function _initEmptyStateScenarios() {
   const grid = document.getElementById('new-chat-scenario-grid');
   if (grid && !grid.children.length) _renderQuickStartScenarios();
   _bindEmptyStateScenarioButtons(row);
-  if (typeof initOssQuickTask === 'function') initOssQuickTask();
   _refreshQuickStartConfig(row);
 }
 function onEnterConversationView() {
@@ -5563,6 +5559,8 @@ function _initNewChatAttachInput() {
 
 let _loadConversationsInFlight = null;
 let _loadConversationsMode = '';
+let _conversationRemovalRevision = 0;
+let _conversationRemovalRenderPending = false;
 const _loadedConversationProjectIds = new Set();
 const _conversationProjectPages = new Map();
 const _projectConversationLoads = new Map();
@@ -5652,11 +5650,12 @@ async function loadConversations(options = {}) {
   // explicitly when its UI genuinely needs every conversation.
   const startup = !(options && options.full === true);
   if (_loadConversationsInFlight) {
-    if (startup || _loadConversationsMode === 'full') return _loadConversationsInFlight;
+    if (!options?.fresh && (startup || _loadConversationsMode === 'full')) return _loadConversationsInFlight;
     await _loadConversationsInFlight;
     return loadConversations(options);
   }
   _loadConversationsMode = startup ? 'startup' : 'full';
+  const removalRevision = _conversationRemovalRevision;
   _loadConversationsInFlight = (async () => {
     try {
       const url = startup
@@ -5664,6 +5663,7 @@ async function loadConversations(options = {}) {
         : '/api/conversations/list';
       const res = await apiFetch(url);
       const data = await res.json();
+      if (removalRevision !== _conversationRemovalRevision) return;
       if (data.ok) {
         _replaceConversationSlice(data.conversations, () => true);
         _loadedConversationProjectIds.clear();
@@ -5733,10 +5733,12 @@ async function loadConversationProject(projectId, options = {}) {
     await existing;
     return loadConversationProject(pid, options);
   }
+  const removalRevision = _conversationRemovalRevision;
   const run = (async () => {
     const offset = append ? currentPage.nextOffset : 0;
     const res = await apiFetch(`/api/conversations/list?mode=project&project_id=${encodeURIComponent(pid)}&offset=${offset}`);
     const data = await res.json();
+    if (removalRevision !== _conversationRemovalRevision) return;
     if (!data.ok) throw new Error(data.error || 'project conversation list failed');
     if (append) _appendConversationSlice(data.conversations);
     else _replaceConversationSlice(data.conversations, (c) => c && c.project_id === pid);
@@ -5768,9 +5770,11 @@ async function loadUnprojectedConversations(options = {}) {
   }
   _unprojectedConversationPage.loading = true;
   const offset = append ? _unprojectedConversationPage.nextOffset : 0;
+  const removalRevision = _conversationRemovalRevision;
   const run = (async () => {
     const res = await apiFetch(`/api/conversations/list?mode=unprojected&offset=${offset}`);
     const data = await res.json();
+    if (removalRevision !== _conversationRemovalRevision) return;
     if (!data.ok) throw new Error(data.error || 'unprojected conversation list failed');
     if (append) _appendConversationSlice(data.conversations);
     else _replaceConversationSlice(data.conversations, (c) => c && !c.project_id);
@@ -6262,13 +6266,38 @@ function _cancelConversationHeaderRename(cid) {
   _refreshChatHeader();
 }
 
+// All sidebar mirrors share this cache. Invalidate older in-flight list reads
+// before repainting so a successful deletion cannot be undone by a late reply.
+function _removeConversationFromSidebar(cid, { deferRender = false } = {}) {
+  _conversationRemovalRevision++;
+  const conversation = (Array.isArray(conversations) ? conversations : [])
+    .find((item) => item && item.conversation_id === cid);
+  // Most cleanup candidates are old history outside the loaded sidebar.
+  // Still invalidate older reads, but do not allocate/sort/repaint unchanged UI.
+  if (!conversation) return;
+  conversations = (Array.isArray(conversations) ? conversations : [])
+    .filter((item) => item && item.conversation_id !== cid);
+  const page = conversation.project_id ? _conversationProjectPages.get(conversation.project_id) : _unprojectedConversationPage;
+  if (page) {
+    page.total = Math.max(0, (Number(page.total) || 0) - 1);
+    if (page.nextOffset !== null) page.nextOffset = Math.max(0, page.nextOffset - 1);
+  }
+  _clearConversationInlineRenameState(cid);
+  const paint = () => {
+    _conversationRemovalRenderPending = false;
+    renderConversationList();
+  };
+  if (deferRender && typeof requestAnimationFrame === 'function') {
+    if (_conversationRemovalRenderPending) return;
+    _conversationRemovalRenderPending = true;
+    requestAnimationFrame(paint);
+  } else renderConversationList();
+}
+
 async function _deleteConversationWithConfirm(cid, opts = {}) {
   if (!cid) return;
   if (!(await uiConfirm(t('chat.conv_del_confirm')))) return;
   const startedAt = Date.now();
-  const conversation = Array.isArray(conversations)
-    ? conversations.find((item) => item && item.conversation_id === cid)
-    : null;
   abortConvStream(cid);
   const projectId = _projectIdForConversation(cid);
   try {
@@ -6289,26 +6318,9 @@ async function _deleteConversationWithConfirm(cid, opts = {}) {
     await uiAlert(t('chat.message_delete_failed', { reason: t('chat.unknown_error') }));
     return false;
   }
+  _removeConversationFromSidebar(cid);
   _forgetConvLocal(cid);
   if (currentCid === cid) setView('new-chat');
-  conversations = (Array.isArray(conversations) ? conversations : [])
-    .filter((item) => item && item.conversation_id !== cid);
-  if (conversation?.project_id) {
-    const page = _conversationProjectPages.get(conversation.project_id);
-    if (page) {
-      page.total = Math.max(0, (Number(page.total) || 0) - 1);
-      if (page.nextOffset !== null) page.nextOffset = Math.max(0, page.nextOffset - 1);
-    }
-  } else if (conversation) {
-    _unprojectedConversationPage.total = Math.max(
-      0,
-      (Number(_unprojectedConversationPage.total) || 0) - 1,
-    );
-    if (_unprojectedConversationPage.nextOffset !== null) {
-      _unprojectedConversationPage.nextOffset = Math.max(0, _unprojectedConversationPage.nextOffset - 1);
-    }
-  }
-  renderConversationList();
   _logConversationManageResult('delete', startedAt, 'success');
   if (typeof opts.afterDelete === 'function') {
     try { await opts.afterDelete(cid); } catch (err) {
@@ -7489,6 +7501,14 @@ async function loadConversationHistory(cid, opts = {}) {
     // last safe point before replacing the transcript DOM.
     if (preserveScroll) scrollSnapshot = _captureHistoryReloadScroll(container);
     const convMeta = data.conversation || {};
+    // Cleanup, search and Home can open history outside the loaded sidebar
+    // slice. Its history receipt already carries the persisted identity; seed
+    // the shared cache without overwriting a newer cached rename or live state.
+    if (convMeta.conversation_id === cid
+        && !conversations.some((conversation) => conversation?.conversation_id === cid)) {
+      _appendConversationSlice([convMeta]);
+      _refreshChatHeader();
+    }
     if (Array.isArray(data.live_display?.active_turns)) {
       convMeta.active_turns = data.live_display.active_turns;
       if (convMeta.active_turns.length) {
