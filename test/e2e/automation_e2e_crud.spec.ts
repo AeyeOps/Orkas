@@ -227,6 +227,34 @@ test.describe('automation', () => {
     expect(modelOrkas.modelRequests).toHaveLength(1);
   });
 
+  test('shows a scheduled run as running before opening its conversation', async ({ modelOrkas }, testInfo) => {
+    const page = modelOrkas.page!;
+    modelOrkas.setModelMode('controlled-slow');
+    const created = await modelOrkas.invoke<{ task: AutoTask }>('autoTasks.create', {
+      content: 'Summarize the release checks',
+      title: 'Scheduled status check',
+      schedule: { type: 'one_time', at: new Date(Date.now() + 1_500).toISOString() },
+    });
+    let cid = '';
+    await expect.poll(async () => {
+      const result = await modelOrkas.invoke<{
+        conversations: Array<{ conversation_id: string; origin_auto_task_id?: string }>;
+      }>('conversations.list');
+      cid = result.conversations.find(item => item.origin_auto_task_id === created.task.id)?.conversation_id || '';
+      return cid;
+    }, { timeout: 30_000 }).not.toBe('');
+    await expect.poll(() => modelOrkas.modelRequests.length).toBe(1);
+    const row = page.locator(`#conversation-list .conv-item[data-cid="${cid}"]`);
+    await expect(row).toBeVisible();
+    await expect(row.locator('.conv-status-badge.is-streaming')).toBeVisible();
+    await expect(page.locator('#panel-new-chat')).toHaveClass(/\bactive\b/);
+    await page.screenshot({ path: testInfo.outputPath('scheduled-running-status.png') });
+    modelOrkas.releaseControlledModelChunk();
+    modelOrkas.finishControlledModelStream();
+    await expect(row.locator('.conv-status-badge.is-streaming')).toHaveCount(0);
+    expect(modelOrkas.modelRequests).toHaveLength(1);
+  });
+
   test('fires while the runnable app is locked or idle', async ({ modelOrkas }) => {
     if (!modelOrkas.page) throw new Error('Orkas renderer is unavailable');
     const page = modelOrkas.page;

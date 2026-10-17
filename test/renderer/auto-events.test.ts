@@ -22,6 +22,7 @@ function createHarness() {
   const monitorError = vi.fn();
   const loadConversations = vi.fn(async () => {});
   const loadAutoList = vi.fn(async () => {});
+  const observeRun = vi.fn();
   const warn = vi.fn();
   const stream = vi.fn((_name: string, _payload: unknown, callback: (event: unknown) => void) => {
     let resolvePromise!: () => void;
@@ -53,6 +54,7 @@ function createHarness() {
     createLogger: () => ({ warn }),
     loadConversations,
     loadAutoList,
+    _observeConversationRunFromPlanAction: observeRun,
     _autoLoadedOnce: true,
     setTimeout,
     clearTimeout,
@@ -69,6 +71,7 @@ function createHarness() {
     monitorError,
     loadConversations,
     loadAutoList,
+    observeRun,
     warn,
   };
 }
@@ -131,6 +134,30 @@ describe('automation event subscription', () => {
     expect(harness.loadConversations).toHaveBeenCalledTimes(1);
     expect(harness.loadAutoList).toHaveBeenCalledWith(true);
     expect(harness.monitorEvent).not.toHaveBeenCalled();
+  });
+
+  // A fire creates and starts its conversation in main, so the renderer never
+  // sent it. Without an observer the sidebar row stays idle until the user
+  // opens it, unlike a run the user started.
+  it.each([
+    ['on time', {}],
+    ['caught up after wake', { catch_up: true }],
+  ])('shows a run that main started %s as running in the sidebar', (_label, mark) => {
+    const harness = createHarness();
+    harness.window.startAutoEventsSubscription();
+    harness.streamRecords[0].callback({
+      event: { type: 'conv_created', source: 'scheduled', ...mark, user_id: 'account-b', task_id: 'b', cid: 'foreign' },
+    });
+    harness.streamRecords[0].callback({
+      event: { type: 'fire_failed', source: 'scheduled', ...mark, user_id: 'account-a', task_id: 'a', error_code: 'send_not_ok' },
+    });
+    expect(harness.observeRun).not.toHaveBeenCalled();
+
+    harness.streamRecords[0].callback({
+      event: { type: 'conv_created', source: 'scheduled', ...mark, user_id: 'account-a', task_id: 'a', cid: 'fired' },
+    });
+    expect(harness.observeRun).toHaveBeenCalledTimes(1);
+    expect(harness.observeRun).toHaveBeenCalledWith('fired', expect.objectContaining({ attachExisting: true }));
   });
 
   it('never reports telemetry from the best-effort UI stream', () => {
