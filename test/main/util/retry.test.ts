@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { fetchWithRetry, retryAsync } from '../../../src/main/util/retry';
+import { fetchAndReadWithRetry, fetchWithRetry, RequestTimeoutError, RetriableHttpStatusError, retryAsync } from '../../../src/main/util/retry';
 
 afterEach(() => {
   vi.useRealTimers();
@@ -38,6 +38,43 @@ describe('retryAsync', () => {
 });
 
 describe('fetchWithRetry', () => {
+  it.each([
+    ['2', 2000],
+    ['Sat, 17 Oct 2026 12:00:03 GMT', 3000],
+    ['busy', undefined],
+    ['-1', undefined],
+  ])('retains a bounded caller receipt for Retry-After %s without replaying the request', async (header, wait) => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-10-17T12:00:00Z'));
+    const fetchMock = vi.fn().mockResolvedValue(new Response('busy', {
+      status: 503, headers: { 'retry-after': header },
+    }));
+    const readBody = vi.fn();
+    const failure = await fetchAndReadWithRetry('test:receipt', 'https://example.test/api',
+      undefined, readBody, { retries: 0, fetch: fetchMock }).catch(error => error);
+    expect(failure).toBeInstanceOf(RetriableHttpStatusError);
+    expect(failure.status).toBe(503);
+    expect(failure.retryAfterMs).toBe(wait);
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(readBody).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('distinguishes a request deadline from transport failure without another attempt', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi.fn((_url, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+    }));
+    const pending = fetchAndReadWithRetry('test:deadline', 'https://example.test/api', undefined,
+      async response => response.text(), { retries: 0, timeoutMs: 100, fetch: fetchMock }).catch(error => error);
+    await vi.advanceTimersByTimeAsync(100);
+    const failure = await pending;
+    expect(failure).toBeInstanceOf(RequestTimeoutError);
+    expect(failure.message).toBe('test:deadline timed out after 100ms');
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each(['request', 'options'])('cancels the %s signal during HTTP backoff without another attempt', async source => {
     vi.useFakeTimers();
     const controller = new AbortController();

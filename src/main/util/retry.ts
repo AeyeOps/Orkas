@@ -31,12 +31,22 @@ export function setFetchImplementation(impl: FetchImplementation | null): void {
 
 export class RetriableHttpStatusError extends Error {
   status: number;
+  retryAfterMs?: number;
 
-  constructor(status: number, label = 'request') {
+  constructor(status: number, label = 'request', retryAfter?: string | null) {
     super(`${label} http ${status}`);
     this.name = 'RetriableHttpStatusError';
     this.status = status;
+    if (retryAfter) {
+      const seconds = Number(retryAfter);
+      const wait = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
+      if (Number.isFinite(wait) && wait >= 0) this.retryAfterMs = Math.ceil(wait);
+    }
   }
+}
+
+export class RequestTimeoutError extends Error {
+  constructor(message: string) { super(message); this.name = 'RequestTimeoutError'; }
 }
 
 export function isRetriableHttpStatus(status: number): boolean {
@@ -160,11 +170,11 @@ export async function fetchAndReadWithRetry<T>(
     try {
       const res = await (opts.fetch || fetchImplementation || fetch)(input, { ...init, signal: composed.signal });
       if (isRetriableHttpStatus(res.status)) {
-        throw new RetriableHttpStatusError(res.status, label);
+        throw new RetriableHttpStatusError(res.status, label, res.headers.get('retry-after'));
       }
       return { response: res, body: await readBody(res, composed.signal) };
     } catch (err) {
-      if (composed.timedOut()) throw new Error(timeoutMessage);
+      if (composed.timedOut()) throw new RequestTimeoutError(timeoutMessage);
       throw err;
     } finally {
       composed.cleanup();
