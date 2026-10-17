@@ -1,3 +1,4 @@
+import { createShutdownCoordinator } from './util/shutdown';
 /**
  * Orkas — Electron main entry.
  *
@@ -1420,34 +1421,19 @@ if (!gotLock) {
   app.quit();
 } else {
 
-  // Normal quit and explicit exit share the same local-resource drain.
-  let shutdownFlushed = false;
-  let shutdownFlushPromise: Promise<void> | null = null;
-  const flushForShutdown = (): Promise<void> => {
-    if (shutdownFlushPromise) return shutdownFlushPromise;
-    shutdownFlushPromise = (async () => {
-      const lifecycleFlush = openLifecycleTracking?.flushQuit();
-      try { await searchFeature.flushAll(); }
-      catch (err) { createLogger('search').warn('final flush failed', { error: (err as Error).message }); }
-      try {
-        const kb = await import('./features/kb_vector');
-        kb.closeAllKb();
-      } catch (err) { createLogger('kb_vector').warn('close failed', { error: (err as Error).message }); }
-      try {
-        const kbEmbed = await import('./features/kb_embed');
-        kbEmbed.closeEmbedder();
-      } catch (err) { createLogger('kb_embed').warn('close failed', { error: logErrorSummary(err) }); }
-      try {
-        const images = await import('./util/sharp-runtime');
-        images.closeImageRuntime();
-      } catch { createLogger('image-runtime').warn('image runtime shutdown failed'); }
-      const webAssistSessions = await import('./features/web_assist_session');
-      await webAssistSessions.flushWebAssistSessions();
-      await sweepOfficeResidents('quit');
-      await lifecycleFlush;
-    })().finally(() => { shutdownFlushed = true; });
-    return shutdownFlushPromise;
-  };
+  const shutdown = createShutdownCoordinator({
+    localTasks: [
+      { name: 'open-lifecycle', run: async () => { await openLifecycleTracking?.flushQuit(); } },
+      { name: 'search', run: () => searchFeature.flushAll() },
+      { name: 'kb_vector', run: async () => { (await import('./features/kb_vector')).closeAllKb(); } },
+      { name: 'kb_embed', run: async () => { (await import('./features/kb_embed')).closeEmbedder(); } },
+      { name: 'image-runtime', run: async () => { (await import('./util/sharp-runtime')).closeImageRuntime(); } },
+      { name: 'office-engine', run: () => sweepOfficeResidents('quit') },
+      { name: 'web-assist-session', run: async () => { await (await import('./features/web_assist_session')).flushWebAssistSessions(); } },
+    ],
+    onFailure: name => createLogger(name).warn('shutdown preparation failed'),
+  });
+  const flushForShutdown = shutdown.prepare;
 
   // Account login is stripped, but connector OAuth still returns through the OS protocol. Keep
   // this connector-only receiver outside the removed account protocol module.
@@ -1756,7 +1742,7 @@ if (!gotLock) {
 
   app.on('before-quit', async (e) => {
     isQuitting = true;
-    if (shutdownFlushed) return;
+    if (shutdown.complete) return;
     e.preventDefault();
     try { await flushForShutdown(); } finally { app.quit(); }
   });

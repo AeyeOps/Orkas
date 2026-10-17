@@ -48,7 +48,8 @@ call node "%APP_DIR%\scripts\ensure-dev-dependencies.cjs"
 if errorlevel 1 exit /b 1
 
 pushd "%APP_DIR%"
-call npm run start:electron
+REM Dependencies were prepared above; avoid repeating npm prestart:electron.
+node "%APP_DIR%\node_modules\electron\cli.js" .
 set "RC=%ERRORLEVEL%"
 popd
 exit /b %RC%

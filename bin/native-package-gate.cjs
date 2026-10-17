@@ -125,18 +125,19 @@ function sharpPreparationFiles(platform, arch, version) {
   };
 }
 
-function nativePackageContract(nodeModules, platform, arch) {
+function nativePackageContract(nodeModules, platform, arch, onnxRuntime = null) {
   const key = targetKey(platform, arch);
   if (!TARGETS.has(key)) {
     throw new Error(`[native-package-gate] unsupported packaged native target: ${key}`);
   }
+
+  onnxRuntime ||= onnxRuntimePackage(nodeModules);
 
   const mac = platform === 'darwin';
   const esbuildPackage = mac ? `darwin-${arch}` : 'win32-x64';
   const sqlitePackage = mac ? `sqlite-vec-darwin-${arch}` : 'sqlite-vec-windows-x64';
   const canvasPackage = mac ? `canvas-darwin-${arch}` : 'canvas-win32-x64-msvc';
   const tokenizersPackage = mac ? 'tokenizers-darwin-universal' : 'tokenizers-win32-x64-msvc';
-  const onnxRuntime = onnxRuntimePackage(nodeModules);
   const onnxBase = `${onnxRuntime.base}/bin/napi-v3/${platform}/${arch}`;
   const onnxVersion = onnxRuntime.version;
 

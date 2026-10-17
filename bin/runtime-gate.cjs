@@ -389,11 +389,20 @@ function verifyRuntimeDir(kind, dir, key, spec, asset, targetPlatform, targetArc
   requiredFile(`${kind} runtime executable`, executable);
   for (const companion of runtimeCompanionFiles(kind, executable, targetPlatform, spec)) {
     requiredFile(`${kind} runtime companion`, companion);
+    verifyExecutableMode(companion, targetPlatform, options);
   }
+  verifyExecutableMode(executable, targetPlatform, options);
   if (options.checkArch !== false && targetPlatform === 'darwin') {
     assertDarwinExecutableArch(executable, targetArch);
   }
   return executable;
+}
+
+function verifyExecutableMode(file, targetPlatform, options) {
+  // Opted in by packaging only; Windows commands have no POSIX execute bit.
+  if (options.requireExecutable && targetPlatform !== 'win32' && (fs.statSync(file).mode & 0o111) === 0) {
+    throw new Error(`[native-deps-gate] runtime file is not executable: ${file}`);
+  }
 }
 
 function verifyFfmpegRuntimeDir(runtimeRoot, targetPlatform, targetArch, options = {}) {
@@ -422,6 +431,7 @@ function verifyFfmpegRuntimeDir(runtimeRoot, targetPlatform, targetArch, options
   }
   for (const [name, file] of Object.entries(binaries)) {
     requiredFile(`${name} runtime executable`, file);
+    verifyExecutableMode(file, targetPlatform, options);
     const expected = marker.binaries && marker.binaries[name];
     const stat = fs.statSync(file);
     const rawHashMatches = expected
@@ -480,6 +490,7 @@ function verifyWhisperRuntimeDir(runtimeRoot, targetPlatform, targetArch, option
       throw new Error(`[native-deps-gate] whisper runtime hash/size mismatch: ${file}`);
     }
     if (expected.executable) {
+      verifyExecutableMode(file, targetPlatform, options);
       assertExecutableArch(file, targetPlatform, targetArch, options);
     }
   }
@@ -808,6 +819,7 @@ function verifyPhonePasskeyRuntimeDir(runtimeRoot, targetPlatform, targetArch, o
     }
   }
   const binary = path.join(dir, 'orkas-phone-passkey');
+  verifyExecutableMode(binary, targetPlatform, options);
   assertExecutableArch(binary, targetPlatform, targetArch, options);
   return binary;
 }

@@ -7,6 +7,7 @@ import * as path from 'node:path';
 
 const require = createRequire(import.meta.url);
 const {
+  verifyRuntimeDir,
   verifyPhonePasskeyRuntimeDir,
   requiredRuntimeVerificationEntries,
   verifyFfmpegRuntimeDir,
@@ -14,6 +15,7 @@ const {
   verifyWhisperRuntimeDir,
   verifyWindowsVcImportClosure,
 } = require('../../../bin/runtime-gate.cjs') as {
+  verifyRuntimeDir: (...args: any[]) => string;
   verifyPhonePasskeyRuntimeDir: (root: string, platform: string, arch: string, options?: Record<string, unknown>) => string;
   requiredRuntimeVerificationEntries: (platform: string, arch: string) => string[];
   verifyFfmpegRuntimeDir: (root: string, platform: string, arch: string, options?: Record<string, unknown>) => string[];
@@ -34,6 +36,27 @@ beforeEach(() => {
 
 afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+describe('packaging executable mode check', () => {
+  it.skipIf(process.platform === 'win32')('rejects non-executable POSIX runtimes and companions only when packaging opts in', () => {
+    const dir = path.join(tmpDir, 'node');
+    fs.mkdirSync(path.join(dir, 'bin'), { recursive: true });
+    const asset = { executable: 'bin/node', name: 'node.tar.gz', sha256: 'fixture', size: 123 };
+    const spec = { version: '24.0.0' };
+    fs.writeFileSync(path.join(dir, '.orkas-runtime.json'), JSON.stringify({ kind: 'node', platformKey: 'darwin-arm64', version: spec.version, asset: asset.name, sha256: asset.sha256, size: asset.size }));
+    for (const name of ['node', 'npm', 'npx']) fs.writeFileSync(path.join(dir, 'bin', name), 'fixture', { mode: 0o755 });
+    const check = (packaging: boolean) => verifyRuntimeDir('node', dir, 'darwin-arm64', spec, asset, 'darwin', 'arm64', { checkArch: false, requireExecutable: packaging });
+    expect(check(true)).toBe(path.join(dir, 'bin/node'));
+    for (const name of ['node', 'npm', 'npx']) {
+      const file = path.join(dir, 'bin', name);
+      fs.chmodSync(file, 0o644);
+      expect(() => check(true)).toThrow(/executable/);
+      expect(() => check(false)).not.toThrow();
+      expect(fs.statSync(file).mode & 0o777).toBe(0o644);
+      fs.chmodSync(file, 0o755);
+    }
+  });
 });
 
 const RUNTIME_SIZES: Record<'python' | 'uv' | 'node', number> = { python: 101, uv: 202, node: 303 };

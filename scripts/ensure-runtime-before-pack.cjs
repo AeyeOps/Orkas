@@ -206,7 +206,7 @@ module.exports = async function ensureRuntimeBeforePack(context) {
 
   const verified = [];
   for (const targetArch of arches) {
-    verified.push(...verifyRuntimeRoot(runtimeRoot, platform, targetArch, { allowedKeys }));
+    verified.push(...verifyRuntimeRoot(runtimeRoot, platform, targetArch, { allowedKeys, requireExecutable: true }));
   }
   console.log(`[runtime-gate] pre-pack verified: ${verified.join(', ')}`);
 };
