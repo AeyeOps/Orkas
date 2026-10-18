@@ -57,7 +57,11 @@ for (const surface of ['hidden-window', 'other-panel', 'other-task'] as const) {
         // Chromium may retain visible for a hidden-at-launch document. Verify
         // the native lifecycle channel independently of that document state.
         await nativeWindow.evaluate(win => win.showInactive());
+        // Establish a real native show-to-hide transition for this initially
+        // hidden fixture before checking the renderer's lifecycle receipt.
+        await expect.poll(() => nativeWindow.evaluate(win => win.isVisible())).toBe(true);
         await nativeWindow.evaluate(win => win.hide());
+        await expect.poll(() => nativeWindow.evaluate(win => win.isVisible())).toBe(false);
         await expect.poll(() => page.evaluate<boolean>('_conversationWindowActive')).toBe(false);
         // Snapshot after the acknowledged hide. The first admitted prefix may
         // arrive between the earlier composer checks and the native transition.

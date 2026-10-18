@@ -2434,3 +2434,93 @@ describe('automation › daylight-saving calendar boundaries', () => {
     expect(nextDueAfterRestoreForTest(task, repeated)?.toISOString()).toBe('2026-11-02T06:30:00.000Z');
   });
 });
+
+describe('automation › recovery discovery sequences', () => {
+  it.each(['success', 'failure'] as const)('preserves the claimed occurrence across restoration before a late %s', async outcome => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 22, 8, 30));
+    const taskId = 'at_18181818';
+    expect((await createTask(TEST_UID, { id: taskId, content: 'Recovery discovery',
+      schedule: { type: 'daily', hour: 9, minute: 0 } })).ok).toBe(true);
+    stopScheduler();
+    let complete!: (value: {ok: boolean; error?: string}) => void;
+    autoRuntime.send.mockImplementationOnce(() => new Promise(resolve => { complete = resolve; }));
+    const events: AutoFireEvent[] = [];
+    const unsubscribe = subscribeFiresForUser(TEST_UID, event => events.push(event));
+    try {
+      vi.setSystemTime(new Date(2026, 4, 22, 9, 0));
+      const firing = _onTimerFireForTest(TEST_UID, taskId);
+      await waitForSchedulerOutcome(() => !!complete, 'pending admitted send');
+      const persisted = fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId));
+      expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(new Date(2026, 4, 22, 9, 0).toISOString());
+      expect(events).toEqual([]);
+      stopScheduler();
+      await rescheduleAllForTest(TEST_UID);
+      expect(armedDueAtForTest(taskId)).toBe(new Date(2026, 4, 23, 9, 0).getTime());
+      expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+      complete(outcome === 'success' ? {ok:true} : {ok:false,error:'injected late refusal'});
+      await firing;
+      expect(events).toHaveLength(1);
+      expect(events[0].type).toBe(outcome === 'success' ? 'conv_created' : 'fire_failed');
+      expect(autoRuntime.deleteConversation).toHaveBeenCalledTimes(outcome === 'success' ? 0 : 1);
+      expect(fs.readFileSync(autoTaskConfigFile(TEST_UID, taskId))).toEqual(persisted);
+      stopScheduler();
+      await rescheduleAllForTest(TEST_UID);
+      await _onTimerFireForTest(TEST_UID, taskId);
+      expect(autoRuntime.send).toHaveBeenCalledTimes(1);
+      vi.setSystemTime(new Date(2026, 4, 23, 9, 0));
+      await _onTimerFireForTest(TEST_UID, taskId);
+      expect(autoRuntime.send).toHaveBeenCalledTimes(2);
+      expect(events).toHaveLength(2);
+      expect(events[1].type).toBe('conv_created');
+      expect((await getTask(TEST_UID, taskId))?.last_run_at).toBe(new Date(2026, 4, 23, 9, 0).toISOString());
+    } finally { unsubscribe(); }
+  });
+
+  it.each([false, true])('retries a failed migration from the latest source and rejects obsolete scoped mutations (rollback failure: %s)', async rollbackFails => {
+    const taskId='at_18181819', projectId='p_daily_recovery';
+    writeProject(TEST_UID, projectId);
+    expect((await createTask(TEST_UID, {id:taskId,project_id:projectId,content:'Original briefing',enabled:false,
+      schedule:{type:'daily',hour:18,minute:0},attachments:['source.txt']})).ok).toBe(true);
+    await uploadAttachment(TEST_UID,taskId,'source.txt',Buffer.from('revision one'));
+    const source=projectAutoTaskConfigFile(TEST_UID,projectId,taskId), target=autoTaskDir(TEST_UID,taskId);
+    const targetAttachments=autoTaskAttachmentsDir(TEST_UID,taskId);
+    fs.mkdirSync(targetAttachments,{recursive:true});
+    fs.writeFileSync(path.join(targetAttachments,'draft.txt'),'unrelated draft');
+    const initial=fs.readFileSync(source);
+    const rename=nativeFs.promises.rename.bind(nativeFs.promises);
+    const fault=Object.assign(new Error('injected activation failure'),{code:'ENOSPC'});
+    const spy=vi.spyOn(nativeFs.promises,'rename').mockImplementation(async(from,to)=>{
+      if(String(to)===target && (rollbackFails || !String(from).endsWith('.previous')))throw fault;
+      return rename(from,to);
+    });
+    syncBuiltinESMExports();
+    try {
+      await expect(updateTask(TEST_UID,taskId,{project_id:null})).rejects.toThrow(fault);
+      expect(fs.readFileSync(source)).toEqual(initial);
+      expect(fs.existsSync(autoTaskConfigFile(TEST_UID,taskId))).toBe(false);
+      if (rollbackFails) {
+        expect(fs.existsSync(target)).toBe(false);
+        const backups=fs.readdirSync(path.dirname(target)).filter(name=>name.startsWith(`.${taskId}.install-`)&&name.endsWith('.previous'));
+        expect(backups).toHaveLength(1);
+        expect(fs.readFileSync(path.join(path.dirname(target),backups[0],'attachments','draft.txt'),'utf8')).toBe('unrelated draft');
+      } else expect(fs.readdirSync(targetAttachments)).toEqual(['draft.txt']);
+    } finally {spy.mockRestore();syncBuiltinESMExports();}
+    expect((await updateTask(TEST_UID,taskId,{content:'Accepted revised briefing'},projectId)).ok).toBe(true);
+    await uploadAttachment(TEST_UID,taskId,'source.txt',Buffer.from('revision two'));
+    expect((await updateTask(TEST_UID,taskId,{project_id:null})).ok).toBe(true);
+    const durable=fs.readFileSync(autoTaskConfigFile(TEST_UID,taskId));
+    expect(await setTaskEnabled(TEST_UID,taskId,true,projectId)).toEqual({ok:false,error:'not_found'});
+    expect(await deleteTask(TEST_UID,taskId,projectId)).toEqual({ok:false});
+    expect(fs.readFileSync(autoTaskConfigFile(TEST_UID,taskId))).toEqual(durable);
+    stopScheduler();await rescheduleAllForTest(TEST_UID);
+    expect(await listTasks(TEST_UID)).toMatchObject([{id:taskId,content:'Accepted revised briefing',enabled:false}]);
+    expect(await listTasks(TEST_UID)).toHaveLength(1);
+    expect(fs.existsSync(source)).toBe(false);
+    expect(fs.readFileSync(path.join(targetAttachments,'source.txt'),'utf8')).toBe('revision two');
+    expect(fs.readFileSync(path.join(targetAttachments,'draft.txt'),'utf8')).toBe('unrelated draft');
+    expect(fs.readdirSync(path.dirname(target)).filter(name=>name.includes('.install-')||name.includes('.old-'))).toEqual([]);
+    expect(autoRuntime.send).not.toHaveBeenCalled();
+    expect(armedDueAtForTest(taskId)).toBeNull();
+  });
+});

@@ -219,8 +219,10 @@ try {
     sheets: [
       {
         name: '汇总',
+        columns: [{ name: 'A', width: '24' }, { name: 'B', width: '18' }],
         rows: [
-          [{ value: '合计', bold: true }, { formula: 'SUM(数据!B2:B2)', format: '0.00' }],
+          [{ value: '合计', bold: true }, { formula: "SUM('数据'!$B$2:$B$2)", format: '0.00' }],
+          [7],
         ],
         charts: [{
           type: 'column',
@@ -238,6 +240,11 @@ try {
       },
       {
         name: '数据',
+        columns: [
+          { name: 'A', width: '24' },
+          { name: 'B', width: '18' },
+          { name: 'C', width: '16' },
+        ],
         rows: [
           [
             { value: '客户编号', bold: true },
@@ -246,6 +253,8 @@ try {
           [
             { value: '00123', format: '@' },
             { value: 100, format: '0.00' },
+            { formula: "'汇总'!$A$2" },
+            { formula: '汇总!A2' },
           ],
         ],
       },
@@ -254,6 +263,22 @@ try {
   }, { workingDir: tempDir, state: {} });
   assert(!createXlsxResult.isError, `create_xlsx with native chart failed: ${createXlsxResult.content}`);
   assert(produced.has(workbook), 'create_xlsx did not register the charted workbook');
+
+  // Reopen the real saved workbook: layout changes must preserve the requested
+  // formula addresses and their independently known values in both directions.
+  for (const [target, formula, value] of [
+    ['/汇总/B1', "SUM('数据'!$B$2:$B$2)", '100'],
+    ['/数据/C2', "'汇总'!$A$2", '7'],
+    ['/数据/D2', '汇总!A2', '7'],
+  ]) {
+    const result = await officeRead.execute({
+      path: workbook, mode: 'get', targets: [target],
+    }, { workingDir: tempDir, state: {} });
+    assert(!result.isError, `created XLSX formula read failed: ${result.content}`);
+    const match = firstOfficeReadMatch(result, 'created XLSX cross-sheet formula');
+    assert(match.format?.formula === formula, `created XLSX formula changed: ${JSON.stringify(match.format?.formula)}`);
+    assert(Number(match.text) === Number(value), `created XLSX formula value was ${JSON.stringify(match.text)}, expected ${value}`);
+  }
 
   const chart = commandText(run(binary, ['get', workbook, '/汇总/chart[1]', '--json']));
   assertContains(chart, '"chartType": "column"', 'native workbook chart');
@@ -363,7 +388,7 @@ try {
     );
   }
 
-  console.log(`[office-artifact-smoke] PASS ${platformKey} OfficeCLI=${version} artifacts=3 production-fixtures=${fixtureScenarios.length} native-xlsx-chart=true xlsx-edit-readback=true tool-copy=true source-preserved=true atomic-rollback=true guarded-html-renders=3`);
+  console.log(`[office-artifact-smoke] PASS ${platformKey} OfficeCLI=${version} artifacts=3 production-fixtures=${fixtureScenarios.length} native-xlsx-chart=true xlsx-cross-sheet-layout=true xlsx-edit-readback=true tool-copy=true source-preserved=true atomic-rollback=true guarded-html-renders=3`);
 } catch (error) {
   failed = true;
   console.error(`[office-artifact-smoke] FAIL: ${error instanceof Error ? error.message : String(error)}`);

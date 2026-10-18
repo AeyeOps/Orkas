@@ -87,7 +87,7 @@ describe('buildXlsxWorkbookBatch', () => {
     ]);
   });
 
-  it('creates all sheets before cross-sheet formulas and all cells before charts', () => {
+  it('creates all sheets and column layouts before cross-sheet formulas, then charts', () => {
     const ops = buildXlsxWorkbookBatch([
       {
         name: '看板',
@@ -100,6 +100,7 @@ describe('buildXlsxWorkbookBatch', () => {
       },
       {
         name: '数据',
+        columns: [{ name: 'A', width: 24 }, { name: 'B', width: 16 }],
         rows: [['日期', '销售额'], ['7月1日', 100], ['7月2日', 120]],
       },
     ]);
@@ -108,6 +109,11 @@ describe('buildXlsxWorkbookBatch', () => {
     const finalDataCell = ops.findIndex((op) => 'path' in op && op.path === '/数据/B3');
     const chart = ops.findIndex((op) => 'type' in op && op.type === 'chart');
     expect(addDataSheet).toBeLessThan(dashboardFormula);
+    // Engine column additions rewrite existing cross-sheet references. Width
+    // settings must therefore precede formulas on every sheet, not just this one.
+    for (const [index, op] of ops.entries()) {
+      if ('type' in op && op.type === 'column') expect(index).toBeLessThan(dashboardFormula);
+    }
     expect(dashboardFormula).toBeLessThan(finalDataCell);
     expect(finalDataCell).toBeLessThan(chart);
   });

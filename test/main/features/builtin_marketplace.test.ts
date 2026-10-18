@@ -1510,3 +1510,37 @@ describe('builtin marketplace seed', () => {
     expect(commanderBlock).not.toContain('**evolved-helper**');
   });
 });
+
+describe('builtin recovery baseline', () => {
+  it.each(['agent', 'skill'] as const)('preserves recovered %s metadata and removes only retired managed files on retry', async kind => {
+    const id=kind==='agent'?TEST_AGENT_ID:'recovered-skill';
+    if(kind==='agent')writeBuiltinAgent(id,{name:'Recovery writer',workflow:'Write.',version:'1.0.0'});
+    else {writeBuiltinSkill(id);writeBuiltinSkillMeta(id,{version:'1.0.0'});}
+    const source=path.join(tmpDir,'builtin','marketplace',kind==='agent'?'agents':'skills',id);
+    fs.writeFileSync(path.join(source,'retired.txt'),'old managed file');
+    const seed=await import('../../../src/main/features/builtin_marketplace');
+    const paths=await import('../../../src/main/paths');
+    await seed.seedBuiltinMarketplaceForUser('u1');
+    const target=kind==='agent'?paths.userMarketplaceAgentDir('u1',id):paths.userMarketplaceSkillDir('u1',id);
+    fs.writeFileSync(path.join(target,'user-notes.txt'),'keep my notes');
+    const meta=JSON.parse(fs.readFileSync(path.join(target,'_install.json'),'utf8'));
+    meta.installed_at=123456;meta.default_install=false;meta.user_annotation='preserve';
+    fs.writeFileSync(path.join(target,'_install.json'),JSON.stringify(meta));
+    // The helper's persistent rollback-fault regression establishes this
+    // durable precondition. Seeding must read metadata after restoring it.
+    const backup=path.join(path.dirname(target),`.${id}.install-recovery.previous`);
+    fs.renameSync(target,backup);
+    fs.unlinkSync(path.join(source,'retired.txt'));
+    fs.writeFileSync(path.join(source,'current.txt'),'new managed file');
+    if(kind==='agent')writeBuiltinAgent(id,{name:'Recovery writer',workflow:'Write updated.',version:'2.0.0'});
+    else writeBuiltinSkillMeta(id,{version:'2.0.0'});
+    await seed.seedBuiltinMarketplaceForUser('u1');
+    expect(fs.readFileSync(path.join(target,'user-notes.txt'),'utf8')).toBe('keep my notes');
+    expect(fs.existsSync(path.join(target,'retired.txt'))).toBe(false);
+    expect(fs.readFileSync(path.join(target,'current.txt'),'utf8')).toBe('new managed file');
+    expect(JSON.parse(fs.readFileSync(path.join(target,'_install.json'),'utf8')))
+      .toMatchObject({version:'2.0.0',installed_at:123456,default_install:false,user_annotation:'preserve'});
+    expect(fs.existsSync(backup)).toBe(false);
+    expect(postJsonMock).not.toHaveBeenCalled();
+  });
+});
