@@ -299,9 +299,10 @@ export type XlsxSheetSpec = {
  * Build the `batch` ops for a multi-sheet workbook. A freshly created xlsx has
  * exactly one sheet, `Sheet1`; the first spec reuses it (renamed via `set` when
  * its `name` differs), and each later spec is `add`ed. This is deliberately
- * three-pass: create every sheet first so dashboard formulas may reference
- * later sheets, populate every sheet next, then add charts after all referenced
- * source cells exist.
+ * four-pass: create every sheet, establish every column layout, populate cells,
+ * then add charts after their source cells exist. OfficeCLI's column additions
+ * shift existing quoted cross-sheet references, even when used for widths, so
+ * no sheet's layout may be added after another sheet's formulas are written.
  */
 export function buildXlsxWorkbookBatch(sheets: readonly XlsxSheetSpec[]): OfficeBatchOp[] {
   const ops: OfficeBatchOp[] = [];
@@ -326,6 +327,8 @@ export function buildXlsxWorkbookBatch(sheets: readonly XlsxSheetSpec[]): Office
         ops.push({ command: 'add', parent: `/${name}`, type: 'column', props: colProps });
       }
     }
+  }
+  for (const { sheet, name } of normalized) {
     if (Array.isArray(sheet.rows)) ops.push(...buildXlsxBatch(name, sheet.rows));
   }
   for (const { sheet, name } of normalized) {
