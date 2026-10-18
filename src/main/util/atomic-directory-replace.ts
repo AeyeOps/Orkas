@@ -62,6 +62,34 @@ export async function sweepStaleReplacementArtifacts(
   return removed;
 }
 
+/** A failed rollback can leave the only prior copy beside a missing target.
+ * Restore that unambiguous copy before a merge consumer reads its baseline.
+ * Existing targets take the constant-time path; cold recovery streams one
+ * parent directory without opening unrelated entries or retaining its listing.
+ */
+async function recoverPreviousDirectory(target: string, opts: AtomicDirectoryReplaceOptions): Promise<void> {
+  if (fs.existsSync(target)) return;
+  const parent = path.dirname(target), name = path.basename(target);
+  let backup: string | undefined;
+  const directory = await fsp.opendir(parent);
+  for await (const entry of directory) {
+    const match = REPLACEMENT_ARTIFACT_RE.exec(entry.name);
+    if (!match || match[1] !== name || !entry.name.endsWith('.previous')) continue;
+    const candidate = path.join(parent, entry.name);
+    if (activeReplacementArtifacts.has(candidate)) throw new Error('Previous directory replacement is still active');
+    if (!entry.isDirectory() || backup) throw new Error('Previous directory recovery is ambiguous');
+    backup = candidate;
+  }
+  if (!backup) return;
+  const recover = async () => {
+    opts.assertReady?.();
+    if (fs.existsSync(target)) throw new Error('Directory changed before recovery');
+    await fsp.rename(backup!, target);
+  };
+  if (opts.activationGuard) await opts.activationGuard(recover);
+  else await recover();
+}
+
 export async function replaceDirectoryAtomically(
   target: string,
   prepare: (staged: string) => Promise<void>,
@@ -71,6 +99,7 @@ export async function replaceDirectoryAtomically(
   const assertReady = opts.assertReady || (() => undefined);
   const parent = path.dirname(target);
   await fsp.mkdir(parent, { recursive: true });
+  await recoverPreviousDirectory(target, opts);
   const staged = await fsp.mkdtemp(path.join(parent, `.${path.basename(target)}.install-`));
   const backup = `${staged}.previous`;
   let previousMoved = false;

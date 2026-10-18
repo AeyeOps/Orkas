@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as fs from 'node:fs';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
@@ -116,6 +118,59 @@ describe('atomic directory replacement', () => {
     expect(fs.existsSync(path.join(target, 'partial.txt'))).toBe(false);
     expect(commit).not.toHaveBeenCalled();
     expect(transactionArtifacts()).toEqual([]);
+  });
+
+  it('recovers the previous directory before retry preparation after activation and rollback both fail', async () => {
+    writeCurrent('user-maintained draft');
+    const rename = nativeFs.promises.rename.bind(nativeFs.promises);
+    const fault = Object.assign(new Error('injected persistent rename failure'), { code: 'ENOSPC' });
+    const spy = vi.spyOn(nativeFs.promises, 'rename').mockImplementation(async (from, to) => {
+      if (String(to) === target) throw fault;
+      return rename(from, to);
+    });
+    syncBuiltinESMExports();
+    try {
+      await expect(replaceDirectoryAtomically(target, async staged => {
+        fs.writeFileSync(path.join(staged, 'new.txt'), 'requested addition');
+      })).rejects.toThrow(fault);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    const backup = transactionArtifacts().find(name => name.endsWith('.previous'))!;
+    expect(fs.readFileSync(path.join(root, backup, 'content.txt'), 'utf8')).toBe('user-maintained draft');
+    expect(fs.existsSync(target)).toBe(false);
+    // The real consumer prepares a merge from the authoritative prior target.
+    // It cannot discover an unreported random backup name itself.
+    const commit = vi.fn(async () => undefined);
+    await replaceDirectoryAtomically(target, async staged => {
+      if (fs.existsSync(target)) fs.cpSync(target, staged, { recursive: true });
+      fs.writeFileSync(path.join(staged, 'new.txt'), 'requested addition');
+    }, commit);
+    await sweepStaleReplacementArtifacts(root);
+    expect(fs.existsSync(path.join(target, 'content.txt'))).toBe(true);
+    expect(fs.readFileSync(path.join(target, 'content.txt'), 'utf8')).toBe('user-maintained draft');
+    expect(fs.readFileSync(path.join(target, 'new.txt'), 'utf8')).toBe('requested addition');
+    expect(commit).toHaveBeenCalledOnce();
+    expect(transactionArtifacts()).toEqual([]);
+  });
+
+  it('keeps recovery behind the existing activation guard and preserves ambiguous backups', async () => {
+    const first = path.join(root, '.installed-item.install-one.previous');
+    fs.mkdirSync(first);
+    fs.writeFileSync(path.join(first, 'content.txt'), 'original');
+    const prepare = vi.fn(async () => undefined);
+    await expect(replaceDirectoryAtomically(target, prepare, undefined, {
+      activationGuard: async () => { throw new Error('account changed'); },
+    })).rejects.toThrow('account changed');
+    expect(fs.existsSync(target)).toBe(false);
+    expect(fs.readFileSync(path.join(first, 'content.txt'), 'utf8')).toBe('original');
+    expect(prepare).not.toHaveBeenCalled();
+    const second = path.join(root, '.installed-item.install-two.previous');
+    fs.mkdirSync(second);
+    fs.writeFileSync(path.join(second, 'content.txt'), 'different original');
+    await expect(replaceDirectoryAtomically(target, prepare)).rejects.toThrow('ambiguous');
+    expect(prepare).not.toHaveBeenCalled();
+    expect(fs.existsSync(target)).toBe(false);
+    expect(fs.readFileSync(path.join(second, 'content.txt'), 'utf8')).toBe('different original');
+    expect(fs.readFileSync(path.join(first, 'content.txt'), 'utf8')).toBe('original');
   });
 
   it('finishes staging before waiting for the activation guard', async () => {

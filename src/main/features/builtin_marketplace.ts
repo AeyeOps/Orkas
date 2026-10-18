@@ -383,10 +383,11 @@ async function _writeAgentSeed(
   opts: BuiltinMarketplaceSeedOptions = {},
 ): Promise<void> {
   const target = userMarketplaceAgentDir(uid, installId);
-  const existing = _readInstallMetaObject(target) || {};
-  const previousFiles = _previousManagedFiles(target, existing, 'agent', installId);
   const files = marketplaceContentTreeFiles(srcDir);
   await _replaceBuiltinInstallDirectory(target, 'agent', installId, opts, async (staged) => {
+    // Recovery may restore the baseline immediately before staging.
+    const existing = _readInstallMetaObject(staged) || {};
+    const previousFiles = _previousManagedFiles(staged, existing, 'agent', installId);
     await _removeStaleManagedFiles(staged, previousFiles, files);
     await _copyManagedFiles(srcDir, staged, files);
     await fsp.writeFile(
@@ -434,10 +435,11 @@ async function _writeAgentMarketplaceOverlay(
   opts: BuiltinMarketplaceSeedOptions = {},
 ): Promise<void> {
   const target = userMarketplaceAgentDir(uid, installId);
-  const existing = _readInstallMetaObject(target) || {};
-  const previousFiles = _previousManagedFiles(target, existing, 'agent', installId);
   const files = marketplaceContentTreeFiles(srcDir);
   await _replaceBuiltinInstallDirectory(target, 'agent', installId, opts, async (staged) => {
+    // Recovery may restore the baseline immediately before staging.
+    const existing = _readInstallMetaObject(staged) || {};
+    const previousFiles = _previousManagedFiles(staged, existing, 'agent', installId);
     await _removeStaleManagedFiles(staged, previousFiles, files);
     await _copyManagedFiles(srcDir, staged, files);
     await fsp.writeFile(
@@ -588,10 +590,11 @@ async function _writeSkillSeed(
   opts: BuiltinMarketplaceSeedOptions = {},
 ): Promise<void> {
   const target = userMarketplaceSkillDir(uid, installId);
-  const existing = _readInstallMetaObject(target) || {};
-  const previousFiles = _previousManagedFiles(target, existing, 'skill', installId);
   const files = marketplaceContentTreeFiles(srcDir);
   await _replaceBuiltinInstallDirectory(target, 'skill', installId, opts, async (staged) => {
+    // Recovery may restore the baseline immediately before staging.
+    const existing = _readInstallMetaObject(staged) || {};
+    const previousFiles = _previousManagedFiles(staged, existing, 'skill', installId);
     await _removeStaleManagedFiles(staged, previousFiles, files);
     await _copyManagedFiles(srcDir, staged, files);
     const contentSha = sha256OfFile(path.join(staged, 'SKILL.md'));
@@ -633,10 +636,11 @@ async function _writeSkillMarketplaceOverlay(
   opts: BuiltinMarketplaceSeedOptions = {},
 ): Promise<void> {
   const target = userMarketplaceSkillDir(uid, installId);
-  const existing = _readInstallMetaObject(target) || {};
-  const previousFiles = _previousManagedFiles(target, existing, 'skill', installId);
   const files = marketplaceContentTreeFiles(srcDir);
   await _replaceBuiltinInstallDirectory(target, 'skill', installId, opts, async (staged) => {
+    // Recovery may restore the baseline immediately before staging.
+    const existing = _readInstallMetaObject(staged) || {};
+    const previousFiles = _previousManagedFiles(staged, existing, 'skill', installId);
     await _removeStaleManagedFiles(staged, previousFiles, files);
     await _copyManagedFiles(srcDir, staged, files);
     const contentSha = sha256OfFile(path.join(staged, 'SKILL.md'));
