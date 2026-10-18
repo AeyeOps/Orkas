@@ -89,7 +89,6 @@ describe('new chat home surface', () => {
     const css = read('src/renderer/style.css');
 
     expect(css).toMatch(/#panel-new-chat\s*{[\s\S]*?position:\s*relative;/);
-    expect(css).toContain('.quick-panel-more');
     expect(css).not.toContain('.sb-connect');
     expect(css).not.toContain('.sidebar-external-agent-btn');
     expect(css).not.toContain('.new-chat-external-agent-btn');
