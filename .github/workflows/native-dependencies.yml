@@ -62,6 +62,14 @@ jobs:
           test/main/util/ensure-deps.test.ts
           test/main/util/ensure-dev-dependencies.test.ts
           test/main/util/linux-source-dependencies.test.ts
+      - name: Verify workbook formulas and interrupted directory recovery
+        run: >-
+          npm run test:js -- --maxWorkers=1
+          test/main/util/atomic-directory-replace.test.ts
+          test/main/features/builtin_marketplace.test.ts
+          test/main/features/auto_tasks.test.ts
+          test/main/model/core-agent/office-batch.test.ts
+          test/main/model/core-agent/office-tools.test.ts
       - name: Verify operator policy Worker, ASAR runtime and write boundaries
         run: >-
           npm run test:js -- --maxWorkers=1
