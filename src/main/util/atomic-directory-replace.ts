@@ -124,7 +124,15 @@ export async function replaceDirectoryAtomically(
         await commit();
       } catch (err) {
         if (stagedActivated) {
-          await fsp.rm(target, { recursive: true, force: true });
+          try {
+            await fsp.rm(target, { recursive: true, force: true });
+          } catch {
+            // Cleanup can fail on an open or protected child even though the
+            // parent permits a rename. Quarantine the rejected candidate at
+            // its now-vacant staging path so the durable backup can return.
+            // Never sweep the backup while an uncommitted target hides it.
+            await fsp.rename(target, staged);
+          }
           stagedActivated = false;
         }
         if (previousMoved) {

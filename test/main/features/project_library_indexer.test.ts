@@ -502,6 +502,57 @@ describe('project_library_indexer › retrieval is read-only', () => {
 });
 
 describe('project_library_indexer › project deletion lifecycle', () => {
+  it.each(['success', 'failure'])('preserves the restored generation after an old embedding settles with %s', async outcome => {
+    const idx = await indexer();
+    const embed = await import('../../../src/main/features/kb_embed');
+    const original = embed.embedTexts;
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const spy = vi.spyOn(embed, 'embedTexts').mockImplementation(async (texts, ...rest) => {
+      if (texts.some(text => text.includes('obsolete-before-delete'))) {
+        entered(); await held;
+        if (outcome === 'failure') throw new Error('obsolete embedding failed');
+      }
+      return original(texts, ...rest);
+    });
+    await createProject();
+    await writeSource('policy.md', 'obsolete-before-delete');
+    idx.enqueue(TEST_UID, PID, 'policy.md');
+    await started;
+    const oldDrain = idx.drain(TEST_UID, PID);
+    try {
+      await idx.dropProjectIndex(TEST_UID, PID);
+      await createProject();
+      await writeSource('policy.md', 'restored authoritative policy');
+      await idx.reconcile(TEST_UID, PID);
+      await idx.drain(TEST_UID, PID);
+      const events = collectEvents(idx.projectLibraryEvents);
+      release(); await oldDrain;
+      expect(idx.readFileChunks(TEST_UID, PID, 'policy.md').map(x => x.content).join('\n')).toBe('restored authoritative policy');
+      expect(idx.getFileByPath(TEST_UID, PID, 'policy.md')).toMatchObject({ status: 'ready' });
+      expect(idx.search(TEST_UID, PID, new Array(512).fill(0), { k: 5 }).map(x => x.content))
+        .toEqual(['restored authoritative policy']);
+      expect(events).toEqual([]);
+      const vs = await import('../../../src/main/features/vec_store');
+      vs.closeAllVecStores();
+      expect(idx.readFileChunks(TEST_UID, PID, 'policy.md').map(x => x.content).join('\n')).toBe('restored authoritative policy');
+      expect(fs.readFileSync(path.join(await filesRoot(), 'policy.md'), 'utf8')).toBe('restored authoritative policy');
+      // Controlled known-bad persistence at the same owning seam: a missing
+      // generation guard would let the old worker replace the restored row.
+      const paths = await import('../../../src/main/paths');
+      await vs.openVecStore(path.dirname(paths.projectLibraryVectorDbPath(TEST_UID, PID))).upsertFile({
+        id: 'policy.md', kind: 'text', bytes: 22, mtime: 1, sha1: 'obsolete-controlled',
+        chunks: [{ content: 'obsolete-before-delete', embedding: new Array(512).fill(0) }],
+      });
+      expect(idx.readFileChunks(TEST_UID, PID, 'policy.md').map(x => x.content).join('\n'))
+        .not.toBe('restored authoritative policy');
+      expect(idx.search(TEST_UID, PID, new Array(512).fill(0), { k: 5 }).map(x => x.content))
+        .toEqual(['obsolete-before-delete']);
+    } finally { release(); await oldDrain; spy.mockRestore(); }
+  });
+
   it('drops derived state and refuses further work for a deleted project', async () => {
     const idx = await indexer();
     const paths = await import('../../../src/main/paths');
