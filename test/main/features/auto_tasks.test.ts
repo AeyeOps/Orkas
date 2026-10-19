@@ -2523,4 +2523,37 @@ describe('automation › recovery discovery sequences', () => {
     expect(autoRuntime.send).not.toHaveBeenCalled();
     expect(armedDueAtForTest(taskId)).toBeNull();
   });
+
+  it('preserves the original task and destination draft when migration commit and rollback deletion fail', async () => {
+    const taskId='at_19191919', projectId='p_rollback_cleanup';
+    writeProject(TEST_UID,projectId);
+    expect((await createTask(TEST_UID,{id:taskId,project_id:projectId,content:'Keep this schedule',enabled:false,
+      schedule:{type:'daily',hour:18,minute:0},attachments:['source.txt']})).ok).toBe(true);
+    await uploadAttachment(TEST_UID,taskId,'source.txt',Buffer.from('source attachment'));
+    const source=path.dirname(projectAutoTaskConfigFile(TEST_UID,projectId,taskId));
+    const target=autoTaskDir(TEST_UID,taskId), attachments=autoTaskAttachmentsDir(TEST_UID,taskId);
+    fs.mkdirSync(attachments,{recursive:true});fs.writeFileSync(path.join(attachments,'draft.txt'),'only draft');
+    const rename=nativeFs.renameSync.bind(nativeFs),rm=nativeFs.promises.rm.bind(nativeFs.promises);
+    const renameSpy=vi.spyOn(nativeFs,'renameSync').mockImplementation((from,to)=>{
+      if(String(from)===source)throw new Error('source retirement denied');
+      return rename(from,to);
+    });
+    const rmSpy=vi.spyOn(nativeFs.promises,'rm').mockImplementation(async(file,options)=>{
+      if(String(file)===target)throw new Error('rollback cleanup denied');
+      return rm(file,options);
+    });
+    syncBuiltinESMExports();
+    try {await expect(updateTask(TEST_UID,taskId,{project_id:null})).rejects.toThrow('source retirement denied');}
+    finally {renameSpy.mockRestore();rmSpy.mockRestore();syncBuiltinESMExports();}
+    expect(await getTask(TEST_UID,taskId)).toMatchObject({project_id:projectId,enabled:false});
+    expect(fs.existsSync(autoTaskConfigFile(TEST_UID,taskId))).toBe(false);
+    expect(fs.readFileSync(path.join(attachments,'draft.txt'),'utf8')).toBe('only draft');
+    expect((await updateTask(TEST_UID,taskId,{project_id:null})).ok).toBe(true);
+    stopScheduler();await rescheduleAllForTest(TEST_UID);
+    expect(await listTasks(TEST_UID)).toMatchObject([{id:taskId,enabled:false}]);
+    expect(await listTasks(TEST_UID)).toHaveLength(1);
+    expect(fs.readFileSync(path.join(attachments,'draft.txt'),'utf8')).toBe('only draft');
+    expect(fs.readFileSync(path.join(attachments,'source.txt'),'utf8')).toBe('source attachment');
+    expect(fs.existsSync(source)).toBe(false);expect(autoRuntime.send).not.toHaveBeenCalled();
+  });
 });

@@ -239,6 +239,33 @@ describe('atomic directory replacement', () => {
     expect(transactionArtifacts()).toEqual([]);
   });
 
+  it('restores the durable draft when rollback removal fails before an explicit retry and sweep', async () => {
+    writeCurrent('only durable draft');
+    const rm = nativeFs.promises.rm.bind(nativeFs.promises);
+    const spy = vi.spyOn(nativeFs.promises, 'rm').mockImplementation(async (file, options) => {
+      if (String(file) === target) throw Object.assign(new Error('injected removal denial'), { code: 'EACCES' });
+      return rm(file, options);
+    });
+    syncBuiltinESMExports();
+    try {
+      await expect(replaceDirectoryAtomically(target, async staged => {
+        fs.writeFileSync(path.join(staged, 'uncommitted.txt'), 'not durable');
+      }, async () => { throw new Error('metadata rejected'); })).rejects.toThrow();
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    // The caller reopens after rejection, before choosing to retry.
+    expect(fs.existsSync(path.join(target, 'content.txt'))).toBe(true);
+    expect(fs.readFileSync(path.join(target, 'content.txt'), 'utf8')).toBe('only durable draft');
+    expect(fs.existsSync(path.join(target, 'uncommitted.txt'))).toBe(false);
+    await replaceDirectoryAtomically(target, async staged => {
+      fs.cpSync(target, staged, { recursive: true });
+      fs.writeFileSync(path.join(staged, 'retry.txt'), 'accepted');
+    });
+    await sweepStaleReplacementArtifacts(root);
+    expect(fs.readFileSync(path.join(target, 'content.txt'), 'utf8')).toBe('only durable draft');
+    expect(fs.readFileSync(path.join(target, 'retry.txt'), 'utf8')).toBe('accepted');
+    expect(transactionArtifacts()).toEqual([]);
+  });
+
   it('checks the continuation guard both before and after activation', async () => {
     writeCurrent();
     let calls = 0;
