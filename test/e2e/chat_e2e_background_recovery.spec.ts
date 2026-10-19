@@ -99,7 +99,9 @@ for (const surface of ['hidden-window', 'other-panel', 'other-task'] as const) {
       } else {
         await page.evaluate(cid => (window as any).setView('conversation', cid), cid);
       }
-      const replies = page.locator('#chat-history .chat-message.assistant');
+      // Recovery can reserve a hidden, actor-less observer placeholder. Only
+      // visible replies represent duplicate output to the user.
+      const replies = page.locator('#chat-history .chat-message.assistant:visible');
       await expect(replies).toHaveCount(1);
       await expect(replies).toContainText('Hello from the local E2E model.');
       if (!completed) {
