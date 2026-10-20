@@ -1,3 +1,6 @@
+import { getEventListeners } from 'node:events';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
@@ -8,6 +11,15 @@ import {
   NO_VISION_SENTINEL,
   type LoadedImage,
 } from '../../../src/main/features/video_vision';
+
+const visionWarnings = vi.hoisted(() => vi.fn());
+vi.mock('../../../src/main/logger', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../../src/main/logger')>();
+  return { ...actual, createLogger: (name: string) => {
+    const logger = actual.createLogger(name);
+    return name === 'video-vision' ? { ...logger, warn: visionWarnings } : logger;
+  } };
+});
 
 const okRes = (text: string) => ({ ok: true, text, error: '', aborted: false });
 
@@ -69,6 +81,74 @@ describe('resolveVisionRoute', () => {
 });
 
 describe('analyzeFrames — orchestration', () => {
+  it.each([false, true])('preserves caller cancellation (already aborted=%s)', async alreadyAborted => {
+    const caller = new AbortController();
+    if (alreadyAborted) caller.abort();
+    const chat = vi.fn((options: { abortSignal?: AbortSignal }) => new Promise(resolve => {
+      const finish = () => resolve({ ok: false, text: '', error: 'cancelled', aborted: true });
+      if (options.abortSignal?.aborted) finish();
+      else options.abortSignal?.addEventListener('abort', finish, { once: true });
+    }));
+    const pending = analyzeFrames({
+      userId: 'u1', framePaths: ['frame.png'], question: 'describe', signal: caller.signal,
+      loadFrames: fakeLoader, chat: chat as never,
+    });
+    await vi.waitFor(() => expect(chat).toHaveBeenCalledOnce());
+    caller.abort();
+    expect(await pending).toMatchObject({ ok: false, reason: 'aborted' });
+    expect(chat.mock.calls[0][0].abortSignal?.aborted).toBe(true);
+    expect(getEventListeners(caller.signal, 'abort')).toEqual([]);
+  });
+
+  it.each(['success', 'failure', 'timeout'] as const)('releases its caller abort listener after %s without removing other listeners', async outcome => {
+    const caller = new AbortController();
+    const otherListener = vi.fn();
+    caller.signal.addEventListener('abort', otherListener);
+    const chat = vi.fn(() => outcome === 'timeout'
+      ? new Promise<ReturnType<typeof okRes>>(() => {})
+      : Promise.resolve(outcome === 'success' ? okRes('Visible frame')
+        : { ok: false, text: '', error: 'controlled failure', aborted: false }));
+    if (outcome === 'timeout') vi.useFakeTimers();
+    try {
+      const pending = analyzeFrames({
+        userId: 'u1', framePaths: ['frame.png'], question: 'describe', signal: caller.signal,
+        loadFrames: fakeLoader, chat: chat as never,
+      });
+      if (outcome === 'timeout') await vi.advanceTimersByTimeAsync(180_000);
+      const result = await pending;
+      expect(result).toMatchObject(outcome === 'success' ? { ok: true }
+        : { ok: false, reason: outcome === 'timeout' ? 'aborted' : 'error' });
+      expect(chat).toHaveBeenCalledOnce();
+      expect(getEventListeners(caller.signal, 'abort')).toEqual([otherListener]);
+      caller.abort();
+      expect(otherListener).toHaveBeenCalledOnce();
+      if (outcome === 'timeout') expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      caller.signal.removeEventListener('abort', otherListener);
+      if (outcome === 'timeout') vi.useRealTimers();
+    }
+  });
+
+  it.each(['frame', 'provider'] as const)('keeps private %s failure details out of the logger boundary', async failure => {
+    visionWarnings.mockClear();
+    const privateDetail = failure === 'frame'
+      ? join(tmpdir(), 'private-client-document', 'unpublished-frame.png')
+      : 'Private provider diagnostic with user request content';
+    const chat = vi.fn(async () => { throw new Error(privateDetail); });
+    const result = await analyzeFrames({
+      userId: 'u1', framePaths: [privateDetail], question: 'describe', chat: chat as never,
+      ...(failure === 'provider' ? { loadFrames: fakeLoader } : {}),
+    });
+    expect(result).toMatchObject({ ok: false, reason: failure === 'frame' ? 'no-frames' : 'error' });
+    expect(chat).toHaveBeenCalledTimes(failure === 'frame' ? 0 : 1);
+    expect(visionWarnings).toHaveBeenCalledOnce();
+    const diagnostic = visionWarnings.mock.calls[0];
+    expect(JSON.stringify(diagnostic)).not.toContain(privateDetail);
+    expect(diagnostic[0]).toBe(failure === 'frame' ? 'frame load failed' : 'frame analysis degraded');
+    expect(diagnostic[1].error).toMatchObject({ message_hash: expect.stringMatching(/^[a-f0-9]{12}$/) });
+    if (failure === 'frame') expect(diagnostic[1].frame).toMatchObject({ path_hash: expect.stringMatching(/^[a-f0-9]{12}$/) });
+  });
+
   it('degrades to no-frames when no paths are supplied (no model call)', async () => {
     const chat = vi.fn();
     const r = await analyzeFrames({ userId: 'u1', framePaths: [], question: 'what?', chat: chat as never });

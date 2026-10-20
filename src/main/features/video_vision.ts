@@ -1,6 +1,6 @@
 /**
  * video_vision — provider-agnostic visual reading for the video pipeline
- * (ingest "据观察不据假设" frame reads + QA visual spot-checks). The seam is a
+ * (observed frame reads + QA visual spot-checks). The seam is a
  * single `analyzeFrames(frames, question) -> text` so callers never bake in a
  * specific model/provider.
  *
@@ -32,6 +32,7 @@ import * as fs from 'node:fs/promises';
 import { chatWithModel } from '../model/client';
 import { toCompressedGrayJpeg } from '../util/image-transform';
 import { createLogger } from '../logger';
+import { logErrorSummary, logPathRef } from '../util/log-redact';
 
 const log = createLogger('video-vision');
 
@@ -141,7 +142,7 @@ async function loadFrame(p: string): Promise<LoadedImage | null> {
     const compressed = await toCompressedGrayJpeg(raw, { maxDim: FRAME_MAX_DIM, quality: FRAME_JPEG_QUALITY, grayscale: false });
     return { data: compressed.buf.toString('base64'), mediaType: 'image/jpeg' };
   } catch (err) {
-    log.warn(`load frame ${p}: ${(err as Error).message}`);
+    log.warn('frame load failed', { frame: logPathRef(p), error: logErrorSummary(err) });
     return null;
   }
 }
@@ -173,9 +174,10 @@ export async function analyzeFrames(params: AnalyzeFramesParams): Promise<Analyz
 
   const chat = params.chat ?? chatWithModel;
   const controller = new AbortController();
+  const abortFromCaller = () => controller.abort();
   if (params.signal) {
     if (params.signal.aborted) controller.abort();
-    else params.signal.addEventListener('abort', () => controller.abort(), { once: true });
+    else params.signal.addEventListener('abort', abortFromCaller, { once: true });
   }
   let timer: NodeJS.Timeout | null = null;
   const timeout = new Promise<{ ok: boolean; text: string; error: string; aborted: boolean }>((resolve) => {
@@ -185,25 +187,29 @@ export async function analyzeFrames(params: AnalyzeFramesParams): Promise<Analyz
     }, VISION_TIMEOUT_MS);
   });
 
-  const call = Promise.resolve(
-    chat({
-      userId: params.userId,
-      message: buildVisionMessage(params.question, loaded.length),
-      images: loaded,
-      skillList: [],
-      idleTimeout: Math.ceil(VISION_TIMEOUT_MS / 1000),
-      abortSignal: controller.signal,
-      ...(params.sessionId ? { sessionId: params.sessionId } : {}),
-      ...(params.agentId ? { agentId: params.agentId } : {}),
-    }),
-  ).catch((err) => ({ ok: false, text: '', error: (err as Error).message || String(err), aborted: false }));
+  try {
+    const call = Promise.resolve(
+      chat({
+        userId: params.userId,
+        message: buildVisionMessage(params.question, loaded.length),
+        images: loaded,
+        skillList: [],
+        idleTimeout: Math.ceil(VISION_TIMEOUT_MS / 1000),
+        abortSignal: controller.signal,
+        ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+        ...(params.agentId ? { agentId: params.agentId } : {}),
+      }),
+    ).catch((err) => ({ ok: false, text: '', error: (err as Error).message || String(err), aborted: false }));
 
-  const res = await Promise.race([call, timeout]);
-  if (timer) clearTimeout(timer);
+    const res = await Promise.race([call, timeout]);
 
-  const out = interpretVisionResponse(res, loaded.length, route);
-  if (out.ok === false && out.reason !== 'aborted') {
-    log.warn(`analyzeFrames degraded (${out.reason}): ${out.message}`);
+    const out = interpretVisionResponse(res, loaded.length, route);
+    if (out.ok === false && out.reason !== 'aborted') {
+      log.warn('frame analysis degraded', { reason: out.reason, error: logErrorSummary(out.message) });
+    }
+    return out;
+  } finally {
+    if (timer) clearTimeout(timer);
+    params.signal?.removeEventListener('abort', abortFromCaller);
   }
-  return out;
 }
