@@ -1744,19 +1744,15 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // ── Project bindings (the strict scope of agents visible inside a
   // project conversation; see CLAUDE.md §6 outer-intersection rule) ──
   // `bindings.list` returns the bound ids JOINED with name/description so
-  // the renderer can paint the detail page in one round-trip. Unknown ids
-  // (referent deleted) are pruned here so stale bindings never become user
-  // cleanup work.
+  // the renderer can paint the detail page in one round-trip. A catalog scan
+  // may miss an updating package or a concurrent addition; reads must not
+  // remove persisted bindings based on that snapshot.
   'projects.bindings.list': async ({ projectId }, ctx) => {
     if (!safeId(projectId)) throw new Error('invalid projectId');
     if (!await projects.projectExists(ctx.userId, projectId)) throw new Error('not_found');
     const agentList = await agents.listAgentSummaries();
     const agentById = new Map(agentList.map((a: any) => [a.agent_id, a]));
-    const pruned = await projects.pruneBindings(ctx.userId, projectId, {
-      agents: new Set(agentList.map((a: any) => a.agent_id)),
-    });
-    if (!pruned.ok) throw new Error((pruned as { error: string }).error);
-    const bindings = pruned.bindings;
+    const bindings = await projects.getBindings(ctx.userId, projectId);
     return {
       bindings,
       agentDetails: bindings.agents
