@@ -2,11 +2,11 @@
 
 **An open-source team of AI agents on your desktop — it turns your goals into finished work and keeps it moving.**
 
-Orkas is an open-source (MIT), local-first multi-agent desktop app — an AI assistant that works as a team. Describe a goal and the **Commander** turns it into to-dos, handles the general parts itself, and coordinates **16 built-in specialist agents** — research, writing, slides, video, voice, design, code, SEO and e-commerce — plus the coding and personal agents you already use: **Claude Code, Codex, OpenCode, OpenClaw and Hermes-Agent**. Projects keep goals, memory and files together; Auto-advance and scheduled automations keep the work moving; finished work comes back for your review.
-
 **[⬇ Download Orkas for macOS & Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** — free, with 500 credits for the built-in Orkas model, so you don't need an API key to start. Prefer your own keys? Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao, or a local OpenAI-compatible endpoint.
 
 [![Download for macOS & Windows](https://img.shields.io/badge/Download-macOS%20%26%20Windows-5b57d6?style=for-the-badge)](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)
+
+Orkas is an open-source (MIT), local-first multi-agent desktop app — an AI assistant that works as a team. Describe a goal and the **Commander** turns it into to-dos, handles the general parts itself, and coordinates **16 built-in specialist agents** — research, writing, slides, video, voice, design, code, SEO and e-commerce — plus the coding and personal agents you already use: **Claude Code, Codex, OpenCode, OpenClaw and Hermes-Agent**. Projects keep goals, memory and files together; Auto-advance and scheduled automations keep the work moving; finished work comes back for your review.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
@@ -92,7 +92,7 @@ Orkas runs the CLI agents you already have installed as local sessions, next to 
 - **A Commander that plans, delegates and does the rest** — it breaks down goals, picks the right agents, skills, connectors and tools, and handles analysis, writing, research and file work itself when no specialist is a better fit.
 - **Local-first by design** — conversations, files, knowledge bases and custom agents stay on your disk by default. Cloud sync is optional in the packaged app. With your own keys, model calls go straight from your machine to the provider; the built-in Orkas model runs through Orkas's managed model service.
 - **Any model, switch any time** — the Commander and built-in agents share one model setting: the built-in Orkas model, your own provider, or a local endpoint. External CLI agents keep their own model settings.
-- **Agents that get better** — each agent keeps private skills and memory, and reflects when a task signals it should (a correction, a recovered error, a known weakness) to improve the next run.
+- **Agents that get better** — each agent keeps private skills and memory. Background reviews examine new activity when the app is idle and can refine self-assessment, reusable methods and learned skills.
 - **Open source, no black box** — MIT licensed. Read exactly what Orkas and every agent and skill do.
 
 > ⭐ If Orkas is useful to you, a star helps more people find the project.
@@ -106,7 +106,7 @@ Orkas runs the CLI agents you already have installed as local sessions, next to 
 | Platforms | macOS 12+ (Apple Silicon & Intel), Windows 10+ | macOS, Windows, glibc 2.34+ Linux x64/arm64 |
 | Account | Sign in — 500 free credits | None |
 | Models | Built-in Orkas model, or your own keys | Your own keys or a local endpoint |
-| Also includes | Cloud sync, shared projects, voice input, web-app publishing | — |
+| Also includes | Project collaboration, app publishing, cloud sync, and more | — |
 | Get it | **[Download Orkas](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** | [Quick start](#quick-start) |
 
 The download link detects your system and starts the right installer.
@@ -133,7 +133,7 @@ The download link detects your system and starts the right installer.
 | **Claude Cowork** | Anthropic's agentic desktop experience, built on Claude. | Orkas is open source (MIT) and model-agnostic — the built-in Orkas model or your own keys from any provider — and coordinates Claude Code, Codex and OpenCode alongside its own specialists. [Claude Cowork alternatives →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
 | **LangChain** | A developer framework/library for building LLM apps and agents — code-first, embedded in your own Python/JS app. | Orkas is a desktop app you direct through chat, not by writing orchestration code. Data stays local by default. |
 | **CrewAI** | A Python framework for orchestrating role-playing autonomous agents — you define crews and agents in code. | Orkas brings multi-agent orchestration into a desktop app, with projects, to-dos, automations and per-agent self-improvement built in. |
-| **OpenClaw** | A single always-on personal assistant reaching you across messaging channels. | Orkas gives you a team rather than one assistant, and OpenClaw plugs in as one of its CLI agents. |
+| **OpenClaw** | A personal-agent platform with messaging integrations, multi-agent routing and sub-agents. | Orkas provides a desktop workspace for finished deliverables, with built-in specialists and coordination across Claude Code, Codex, OpenCode and other CLI agents. OpenClaw can join that workflow as a CLI agent. |
 | **Hermes-Agent** | Nous Research's self-improving agent — one agent with memory and skills, available as a CLI, a messaging gateway and a desktop app. | Orkas coordinates a team: the Commander directs many specialists and other CLI agents, and Hermes-Agent plugs in as one of them. |
 
 **Orkas is for you if** you want a team of agents rather than one assistant, work that keeps moving across days, and your data, keys and agents on your own disk.
@@ -214,7 +214,7 @@ Native dependency errors: use Node.js 24 LTS (minimum 22.12.0), then run
 repairs SQLite for Electron, prepares bundled Node for isolated image processing,
 and checks SQL, sqlite-vec and sharp before success.
 Use `npm run native:check` for a check without installation.
-See [native dependency setup and troubleshooting](docs/native-dependencies.md).
+See the [native dependency verification script](./scripts/verify-native-dependencies.cjs) for the checks performed.
 
 ---
 
@@ -224,61 +224,43 @@ See [native dependency setup and troubleshooting](docs/native-dependencies.md).
 
 ---
 
-## How it works (core design)
+## How it works
 
-> Full design and hard constraints → [`CLAUDE.md`](./CLAUDE.md)
+### Task routing
 
-### Three dispatch verbs, and the rule for choosing between them
+The Commander handles general work itself and delegates specialist work through three tools:
 
-The Commander is the only actor holding dispatch tools — workers and agents have none. Which verb it picks decides who the user hears from and whether the Commander stays in the loop:
+- **`dispatch_to`** runs a named agent and returns its result for continued work. It can wait for the result or run asynchronously and notify the Commander when the task finishes.
+- **`hand_off_to`** transfers the remaining work to a named agent and ends the current Commander turn. The agent delivers its own reply; an optional continuation lets the Commander resume a broader task afterward.
+- **`run_worker`** runs an anonymous, isolated sub-task and returns a private result. It does not receive conversation history or a named agent's skills.
 
-| Verb | User sees the agent's reply | Result returns to the Commander | Commander's turn |
-| --- | --- | --- | --- |
-| `hand_off_to({ to, message })` | yes | no | ends — the agent's reply stands as the answer |
-| `dispatch_to({ to, message })` | yes | yes | continues with a named next step |
-| `run_worker({ to, task })` | no — private input | yes | continues |
+Named agent tasks and anonymous workers have separate concurrency controls. See the [dispatch implementation](./src/main/features/group_chat/bus.ts) and [execution locks](./src/main/util/locks.ts).
 
-The Commander has to name its concrete next action *before* it may choose `dispatch_to`; if all that remains is restating the agent's reply, the rule forces `hand_off_to`. That single constraint is what stops a multi-agent chat from ending in a redundant re-summary of what you already read. Emitting several `run_worker` calls in one response runs them concurrently.
+### Context management
 
-### One runtime, bounded fan-out
+The runtime budgets context against the selected model's usable input capacity, accounting for prompts, tools and persistent runtime state. Completed dialogue uses a bounded recent-history window; long active tasks use checkpoints to condense earlier process messages while retaining recent work. File reads, file changes and command executions also have structured records that can survive context compaction.
 
-Each conversation has a single FIFO runtime, and top-level turns run through it serially; parallelism happens *inside* a turn as nested in-process dispatch ([`bus.ts`](./src/main/features/group_chat/bus.ts)). Two separate semaphores bound it — `globalSlots = 10` across all users, and `dispatchSlots = 4` for nested dispatches (`ORKAS_MAX_DISPATCH_CONCURRENCY`).
+See [context budgets](./src/core-agent/src/agent/context-budget.ts), [session history and checkpoints](./src/core-agent/src/agent/session.ts) and [workspace records](./src/core-agent/src/agent/workspace-state.ts).
 
-Nested runs deliberately skip `globalSlots`: the parent turn already holds a slot, so a nested acquire would deadlock as parent-waits-on-child. That shortcut is safe only because dispatch tools belong to the Commander alone, so the semaphore is never acquired re-entrantly — the deadlock is ruled out by construction, not by a timeout.
+### Memory and the Library
 
-### Context budget: derived from the model, not a fixed number
+Durable notes keep user preferences, project facts and each agent's reusable knowledge in separate scopes. These notes are distinct from the Library's document index and the stored conversation history.
 
-Every compaction threshold is derived from the model in use, so one policy fits a 32K window and a 1M one alike ([`context-budget.ts`](./src/core-agent/src/agent/context-budget.ts)):
+The Library extracts documents into passages and stores a local SQLite vector index. Its embedding model runs on your machine; the `library` tool can list files, search relevant passages and read source content from the global or current-project Library. Earlier conversations are retrieved separately through `chat_history`.
 
-```
-usableInput   = contextWindow − maxOutputTokens − safety
-messageBudget = max(usableInput × 0.2, usableInput − systemPrompt − toolDefs)
-```
+See [scoped memory](./src/main/features/memory.ts), [document extraction](./src/main/util/file_to_chunks.ts), [Library tools](./src/main/model/core-agent/kb-tools.ts) and [conversation retrieval](./src/main/model/core-agent/chat-history-tools.ts).
 
-Every trigger is a share of `messageBudget` — 0.3 for the in-turn layer, 0.2 for cross-turn history, 0.1 for one round's inline tool results — and everything else derives from its trigger, so the shares are the only tunable surface. They sum to well under 1, leaving room for injected runtime state and for the growth that happens between a trigger firing and its summary landing. The `max` is a fuse: when a large tool set would otherwise swallow the window, messages keep a floor share instead of computing a negative budget.
+### Execution limits and recovery
 
-A run compacts as many times as it needs to — there is deliberately **no ceiling on successful passes**. What is bounded is wasted work instead: a fingerprint check refuses to compact identical state twice, a minimum-savings threshold rejects passes that would free too little, and three consecutive failures stop LLM-backed compaction.
+Session locks and concurrency limits bound parallel work. Tool-round budgets, progress checkpoints, repeated-call checks and phase-aware idle watchdogs help contain runs that stall or repeat work. Named agent tasks can be tracked and cancelled individually; an admitted or queued task is not treated as a completed result.
 
-Summarization loses detail, so what an agent must not forget is kept as structure rather than prose. A workspace ledger of files written, files read, and commands run survives compaction ([`workspace-state.ts`](./src/core-agent/src/agent/workspace-state.ts)), and a spin detector — two or more compactions plus 75% of the tool budget consumed — nudges the agent once to re-anchor on that ledger instead of re-deriving work it just summarized away.
+See [actor budgets](./src/main/features/group_chat/actor-budgets.ts), the [agent runtime](./src/core-agent/src/agent/runner.ts) and the [desktop model adapter](./src/main/model/core-agent/client.ts).
 
-### Memory: hybrid retrieval over a local index
+### Learning from activity
 
-A knowledge base is a SQLite index built on your machine — FTS5 for full text, stored vectors for similarity ([`memory/`](./src/core-agent/src/memory)). Documents are chunked at 512 lines with 64 lines of overlap; a query runs both ways and the two ranked lists merge by reciprocal rank fusion, weighted 0.7 vector to 0.3 keyword. Agents reach it through `memory_search` and `memory_read`, over stored documents and past sessions alike.
+Background reviews examine new agent activity when the app is idle, subject to cooldowns and execution limits. A review may update an agent's self-assessment (`COMPETENCE.md`), reusable methods (`LEARNING_STRATEGIES.md`) or learned skills. Reviews depend on new activity rather than task count, and can conclude that there is nothing worth saving.
 
-Embeddings are computed **on device** by a bundled ONNX model (`bge-small-zh-v1.5`, ~95 MB, fetched once during install), so indexing a knowledge base sends nothing anywhere. Cloud embedding providers — OpenAI, Gemini, Voyage, Mistral — are available if you prefer them.
-
-### Four independent runaway guards
-
-- **Turn ceiling** — `MAX_WORKER_TURNS = 100` counts turns, not wall-clock time, so a slow-but-progressing model isn't killed.
-- **Per-turn tool rounds** — Commander 120, named agent 100, ephemeral worker the schema default ([`actor-budgets.ts`](./src/main/features/group_chat/actor-budgets.ts)), pinned by unit tests so they can't silently drift.
-- **`loop_detection`** — nudges the model after N consecutive identical or near-duplicate tool calls.
-- **Tool-idle watchdog** — for turns that stall rather than loop.
-
-### Self-evolution: signal-triggered, not after every task
-
-Each agent keeps `meta/COMPETENCE.md` (what it is and isn't good at) and `meta/LEARNING_STRATEGIES.md` (methods that have worked for it), both fed back into its system prompt on the next run.
-
-Reflection is not a fixed counter. A weighted trigger scores six signals — `error_recovery`, `user_correction`, `complexity`, `known_weakness`, `weakness_succeeded`, `skill_ineffective` — and reviews only when the total clears a threshold, generating the review prompt from whichever signal dominated ([`metacognition.ts`](./src/core-agent/src/evolution/metacognition.ts)). Through `skill_manage` an agent can also crystallize "how I solved X" into a **private** `SKILL.md` that it can use from the next turn on.
+See the [reflection scheduler](./src/main/features/reflection-orchestrator.ts) and [review prompt](./src/core-agent/src/evolution/metacognition.ts).
 
 ---
 

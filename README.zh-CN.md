@@ -2,11 +2,11 @@
 
 **开源的 AI 智能体团队，就在你的桌面上——把目标变成交付成果，并持续推进。**
 
-Orkas 是一个开源（MIT）、本地优先的多智能体桌面应用，也是一支协同工作的 AI 助手团队。你描述目标，**指挥官（Commander）**将它拆成待办、亲自完成通用部分，并协调 **16 个内置专业智能体**完成研究、写作、幻灯片、视频、语音、设计、代码、SEO 和电商工作；还可接入你已在使用的编程与个人智能体：**Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent**。项目汇集目标、记忆和文件，Auto-advance（自动推进）与定时自动化让工作持续推进，完成的成果交回给你审核。
-
 **[⬇ 下载 Orkas：macOS 与 Windows](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** —— 免费使用，内置 Orkas 模型赠送 500 积分，开始使用无需 API Key。也可以用自己的 Key：Claude · OpenAI · Gemini · DeepSeek · Kimi · GLM · Qwen · MiniMax · Doubao，或接入本地 OpenAI 兼容模型端点。
 
 [![下载 macOS 与 Windows 版](https://img.shields.io/badge/Download-macOS%20%26%20Windows-5b57d6?style=for-the-badge)](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)
+
+Orkas 是一个开源（MIT）、本地优先的多智能体桌面应用，也是一支协同工作的 AI 助手团队。你描述目标，**指挥官（Commander）**将它拆成待办、亲自完成通用部分，并协调 **16 个内置专业智能体**完成研究、写作、幻灯片、视频、语音、设计、代码、SEO 和电商工作；还可接入你已在使用的编程与个人智能体：**Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent**。项目汇集目标、记忆和文件，Auto-advance（自动推进）与定时自动化让工作持续推进，完成的成果交回给你审核。
 
 [![许可证：MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Stars](https://img.shields.io/github/stars/Orkas-AI/Orkas?style=social)](https://github.com/Orkas-AI/Orkas/stargazers)
@@ -92,7 +92,7 @@ Orkas 将你已安装的 CLI 智能体作为本地会话运行，与内置专业
 - **会规划、分工，也会亲自完成工作的指挥官** —— 拆解目标，选择合适的智能体、技能、连接器与工具；没有更合适的专业智能体时，亲自处理分析、写作、研究和文件工作。
 - **本地优先** —— 对话、文件、知识库和自定义智能体默认保存在本机，安装版可选择开启云同步。使用自己的 Key 时，模型调用从本机直连服务商；内置 Orkas 模型通过 Orkas 托管服务运行。
 - **模型随时可切换** —— 指挥官与内置智能体共用一个模型设置，可选择内置 Orkas 模型、自有服务商或本地端点；外接 CLI 智能体保留各自的模型设置。
-- **能积累经验的智能体** —— 各自保留私有技能与记忆，在被纠正、错误恢复或遇到已知弱项等信号触发时反思，改进后续工作。
+- **能积累经验的智能体** —— 各自保留私有技能与记忆；后台复盘在应用空闲时检查新活动，可改进自我评估、可复用方法与学习到的技能。
 - **开源、可审查** —— MIT 许可证，可以查看 Orkas、智能体与技能的具体实现。
 
 > ⭐ 如果 Orkas 对你有用，点一颗 Star 能帮助更多人发现它。
@@ -106,7 +106,7 @@ Orkas 将你已安装的 CLI 智能体作为本地会话运行，与内置专业
 | 平台 | macOS 12+（Apple Silicon 与 Intel）、Windows 10+ | macOS、Windows、glibc 2.34+ Linux x64/arm64 |
 | 账号 | 登录即送 500 积分 | 无需账号 |
 | 模型 | 内置 Orkas 模型，或使用自己的 Key | 自己的 Key，或本地模型端点 |
-| 另含 | 云同步、共享项目、语音输入、网页应用发布 | — |
+| 另含 | 项目协作、应用发布、云端同步等 | — |
 | 获取方式 | **[下载 Orkas](https://orkas.ai/download/?source=gh-orkas&entry_point=github_readme&download=1)** | [快速开始](#快速开始) |
 
 下载链接会识别你的系统，并开始下载对应安装包。
@@ -133,7 +133,7 @@ Orkas 将你已安装的 CLI 智能体作为本地会话运行，与内置专业
 | **Claude Cowork** | Anthropic 基于 Claude 构建的桌面智能体体验。 | Orkas 开源（MIT），可使用内置 Orkas 模型或自有服务商，并协调 Claude Code、Codex、OpenCode 与内置专业智能体。[Claude Cowork 替代方案 →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
 | **LangChain** | 面向开发者的 LLM 应用与智能体框架，通过代码嵌入 Python/JS 应用。 | Orkas 是通过对话指挥的桌面应用，数据默认保存在本地。 |
 | **CrewAI** | 通过 Python 代码定义团队与角色、编排自治智能体的框架。 | Orkas 将多智能体编排做成桌面应用，内置项目、待办、自动化与各智能体的经验积累。 |
-| **OpenClaw** | 跨消息渠道与你联系的常驻个人助理。 | Orkas 协调一支团队，OpenClaw 也可作为其中一个 CLI 智能体接入。 |
+| **OpenClaw** | 提供消息渠道集成、多智能体路由和子智能体能力的个人智能体平台。 | Orkas 提供面向成品交付的桌面工作区，内置专业智能体，并协调 Claude Code、Codex、OpenCode 等 CLI 智能体；OpenClaw 也可作为其中一员接入。 |
 | **Hermes-Agent** | Nous Research 的自我改进智能体，具备记忆与技能，提供 CLI、消息网关和桌面版。 | Orkas 由指挥官协调多个专业智能体与外部 CLI 智能体，Hermes-Agent 也可作为其中一员接入。 |
 
 **适合你，如果你希望：**让智能体团队协作，跨天持续推进工作，并将数据、Key 与智能体默认保存在自己的硬盘上。
@@ -212,7 +212,7 @@ Linux 源码运行需要 glibc 2.34+，不支持 Alpine 及其他基于 musl 的
 遇到原生依赖错误时，请使用 Node.js 24 LTS（最低 22.12.0），在此源码目录执行
 `npm run native:repair`。它会恢复可选依赖、修复 Electron 对应的 SQLite，并验证 SQL、
 sqlite-vec，并准备随包 Node、在独立进程中验证 sharp 后才报告成功。只检查、不安装可运行 `npm run native:check`。
-详见[原生依赖安装与排错说明](docs/native-dependencies.md)。
+具体检查内容见[原生依赖校验脚本](./scripts/verify-native-dependencies.cjs)。
 
 ---
 
@@ -222,61 +222,43 @@ sqlite-vec，并准备随包 Node、在独立进程中验证 sharp 后才报告�
 
 ---
 
-## 工作原理（核心设计）
+## 工作原理
 
-> 完整设计与硬约束 → [`CLAUDE.md`](./CLAUDE.md)
+### 任务分工
 
-### 三个派发动词，以及选哪个的规则
+指挥官亲自处理通用工作，通过三种工具委派专业任务：
 
-指挥官是唯一持有派发工具的角色 —— worker 和智能体都没有。选哪个动词，决定了用户听谁说话、以及指挥官是否留在回合里：
+- **`dispatch_to`** 调用具名智能体，取得结果后继续工作；既可等待结果，也可异步运行，在任务结束后通知指挥官。
+- **`hand_off_to`** 将剩余工作交给具名智能体，并结束指挥官当前回合，由智能体直接回复；如果还有更大的任务待完成，也可设置后续步骤，让指挥官之后恢复工作。
+- **`run_worker`** 执行匿名、隔离的子任务，将结果私下回传；它不接收对话历史或具名智能体的技能。
 
-| 动词 | 用户看得到智能体的回复 | 结果回传给指挥官 | 指挥官的回合 |
-| --- | --- | --- | --- |
-| `hand_off_to({ to, message })` | 是 | 否 | 结束 —— 智能体的回复本身就是答案 |
-| `dispatch_to({ to, message })` | 是 | 是 | 继续执行一个已命名的下一步 |
-| `run_worker({ to, task })` | 否 —— 作为私有输入 | 是 | 继续 |
+具名智能体任务和匿名 worker 分别受并发控制。参见[派发实现](./src/main/features/group_chat/bus.ts)与[执行锁](./src/main/util/locks.ts)。
 
-指挥官必须**先**说出自己具体的下一步动作，才可以选 `dispatch_to`；如果剩下的事只是复述智能体的回复，规则就强制它改用 `hand_off_to`。正是这一条约束，让多智能体对话不会以"把你刚读过的内容再总结一遍"收尾。在同一次回复里发出多个 `run_worker` 调用，它们会并发执行。
+### 上下文管理
 
-### 单一运行时，有界扇出
+运行时根据所选模型可用的输入容量分配上下文，计入提示、工具和持续保留的运行状态。已完成对话使用有界的近期历史窗口；较长的当前任务通过检查点压缩早期过程消息，保留近期工作。文件读取、文件变更与命令执行也有结构化记录，可在上下文压缩后保留。
 
-每个对话只有一个 FIFO 运行时，顶层回合串行通过它；并行发生在回合**内部**，以进程内嵌套派发的形式（[`bus.ts`](./src/main/features/group_chat/bus.ts)）。两个独立的信号量为它设界 —— 跨所有用户的 `globalSlots = 10`，以及用于嵌套派发的 `dispatchSlots = 4`（可用 `ORKAS_MAX_DISPATCH_CONCURRENCY` 覆盖）。
+参见[上下文预算](./src/core-agent/src/agent/context-budget.ts)、[会话历史与检查点](./src/core-agent/src/agent/session.ts)和[工作区记录](./src/core-agent/src/agent/workspace-state.ts)。
 
-嵌套运行刻意跳过 `globalSlots`：父回合已经占着一个槽位，嵌套获取会造成"父等子"的死锁。这个捷径之所以安全，只因为派发工具专属于指挥官，信号量不可能被重入获取 —— 死锁是被构造排除的，而不是靠超时兜底。
+### 记忆与资料库
 
-### 上下文预算：由模型推导，而不是写死一个数
+持久记忆分别保存用户偏好、项目事实和各智能体可复用的知识；它们与资料库的文档索引、已保存的对话历史是不同的数据来源。
 
-每个压缩阈值都由当前使用的模型推导而来，因此同一套策略既适配 32K 窗口，也适配 1M 窗口（[`context-budget.ts`](./src/core-agent/src/agent/context-budget.ts)）：
+资料库将文档提取成段落，建立本地 SQLite 向量索引，嵌入模型在你的电脑上运行。智能体通过 `library` 工具列出文件、搜索相关段落和读取来源内容，范围包括全局资料库与当前项目资料库；较早的对话则通过 `chat_history` 单独检索。
 
-```
-usableInput   = 上下文窗口 − 最大输出 token − 安全余量
-messageBudget = max(usableInput × 0.2, usableInput − 系统提示 − 工具定义)
-```
+参见[分层记忆](./src/main/features/memory.ts)、[文档提取](./src/main/util/file_to_chunks.ts)、[资料库工具](./src/main/model/core-agent/kb-tools.ts)和[对话检索](./src/main/model/core-agent/chat-history-tools.ts)。
 
-每个触发阈值都是 `messageBudget` 的一个份额 —— 回合内层 0.3、跨回合历史 0.2、单轮内联工具结果 0.1 —— 其余参数都由触发阈值派生，因此这几个份额是唯一的可调面。它们的总和远小于 1，留出的余量用于回灌的运行时状态，以及"触发发生到摘要落地"之间仍在继续的增长。那个 `max` 是保险丝：当工具集大到会吃掉整个窗口时，消息仍保有一个底线份额，而不是算出一个负预算。
+### 执行保护与恢复
 
-一次运行需要压缩多少次就压缩多少次 —— **成功压缩的次数刻意不设上限**。真正设界的是无效功：指纹校验拒绝对同一状态重复压缩，最小收益阈值拒绝那些释放太少的压缩，连续三次失败则停止 LLM 压缩。
+会话锁和并发限制控制同时运行的工作量。工具轮数预算、进度检查点、重复调用检查和分阶段的空闲监测，共同约束停滞或重复执行的任务。具名智能体任务可以单独跟踪和取消；任务已接收或已排队，不会被当作已经完成。
 
-摘要必然丢细节，所以智能体绝不能忘的东西不交给散文承载。一份记录"写过哪些文件、读过哪些文件、跑过哪些命令"的工作台账会以结构形式挺过压缩（[`workspace-state.ts`](./src/core-agent/src/agent/workspace-state.ts)）；另有一个空转检测 —— 压缩两次以上且工具预算已消耗 75% —— 会提醒智能体一次，让它回到台账重新锚定，而不是把刚被摘要掉的工作再推导一遍。
+参见[角色预算](./src/main/features/group_chat/actor-budgets.ts)、[智能体运行时](./src/core-agent/src/agent/runner.ts)和[桌面模型适配层](./src/main/model/core-agent/client.ts)。
 
-### 记忆：本地索引上的混合检索
+### 从工作中积累经验
 
-资料库是一份构建在你本机的 SQLite 索引 —— 用 FTS5 做全文、用存储的向量做相似度（[`memory/`](./src/core-agent/src/memory)）。文档按 512 行切块、块间重叠 64 行；一次查询两路并发，两个排序结果用 reciprocal rank fusion 融合，权重为向量 0.7、关键词 0.3。智能体通过 `memory_search` 与 `memory_read` 访问它，检索范围同时覆盖存入的文档和历史会话。
+后台复盘在应用空闲时检查智能体的新活动，并受冷却间隔和执行限制控制。复盘可更新智能体的自我评估（`COMPETENCE.md`）、可复用方法（`LEARNING_STRATEGIES.md`）或学习到的技能，也可以判断没有值得保存的新内容。复盘依据新活动安排，而非按完成任务的次数触发。
 
-嵌入向量**在本机计算**，由随包的 ONNX 模型完成（`bge-small-zh-v1.5`，约 95 MB，安装时下载一次），因此建立资料库索引不会把任何内容发出去。如果你更愿意用云端嵌入服务，OpenAI、Gemini、Voyage、Mistral 也都支持。
-
-### 四道互相独立的失控保护
-
-- **轮次上限** —— `MAX_WORKER_TURNS = 100` 计的是回合数而非墙钟时间，因此一个慢但在推进的模型不会被误杀。
-- **每回合工具轮数** —— 指挥官 120、具名智能体 100、临时 worker 用 schema 默认值（[`actor-budgets.ts`](./src/main/features/group_chat/actor-budgets.ts)），由单元测试钉死，不会悄悄漂移。
-- **`loop_detection`** —— 连续 N 次相同或近似重复的工具调用后提醒模型。
-- **工具空闲看门狗** —— 针对卡住而非打转的回合。
-
-### 自我进化：由信号触发，而非每次任务都做
-
-每个智能体维护 `meta/COMPETENCE.md`（我擅长什么 / 不擅长什么）和 `meta/LEARNING_STRATEGIES.md`（对我有效的方法），两者都会在下一次运行时回喂进它的系统提示。
-
-复盘不是固定计数器。一个加权触发器为六个信号打分 —— `error_recovery`、`user_correction`、`complexity`、`known_weakness`、`weakness_succeeded`、`skill_ineffective` —— 只有总分越过阈值才触发复盘，并依据占主导的那个信号生成复盘提示（[`metacognition.ts`](./src/core-agent/src/evolution/metacognition.ts)）。通过 `skill_manage`，智能体还能把"我是如何解决 X 的"结晶成一份**私有** `SKILL.md`，从下一回合起即可使用。
+参见[复盘调度](./src/main/features/reflection-orchestrator.ts)与[复盘提示](./src/core-agent/src/evolution/metacognition.ts)。
 
 ---
 
