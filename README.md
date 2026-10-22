@@ -17,11 +17,7 @@ Orkas is an open-source (MIT), local-first multi-agent desktop app — an AI ass
 
 ---
 
-**You:** *"Research the top 5 competitors, write it up, and turn it into a deck."*
-
-**Orkas:** the Commander turns the goal into to-dos and runs them across specialists — **DeepResearcher** gathers and verifies the sources, **ContentWriter** drafts the report, **PptMaker** builds the slides. One chat, one shared plan, finished files in your project.
-
-![Orkas demo: the Commander turns a goal into to-dos, dispatches them to specialist agents, and delivers the finished files](./resources/app-ui/demo-en.gif)
+https://github.com/user-attachments/assets/56c188ec-f19b-4911-8d51-a37cdf4717f5
 
 ---
 

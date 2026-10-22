@@ -17,11 +17,7 @@ Orkas 是一个开源（MIT）、本地优先的多智能体桌面应用，也�
 
 ---
 
-**你：** *“研究排名前 5 的竞品，写成报告，再做成一份幻灯片。”*
-
-**Orkas：** 指挥官把目标拆成待办，再协调专业智能体执行：**DeepResearcher** 收集并核实来源，**ContentWriter** 撰写报告，**PptMaker** 制作幻灯片。一个对话、一份共享计划，成品留在你的项目里。
-
-![Orkas 演示：指挥官把目标拆成待办，调度专业智能体并交付成品](./resources/app-ui/demo.gif)
+https://github.com/user-attachments/assets/56c188ec-f19b-4911-8d51-a37cdf4717f5
 
 ---
 
