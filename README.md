@@ -20,7 +20,7 @@ Orkas is built to keep a project moving, not just answer one prompt. A **project
 
 ---
 
-https://github.com/user-attachments/assets/9e5ee6d2-6f53-4c34-ac46-df2f5e6f7e56
+[![Orkas demo — scale your business without hiring](./resources/demo/orkas-demo-poster.jpg)](./resources/demo/orkas-demo.mp4)
 
 ![Orkas desktop — task conversation and deliverables](./resources/app-ui/task-en.png)
 
