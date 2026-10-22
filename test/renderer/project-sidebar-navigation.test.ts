@@ -44,7 +44,7 @@ function mount({ cached = true, collapsed = false, previous = '' } = {}) {
     _composerNavigationEpoch: 0, composerBindOwner() {}, _saveLastView() {},
     _bootLog: { info() {}, warn() {} }, createLogger: () => ({ info() {}, warn() {} }),
     _clearLazyFeatureError() {}, _showLazyFeatureError() {},
-    setTimeout: () => 0, clearTimeout() {}, t: String, escapeHtml: String,
+    setTimeout: () => 0, clearTimeout() {}, performance, t: String, escapeHtml: String,
     localStorage: { getItem: () => null, setItem() {} },
     document: {
       addEventListener() {}, getElementById: (id: string) => nodes.get(id) || null,
@@ -65,10 +65,78 @@ function mount({ cached = true, collapsed = false, previous = '' } = {}) {
   if (cached) vm.runInContext(`_projectsCache = ${JSON.stringify(projects)}`, context);
   const selected = () => [...list.innerHTML.matchAll(/class="project-row active" data-pid="([^"]+)"/g)]
     .map(match => match[1]);
-  return { context, list, toggle, scrolled, selected, deferred, featureLoads, loadProjectDetail };
+  return { context, nodes, projects, list, toggle, scrolled, selected, deferred, featureLoads, loadProjectDetail };
 }
 
 describe('project navigation follows the destination in the sidebar', () => {
+  it('updates the open detail immediately after a sidebar rename, preserving drafts while the list refresh waits', async () => {
+    const h = mount({ previous: 'alpha' });
+    h.context.currentView = 'project';
+    h.context._projectDetailMeta = {
+      project: { project_id: 'alpha', name: 'alpha' },
+      draft: 'Keep editing',
+    };
+    const draft = { value: 'Unsubmitted title', selectionStart: 3 };
+    h.nodes.set('project-detail-title-input', draft);
+    h.nodes.get('project-detail-title').textContent = 'alpha';
+    h.nodes.get('project-detail-content').innerHTML = 'Unsaved workspace';
+    const renamed = { ...h.context._projectDetailMeta.project, name: 'Release readiness' };
+    let releaseList!: (value: any) => void;
+    const listResult = new Promise(resolve => { releaseList = resolve; });
+    h.context.orkas.invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'projects.rename') return { ok: true, project: renamed };
+      if (channel === 'projects.list') return listResult;
+      throw new Error(`Unexpected channel: ${channel}`);
+    });
+    h.context._startProjectInlineRename('alpha');
+    const listeners = new Map<string, (...args: any[]) => any>();
+    h.context._bindInlineRenameInput({
+      dataset: { renamePid: 'alpha' }, value: 'Release readiness',
+      addEventListener: (name: string, listener: any) => listeners.set(name, listener),
+    });
+    const rename = listeners.get('blur')!();
+    await new Promise(resolve => setImmediate(resolve));
+
+    // Saved identity is visible before an unrelated list read finishes.
+    expect(h.nodes.get('project-detail-title').textContent).toBe('Release readiness');
+    expect(h.context._projectDetailMeta.project.name).toBe('Release readiness');
+    expect(h.list.innerHTML).toContain('Release readiness');
+    expect(h.context._projectDetailMeta.draft).toBe('Keep editing');
+    expect(h.nodes.get('project-detail-content').innerHTML).toBe('Unsaved workspace');
+    expect(draft).toEqual({ value: 'Unsubmitted title', selectionStart: 3 });
+    expect(h.loadProjectDetail).not.toHaveBeenCalled();
+    releaseList({ ok: true, projects: [renamed, h.projects[1]] });
+    await rename;
+    expect(h.nodes.get('project-detail-title').textContent).toBe('Release readiness');
+  });
+
+  it.each([true, false])('preserves the displayed project on another project rename or a rejected rename (success=%s)', async success => {
+    const openProject = success ? 'beta' : 'alpha';
+    const h = mount({ previous: openProject });
+    h.context._projectDetailMeta = { project: { project_id: openProject, name: openProject } };
+    h.nodes.get('project-detail-title').textContent = openProject;
+    h.context.orkas.invoke.mockImplementation(async (channel: string) => {
+      if (channel === 'projects.rename') return success
+        ? { ok: true, project: { project_id: 'alpha', name: 'Renamed alpha' } }
+        : { ok: false, error: 'name_dup' };
+      return { ok: true, projects: [{ project_id: 'alpha', name: 'Renamed alpha' }, h.projects[1]] };
+    });
+    h.context._startProjectInlineRename('alpha');
+    const listeners = new Map<string, (...args: any[]) => any>();
+    h.context._bindInlineRenameInput({
+      dataset: { renamePid: 'alpha' }, value: 'Renamed alpha',
+      addEventListener: (name: string, listener: any) => listeners.set(name, listener),
+    });
+    await listeners.get('blur')!();
+    expect(h.nodes.get('project-detail-title').textContent).toBe(openProject);
+    expect(h.context._projectDetailMeta.project).toEqual({ project_id: openProject, name: openProject });
+    if (!success) {
+      expect(vm.runInContext('_projectsCache[0].name', h.context)).toBe('alpha');
+      expect(h.context._renderProjectRow(h.projects[0], [])).toContain('project.name_dup_inline');
+    }
+  });
+
+
   it.each(['', 'alpha'])('selects and reveals the target before detail loading, with previous detail %j', previous => {
     const h = mount({ previous, collapsed: true });
     h.context.setView('project', 'beta');

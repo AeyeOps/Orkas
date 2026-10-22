@@ -653,6 +653,7 @@ function _bindInlineRenameInput(input) {
       _projectsInlineRenameDraft = '';
       _projectsInlineRenameError = '';
       _projectsInlineRenameSubmitting = false;
+      _applyProjectRename(pid, res.project.name);
       await loadProjects(true);
     } catch (err) {
       if (
@@ -977,6 +978,20 @@ window.openProjectsSurface = async function openProjectsSurface(request) {
   }
   return false;
 };
+
+function _applyProjectRename(projectId, name) {
+  const cached = Array.isArray(_projectsCache)
+    ? _projectsCache.find((project) => project?.project_id === projectId) : null;
+  if (cached) cached.name = name;
+  // Update only the title; reloading the detail would replace active editors.
+  if (typeof _projectDetailPid !== 'undefined' && _projectDetailPid === projectId
+      && typeof _projectDetailMeta !== 'undefined' && _projectDetailMeta?.project) {
+    _projectDetailMeta.project.name = name;
+    const title = document.getElementById('project-detail-title');
+    if (title) title.textContent = name;
+  }
+  renderProjectsSection();
+}
 
 // ── Init ────────────────────────────────────────────────────────────────
 

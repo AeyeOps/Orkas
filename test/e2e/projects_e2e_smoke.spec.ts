@@ -764,36 +764,52 @@ test.describe('projects', () => {
     expect(afterCancel.projects.some((project) => project.name === draftName)).toBe(false);
   });
 
-  test('renames a project and keeps the new name after relaunch', async ({ orkas }) => {
-    const originalName = 'E2E Project Before Rename';
-    const renamedName = 'E2E Project After Rename';
-    await createProject(orkas, originalName);
-    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
+  for (const [locale, width, height] of [['zh', 1280, 900], ['en', 960, 720]] as const) {
+    test(`renames a project and keeps the new name after relaunch (${locale})`, async ({ orkas }, testInfo) => {
+      const originalName = 'E2E Project Before Rename';
+      const renamedName = 'E2E Project After Rename';
+      await createProject(orkas, originalName);
+      if (!orkas.page) throw new Error('Orkas renderer is unavailable');
 
-    const originalRow = orkas.page.locator('.project-row', {
-      has: orkas.page.locator('.project-name', { hasText: originalName }),
+      await orkas.page.setViewportSize({ width, height });
+      await orkas.page.evaluate(lang => (window as any).setLang(lang), locale);
+      const composer = orkas.page.locator('#project-chat-input');
+      await composer.fill('Keep this unsent project draft');
+      await orkas.page.evaluate(() => (window as any).composerSetSelection('project-chat-input', 3, 7));
+      const composerNode = await composer.elementHandle();
+
+      const originalRow = orkas.page.locator('.project-row', {
+        has: orkas.page.locator('.project-name', { hasText: originalName }),
+      });
+      await originalRow.hover();
+      const renameMenuButton = originalRow.locator('[data-project-menu]');
+      await expect(renameMenuButton).toBeVisible();
+      await renameMenuButton.click();
+      await orkas.page.locator('#project-row-menu [data-action="rename"]').click();
+      const renameInput = orkas.page.locator('input.project-rename-input[data-rename-pid]');
+      await expect(renameInput).toBeFocused();
+      await renameInput.fill(renamedName);
+      await renameInput.press('Enter');
+
+      await expect(orkas.page.locator('.project-name', { hasText: originalName })).toHaveCount(0);
+      await expect(orkas.page.locator('.project-name', { hasText: renamedName })).toHaveCount(1);
+
+      await expect(orkas.page.locator('#project-detail-title')).toHaveText(renamedName);
+      expect(await orkas.page.evaluate(() => (window as any).composerText('project-chat-input'))).toBe('Keep this unsent project draft');
+      expect(await composerNode!.evaluate(el => el === document.getElementById('project-chat-input'))).toBe(true);
+      expect(await orkas.page.evaluate(() => (window as any).composerSelection('project-chat-input'))).toEqual({ start: 3, end: 7 });
+      await orkas.page.screenshot({ path: testInfo.outputPath(`project-sidebar-rename-${locale}.png`) });
+
+      const relaunchedPage = await orkas.relaunch();
+      const renamedRow = relaunchedPage.locator('.project-row', {
+        has: relaunchedPage.locator('.project-name', { hasText: renamedName }),
+      });
+      await expect(renamedRow).toHaveCount(1);
+      await renamedRow.click();
+      await expect(relaunchedPage.locator('#project-detail-title')).toHaveText(renamedName);
     });
-    await originalRow.hover();
-    const renameMenuButton = originalRow.locator('[data-project-menu]');
-    await expect(renameMenuButton).toBeVisible();
-    await renameMenuButton.click();
-    await orkas.page.locator('#project-row-menu [data-action="rename"]').click();
-    const renameInput = orkas.page.locator('input.project-rename-input[data-rename-pid]');
-    await expect(renameInput).toBeFocused();
-    await renameInput.fill(renamedName);
-    await renameInput.press('Enter');
 
-    await expect(orkas.page.locator('.project-name', { hasText: originalName })).toHaveCount(0);
-    await expect(orkas.page.locator('.project-name', { hasText: renamedName })).toHaveCount(1);
-
-    const relaunchedPage = await orkas.relaunch();
-    const renamedRow = relaunchedPage.locator('.project-row', {
-      has: relaunchedPage.locator('.project-name', { hasText: renamedName }),
-    });
-    await expect(renamedRow).toHaveCount(1);
-    await renamedRow.click();
-    await expect(relaunchedPage.locator('#project-detail-title')).toHaveText(renamedName);
-  });
+  }
 
   // The project page header keeps only the title; rename and delete live in its
   // "⋯" menu, and "Done" stands in for the menu while the title is edited.
