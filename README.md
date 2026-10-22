@@ -249,8 +249,8 @@ The packaged desktop app asks you to sign in when you first launch it. The sourc
 **Can Orkas drive Claude Code and other CLI agents?**
 Yes. Orkas can drive five external CLI agents as local subprocesses — the coding agents Claude Code, Codex and OpenCode, plus the personal agents OpenClaw and Hermes-Agent — and onboard open-source projects like HyperFrames, all directed from the same chat.
 
-**How is Orkas different from Claude Cowork / Claude Desktop / CrewAI / LangChain?**
-Claude Cowork and Claude Desktop are built on Claude alone; CrewAI and LangChain are code-first frameworks. Orkas is an open-source desktop app where a Commander coordinates a team of specialist agents and your CLI agents, with any model provider, and keeps data and keys local. See the [full comparisons](https://orkas.ai/compare/?source=gh-orkas).
+**How is Orkas different from Claude Code / Codex / CrewAI / LangChain?**
+Claude Code and Codex are coding agents — Orkas runs both as members of its team, so you don't have to choose between them; CrewAI and LangChain are code-first frameworks. Orkas is an open-source desktop app where a Commander coordinates a team of specialist agents and your CLI agents, with any model provider, and keeps data and keys local. See the [full comparisons](https://orkas.ai/compare/?source=gh-orkas).
 
 **Which platforms does Orkas support?**
 macOS 12+ (Apple Silicon and Intel) and Windows 10+ have packaged installers. glibc 2.34+ Linux x64/arm64 runs from source today, with no installer yet. Local speech transcription is supported on Linux through the pinned whisper.cpp runtime prepared on first launch. Alpine and other musl-based distributions are not supported. The source bootstrap needs Node 22.12+; Python 3 and a C/C++ build toolchain are needed only when a native npm package has no compatible prebuilt binary and must be rebuilt locally.

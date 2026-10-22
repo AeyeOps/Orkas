@@ -247,8 +247,8 @@ Orkas 是开源（MIT）、本地优先的多智能体桌面应用。指挥官�
 **能驱动 Claude Code 等 CLI 智能体吗？**
 可以。Orkas 能将五个外部 CLI 智能体作为本地子进程运行：Claude Code、Codex、OpenCode、OpenClaw 和 Hermes-Agent；也可接入 HyperFrames 等开源工具，在同一个对话中协调工作。
 
-**和 Claude Cowork、Claude Desktop、CrewAI、LangChain 有什么不同？**
-Claude Cowork 和 Claude Desktop 基于 Claude；CrewAI 和 LangChain 是代码优先的框架。Orkas 是开源桌面应用，由指挥官协调专业智能体与 CLI 智能体，可选择不同模型服务商，数据与 Key 默认保存在本地。[查看完整对比](https://orkas.ai/compare/?source=gh-orkas)。
+**和 Claude Code、Codex、CrewAI、LangChain 有什么不同？**
+Claude Code 和 Codex 是编程智能体，Orkas 可以把它们都作为团队成员来运行，不必二选一；CrewAI 和 LangChain 是代码优先的框架。Orkas 是开源桌面应用，由指挥官协调专业智能体与 CLI 智能体，可选择不同模型服务商，数据与 Key 默认保存在本地。[查看完整对比](https://orkas.ai/compare/?source=gh-orkas)。
 
 **支持哪些平台？**
 macOS 12+（Apple Silicon 与 Intel）和 Windows 10+ 提供安装包。glibc 2.34+ Linux x64/arm64 目前通过源码运行，尚无安装包；首次启动会准备固定版本的 whisper.cpp 运行时，支持本地语音转写。不支持 Alpine 等基于 musl 的发行版。源码启动需要 Node 22.12+；只有原生 npm 包缺少兼容的预编译文件、需要本地重建时，才需要 Python 3 和 C/C++ 构建工具链。
