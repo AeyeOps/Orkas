@@ -19,6 +19,8 @@ Orkas is an open-source (MIT), local-first multi-agent desktop app — an AI ass
 
 https://github.com/user-attachments/assets/9e5ee6d2-6f53-4c34-ac46-df2f5e6f7e56
 
+![Orkas desktop — task conversation and deliverables](./resources/app-ui/task-en.png)
+
 ---
 
 ## Keep the work moving

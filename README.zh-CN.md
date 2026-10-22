@@ -19,6 +19,8 @@ Orkas 是一个开源（MIT）、本地优先的多智能体桌面应用，也�
 
 https://github.com/user-attachments/assets/9e5ee6d2-6f53-4c34-ac46-df2f5e6f7e56
 
+![Orkas 桌面界面 — 任务对话与交付文件](./resources/app-ui/task-zh.png)
+
 ---
 
 ## 让工作持续推进
