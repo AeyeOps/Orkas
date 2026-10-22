@@ -214,12 +214,6 @@ See the [native dependency verification script](./scripts/verify-native-dependen
 
 ---
 
-## Screenshots
-
-![Orkas home screen: sidebar with Commander, Agents, Skills, Connectors and Library, and a task box with quick-start templates](./resources/app-ui/home-en.jpg)
-
----
-
 ## How it works
 
 ### Task routing
