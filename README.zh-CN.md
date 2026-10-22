@@ -20,7 +20,7 @@ Orkas 为持续推进的项目而设计，而不只是回答一次提问。**项
 
 ---
 
-[![Orkas 演示 — 扩大业务规模，无需额外招人](./resources/demo/orkas-demo-poster.jpg)](./resources/demo/orkas-demo.mp4)
+https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 
 ![Orkas 桌面界面 — 任务对话与交付文件](./resources/app-ui/task-zh.png)
 
