@@ -48,13 +48,13 @@ export function listSearchProfiles(): SearchProfile[] {
  * the keyless built-in web_search).
  */
 export function pickActiveSearchProfile(): SearchProfile | null {
-  return listSearchProfiles()[0] || null;
+  return listSearchProfiles().find((profile) => profile.provider !== 'orkas-api') || null;
 }
 
 /** Quick boolean for `native-search-tools.ts` to short-circuit native
  *  search injection when the user has any paid search API configured. */
 export function hasAnySearchProfile(): boolean {
-  return listSearchProfiles().length > 0;
+  return pickActiveSearchProfile() !== null;
 }
 
 export interface AddSearchProfileInput {

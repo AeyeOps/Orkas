@@ -15,13 +15,7 @@
 import type { SearchProfile } from '../../features/auth';
 import { createLogger } from '../../logger';
 import { fetchAndReadWithTimeout } from '../../util/abort';
-import {
-  ORKAS_API_BASE_URL,
-  ORKAS_API_KEYS_URL,
-  ORKAS_API_PROVIDER,
-  orkasApiUsageHeaders,
-  type OrkasApiUsageContext,
-} from '../../features/orkas_api';
+import type { OrkasApiUsageContext } from '../../features/orkas_api';
 
 const log = createLogger('search-adapters');
 
@@ -68,39 +62,6 @@ function parseJson<T>(text: string): T {
 
 function clamp(n: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, n));
-}
-
-// ── Orkas public search API ─────────────────────────────────────────────
-
-async function orkasApiSearch(
-  profile: SearchProfile,
-  query: string,
-  count: number,
-  context?: OrkasApiUsageContext,
-): Promise<SearchAdapterResult> {
-  const { response: resp, text } = await fetchTextWithTimeout(`${ORKAS_API_BASE_URL}/search`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${profile.apiKey}`,
-      'Content-Type': 'application/json',
-      ...orkasApiUsageHeaders(context),
-    },
-    body: JSON.stringify({ query, max_results: clamp(count, 1, 20) }),
-  });
-  if (!resp.ok) {
-    throw new Error(`Orkas Search ${resp.status}: ${text.slice(0, 300)}`);
-  }
-  const data = parseJson(text) as {
-    results?: Array<{ title?: string; url?: string; snippet?: string }>;
-  };
-  return {
-    provider: ORKAS_API_PROVIDER,
-    results: (data.results || []).map((result) => ({
-      title: String(result.title || ''),
-      url: String(result.url || ''),
-      snippet: String(result.snippet || ''),
-    })).filter((result) => result.url),
-  };
 }
 
 // ── Tavily ──────────────────────────────────────────────────────────────
@@ -295,7 +256,6 @@ export type SearchAdapter = (
 ) => Promise<SearchAdapterResult>;
 
 export const searchAdaptersByProvider: Record<string, SearchAdapter> = {
-  [ORKAS_API_PROVIDER]: orkasApiSearch,
   tavily:            tavilySearch,
   serper:            serperSearch,
   'brave-search':    braveApiSearch,
@@ -306,7 +266,6 @@ export const searchAdaptersByProvider: Record<string, SearchAdapter> = {
 /** Display labels for provider ids — used by both the settings UI and the
  *  formatted tool result so the LLM knows which API answered. */
 export const SEARCH_PROVIDER_LABEL: Record<string, string> = {
-  [ORKAS_API_PROVIDER]: 'Orkas · Search',
   tavily:            'Tavily',
   serper:            'Serper',
   'brave-search':    'Brave',
@@ -316,7 +275,6 @@ export const SEARCH_PROVIDER_LABEL: Record<string, string> = {
 
 /** Documentation URL shown next to the API-key input in the settings UI. */
 export const SEARCH_PROVIDER_DOCS: Record<string, string> = {
-  [ORKAS_API_PROVIDER]: ORKAS_API_KEYS_URL,
   tavily:            'https://tavily.com/',
   serper:            'https://serper.dev/',
   'brave-search':    'https://brave.com/search/api/',

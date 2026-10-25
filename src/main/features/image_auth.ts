@@ -30,7 +30,6 @@ import {
 } from './image_gen';
 import { createLogger } from '../logger';
 import { logErrorSummary } from '../util/log-redact';
-import { ORKAS_API_KEYS_URL } from './orkas_api';
 
 const log = createLogger('image-auth');
 
@@ -147,7 +146,6 @@ export interface ImageProviderPickerOption {
 
 export function listImageProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
   return [
-    { id: 'orkas-api', label: 'Orkas · Image', docs: ORKAS_API_KEYS_URL },
     { id: 'openai', label: 'OpenAI', docs: 'https://platform.openai.com/api-keys' },
     { id: 'google', label: 'Google', docs: 'https://aistudio.google.com/app/apikey' },
     {

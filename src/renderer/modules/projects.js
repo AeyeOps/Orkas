@@ -738,7 +738,6 @@ function _openProjectRowMenu(anchorBtn, pid) {
   _closeProjectRowMenu();
 
   const items = [
-    { action: 'invite-members', label: t('project.menu.invite_members') },
     { action: 'rename', label: t('project.menu.rename') },
     { action: 'delete', label: t('project.menu.delete'), danger: true },
   ];
@@ -1025,18 +1024,5 @@ document.addEventListener('DOMContentLoaded', () => {
 if (typeof window !== 'undefined') window.primeProjectDetailShell = primeProjectDetailShell;
 
 async function _showProjectMemberInviteGate() {
-  const download = await uiConfirm({
-    message: t('project.invite_members.commercial_only'),
-    okLabel: t('project.invite_members.download'),
-    cancelLabel: t('common.cancel'),
-  });
-  if (!download) return;
-  const lang = getLang();
-  const url = `https://orkas.ai/download/?lang=${encodeURIComponent(lang)}`;
-  try {
-    const result = await window.orkas.invoke('auth.openExternal', { url });
-    if (!result?.ok) throw new Error('open rejected');
-  } catch (_) {
-    await uiAlert(t('project.invite_members.open_failed'));
-  }
+  await uiAlert(t('app.vendor_services_unavailable'));
 }

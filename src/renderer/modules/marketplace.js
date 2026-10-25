@@ -344,7 +344,8 @@ function isMarketplaceOpen() {
   return document.getElementById('panel-marketplace')?.classList.contains('active') === true;
 }
 
-function openMarketplace(initialTab = 'agent', opts = {}) {
+function openMarketplace(initialTab = 'oss', opts = {}) {
+  if (initialTab !== 'oss') throw new Error('The vendor marketplace is unavailable in this build');
   const panel = document.getElementById('panel-marketplace');
   if (!panel) return;
 

@@ -38,7 +38,6 @@ export type ToolGroupId =
   | 'management.app'
   | 'management.projects'
   | 'management.skills'
-  | 'management.marketplace'
   | 'management.automation'
   | 'runtime';
 
@@ -116,7 +115,6 @@ export const TOOL_GROUPS: readonly ToolGroupEntry[] = [
   { id: 'management.app', title: 'App support', summary: 'Navigate supported Orkas screens and inspect sanitized app health.', parent: 'management', activation: 'loadable', agentDependency: false },
   { id: 'management.projects', title: 'Project tasks', summary: 'Find an existing project and read or update its task backlog.', parent: 'management', activation: 'loadable', agentDependency: true },
   { id: 'management.skills', title: 'Skill management', summary: 'Search available shared Skills or import a user-requested Skill package.', parent: 'management', activation: 'loadable', agentDependency: false },
-  { id: 'management.marketplace', title: 'Marketplace management', summary: 'Search the Marketplace and request a confirmed installation.', parent: 'management', activation: 'loadable', agentDependency: false },
   { id: 'management.automation', title: 'Automation management', summary: 'Manage scheduled automations.', parent: 'management', activation: 'loadable', agentDependency: true },
   { id: 'runtime', title: 'Runtime', summary: 'Tool-surface, learned-skill, and oversized-result runtime controls.', activation: 'host-managed', agentDependency: false },
 ] as const;
@@ -217,8 +215,6 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'skill_search', loadGroups: ['management.skills'], programmatic: { mode: 'conditional', policy: 'catalog-read' }, summary: 'Search available non-System, non-private Skills.' },
   { name: 'import_skill_package', loadGroups: ['management.skills'], summary: 'Import a user-requested skill package.' },
   { name: 'skill_manage', loadGroups: ['runtime'], summary: 'Manage an Agent-owned learned skill.' },
-  { name: 'marketplace_search', loadGroups: ['management.marketplace'], programmatic: { mode: 'conditional', policy: 'catalog-read' }, summary: 'Search the marketplace.' },
-  { name: 'marketplace_request_install', loadGroups: ['management.marketplace'], summary: 'Request a user-confirmed marketplace installation.' },
   { name: 'auto_tasks', loadGroups: ['management.automation'], programmatic: { mode: 'allow' }, summary: 'Manage scheduled automations.' },
   { name: 'open_app_view', loadGroups: ['management.app'], summary: 'Stage a click-to-open navigation card to an app surface.' },
   { name: 'app_health', loadGroups: ['management.app'], programmatic: { mode: 'allow' }, summary: 'Read-only sanitized app diagnosis snapshot.' },

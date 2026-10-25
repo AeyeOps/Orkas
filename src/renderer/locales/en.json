@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "This feature requires Orkas vendor services and is unavailable in this build.",
   "dialog.context.application": "Application request",
   "dialog.context.background": "Background request",
   "dialog.context.requester": "Requested by: {name}",

@@ -40,12 +40,6 @@ import {
   getConfiguredProviderModels,
 } from '../features/client_config';
 import type { Api, Model } from '@earendil-works/pi-ai';
-import {
-  ORKAS_API_IMAGE_MODEL,
-  ORKAS_API_KEYS_URL,
-  ORKAS_API_LLM_MODELS,
-  ORKAS_API_PROVIDER,
-} from '../features/orkas_api';
 
 // ── Catalog entry shape ─────────────────────────────────────────────────
 
@@ -83,12 +77,6 @@ export interface CatalogEntry {
 // Group 3: aggregators (OpenRouter)
 
 export const CATALOG: readonly CatalogEntry[] = [
-  {
-    id: ORKAS_API_PROVIDER,
-    label: 'Orkas',
-    docsUrl: ORKAS_API_KEYS_URL,
-    recommended: true,
-  },
   // DeepSeek direct (not in pi-ai 0.68.1; routed through the
   // openai-completions adapter in external-providers.ts).
   { id: 'deepseek',     label: 'DeepSeek',      docsUrl: 'https://platform.deepseek.com/api_keys' },
@@ -141,7 +129,6 @@ export const CATALOG: readonly CatalogEntry[] = [
 
 export const CURATED_MODELS: Readonly<Record<string, readonly ProviderModelEntry[]>> = {
   ...DEFAULT_PROVIDER_MODELS,
-  [ORKAS_API_PROVIDER]: ORKAS_API_LLM_MODELS,
 };
 
 export function curatedModelsFor(providerId: string): ProviderModelEntry[] {
@@ -726,7 +713,7 @@ export interface CustomOpenAICompatibleRuntimeConfig {
  * provider registry. `listProviders()` treats these as API-key-capable
  * even though `listPiProviders()` doesn't list them.
  */
-export const EXTERNAL_API_PROVIDERS: readonly string[] = [ORKAS_API_PROVIDER, 'moonshot', 'deepseek', 'doubao', 'custom'];
+export const EXTERNAL_API_PROVIDERS: readonly string[] = ['moonshot', 'deepseek', 'doubao', 'custom'];
 
 // ── Image-generation capability map ─────────────────────────────────────
 //
@@ -752,11 +739,6 @@ export type ImageGenCapability = Omit<ConfigImageGenCapability, 'api'> & {
 
 export const IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapability>> = {
   ...DEFAULT_IMAGE_GEN_BY_PROVIDER,
-  [ORKAS_API_PROVIDER]: {
-    model: ORKAS_API_IMAGE_MODEL,
-    api: 'orkas',
-    supportsEdit: true,
-  },
 };
 
 export function findImageGenCapability(providerId: string): ImageGenCapability | null {

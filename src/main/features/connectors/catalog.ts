@@ -12,7 +12,6 @@
  * spawning. Refresh is lazy — checked at boot / `connectors.refresh` / when the model's tool
  * call surfaces a 401.
  */
-import { getRemoteConfigRevision, getServerConnectorCatalogConfig } from '../client_config';
 import { COMPOSIO_COMMERCE_ENTRIES } from './catalog-commerce';
 import { COMPOSIO_MANAGED_ENTRIES } from './catalog-managed';
 import { DIRECT_COMMERCE_ENTRIES } from './catalog-direct-commerce';
@@ -492,39 +491,23 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
   },
 ];
 
-let catalogSnapshot: { revision: number; byId: Map<string, CatalogEntry> } | undefined;
+const catalogById = new Map(CONNECTOR_CATALOG
+  .filter(entry => (entry.auth_mode === 'local_api' || entry.auth_mode === 'local_cli') && !entry.requires_credits)
+  .map(entry => [entry.id, entry]));
 
 function catalogIndex(): Map<string, CatalogEntry> {
-  const revision = getRemoteConfigRevision();
-  if (catalogSnapshot?.revision === revision) return catalogSnapshot.byId;
-  const byId = new Map<string, CatalogEntry>();
-  for (const entry of CONNECTOR_CATALOG) byId.set(entry.id, entry);
-  for (const entry of getServerConnectorCatalogConfig()) {
-    const existing = byId.get(entry.id);
-    const serverEntry = entry as CatalogEntry;
-    // Released local/official connectors are authoritative. A stale Server-side Composio row
-    // with the same id must not roll a migrated connector back to third-party auth/metering.
-    if (existing && (existing.auth_mode !== 'composio' || serverEntry.auth_mode !== 'composio')) continue;
-    if (existing?.auth_mode === 'composio' && serverEntry.auth_mode === 'composio') {
-      byId.set(entry.id, {
-        ...existing,
-        composio: serverEntry.composio,
-        usage_metering: serverEntry.usage_metering || existing.usage_metering,
-        requires_credits: serverEntry.requires_credits ?? existing.requires_credits,
-        availability: serverEntry.availability || existing.availability,
-        disabled_reason: serverEntry.disabled_reason || existing.disabled_reason,
-        unavailable_reason: serverEntry.unavailable_reason || existing.unavailable_reason,
-      });
-      continue;
-    }
-    byId.set(entry.id, serverEntry);
-  }
-  catalogSnapshot = { revision, byId };
-  return byId;
+  return catalogById;
 }
 
+const VENDOR_RELAY_LOCAL_API_PROVIDERS = new Set([
+  'yahoo_shopping', 'base_shop', 'ebay', 'etsy', 'mercado_libre', 'taobao_top',
+  'alibaba_1688', 'jd_jos', 'pinduoduo', 'kuaishou_shop', 'lazada', 'shein',
+  'alibaba_icbu', 'aliexpress', 'shopee', 'tiktok_shop',
+]);
+
 export function connectorCatalog(): CatalogEntry[] {
-  return structuredClone(Array.from(catalogIndex().values()));
+  return structuredClone(Array.from(catalogIndex().values())
+    .filter(entry => !VENDOR_RELAY_LOCAL_API_PROVIDERS.has(entry.local_api?.provider)));
 }
 
 export function findCatalogEntry(id: string): CatalogEntry | null {
