@@ -2755,7 +2755,7 @@ function _settingsRenderVideoEntries() {
     if (!available) {
       const reason = document.createElement('div');
       reason.className = 'form-hint';
-      reason.textContent = t('settings.video.provider_unavailable');
+      reason.textContent = t('app.vendor_services_unavailable');
       main.appendChild(reason);
     }
     row.appendChild(main);
