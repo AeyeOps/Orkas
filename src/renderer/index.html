@@ -472,12 +472,6 @@
               <span class="agents-grid-title" data-i18n="agents.title">AI Team</span>
               <span class="agents-grid-subtitle" data-i18n="agents.subtitle">Every member is an agent — @ it, form squads, assign tasks.</span>
             </div>
-            <!-- AI Team entry cluster. The old icon-less `+ Create` / `More`
-                 chips were too small to find, so each entry now names what it
-                 opens and the coding-CLI flow — previously only the create
-                 dialog's second tab — gets its own button. Ids and targets are
-                 unchanged: `agents-more-btn` still opens the agent
-                 marketplace. -->
             <div class="header-actions header-entry-actions">
               <button class="btn header-entry-btn header-entry-btn-create" id="create-agent-btn">
                 <span data-ui-icon="plus" data-ui-icon-class="header-entry-icon"></span>
@@ -489,6 +483,10 @@
                   <span data-i18n="agents.connect_cli_btn">Connect an agent</span>
                   <small data-i18n="agents.connect_cli_sub">Claude Code / Codex CLIs</small>
                 </span>
+              </button>
+              <button class="btn header-entry-btn header-entry-btn-market" id="agents-more-btn">
+                <span data-ui-icon="code" data-ui-icon-class="header-entry-icon"></span>
+                <span data-i18n="marketplace.tab_oss">Open Source</span>
               </button>
             </div>
           </div>

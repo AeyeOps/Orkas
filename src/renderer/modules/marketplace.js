@@ -349,8 +349,6 @@ function openMarketplace(initialTab = 'oss', opts = {}) {
   const panel = document.getElementById('panel-marketplace');
   if (!panel) return;
 
-  // Idempotent; normally already started at module load so the Agents/Skills pages can show
-  // boot-time default-install progress before the user opens Marketplace.
   _mpInitReconcileWatch();
 
   const requestedReturnView = String((opts && opts.returnView) || '');
@@ -422,10 +420,6 @@ function openMarketplace(initialTab = 'oss', opts = {}) {
   const searchEl = panel.querySelector('[data-mp-search]');
   if (searchEl) searchEl.value = '';
 
-  // Show the panel + a loading affordance synchronously — before ANY async work — so a slow
-  // cache-read IPC or a slow server fetch never leaves the user on the prior view with no
-  // feedback. `_mpLoadAll` then hydrates the listings cache, paints cached rows when present,
-  // and overlays fresh data — all via its own `_mpRender` calls.
   if (typeof setView === 'function') setView('marketplace');
   if (opts && opts.preserveReturnTab === true) {
     const returnTabId = {
@@ -457,8 +451,7 @@ function openMarketplace(initialTab = 'oss', opts = {}) {
     Promise.resolve().then(() => _mpOpenDetail(deepLinkKind === 'skill' ? 'skill' : 'agent', deepLinkItem)).catch(() => {});
   }
 
-  _mpLoadAll();
-  if (_mpState.tab === 'oss') _mpLoadOss();
+  _mpLoadOss();
 }
 
 function closeMarketplace() {
@@ -592,10 +585,8 @@ function _mpApplyReconcileStatus(status) {
           await loadSkills(true);
         }
       } catch { /* ignore */ }
-      // If marketplace panel is open right now, also re-run the install-state hydration
-      // so card buttons flip from Install to Installed without a tab switch.
       if (isMarketplaceOpen()) {
-        try { await _mpLoadAll(); } catch { /* ignore */ }
+        try { await _mpLoadOss({ forceState: true }); } catch { /* ignore */ }
       }
     }).catch(() => { /* ignore */ });
   }
