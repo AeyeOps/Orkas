@@ -26,6 +26,8 @@ const _OSS_CAT_ICON = {
 };
 function ossIconFor(cat) { return _OSS_CAT_ICON[cat] || 'sparkles'; }
 
+const OSS_MARKETPLACE_PAGE_SIZE = 100;
+
 function _ossNormalizeCatalogOpts(forceOrOpts) {
   if (typeof forceOrOpts === 'boolean') return { force: forceOrOpts };
   const raw = forceOrOpts && typeof forceOrOpts === 'object' ? forceOrOpts : {};
