@@ -74,6 +74,12 @@ let appTray: Tray | null = null;
 const mainWindows = new Set<BrowserWindow>();
 let isQuitting = false;
 
+if (process.platform !== 'darwin') {
+  app.on('session-created', (createdSession) => {
+    createdSession.setSpellCheckerLanguages([]);
+  });
+}
+
 app.setName('Orkas');
 try {
   if (IS_PACKAGED_LAUNCH_SMOKE) {
