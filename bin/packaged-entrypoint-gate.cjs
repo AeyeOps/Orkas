@@ -267,8 +267,6 @@ const PACKAGED_MCP_RUNTIME_UNPACK_GLOBS = Object.freeze([
 const PACKAGED_MCP_RUNTIME_FILES = Object.freeze([
   { lockPath: 'node_modules/@modelcontextprotocol/server', packageName: '@modelcontextprotocol/server', entries: ['dist/index.cjs', 'dist/stdio.cjs'] },
   { lockPath: 'node_modules/@modelcontextprotocol/core', packageName: '@modelcontextprotocol/core', entries: ['dist/index.cjs'] },
-  { lockPath: 'node_modules/@modelcontextprotocol/server/node_modules/zod', packageName: 'zod', entries: ['index.cjs', 'v4/index.cjs'] },
-  { lockPath: 'node_modules/@modelcontextprotocol/core/node_modules/zod', packageName: 'zod', entries: ['index.cjs', 'v4/index.cjs'] },
   {
     lockPath: 'node_modules/@modelcontextprotocol/sdk',
     packageName: '@modelcontextprotocol/sdk',
@@ -286,7 +284,7 @@ const PACKAGED_MCP_RUNTIME_FILES = Object.freeze([
     packageName: 'ajv-formats',
     entries: ['dist/index.js'],
   },
-  { lockPath: 'node_modules/zod', packageName: 'zod', entries: ['index.cjs'] },
+  { lockPath: 'node_modules/zod', packageName: 'zod', entries: ['index.cjs', 'v3/index.cjs', 'v4/index.cjs'] },
   {
     lockPath: 'node_modules/zod-to-json-schema',
     packageName: 'zod-to-json-schema',
@@ -534,7 +532,7 @@ function verifyBridgeSdkRuntime(projectRoot) {
   const bridgePackages = PACKAGED_MCP_RUNTIME_FILES.filter(spec =>
     spec.lockPath.startsWith('node_modules/@modelcontextprotocol/server')
     || spec.lockPath.startsWith('node_modules/@modelcontextprotocol/core')
-    || spec.packageName === 'zod-to-json-schema');
+    || spec.packageName === 'zod');
   for (const spec of bridgePackages) {
     const installed = readJson(`${spec.lockPath} package.json`, path.join(projectRoot, spec.lockPath, 'package.json'));
     if (installed.version !== packageLockPathVersion(packageLock, spec.lockPath)) {
@@ -544,7 +542,7 @@ function verifyBridgeSdkRuntime(projectRoot) {
   const fromProject = Module.createRequire(path.join(projectRoot, 'package.json'));
   if (typeof fromProject('@modelcontextprotocol/server').McpServer !== 'function'
     || typeof fromProject('@modelcontextprotocol/server/stdio').serveStdio !== 'function'
-    || typeof fromProject('zod-to-json-schema').zodToJsonSchema !== 'function') {
+    || typeof fromProject('zod').z.toJSONSchema !== 'function') {
     throw new Error('[packaged-entrypoint-gate] bridge dependency exports are unavailable');
   }
 }

@@ -24,8 +24,8 @@ const imageItem = z.object({
   cid: id.nullish(), absPath: text.optional(), attachmentName: text.nullish(),
 }).strict();
 const gallerySchema = z.object({
-  items: z.array(imageItem).max(10000), index: z.number().int().nonnegative(),
-  nextCursor: z.number().int().nonnegative().nullable(), cid: id,
+  items: z.array(imageItem).max(10000), index: z.number().nonnegative().refine(Number.isInteger, 'Expected integer, received float'),
+  nextCursor: z.number().nonnegative().refine(Number.isInteger, 'Expected integer, received float').nullable(), cid: id,
 }).strict();
 const sourceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('image'), src: z.string().min(1).max(2 * 1024 * 1024), title: text, options, gallery: gallerySchema.nullish() }).strict(),
@@ -198,7 +198,7 @@ export async function requestPreviewOwner(uid: string, sender: WebContents, payl
   if (kind !== 'gallery' && kind !== 'artifact-submit') throw new Error('Invalid preview action.');
   if (kind === 'gallery' && (r.source.kind !== 'image' || !r.source.gallery)) throw new Error('Gallery is unavailable.');
   if (kind === 'artifact-submit' && r.source.kind !== 'artifact') throw new Error('Application is unavailable.');
-  const before = payload.before == null ? null : z.number().int().nonnegative().parse(payload.before);
+  const before = payload.before == null ? null : z.number().nonnegative().refine(Number.isInteger, 'Expected integer, received float').parse(payload.before);
   const submission = kind === 'artifact-submit' ? z.string().max(1024 * 1024).parse(payload.text) : undefined;
   if (pending.size >= 32) throw new Error('Preview is busy. Try again.');
   const requestId = randomUUID();

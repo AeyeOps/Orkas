@@ -15,9 +15,9 @@ developer override, not an automatic repair cache.
 Version policy:
 
 - Python is pinned to CPython 3.12 for broad third-party wheel compatibility in
-  skill/package scripts. The current lock is Python 3.12.13 from Python's 3.12
-  security line, using `astral-sh/python-build-standalone` release `20260610`.
-- uv is pinned to `0.11.21`, the upstream uv release checked on 2026-06-18.
+  skill/package scripts. The current lock is Python 3.12.15 from Python's 3.12
+  security line, using `astral-sh/python-build-standalone` release `20261021`.
+- uv is pinned to `0.13.4`, the upstream uv release checked on 2026-10-25.
 - Node is pinned to Node.js 24.x Active LTS. Official Node archives include
   `node`, `npm`, and `npx`; Orkas exposes them in bash so users do not need a
   system Node/npm install.

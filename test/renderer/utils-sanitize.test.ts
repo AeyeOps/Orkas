@@ -149,10 +149,10 @@ describe('sanitizeHtml — DOMPurify hardening', () => {
       path.join(__dirname, '../../src/renderer/vendor/dompurify/README.txt'),
       'utf8',
     );
-    expect(source).toContain('@license DOMPurify 3.4.13');
+    expect(source).toContain('@license DOMPurify 3.4.17');
     expect(source).not.toContain('@license DOMPurify 3.2.4');
-    expect(provenance).toContain('DOMPurify 3.4.13');
-    expect(provenance).toContain('verified dompurify@3.4.13 npm package');
+    expect(provenance).toContain('DOMPurify 3.4.17');
+    expect(provenance).toContain('verified dompurify@3.4.17 npm package');
   });
 
   it('passes a null-prototype config that explicitly disables custom elements', () => {

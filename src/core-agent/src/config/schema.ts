@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod/v3";
 
 /** Provider configuration schema. */
 export const ProviderConfigSchema = z.object({
