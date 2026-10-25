@@ -13,6 +13,7 @@ export function hardenedWebPreferences(overrides: Partial<WebPreferences> = {}):
     nodeIntegration: false,
     sandbox: true,
     webSecurity: true,
+    spellcheck: false,
   };
 }
 

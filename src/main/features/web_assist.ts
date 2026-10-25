@@ -1611,7 +1611,6 @@ function mountTab(
       ...options.webPreferences,
       session: ses,
       devTools: false,
-      spellcheck: true,
       // A task tab is routinely off screen: another conversation is in front,
       // Task Details is closed, or an unattended run made a minimised window.
       // Chromium's default clamps a hidden renderer's timers to 1 Hz, measured
@@ -1690,7 +1689,7 @@ function mountTab(
         action: 'allow',
         outlivesOpener: true,
         overrideBrowserWindowOptions: {
-          webPreferences: hardenedWebPreferences({ session: ses, devTools: false, spellcheck: true }),
+          webPreferences: hardenedWebPreferences({ session: ses, devTools: false }),
         },
         createWindow: (windowOptions) => {
           // Electron supplies this guest at runtime; its constructor type omits it.
