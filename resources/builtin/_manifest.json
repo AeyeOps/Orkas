@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "0e78e96e8b9b5abf21a7977610c05c909e5582414d43da4710e36303fa6111b5",
+  "content_tree_sha256": "564004c2f226b654158f9a9e3d8934e25acb2f8b21ff172a137da0a9ca2f800e",
   "files": [
     {
       "path": "marketplace/agents/1040b336306f/agent.json",
@@ -1844,8 +1844,8 @@
     },
     {
       "path": "system/skills/web-app-sdk/references/api.json",
-      "bytes": 46594,
-      "sha256": "f892bf39debafc38ca2acaa731089ea2f02e67edab0d71836df7dd3e9af9aaea"
+      "bytes": 46783,
+      "sha256": "4b6736b3dd165da50ac384451142d5ec4bd80d91c07c72a8bad473a2ea6e820f"
     },
     {
       "path": "system/skills/web-app-sdk/references/common.md",
@@ -1859,8 +1859,8 @@
     },
     {
       "path": "system/skills/web-app-sdk/references/web-api.json",
-      "bytes": 28742,
-      "sha256": "7c944c4ab1186beb091b3df4ae1917a3c551be8a19536cc85fd860b3329983a8"
+      "bytes": 28896,
+      "sha256": "5f78daa4847364f7b0f251cf4e83a21c06d39862997458019992aca77eb86d9f"
     },
     {
       "path": "system/skills/web-app-sdk/references/web.md",

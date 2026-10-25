@@ -18,7 +18,7 @@ exports.inputSchema = {
   additionalProperties: false,
 };
 exports.shape = z => Object.fromEntries(Object.entries(exports.inputSchema.properties).map(([key, field]) => {
-  let value = field.type === 'string' ? z.string() : z.number().int().safe();
+  let value = field.type === 'string' ? z.string() : z.number().int({ error: 'Expected safe integer' }).safe();
   if (field.minLength !== undefined) value = value.min(field.minLength);
   if (field.maxLength !== undefined) value = value.max(field.maxLength);
   if (field.minimum !== undefined) value = value.min(field.minimum);
@@ -29,7 +29,7 @@ exports.shape = z => Object.fromEntries(Object.entries(exports.inputSchema.prope
       // exact-schema conflicts and the search-versus-browse default choice.
       if (context.input === undefined) return undefined;
       if (defaultNumericRange(context.input, undefined, 1, 50) !== context.input) return context.input;
-      throw context.error;
+      throw new z.ZodError(context.error.issues.map(issue => ({ ...issue, path: [key, ...issue.path] })));
     })
     : value.optional()).describe(field.description)];
 }));

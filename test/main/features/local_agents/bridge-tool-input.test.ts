@@ -23,7 +23,7 @@ describe('tolerant MCP argument receipts', () => {
     const result = { content: [{ type: 'text', text: '{"found":true}' },
       { type: 'image', data: 'fixture', mimeType: 'image/png' }], structuredContent: { found: true } };
     const handler = vi.fn(async () => result);
-    const call = register({ id: z.string(), args: z.record(z.unknown()) }, handler);
+    const call = register({ id: z.string(), args: z.record(z.string(), z.unknown()) }, handler);
     const reply = await call({ id: 'item', args: { provider_extension: 42 }, extra_note: { secret: 'PRIVATE_VALUE' } });
     expect(handler).toHaveBeenCalledExactlyOnceWith({ id: 'item', args: { provider_extension: 42 } }, {});
     expect(reply.content.slice(0, 2)).toEqual(result.content);

@@ -9,7 +9,6 @@
 
 import type { AgentTool, ToolResult } from '#core-agent';
 import { z } from 'zod';
-import { zodToJsonSchema } from 'zod-to-json-schema';
 import { createLogger } from '../../logger';
 import { withRetrievalBudget } from '../../util/tool-result-cap';
 import { browserTaskRunId, type BrowserTabRetention } from '../web_assist_lifecycle';
@@ -17,7 +16,7 @@ import { browserTaskRunId, type BrowserTabRetention } from '../web_assist_lifecy
 const log = createLogger('browser-tool');
 const contract = require('../../../../bin/browser-tool-contract.cjs');
 const schema = z.object(contract.shape(z)).strict();
-const { $schema: _schemaVersion, ...inputSchema } = zodToJsonSchema(schema);
+const { $schema: _schemaVersion, ...inputSchema } = z.toJSONSchema(schema, { target: 'draft-7', io: 'input', reused: 'inline' });
 
 export interface BrowserToolCallbacks {
   tabs: () => Promise<Record<string, unknown>> | Record<string, unknown>;

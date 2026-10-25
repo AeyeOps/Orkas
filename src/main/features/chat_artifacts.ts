@@ -314,24 +314,26 @@ function declarationError(detail: string): string {
   return text.length <= DECLARATION_ERROR_MAX ? text : text.slice(0, DECLARATION_ERROR_MAX - 3) + '...';
 }
 
-function declarationPath(issuePath: ReadonlyArray<string | number>): string {
+function declarationPath(issuePath: readonly PropertyKey[]): string {
   let out = '';
   for (const part of issuePath) {
     if (typeof part === 'number') out += `[${part}]`;
-    else out += (out ? '.' : '') + (IDENTIFIER_KEY.test(part) ? part : '<key>');
+    else out += (out ? '.' : '') + (IDENTIFIER_KEY.test(String(part)) ? String(part) : '<key>');
   }
   return out || 'root';
 }
 
 /** The schema-side reason for one issue, without its location. */
-function declarationReason(issue: ZodIssue): string {
+function declarationReason(issue: ZodIssue, value: unknown): string {
   switch (issue.code) {
-    case 'invalid_type':
-      return issue.received === 'undefined' ? 'is required' : `must be ${issue.expected}, received ${issue.received}`;
-    case 'invalid_literal':
-      return issue.received === undefined ? 'is required' : `must be ${JSON.stringify(issue.expected)}`;
-    case 'invalid_enum_value':
-      return `must be one of ${issue.options.join(', ')}`;
+    case 'invalid_type': {
+      const received = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+      return received === 'undefined' ? 'is required' : `must be ${issue.expected}, received ${received}`;
+    }
+    case 'invalid_value':
+      return issue.values.length === 1
+        ? value === undefined ? 'is required' : `must be ${JSON.stringify(issue.values[0])}`
+        : `must be one of ${issue.values.join(', ')}`;
     case 'unrecognized_keys': {
       const named = issue.keys.filter(key => IDENTIFIER_KEY.test(key));
       const unnamed = issue.keys.length - named.length;
@@ -339,7 +341,7 @@ function declarationReason(issue: ZodIssue): string {
         ...(unnamed ? [`${unnamed} other key(s)`] : [])];
       return `has unsupported field(s) ${list.join(', ')}`;
     }
-    case 'invalid_string':
+    case 'invalid_format':
       return 'has an invalid format';
     default:
       // Remaining zod messages and data-contract refinements are schema-authored.
@@ -349,11 +351,13 @@ function declarationReason(issue: ZodIssue): string {
 
 /** Group identical reasons; unsupported fields first because an invented
  *  member (e.g. `interfaces`) usually explains the missing required ones. */
-function describeDeclarationIssues(issues: readonly ZodIssue[]): string {
+function describeDeclarationIssues(issues: readonly ZodIssue[], input: unknown): string {
   const groups = new Map<string, string[]>();
   const ordered = [...issues].sort((a, b) => Number(b.code === 'unrecognized_keys') - Number(a.code === 'unrecognized_keys'));
   for (const issue of ordered) {
-    const reason = declarationReason(issue);
+    const value = issue.path.reduce<unknown>((current, key) => current !== null && typeof current === 'object'
+      ? (current as Record<PropertyKey, unknown>)[key] : undefined, input);
+    const reason = declarationReason(issue, value);
     const paths = groups.get(reason) ?? [];
     paths.push(declarationPath(issue.path));
     groups.set(reason, paths);
@@ -445,7 +449,7 @@ export async function createArtifact(
     let parsedJson:unknown;
     try{parsedJson=JSON.parse(declaredText);}catch{return {ok:false,error:declarationError('content must be valid JSON')};}
     const parsed=manifestSchema.safeParse(parsedJson);
-    if(!parsed.success)return {ok:false,error:declarationError(describeDeclarationIssues(parsed.error.issues))};
+    if(!parsed.success)return {ok:false,error:declarationError(describeDeclarationIssues(parsed.error.issues,parsedJson))};
     const manifest=parsed.data;
     const hostOnly=manifest.capabilities.filter(c=>c!=='data');
     if(appType==='web'&&hostOnly.length)return {ok:false,error:`web applications cannot use host interfaces: declared local-only capabilities ${hostOnly.join(', ')}; web apps may declare only data`};

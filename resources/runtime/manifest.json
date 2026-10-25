@@ -1,177 +1,177 @@
 {
   "schema": 1,
-  "lockedAt": "2026-06-18",
+  "lockedAt": "2026-10-25",
   "selectionPolicy": {
-    "python": "Pin CPython 3.12 as Orkas' conservative skill/runtime baseline for broad third-party wheel compatibility. 3.12.13 is the Python.org 3.12 security release available in python-build-standalone 20260610. Move to a newer Python minor only after package smoke tests pass on macOS, Windows, and Linux.",
-    "uv": "Pin the upstream uv release used to create and install Python package venvs. 0.11.21 was the latest astral-sh/uv GitHub release checked on 2026-06-18. Move only with manifest digest refresh and package install smoke tests.",
-    "node": "Pin Node.js 24.x Active LTS as the baseline for Node-based skills/packages (bash `node`/`npm`/`npx` and orkas-pkg `npm install`). Newest LTS chosen so libraries requiring high node versions are covered; official nodejs.org binaries bundle npm/npx. 24.17.0 was the latest v24 LTS on nodejs.org dist/latest-v24.x checked on 2026-06-22. Libraries needing an even newer major are out of scope for the built-in single version. Move only after package install/run smoke tests pass on macOS and Windows.",
+    "python": "Pin CPython 3.12 as Orkas' conservative skill/runtime baseline for broad third-party wheel compatibility. 3.12.15 is the Python.org 3.12 security release available in python-build-standalone 20261021. Move to a newer Python minor only after package smoke tests pass on macOS, Windows, and Linux.",
+    "uv": "Pin the upstream uv release used to create and install Python package venvs. 0.13.4 is the astral-sh/uv security release checked on 2026-10-25. Move only with manifest digest refresh and package install smoke tests.",
+    "node": "Pin Node.js 24.x Active LTS as the baseline for Node-based skills/packages (bash `node`/`npm`/`npx` and orkas-pkg `npm install`). Newest LTS chosen so libraries requiring high node versions are covered; official nodejs.org binaries bundle npm/npx. 24.22.1 is the v24 security release from nodejs.org checked on 2026-10-25. Libraries needing an even newer major are out of scope for the built-in single version. Move only after package install/run smoke tests pass on macOS and Windows.",
     "sources": [
-      "https://www.python.org/downloads/release/python-31213/",
-      "https://github.com/astral-sh/python-build-standalone/releases/tag/20260610",
-      "https://github.com/astral-sh/uv/releases/tag/0.11.21",
-      "https://nodejs.org/dist/v24.17.0/"
+      "https://www.python.org/downloads/release/python-31215/",
+      "https://github.com/astral-sh/python-build-standalone/releases/tag/20261021",
+      "https://github.com/astral-sh/uv/releases/tag/0.13.4",
+      "https://nodejs.org/dist/v24.22.1/"
     ]
   },
   "python": {
-    "version": "3.12.13+20260610",
+    "version": "3.12.15+20261021",
     "source": "astral-sh/python-build-standalone",
-    "release": "20260610",
+    "release": "20261021",
     "assets": {
       "darwin-arm64": {
-        "name": "cpython-3.12.13+20260610-aarch64-apple-darwin-install_only_stripped.tar.gz",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-aarch64-apple-darwin-install_only_stripped.tar.gz",
-        "sha256": "f0a7fa7decc75df2b1a789329a44f657c4a15c0a683f197ce46a5cb621bc6ef4",
-        "size": 25000199,
+        "name": "cpython-3.12.15+20261021-aarch64-apple-darwin-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-aarch64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "7b8d00b751db21cea87dc551a8f8165147c5fbc5251d5537d7e5497dde00a219",
+        "size": 25017408,
         "archive": "tar.gz",
         "executable": "python/bin/python3"
       },
       "darwin-x64": {
-        "name": "cpython-3.12.13+20260610-x86_64-apple-darwin-install_only_stripped.tar.gz",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-x86_64-apple-darwin-install_only_stripped.tar.gz",
-        "sha256": "c56c2dfe3fb5569430f4eabcff1fc1334c66db708bf17c103eef3dd237f3e3ab",
-        "size": 24690110,
+        "name": "cpython-3.12.15+20261021-x86_64-apple-darwin-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-x86_64-apple-darwin-install_only_stripped.tar.gz",
+        "sha256": "f12e0504397683d6be0745ffd4c39ef45a455cec169adf35c628840d06133773",
+        "size": 24740782,
         "archive": "tar.gz",
         "executable": "python/bin/python3"
       },
       "win32-arm64": {
-        "name": "cpython-3.12.13+20260610-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
-        "sha256": "45cef3d23be2bbf950e33f1ed2517aaab5b5efb2f1bf2ae5b2c16ad9a7acc176",
-        "size": 20655217,
+        "name": "cpython-3.12.15+20261021-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-aarch64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "sha256": "bd9ed42f9fd96c81d9059954e96e2dfb6d68fa92d1b713e682451fa208b7a94d",
+        "size": 21026301,
         "archive": "tar.gz",
         "executable": "python/python.exe"
       },
       "win32-x64": {
-        "name": "cpython-3.12.13+20260610-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
-        "sha256": "99dce0b23bf3c3b28d350cdd7bfe3cd3be51cc4f285faae7c0df110d106d1a8d",
-        "size": 21932694,
+        "name": "cpython-3.12.15+20261021-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-x86_64-pc-windows-msvc-install_only_stripped.tar.gz",
+        "sha256": "aac5d331fc3307343f95928fdbea4583f0d53973d08c7e1d081884fbd229a0e1",
+        "size": 21990627,
         "archive": "tar.gz",
         "executable": "python/python.exe"
       },
       "linux-arm64": {
-        "name": "cpython-3.12.13+20260610-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
-        "sha256": "eb85c6903552b1cb40b183a119681a9326fa97e31cf0e4b8c78bf26735ff1552",
-        "size": 29197829,
+        "name": "cpython-3.12.15+20261021-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-aarch64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "sha256": "b4567aa5a11f51b540c4dfd9e082ebf23e554f8ac17b85caa6cea23e83693394",
+        "size": 29198711,
         "archive": "tar.gz",
         "executable": "python/bin/python3"
       },
       "linux-x64": {
-        "name": "cpython-3.12.13+20260610-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
-        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260610/cpython-3.12.13%2B20260610-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
-        "sha256": "6682afef6b510037a0ad84e61150e5121af2e2785c9ca27b047e029270a840fe",
-        "size": 34145919,
+        "name": "cpython-3.12.15+20261021-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20261021/cpython-3.12.15%2B20261021-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz",
+        "sha256": "6d7521138fd33afddc1ccd08abb007d9a2829e38117c2576f9efdc0ec73ce772",
+        "size": 34479606,
         "archive": "tar.gz",
         "executable": "python/bin/python3"
       }
     }
   },
   "uv": {
-    "version": "0.11.21",
+    "version": "0.13.4",
     "source": "astral-sh/uv",
-    "release": "0.11.21",
+    "release": "0.13.4",
     "assets": {
       "darwin-arm64": {
         "name": "uv-aarch64-apple-darwin.tar.gz",
-        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-aarch64-apple-darwin.tar.gz",
-        "sha256": "1f921d491ba5ffeea774eb04d6681ecee379101341cbb1500394993b541bf3f4",
-        "size": 20835123,
+        "url": "https://github.com/astral-sh/uv/releases/download/0.13.4/uv-aarch64-apple-darwin.tar.gz",
+        "sha256": "e0b1d4743ce64c55d9f0f4a444afa6b81125680070ee04e853fcd0f6c1ebf8f1",
+        "size": 14326193,
         "archive": "tar.gz",
         "executable": "uv"
       },
       "darwin-x64": {
         "name": "uv-x86_64-apple-darwin.tar.gz",
-        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-x86_64-apple-darwin.tar.gz",
-        "sha256": "f3c8e5708a84b920c18b691214d54d2b0da6b984789caae95d47c95120cb7765",
-        "size": 22349034,
+        "url": "https://github.com/astral-sh/uv/releases/download/0.13.4/uv-x86_64-apple-darwin.tar.gz",
+        "sha256": "7be2dcd316122f4b3e5a0a7889f6248266c14425374e105ff7dc9779184603a6",
+        "size": 17217446,
         "archive": "tar.gz",
         "executable": "uv"
       },
       "win32-arm64": {
         "name": "uv-aarch64-pc-windows-msvc.zip",
-        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-aarch64-pc-windows-msvc.zip",
-        "sha256": "74e443f8004022dde57a1bd0d10c097830f9ea8feb4ec927db52cd5d805c2f48",
-        "size": 21936792,
+        "url": "https://github.com/astral-sh/uv/releases/download/0.13.4/uv-aarch64-pc-windows-msvc.zip",
+        "sha256": "c4bc5a9534b2bb6a12fe29ea748445e1a6f9cb7bb275211c4fb74c52ecf317a5",
+        "size": 15595599,
         "archive": "zip",
         "executable": "uv.exe"
       },
       "win32-x64": {
         "name": "uv-x86_64-pc-windows-msvc.zip",
-        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-x86_64-pc-windows-msvc.zip",
-        "sha256": "ace861f360c6de2babedc1607d0f454b6b09a820dbc8182dc15af927e4df9589",
-        "size": 23452481,
+        "url": "https://github.com/astral-sh/uv/releases/download/0.13.4/uv-x86_64-pc-windows-msvc.zip",
+        "sha256": "ccec7508a07d9933d7cb1261880633efcf1f30d6e6eddab21823f1dae6f23225",
+        "size": 15237259,
         "archive": "zip",
         "executable": "uv.exe"
       },
       "linux-arm64": {
         "name": "uv-aarch64-unknown-linux-gnu.tar.gz",
-        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-aarch64-unknown-linux-gnu.tar.gz",
-        "sha256": "88e800834007cc5efd4675f166eb2a51e7e3ad19876d85fa8805a6fb5c922397",
-        "size": 22805727,
+        "url": "https://github.com/astral-sh/uv/releases/download/0.13.4/uv-aarch64-unknown-linux-gnu.tar.gz",
+        "sha256": "1ae72b4718729e2ccc4f1ae2c6d1e531ca8467800e0546e9130b3886023a60ab",
+        "size": 15769557,
         "archive": "tar.gz",
         "executable": "uv"
       },
       "linux-x64": {
         "name": "uv-x86_64-unknown-linux-gnu.tar.gz",
-        "url": "https://github.com/astral-sh/uv/releases/download/0.11.21/uv-x86_64-unknown-linux-gnu.tar.gz",
-        "sha256": "8c88519b0ef0af9801fcdee419bbb12116bd9e6b18e162ae093c932d8b264050",
-        "size": 24437894,
+        "url": "https://github.com/astral-sh/uv/releases/download/0.13.4/uv-x86_64-unknown-linux-gnu.tar.gz",
+        "sha256": "2b428396f12572d4429cf210ca234dd599a33b3af0958a4d5ed569d63e3f344f",
+        "size": 16653835,
         "archive": "tar.gz",
         "executable": "uv"
       }
     }
   },
   "node": {
-    "version": "24.17.0",
+    "version": "24.22.1",
     "source": "nodejs.org",
-    "release": "v24.17.0",
+    "release": "v24.22.1",
     "assets": {
       "darwin-arm64": {
-        "name": "node-v24.17.0-darwin-arm64.tar.gz",
-        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-darwin-arm64.tar.gz",
-        "sha256": "4fc3266a3702eebc39cc37661cf4eeceeade307e242ab64e4d7ce7949197e11f",
-        "size": 51886390,
+        "name": "node-v24.22.1-darwin-arm64.tar.gz",
+        "url": "https://nodejs.org/dist/v24.22.1/node-v24.22.1-darwin-arm64.tar.gz",
+        "sha256": "89c682593d76cd44233fa53b1563264e7de9cbb189cad169135c5b4fadfbc0a7",
+        "size": 53062778,
         "archive": "tar.gz",
         "executable": "bin/node"
       },
       "darwin-x64": {
-        "name": "node-v24.17.0-darwin-x64.tar.gz",
-        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-darwin-x64.tar.gz",
-        "sha256": "80da552fe037290cb130e9dea590f5eeeb7aa450636f0c89ab41415511c1ec27",
-        "size": 53067264,
+        "name": "node-v24.22.1-darwin-x64.tar.gz",
+        "url": "https://nodejs.org/dist/v24.22.1/node-v24.22.1-darwin-x64.tar.gz",
+        "sha256": "d132557e7ee2b85af08b0c8c34338e65c6430f2238d01f727728ef42dc83b035",
+        "size": 54382566,
         "archive": "tar.gz",
         "executable": "bin/node"
       },
       "win32-arm64": {
-        "name": "node-v24.17.0-win-arm64.zip",
-        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-win-arm64.zip",
-        "sha256": "4957712f67fce55779cc794d9b4df9e0e802a18c841ad5a4e42f17be490e634d",
-        "size": 33190180,
+        "name": "node-v24.22.1-win-arm64.zip",
+        "url": "https://nodejs.org/dist/v24.22.1/node-v24.22.1-win-arm64.zip",
+        "sha256": "a0c807319fede24c4a0d8f84564c82a619bd313b16b10c007c383c2609e99171",
+        "size": 33786263,
         "archive": "zip",
         "executable": "node.exe"
       },
       "win32-x64": {
-        "name": "node-v24.17.0-win-x64.zip",
-        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-win-x64.zip",
-        "sha256": "f2aa33b35b75aca5f3f7b85675a6f6423201053e9381911e64961f3bda2528ab",
-        "size": 36948900,
+        "name": "node-v24.22.1-win-x64.zip",
+        "url": "https://nodejs.org/dist/v24.22.1/node-v24.22.1-win-x64.zip",
+        "sha256": "d2046d28c2c3dcd211ac5145c0bf30e2047ef9dfb306693c8c6e2eccd8b95fa5",
+        "size": 37748064,
         "archive": "zip",
         "executable": "node.exe"
       },
       "linux-arm64": {
-        "name": "node-v24.17.0-linux-arm64.tar.gz",
-        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-linux-arm64.tar.gz",
-        "sha256": "faa0d59ba7fe7045c950ed09b190578fb8eee73e4358686d38fcc99ca58c1480",
-        "size": 56767465,
+        "name": "node-v24.22.1-linux-arm64.tar.gz",
+        "url": "https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-arm64.tar.gz",
+        "sha256": "33c37be234ba8bee041961047b19160f4d7d0f164e8e246f78bdd10feff148b3",
+        "size": 58021129,
         "archive": "tar.gz",
         "executable": "bin/node"
       },
       "linux-x64": {
-        "name": "node-v24.17.0-linux-x64.tar.gz",
-        "url": "https://nodejs.org/dist/v24.17.0/node-v24.17.0-linux-x64.tar.gz",
-        "sha256": "e0472427aa791ad80bdc426ff7cc73cdd28ed0f616d1ff9689a23a7f47f1265f",
-        "size": 57017543,
+        "name": "node-v24.22.1-linux-x64.tar.gz",
+        "url": "https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-x64.tar.gz",
+        "sha256": "eb6728e77c576a35162c122c45ccadf224d89ff00abc8dae46cc2897c6002d7c",
+        "size": 58290700,
         "archive": "tar.gz",
         "executable": "bin/node"
       }
