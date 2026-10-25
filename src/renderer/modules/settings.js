@@ -1920,8 +1920,9 @@ function _settingsRenderEntries() {
   const displayedEntries = _settingsState.entries.filter((entry) => (
     entry && entry.profileType !== 'managed'
   ));
+  const defaultEntry = displayedEntries.find((entry) => !_settingsEntryProblem(entry));
   displayedEntries.forEach((entry, idx) => {
-    container.appendChild(_settingsRenderEntryRow(entry, idx));
+    container.appendChild(_settingsRenderEntryRow(entry, idx, entry === defaultEntry));
   });
 }
 
@@ -1981,17 +1982,17 @@ async function _settingsUpdateEntryModel(entry, model, modelSel) {
   return true;
 }
 
-function _settingsRenderEntryRow(entry, priorityIdx) {
+function _settingsRenderEntryRow(entry, priorityIdx, isDefault) {
+  const entryProblem = _settingsEntryProblem(entry);
   const row = document.createElement('div');
-  row.className = 'entry-row' + (priorityIdx === 0 ? ' is-default' : '');
+  row.className = 'entry-row' + (isDefault ? ' is-default' : '');
   row.dataset.entryId = entry.entryId;
   row.draggable = true;
 
   const rank = document.createElement('div');
   rank.className = 'entry-rank';
-  rank.textContent = priorityIdx === 0
-    ? t('settings.entries.default_tag')
-    : `#${priorityIdx + 1}`;
+  rank.textContent = entryProblem ? t('new_chat.model_picker.unavailable')
+    : isDefault ? t('settings.entries.default_tag') : `#${priorityIdx + 1}`;
   row.appendChild(rank);
 
   const main = document.createElement('div');
@@ -2075,7 +2076,6 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
 
   const status = document.createElement('div');
   status.className = 'entry-status';
-  const entryProblem = _settingsEntryProblem(entry);
   if (entryProblem) {
     status.className += ' error';
     status.textContent = entryProblem;
@@ -2105,9 +2105,8 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
     id: entry.entryId,
     getIds: () => _settingsState.entries.map((e) => e.entryId),
     ipcName: 'auth.reorderEntries',
-    onSuccess: (res) => {
-      _settingsState.entries = Array.isArray(res.entries) ? res.entries : _settingsState.entries;
-      _settingsEmitModelEntriesChanged();
+    onSuccess: async () => {
+      await _settingsRefreshEntries();
       _settingsRenderEntries();
     },
   });

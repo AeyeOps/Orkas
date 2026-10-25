@@ -1627,7 +1627,8 @@ function entryToView(
     model: e.model,
     modelName: modelNameLookup(e.provider, e.model),
     modelEditable: e.provider !== ORKAS_API_PROVIDER && !providerUsesCustomOpenAIConfig(e.provider),
-    modelAvailable: isSelectableModel(e.provider, e.model) && runtimeResolvable,
+    modelAvailable: isModelProviderAllowed(e.provider, e.model)
+      && isSelectableModel(e.provider, e.model) && runtimeResolvable,
     includedModels: catalogModel?.includedModels ? [...catalogModel.includedModels] : [],
     ...(e.provider === ORKAS_API_PROVIDER && catalogModel ? { official: true } : {}),
     ...(catalogModel?.recommended ? { recommended: true } : {}),
