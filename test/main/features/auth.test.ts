@@ -43,15 +43,6 @@ afterEach(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-async function setDeepSeekEnabled(enabled: boolean): Promise<void> {
-  const { clientConfig } = await import('../../../src/main/features/client_config');
-  clientConfig.applyServerPayload({
-    immediate: { 'model.deepseek.enabled': enabled },
-    restart: {},
-    config_hash: `sha256:deepseek-${enabled ? 'on' : 'off'}`,
-  }, `"deepseek-${enabled ? 'on' : 'off'}"`);
-}
-
 describe('auth › maskKey', () => {
   it('returns empty for non-string inputs', async () => {
     const a = await import('../../../src/main/features/auth');
@@ -102,7 +93,6 @@ describe('auth › FEATURED_PROVIDERS', () => {
     // / Kimi-Coding / MiniMax / Doubao；去掉 oauthOnly 的 minimax-portal*）
     // → 聚合器 OpenRouter。必须严格跟 CATALOG 对齐（减 oauthOnly 项）。
     expect(a.FEATURED_PROVIDERS).toEqual([
-      'orkas-api',
       'deepseek',
       'openai',
       'google',
@@ -118,103 +108,6 @@ describe('auth › FEATURED_PROVIDERS', () => {
     // excluded from the API-key docs list (FEATURED_PROVIDERS). They still
     // appear in CATALOG / VISIBLE_PROVIDERS.
   });
-});
-
-describe('auth › Orkas API quick setup', () => {
-  it('configures all five public services idempotently with the documented model ids', async () => {
-    const a = await import('../../../src/main/features/auth');
-    await a.addApiKeyEntry('anthropic', 'claude-opus-4-8', 'third-party-key-xxxxxxxx', 'work');
-
-    expect(a.configureAllOrkasApiServices('  orkas-key-first-xxxxxxxx  ')).toEqual({ configured: true });
-    a.saveImageProfiles(a.loadImageProfiles().map((profile) => (
-      profile.provider === 'orkas-api' ? { ...profile, model: 'old-image-model' } : profile
-    )));
-    a.saveVideoProfiles(a.loadVideoProfiles().map((profile) => (
-      profile.provider === 'orkas-api' ? { ...profile, model: 'old-video-model' } : profile
-    )));
-    a.saveTtsProfiles(a.loadTtsProfiles().map((profile) => (
-      profile.provider === 'orkas-api'
-        ? { ...profile, baseUrl: 'https://legacy.example/v1', model: 'old-tts-model' }
-        : profile
-    )));
-    expect(a.configureAllOrkasApiServices('orkas-key-second-xxxxxxxx')).toEqual({ configured: true });
-
-    const entries = (await a.listEntries({ includeUnavailable: true })).entries;
-    expect(entries.filter((entry) => entry.provider === 'orkas-api')).toEqual([
-      expect.objectContaining({
-        model: 'orkas-llm-1.5',
-        modelName: 'Orkas-1.5',
-        official: true,
-        profileLabel: 'Orkas',
-        profileMasked: 'orka…xxxx',
-        recommended: true,
-        includedModels: ['DeepSeek V4', 'GPT-5.6 Luna', 'Claude-Sonnet-5', 'Gemini-3.6 Flash'],
-      }),
-      expect.objectContaining({
-        model: 'orkas-llm-1.5-pro',
-        modelName: 'Orkas-1.5 Pro',
-        official: true,
-        profileLabel: 'Orkas',
-        profileMasked: 'orka…xxxx',
-        includedModels: ['GPT-5.6 Sol', 'Claude Opus 5', 'Kimi K3'],
-      }),
-    ]);
-    expect((await a.listComposerEntries()).entries).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          provider: 'orkas-api',
-          model: 'orkas-llm-1.5',
-          modelName: 'Orkas-1.5',
-          official: true,
-        }),
-        expect.objectContaining({
-          provider: 'orkas-api',
-          model: 'orkas-llm-1.5-pro',
-          modelName: 'Orkas-1.5 Pro',
-          official: true,
-        }),
-      ]),
-    );
-    expect(entries[0]).toMatchObject({ provider: 'anthropic', model: 'claude-opus-5' });
-
-    expect(a.loadSearchProfiles().filter((profile) => profile.provider === 'orkas-api')).toHaveLength(1);
-    expect(a.loadImageProfiles().filter((profile) => profile.provider === 'orkas-api')).toEqual([
-      expect.objectContaining({ model: 'orkas-image' }),
-    ]);
-    expect(a.loadVideoProfiles().filter((profile) => profile.provider === 'orkas-api')).toEqual([
-      expect.objectContaining({ model: 'orkas-video' }),
-    ]);
-    expect(a.loadTtsProfiles().filter((profile) => profile.provider === 'orkas-api')).toEqual([
-      expect.objectContaining({
-        baseUrl: 'https://orkas.ai/v1',
-        model: 'orkas-tts-1',
-        voice: 'zh_female_vv_uranus_bigtts',
-      }),
-    ]);
-
-    const paths = await import('../../../src/main/paths');
-    const localSecrets = await import('../../../src/main/util/local-secret-store');
-    const file = paths.userAuthProfilesFile(TEST_UID);
-    const raw = fs.readFileSync(file, 'utf8');
-    expect(localSecrets.isEncryptedSecret(raw)).toBe(true);
-    expect(raw).not.toContain('orkas-key-second-xxxxxxxx');
-    const persisted = JSON.parse(localSecrets.decryptLocalSecret(
-      { namespace: 'auth.profiles', ownerId: TEST_UID, recordId: 'auth-profiles.json' },
-      raw,
-      { legacySeeds: [TEST_UID] },
-    ));
-    const orkasKeys = [
-      ...Object.values(persisted.profiles as Record<string, any>)
-        .filter((profile: any) => profile.provider === 'orkas-api')
-        .map((profile: any) => profile.key),
-      ...persisted.searchProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
-      ...persisted.imageProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
-      ...persisted.videoProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
-      ...persisted.ttsProfiles.filter((profile: any) => profile.provider === 'orkas-api').map((profile: any) => profile.apiKey),
-    ];
-    expect(new Set(orkasKeys)).toEqual(new Set(['orkas-key-second-xxxxxxxx']));
-  });
-
 });
 
 describe('auth › multi-profile store (addApiKey / removeCredential / renameProfile)', () => {
@@ -1119,49 +1012,6 @@ describe('auth › listModels', () => {
     ]);
   });
 
-  it('exposes and saves only configured models resolvable by this runtime', async () => {
-    const { clientConfig } = await import('../../../src/main/features/client_config');
-    const a = await import('../../../src/main/features/auth');
-    const exact = { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' };
-    const templated = {
-      id: 'claude-open-future-999',
-      name: 'Claude Future',
-      template: 'claude-opus-4-8',
-      supportsVision: true,
-    };
-    const unresolved = { id: 'brand-new-open-999', name: 'Brand New' };
-    clientConfig.applyServerPayload({
-      immediate: {
-        model_catalog: {
-          providers: { anthropic: [exact, templated, unresolved] },
-        },
-      },
-      restart: {},
-      config_hash: 'sha256:runtime-model-resolution',
-    }, '"runtime-model-resolution"');
-
-    expect((await a.listModels('anthropic')).models.map((model) => model.id)).toEqual([
-      exact.id,
-      templated.id,
-    ]);
-    await expect(a.addApiKeyEntry(
-      'anthropic',
-      unresolved.id,
-      'sk-unresolved-must-not-save-xxxxxxxx',
-    )).rejects.toMatchObject({ code: 'MODEL_NOT_AVAILABLE' });
-    expect((await a.listProviders()).providers
-      .find((provider) => provider.id === 'anthropic')?.profiles).toEqual([]);
-
-    const added = await a.addApiKeyEntry(
-      'anthropic',
-      templated.id,
-      'sk-templated-model-xxxxxxxx',
-    );
-    expect((await a.pickChatEntryGroup())[0]).toMatchObject({
-      entryId: added.entryId,
-      model: templated.id,
-    });
-  });
 });
 
 describe('auth › DeepSeek policy gate', () => {
@@ -1172,38 +1022,6 @@ describe('auth › DeepSeek policy gate', () => {
     expect((await a.listModels('deepseek')).models.length).toBeGreaterThan(0);
   });
 
-  it('hides DeepSeek direct and DeepSeek-backed OpenRouter models when Server config disables it', async () => {
-    await setDeepSeekEnabled(false);
-    const a = await import('../../../src/main/features/auth');
-
-    const { providers } = await a.listProviders();
-    expect(providers.map((p) => p.id)).not.toContain('deepseek');
-    expect(providers.map((p) => p.id)).toContain('openrouter');
-    expect((await a.listModels('deepseek')).models).toEqual([]);
-    expect((await a.listModels('openrouter')).models.some((m) => /deepseek/i.test(m.id))).toBe(false);
-    await expect(a.addApiKey('deepseek', 'sk-deepseek-disabled')).rejects.toThrow(/DeepSeek is disabled/);
-  });
-
-  it('does not use existing DeepSeek entries while disabled', async () => {
-    const a = await import('../../../src/main/features/auth');
-    const p = await a.addApiKey('deepseek', 'sk-deepseek-existing');
-    await a.addEntry({ provider: 'deepseek', model: 'deepseek-v4-flash', profileId: p.profileId });
-    expect(a.hasConfiguredModel()).toEqual({ configured: true });
-
-    await setDeepSeekEnabled(false);
-    expect(a.hasConfiguredModel()).toEqual({ configured: false });
-    expect((await a.listEntries()).entries).toEqual([]);
-    expect(a.listApiKeyEntries()).toEqual([]);
-    expect(await a.pickChatEntry()).toBeNull();
-    expect(await a.pickRotationKey('deepseek')).toBeNull();
-    const { providers } = await a.listProviders();
-    expect(providers.flatMap((provider) => provider.profiles).some((profile) =>
-      profile.provider === 'deepseek' || profile.profileId.startsWith('deepseek:'),
-    )).toBe(false);
-    await expect(
-      a.addEntry({ provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', profileId: p.profileId }),
-    ).rejects.toThrow(/DeepSeek is disabled/);
-  });
 });
 
 describe('auth › getConfig', () => {

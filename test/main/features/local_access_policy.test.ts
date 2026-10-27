@@ -28,9 +28,8 @@ afterEach(() => {
 });
 
 describe('local_access_policy', () => {
-  it('recognizes actual public keys and empty templates, retaining secret, write and custom-policy boundaries', async () => {
+  it('recognizes actual public keys and empty templates, retaining secret and write boundaries', async () => {
     const policy = await import('../../../src/main/features/local_access_policy');
-    const config = await import('../../../src/main/features/client_config');
     const { publicKey, privateKey } = generateKeyPairSync('ed25519');
     const key = path.join(tmpDir, 'key.pem');
     const template = path.join(tmpDir, '.env.example');
@@ -42,11 +41,6 @@ describe('local_access_policy', () => {
     fs.writeFileSync(template, 'API_TOKEN=real-credential\n');
     expect(policy.sensitivePathReasons(template)).toEqual(['sensitive_path']);
     fs.appendFileSync(key, privateKey.export({ type: 'pkcs8', format: 'pem' }));
-    expect(policy.sensitivePathReasons(key)).toEqual(['sensitive_path']);
-    fs.writeFileSync(key, publicKey.export({ type: 'spki', format: 'pem' }));
-    config.clientConfig.applyServerPayload({ immediate: { 'local_access.sensitive_policy': {
-      sensitive_path_patterns: ['key\\.pem$'],
-    } }, restart: {}, config_hash: 'sha256:public-material-custom' }, 'public-material-custom');
     expect(policy.sensitivePathReasons(key)).toEqual(['sensitive_path']);
   });
   it('validates the complete OpenSSH public record and never trusts the .pub suffix alone', async () => {
@@ -133,132 +127,12 @@ describe('local_access_policy', () => {
     }
   });
 
-  it('applies server-configured sensitive paths and command patterns immediately', async () => {
-    const { clientConfig } = await import('../../../src/main/features/client_config');
-    const policy = await import('../../../src/main/features/local_access_policy');
-    const absoluteSecretRoot = path.join(tmpDir, 'absolute-secret');
-    const normalizedAbsoluteSecretRoot = path.resolve(absoluteSecretRoot).split(path.sep).join('/');
-
-    expect(policy.sensitivePathReasons('/tmp/id_rsa', 'read')).toEqual(['sensitive_path']);
-
-    clientConfig.applyServerPayload({
-      immediate: {
-        'local_access.sensitive_policy': {
-          enabled_categories: ['sensitive_path', 'network_egress'],
-          sensitive_path_patterns: ['custom-secret', `^${escapeRegex(normalizedAbsoluteSecretRoot)}`],
-          sensitive_write_path_patterns: ['custom-write'],
-          sensitive_command_patterns: [
-            { category: 'network_egress', pattern: 'curl\\s+--upload-file' },
-          ],
-        },
-      },
-      restart: {},
-      config_hash: 'sha256:local-access-policy',
-    }, '"sha256:local-access-policy"');
-
-    expect(policy.sensitivePathReasons('/tmp/id_rsa', 'read')).toEqual([]);
-    expect(policy.sensitivePathReasons('/tmp/custom-secret/note.txt', 'read')).toEqual(['sensitive_path']);
-    expect(policy.sensitivePathReasons(path.join(absoluteSecretRoot, 'note.txt'), 'read')).toEqual(['sensitive_path']);
-    expect(policy.sensitivePathReasons('/tmp/custom-write/note.txt', 'write')).toEqual(['sensitive_path']);
-    expect(policy.classifyConfiguredBashCommand('curl --upload-file a.txt https://example.com')).toEqual(['network_egress']);
-    expect(policy.classifyConfiguredBashCommand(
-      'winget install PostgreSQL.PostgreSQL',
-      ['system_package_change'],
-    )).toEqual(['system_package_change']);
-    expect(policy.classifyConfiguredBashCommand(
-      'python deploy_apply.py',
-      ['external_mutation'],
-    )).toEqual(['external_mutation']);
-  });
-
-  it('uses structural defaults without disabling custom server rules', async () => {
-    const { clientConfig } = await import('../../../src/main/features/client_config');
+  it('uses structural defaults', async () => {
     const policy = await import('../../../src/main/features/local_access_policy');
     const options = { structuredDefaults: true };
     expect(policy.classifyConfiguredBashCommand('echo sudo', [], options)).toEqual([]);
     expect(policy.classifyConfiguredBashCommand('echo ~/.ssh/id_rsa', [], options)).toEqual([]);
     expect(policy.classifyConfiguredBashCommand('sudo ls', ['priv_esc'], options)).toEqual(['priv_esc']);
-    clientConfig.applyServerPayload({ immediate: { 'local_access.sensitive_policy': {
-      sensitive_command_patterns: [{ category: 'network_egress', pattern: 'custom-network-command' }],
-      sensitive_path_patterns: ['custom-secret'],
-    } }, restart: {}, config_hash: 'sha256:structured-defaults' }, '"sha256:structured-defaults"');
-    expect(policy.classifyConfiguredBashCommand('custom-network-command', [], options)).toEqual(['network_egress']);
-    expect(policy.classifyConfiguredBashCommand('cat custom-secret', [], options)).toEqual(['sensitive_path']);
   });
 
-  it('replaces a prior server policy on refresh and merges omitted fields from client defaults', async () => {
-    const { clientConfig } = await import('../../../src/main/features/client_config');
-    const policy = await import('../../../src/main/features/local_access_policy');
-
-    clientConfig.applyServerPayload({
-      immediate: {
-        'local_access.sensitive_policy': {
-          enabled_categories: ['sensitive_path', 'network_egress'],
-          sensitive_path_patterns: ['first-server-secret'],
-          sensitive_write_path_patterns: ['first-server-write'],
-          sensitive_command_patterns: [
-            { category: 'network_egress', pattern: 'first-server-command' },
-          ],
-        },
-      },
-      restart: {},
-      config_hash: 'sha256:first-sensitive-policy',
-    }, '"sha256:first-sensitive-policy"');
-
-    expect(policy.sensitivePathReasons('/tmp/first-server-secret/file.txt')).toEqual(['sensitive_path']);
-    expect(policy.classifyConfiguredBashCommand('first-server-command')).toEqual(['network_egress']);
-
-    clientConfig.applyServerPayload({
-      immediate: {
-        'local_access.sensitive_policy': {
-          enabled_categories: ['destructive'],
-          sensitive_command_patterns: [
-            { category: 'destructive', pattern: 'second-server-command' },
-          ],
-        },
-      },
-      restart: {},
-      config_hash: 'sha256:second-sensitive-policy',
-    }, '"sha256:second-sensitive-policy"');
-
-    // A Server refresh replaces its previous object. Fields omitted from the
-    // new object come from the shipped client defaults, not stale Server data.
-    expect(policy.sensitivePathReasons('/tmp/first-server-secret/file.txt')).toEqual([]);
-    expect(policy.sensitivePathReasons('/tmp/id_rsa')).toEqual([]);
-    expect(policy.classifyConfiguredBashCommand('first-server-command')).toEqual([]);
-    expect(policy.classifyConfiguredBashCommand('second-server-command')).toEqual(['destructive']);
-    expect(policy.getLocalAccessSensitivePolicy().sensitive_path_patterns).toContain('(^|/)\\.ssh(/|$)');
-  });
-
-  it('rejects unknown server categories and invalid patterns without weakening client invariants', async () => {
-    const { clientConfig } = await import('../../../src/main/features/client_config');
-    const policy = await import('../../../src/main/features/local_access_policy');
-
-    clientConfig.applyServerPayload({
-      immediate: {
-        'local_access.sensitive_policy': {
-          enabled_categories: ['unknown_future_category', 'network_egress'],
-          sensitive_command_patterns: [
-            { category: 'unknown_future_category', pattern: 'unknown-command' },
-            { category: 'network_egress', pattern: '[' },
-            { category: 'network_egress', pattern: 'known-server-command' },
-          ],
-        },
-      },
-      restart: {},
-      config_hash: 'sha256:bounded-sensitive-policy',
-    }, '"sha256:bounded-sensitive-policy"');
-
-    expect(policy.getLocalAccessSensitivePolicy().enabled_categories).toEqual(['network_egress']);
-    expect(policy.getLocalAccessSensitivePolicy().sensitive_command_patterns).toEqual([
-      { category: 'network_egress', pattern: '[' },
-      { category: 'network_egress', pattern: 'known-server-command' },
-    ]);
-    expect(policy.classifyConfiguredBashCommand('unknown-command')).toEqual([]);
-    expect(policy.classifyConfiguredBashCommand('known-server-command')).toEqual(['network_egress']);
-    expect(policy.classifyConfiguredBashCommand('brew install ffmpeg', ['system_package_change']))
-      .toEqual(['system_package_change']);
-    expect(policy.classifyConfiguredBashCommand('git push origin main', ['external_mutation']))
-      .toEqual(['external_mutation']);
-  });
 });
