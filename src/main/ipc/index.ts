@@ -75,6 +75,7 @@ import { invokeHandlers as localAgentsHandlers } from './local_agents';
 import { invokeHandlers as qualityHandlers } from './quality';
 import {
   invokeHandlers as connectorsHandlers,
+  removeApiKeyConnectorsForCredentialChange,
 } from './connectors';
 import { invokeHandlers as webAssistHandlers } from './web_assist';
 import { bindWebAssistConversation } from '../features/web_assist';
@@ -3116,6 +3117,12 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'auth.reorderEntries':  async ({ orderedIds }) => auth.reorderEntries(orderedIds || []),
   'auth.selectEntry':     async ({ entryId, model }) => auth.selectEntry(entryId, model),
   'auth.updateEntryModel':async ({ entryId, model }) => auth.updateEntryModel(entryId, model),
+
+  'orkasApi.getStatus': async () => auth.getOrkasApiCredentialStatus(),
+  'orkasApi.remove': async (_payload, ctx) => {
+    await removeApiKeyConnectorsForCredentialChange(ctx.userId);
+    return auth.removeOrkasApiCredential();
+  },
 
   // ── Image-generation API key (independent from chat entries) ──
   // `list` strips raw apiKey and replaces it with `apiKeyMasked` so

@@ -19517,6 +19517,7 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
   background: var(--surface);
 }
 .settings-orkas-api-saved[hidden] { display: none; }
+.settings-orkas-api-group[hidden] { display: none; }
 .settings-orkas-api-key-summary {
   display: flex;
   flex-direction: column;

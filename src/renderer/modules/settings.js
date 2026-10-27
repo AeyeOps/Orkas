@@ -47,6 +47,8 @@ let _settingsState = {
   taskNotificationPermissionLogKey: '',
   clientConfigBound: false,
   recycleBound: false,
+  orkasApiCredential: null,
+  orkasApiBound: false,
 };
 
 function _settingsLogOperationResult(eventAction, startedAt, result, data, errorCode = '', errorType = 'operation') {
@@ -89,6 +91,7 @@ async function loadSettings() {
   _settingsBindTaskNotificationsOnce();
   _settingsBindClientConfigOnce();
   _settingsBindRecycleBinOnce();
+  _settingsBindOrkasApiOnce();
   _settingsBindMetacognitionOnce();
   _settingsRenderTaskNotifications();
   _settingsRenderLocalExec();
@@ -102,6 +105,7 @@ async function loadSettings() {
     _settingsSafeCall('settings image refresh', _settingsRefreshImageProfiles),
     _settingsSafeCall('settings video refresh', _settingsRefreshVideoProfiles),
     _settingsSafeCall('settings tts refresh', _settingsRefreshTtsProfiles),
+    _settingsSafeCall('settings Orkas API credential refresh', _settingsRefreshOrkasApiCredential),
     _settingsSafeCall('settings task notifications refresh', _settingsRefreshTaskNotifications),
     _settingsSafeCall('settings metacognition refresh', _settingsRefreshMetacognition),
     _settingsSafeCall('settings data root refresh', _settingsRefreshDataRoot),
@@ -1139,6 +1143,67 @@ async function _settingsRefreshEntries() {
   const res = await window.orkas.invoke('auth.listEntries', { includeUnavailable: true });
   _settingsState.entries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
   _settingsEmitModelEntriesChanged();
+}
+
+function _settingsRenderOrkasApiCard() {
+  const credential = _settingsState.orkasApiCredential;
+  const configured = !!(credential && credential.configured);
+  const group = document.getElementById('settings-orkas-api-group');
+  const masked = document.getElementById('settings-orkas-api-key-masked');
+  if (group) group.hidden = !configured;
+  if (masked) masked.textContent = configured ? String(credential.keyMasked || '') : '';
+}
+
+async function _settingsRefreshOrkasApiCredential() {
+  const res = await window.orkas.invoke('orkasApi.getStatus');
+  _settingsState.orkasApiCredential = res && res.ok ? res : null;
+  _settingsRenderOrkasApiCard();
+}
+
+async function _settingsRefreshAllCredentialSections() {
+  await Promise.all([
+    _settingsRefreshProviders(),
+    _settingsRefreshEntries(),
+    _settingsRefreshSearchProfiles(),
+    _settingsRefreshImageProfiles(),
+    _settingsRefreshVideoProfiles(),
+    _settingsRefreshTtsProfiles(),
+    _settingsRefreshOrkasApiCredential(),
+  ]);
+  await _settingsRenderPicker();
+  await _settingsRenderEntries();
+  _settingsRenderSearchSection();
+  _settingsRenderImageSection();
+  _settingsRenderVideoSection();
+  _settingsRenderTtsEntries();
+}
+
+function _settingsBindOrkasApiOnce() {
+  if (_settingsState.orkasApiBound) return;
+  const deleteBtn = document.getElementById('settings-orkas-api-delete');
+  if (!deleteBtn) return;
+  _settingsState.orkasApiBound = true;
+
+  deleteBtn.addEventListener('click', async () => {
+    if (!(await uiConfirm(t('settings.orkas_api.delete_confirm')))) return;
+    deleteBtn.disabled = true;
+    try {
+      const res = await window.orkas.invoke('orkasApi.remove');
+      if (!res || !res.ok) throw new Error((res && res.error) || t('settings.orkas_api.delete_failed'));
+      _settingsState.orkasApiCredential = null;
+      await _settingsRefreshAllCredentialSections();
+      if (typeof refreshModelGuard === 'function') await refreshModelGuard();
+      _settingsSetStatus('settings-orkas-api-status', '', '');
+    } catch (err) {
+      _settingsSetStatus(
+        'settings-orkas-api-status',
+        'error',
+        (err && err.message) || t('settings.orkas_api.delete_failed'),
+      );
+    } finally {
+      deleteBtn.disabled = false;
+    }
+  });
 }
 
 async function _settingsGetModels(providerId) {

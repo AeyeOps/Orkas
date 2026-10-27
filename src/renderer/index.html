@@ -1275,6 +1275,24 @@
                   <p data-i18n="settings.models.page_sub">按用途配置服务，设置默认模型与备用顺序。</p>
                 </header>
 
+                <div class="settings-group settings-orkas-api-group" id="settings-orkas-api-group" hidden>
+                  <div class="settings-group-head settings-orkas-api-head">
+                    <div class="settings-group-head-main">
+                      <div class="settings-group-title" data-i18n="settings.orkas_api.title">Orkas API Key</div>
+                      <div class="settings-group-sub" data-i18n="app.vendor_services_unavailable">This feature requires Orkas vendor services and is unavailable in this build.</div>
+                    </div>
+                  </div>
+                  <div class="settings-orkas-api-saved" id="settings-orkas-api-saved">
+                    <div class="settings-orkas-api-key-summary">
+                      <code id="settings-orkas-api-key-masked"></code>
+                    </div>
+                    <div class="settings-orkas-api-actions">
+                      <button type="button" class="btn btn-sm btn-danger" id="settings-orkas-api-delete" data-i18n="settings.orkas_api.delete">Delete</button>
+                    </div>
+                  </div>
+                  <div class="settings-status settings-orkas-api-status" id="settings-orkas-api-status" aria-live="polite"></div>
+                </div>
+
                 <div class="settings-note settings-section-note">
                   <span data-ui-icon="lock" data-ui-icon-class="settings-note-icon"></span>
                   <span data-i18n="settings.section.models_note">API keys and authorization data are stored only on this device — never synced or sent elsewhere.</span>
