@@ -552,7 +552,6 @@ async function _mpInitReconcileWatch() {
 
 function _mpApplyReconcileStatus(status) {
   if (!status) return;
-  const prevState = _mpReconcileLastState;
   _mpReconcileStatus = status;
   _mpReconcileLastState = status.state;
   // Auto-hide a finished banner after 3s so a successful reconcile doesn't linger.
@@ -565,30 +564,13 @@ function _mpApplyReconcileStatus(status) {
     }, 3000);
   }
   _mpUpdateReconcileBanner();
-  // Reconcile just pulled new content into install dirs. Refresh the agents / skills /
-  // marketplace-installed-state caches so the new items appear without the user having to
-  // switch tabs. Force re-fetch (loadAgents(true) / loadSkills(true)) bypasses the renderer
-  // module-level lists cache; the marketplace listed-state hydrates from those.
-  if (status.state === 'done' && prevState === 'running' && status.pulled > 0) {
-    Promise.resolve().then(async () => {
-      try {
-        if (typeof refreshAgentsAfterMarketplaceReconcile === 'function') {
-          await refreshAgentsAfterMarketplaceReconcile();
-        } else if (typeof loadAgents === 'function') {
-          await loadAgents(true);
-        }
-      } catch { /* ignore */ }
-      try {
-        if (typeof refreshSkillsAfterMarketplaceReconcile === 'function') {
-          await refreshSkillsAfterMarketplaceReconcile();
-        } else if (typeof loadSkills === 'function') {
-          await loadSkills(true);
-        }
-      } catch { /* ignore */ }
-      if (isMarketplaceOpen()) {
-        try { await _mpLoadOss({ forceState: true }); } catch { /* ignore */ }
-      }
-    }).catch(() => { /* ignore */ });
+}
+
+// The eager catalog owner calls this only when this feature is loaded. Keep
+// installed buttons and an open detail in sync with the changed local catalog.
+async function refreshMarketplaceAfterContentChange() {
+  if (isMarketplaceOpen() && _mpState) {
+    await Promise.all([_mpRefreshInstalledState(), _mpLoadOss({ forceState: true })]);
   }
 }
 

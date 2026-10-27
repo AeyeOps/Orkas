@@ -36,6 +36,7 @@
 'use strict';
 
 const { defaultNumericRange } = require('./tool-input-compat.cjs');
+const { PROJECT_INSTRUCTIONS_TEXT_DESCRIPTION } = require('./project-instructions-contract.cjs');
 
 const path = require('node:path');
 const fs = require('node:fs');
@@ -97,7 +98,7 @@ const RPC_TIMEOUT_MS = 60 * 1000;
 const RPC_TIMEOUT_SLOW_MS = Number(process.env.ORKAS_BRIDGE_RPC_SLOW_TIMEOUT_MS) > 0
   ? Number(process.env.ORKAS_BRIDGE_RPC_SLOW_TIMEOUT_MS)
   : 11 * 60 * 1000;
-const CANCELLABLE_METHODS = new Set(['connectors.call', 'browser']);
+const CANCELLABLE_METHODS = new Set(['connectors.call', 'browser', 'todo_tasks']);
 
 let _socket = null;
 let _buf = '';
@@ -272,7 +273,7 @@ function createServer() {
         args: z.array(z.string()).optional().describe('For run, arguments passed to the script'),
         output_ref: z.string().optional().describe('Required for read: opaque outputRef from the run result'),
         stream: z.enum(['stdout', 'stderr']).optional().describe('Required for read'),
-        offset: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional()
+        offset: z.number().int().min(0).optional()
           .describe('For read, byte offset returned as stdoutNextOffset or stderrNextOffset; default 0'),
         limit: z.preprocess(value => defaultNumericRange(value, RUN_SKILL_READ_BYTES, 1, RUN_SKILL_MAX_READ_BYTES), z.number().int().min(1).max(RUN_SKILL_MAX_READ_BYTES).optional())
           .describe(`For read, maximum bytes; default ${RUN_SKILL_READ_BYTES}`),
@@ -395,8 +396,8 @@ function createServer() {
         status: z.enum(['pending', 'processing', 'ready', 'failed']).optional().describe('For list, restrict to one indexing status.'),
         limit: z.number().int().min(1).max(300).optional().describe('For list, maximum files to return.'),
         scope: z.enum(['all', 'project', 'global']).optional().describe('Library scope. Default all when a project is active, otherwise global.'),
-        chunk: z.number().min(1).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional().describe('1-based chunk index; omit for the full body'),
-        window: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional().describe('Include ±window neighbour chunks around `chunk`'),
+        chunk: z.number().int().min(1).optional().describe('1-based chunk index; omit for the full body'),
+        window: z.number().int().min(0).optional().describe('Include ±window neighbour chunks around `chunk`'),
       },
       async (params) => {
         try {
@@ -418,15 +419,16 @@ function createServer() {
         scope: z.literal('current').describe('Required capability scope; only current is available'),
         page: z.object({
           mode: z.enum(['latest', 'around', 'before', 'from']),
-          index: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional().describe('Required for around, before or from'),
+          index: z.number().int().min(0).optional().describe('Required for around, before or from'),
           count: z.preprocess(value => defaultNumericRange(value, undefined, 0, 30), z.number().int().min(0).max(30).optional()).describe('Around radius or latest/before page size'),
         }).strict().optional(),
         record_id: z.string().optional().describe('Exact message ID from search/read'),
         turn_id: z.string().optional().describe('User message ID or execution turn_id'),
         tool_call_id: z.string().optional().describe('Stored tool call and its input/output'),
+        process_index: z.number().int().min(0).optional().describe('Public segment index from search; requires record_id, excludes page/output_cursor. cursor pages this segment'),
         include_process: z.boolean().optional().describe('Public execution records; default true with tool_call_id, else false'),
-        cursor: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional().describe('Partial-read character cursor'),
-        output_cursor: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional().describe('Full output cursor; requires exact record_id and tool_call_id'),
+        cursor: z.number().int().min(0).optional().describe('Partial-read character cursor'),
+        output_cursor: z.number().int().min(0).optional().describe('Full output cursor; requires exact record_id and tool_call_id'),
         max_tokens: z.preprocess(value => defaultNumericRange(value, 10000, 1, 10000), z.number().int().min(1).max(10000).optional()).describe('Page token budget; default 10K'),
       },
       async (params) => {
@@ -468,6 +470,7 @@ function createServer() {
           source_path: z.string().min(1).optional().describe('For add_attachment, supply task_id and the absolute path of a file in the current workspace or conversation attachments. Copies into the task using its filename; existing names are rejected. Maximum 200 MiB.'),
           owner: z.string().optional().describe('Agent DISPLAY NAME, not an id. Empty clears on update. Ignored when assigned to another member.'),
           assignee_uid: z.string().optional().describe('Responsible member UID from list_members (shared projects only). Create defaults to yourself; update omission keeps assignment, empty uses the project owner. Reassignment to another member clears the previous Agent. In private/global scope, ignored with a warning.'),
+          due_at: z.string().optional().describe('Local calendar date YYYY-MM-DD the user wants the task done by, when they gave one. Empty clears on update.'),
         } : {}),
         // The owning executor validates effective ids and ignores unused list/create values.
         task_id: z.string().min(1).optional().catch(ctx => ctx.input).describe('Required for get/update/complete/add_attachment/delete. Omit for list/create; ignored if supplied, reported in ignored_fields. Created task ids come from the result. delete also removes attachments.'),
@@ -475,9 +478,9 @@ function createServer() {
         offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional().describe('List only; default 0. Continue with next_offset until null, keeping the same filters.'),
         limit: z.preprocess(value => defaultNumericRange(value, 20, 1, 50), z.number().int().min(1).max(50).optional()).describe('List only; default 20. Pages may be smaller to bound result size.'),
       },
-      async (params) => {
+      async (params, extra) => {
         try {
-          return textResult(JSON.stringify(await rpc('todo_tasks', params)));
+          return textResult(JSON.stringify(await rpc('todo_tasks', params, false, extra && extra.signal)));
         } catch (err) { return errorResult(err); }
       }, ['project', 'title', 'detail']), // Existing scope check and legacy text fields.
     );
@@ -522,7 +525,8 @@ function createServer() {
     server.registerTool('project_instructions', ...bridgeToolInput(
       z,
       'Replace the current project standing instructions with the complete text. Preserve applicable existing rules; concurrent changes return a conflict.',
-      { instructions: z.string().min(1).max(4000).describe('Complete replacement goal and rules text.') },
+      // The host enforces UTF-16 length and returns limit/actual without clipping.
+      { instructions: z.string().min(1).describe(PROJECT_INSTRUCTIONS_TEXT_DESCRIPTION) },
       async (params) => {
         try { return projectWriteResult(await rpc('project_instructions', params)); }
         catch (err) { return errorResult(err); }

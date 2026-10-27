@@ -50,19 +50,19 @@ describe('My Apps list refresh', () => {
   });
 });
 
-describe('My Apps unavailable web features', () => {
-  it('keeps the local view, focus and cards after dismissing a web-tab notice', async () => {
-    const h = await openPanel(apps([budget, { id: 'historic-web', appType: 'web', title: 'Historic', savedAt }]));
-    const tab = h.$('[data-app-filter="web"]')!; tab.focus();
-    await h.showTab('web');
+describe('My Apps publication entry', () => {
+  it.each(['local', 'web', 'cloud'])('keeps a %s app and its draft after the unavailable publication notice', async appType => {
+    const h = await openPanel(apps([{ id: 'app-weather', title: 'Weather', appType, savedAt }]));
+    h.card('app-weather')!.querySelector('[data-app-more]')!.click();
+    expect(h.$('.app-row-menu [data-action="publish"]')!.textContent).toBe('发布');
+    h.press('Escape');
+    await h.chooseMenuAction('app-weather', 'publish');
     const [dialog] = h.openDialogs();
-    expect(h.dialogText(dialog)).toBe('此功能需要 Orkas 官方服务，在此版本中不可用。');
-    expect(h.$('[data-app-filter="local"]')!.getAttribute('aria-selected')).toBe('true');
-    expect(h.cards()).toEqual(['app-budget']);
-    dialog.querySelector('[data-act="ok"]')!.click(); await flush();
-    expect(h.openDialogs()).toHaveLength(0);
-    expect(h.document.activeElement).toBe(tab);
+    expect(h.dialogText(dialog)).toBe(h.context.t('app.vendor_services_unavailable'));
     expect(h.channels()).toEqual(['savedApps.list']);
+    dialog.querySelector('[data-act="ok"]')!.click(); await flush();
+    expect(h.openDialogs()).toHaveLength(0); expect(h.cards()).toEqual(['app-weather']);
+    expect(h.warnings).toEqual([]);
   });
 });
 
@@ -145,15 +145,11 @@ describe('My Apps edit', () => {
   });
 });
 
-describe('My Apps creation type', () => {
-  it.each(['cancel', 'escape', 'backdrop'])('retains the idea and selected type after %s without creating a task', async dismissal => {
+describe('My Apps unified creation', () => {
+  it.each(['cancel', 'escape', 'backdrop'])('retains the idea after %s without creating a task', async dismissal => {
     const h = await openPanel(apps([]));
     h.$('#apps-create-btn')!.click();
     const panel = h.$('.apps-create-overlay')!;
-    panel.querySelector('[data-app-type="web"]')!.click();
-    await flush();
-    expect(h.openDialogs().filter(dialog => dialog.querySelector('.ui-dialog-message'))).toHaveLength(1);
-    h.openDialogs().find(dialog => dialog.querySelector('.ui-dialog-message'))!.querySelector('[data-act="ok"]')!.click(); await flush();
     h.input(panel.querySelector('textarea')!, '  Family meals\n购物清单 <b>raw</b>  ');
     if (dismissal === 'cancel') panel.querySelector('[data-create-cancel]')!.click();
     else if (dismissal === 'escape') h.press('Escape');
@@ -161,7 +157,7 @@ describe('My Apps creation type', () => {
     expect(h.$('.apps-create-overlay')).toBeNull();
     h.$('#apps-create-btn')!.click();
     expect(h.$('.apps-create-overlay textarea')!.value).toBe('  Family meals\n购物清单 <b>raw</b>  ');
-    expect(h.$('[data-app-type="local"]')!.getAttribute('aria-pressed')).toBe('true');
+    expect(h.$('[data-app-type]')).toBeNull();
     expect(h.$('[data-create-submit]')!.disabled).toBe(false);
     expect(h.channels()).toEqual(['savedApps.list']);
   });
@@ -178,10 +174,7 @@ describe('My Apps creation type', () => {
     expect(h.$('[data-create-submit]')!.disabled).toBe(true);
   });
 
-  it.each([
-    ['local', null, 'local'],
-    ['local', 'local', 'local'],
-  ] as const)('opened on the %s tab with %s chosen creates a %s app task', async (tab, chosen, expected) => {
+  it('creates an app without asking for a runtime type', async () => {
     const accepted = deferred();
     const h = await openPanel(apps([], channel => {
       if (channel !== 'conversations.create') throw new Error('unexpected IPC');
@@ -193,23 +186,21 @@ describe('My Apps creation type', () => {
       _rememberSentComposerSnapshot: vi.fn(),
       sendInConversation: vi.fn(async (_cid: string, _text: string, _extra: unknown, options: any) => { options.onAccepted(); accepted.resolve(null); }),
     });
-    if (tab === 'web') await h.showTab('web');
     h.$('#apps-create-btn')!.click();
     const overlay = h.$('.apps-create-overlay')!;
-    expect(overlay.querySelector(`[data-app-type="${tab}"]`)!.getAttribute('aria-pressed')).toBe('true');
-    if (chosen) overlay.querySelector(`[data-app-type="${chosen}"]`)!.click();
+    expect(overlay.querySelector('[data-app-type]')).toBeNull();
     h.input(overlay.querySelector('#apps-create-idea')!, 'Habit tracker');
     overlay.querySelector('[data-create-submit]')!.click();
     await accepted.promise; await flush();
 
     expect(h.invoke.mock.calls.filter(call => call[0] === 'conversations.create')).toEqual([
-      ['conversations.create', { title: 'Habit tracker', assistance: { kind: 'app_creation', appType: expected } }],
+      ['conversations.create', { title: 'Habit tracker', assistance: { kind: 'app_creation', appType: 'local' } }],
     ]);
     expect(h.context.sendInConversation).toHaveBeenCalledOnce();
     expect(h.$('.apps-create-overlay')).toBeNull();
     h.$('#apps-create-btn')!.click();
     expect(h.$('.apps-create-overlay textarea')!.value).toBe('');
-    expect(h.$(`[data-app-type="${tab}"]`)!.getAttribute('aria-pressed')).toBe('true');
+    expect(h.$('[data-app-type]')).toBeNull();
   });
 });
 
@@ -257,4 +248,12 @@ describe('My Apps failure alerts', () => {
     expect(JSON.stringify(h.warnings)).not.toContain('/Users/');
     expect(h.cards()).toEqual(['app-budget']);
   });
+});
+
+ it('shows old local and web apps together and offers publishing for both', async () => {
+  const h = await openPanel(apps([budget,{id:'old-web',title:'Web',appType:'web',savedAt}]));
+  expect(h.cards()).toEqual(['app-budget','old-web']);
+  expect(h.$('[data-app-filter]')).toBeNull();
+  h.card('app-budget')!.querySelector('[data-app-more]')!.click();
+  expect(h.$('.app-row-menu [data-action="publish"]')).not.toBeNull();
 });

@@ -511,6 +511,11 @@ export function connectorCatalog(): CatalogEntry[] {
     .filter(entry => !VENDOR_RELAY_LOCAL_API_PROVIDERS.has(entry.local_api?.provider)));
 }
 
+/** Membership checks must not clone catalog transport, policy or icon data. */
+export function isCatalogConnectorId(id: string): boolean {
+  return catalogIndex().has(id);
+}
+
 export function findCatalogEntry(id: string): CatalogEntry | null {
   const entry = catalogIndex().get(id);
   // Callers may prepare transport/policy data locally without changing future lookups.

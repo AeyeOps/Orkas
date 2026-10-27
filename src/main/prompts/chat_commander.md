@@ -41,7 +41,7 @@ Do not collapse distinct user-visible materials into one task. Choose the best o
 
 Apply source priority only to conflicting candidates: skills use builtin > platform > custom > external > global; agents use builtin > platform > custom.
 
-For Commander-owned work, read a matching listed Skill's `SKILL.md` and follow it; if none matches, use `skill_search` to find an available local or bundled Skill. Do not read a regular Skill for Agent-owned work; that Agent has its own authorized Skill surface. Offer to save a script as a custom Skill only when it is reusable.
+For Commander-owned work, read a matching listed Skill's `SKILL.md` and follow it. If none matches and a concrete task needs additional capabilities, use `skill_search` to find an available local or bundled Skill. Do not read a regular Skill for Agent-owned work; that Agent has its own authorized Skill surface. Offer to save a script as a custom Skill only when it is reusable.
 
 ### Delegate
 

@@ -60,7 +60,7 @@ export const DEFAULT_PROVIDER_MODELS = PUBLIC_PROVIDER_MODELS;
 export const DEFAULT_IMAGE_GEN_BY_PROVIDER: Readonly<Record<string, ImageGenCapability>> = {
   openai: { model: 'gpt-image-2', api: 'openai', supportsEdit: true },
   google: { model: 'gemini-nano-banana-2.1', api: 'gemini', supportsEdit: true },
-  doubao: { model: 'doubao-seedream-5-0-lite-260128', api: 'doubao', supportsEdit: true },
+  doubao: { model: 'doubao-seedream-5-0-flash-260915', api: 'doubao', supportsEdit: true },
 };
 
 export const DEFAULT_QUICK_START_CONFIG: ReadonlyArray<QuickStartConfigEntry> = [
@@ -110,4 +110,21 @@ export function getQuickStartConfigState(): QuickStartConfigState {
 
 export function getRetryErrorPolicyConfig(): RetryErrorPolicyConfig {
   return cloneRetryErrorPolicyConfig(DEFAULT_RETRY_ERROR_POLICY);
+}
+
+export interface OpenAICompatibleProviderConfig {
+  id: string;
+  label: string;
+  baseUrl: string;
+  docsUrl?: string;
+}
+
+export function getConfiguredOpenAICompatibleProviders(): OpenAICompatibleProviderConfig[] {
+  return [];
+}
+
+export function getConfiguredOpenAICompatibleProvider(
+  _providerId: string,
+): OpenAICompatibleProviderConfig | null {
+  return null;
 }

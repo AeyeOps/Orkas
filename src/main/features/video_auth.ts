@@ -7,7 +7,18 @@ import { createLogger } from '../logger';
 
 const log = createLogger('video-auth');
 
-const VIDEO_AUTH_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: string; name: string }>>> = {};
+export const VIDEO_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: string; name: string }>>> = {
+  doubao: [
+    { id: 'doubao-seedance-2-0-260128', name: 'Seedance 2.0' },
+    { id: 'doubao-seedance-2-0-fast-260128', name: 'Seedance 2.0 Fast' },
+    { id: 'doubao-seedance-2-0-mini', name: 'Seedance 2.0 Mini' },
+  ],
+  minimax: [{ id: 'MiniMax-Hailuo-2.3', name: 'Hailuo 2.3' }],
+  vidu: [{ id: 'viduq3-pro', name: 'Q3 Pro' }],
+  kling: [{ id: 'kling-v3-0-turbo', name: '3.0 Turbo' }],
+  google: [{ id: 'veo-3.1-generate-preview', name: 'Veo 3.1' }],
+  runway: [{ id: 'gen4.5', name: 'Gen-4.5' }],
+};
 
 let _idCounter = 0;
 function nextVideoProfileId(): string {
@@ -31,11 +42,11 @@ export interface AddVideoProfileInput {
 }
 
 export function isVideoProviderModelAllowed(provider: string, model: string): boolean {
-  return !!VIDEO_AUTH_MODELS_BY_PROVIDER[provider]?.some((m) => m.id === model);
+  return !!VIDEO_MODELS_BY_PROVIDER[provider]?.some((m) => m.id === model);
 }
 
 function defaultVideoModel(provider: string): string {
-  return VIDEO_AUTH_MODELS_BY_PROVIDER[provider]?.[0]?.id || '';
+  return VIDEO_MODELS_BY_PROVIDER[provider]?.[0]?.id || '';
 }
 
 export function addVideoProfile(input: AddVideoProfileInput): { ok: true; id: string } | { ok: false; error: string } {
@@ -84,16 +95,23 @@ export function reorderVideoProfiles(orderedIds: string[]): { ok: boolean } {
 }
 
 export function listVideoProviderOptions(): Array<{ id: string; label: string; docs?: string }> {
-  return [];
+  return [
+    { id: 'doubao', label: 'DouBao · Seedance', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
+    { id: 'minimax', label: 'MiniMax', docs: 'https://platform.minimax.io/user-center/basic-information/interface-key' },
+    { id: 'vidu', label: 'Vidu', docs: 'https://platform.vidu.com/' },
+    { id: 'kling', label: 'Kling', docs: 'https://kling.ai/global/dev' },
+    { id: 'google', label: 'Google', docs: 'https://aistudio.google.com/app/apikey' },
+    { id: 'runway', label: 'Runway', docs: 'https://dev.runwayml.com/' },
+  ];
 }
 
 export function listVideoModelOptions(provider: string): Array<{ id: string; name: string }> {
-  return VIDEO_AUTH_MODELS_BY_PROVIDER[provider] || [];
+  return VIDEO_MODELS_BY_PROVIDER[provider] || [];
 }
 
 export function listVideoModelsByProvider(): Record<string, Array<{ id: string; name: string }>> {
   return Object.fromEntries(
-    Object.keys(VIDEO_AUTH_MODELS_BY_PROVIDER).map((provider) => [
+    Object.keys(VIDEO_MODELS_BY_PROVIDER).map((provider) => [
       provider,
       listVideoModelOptions(provider),
     ]),
