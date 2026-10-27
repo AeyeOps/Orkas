@@ -52,7 +52,6 @@ export const APP_NAV_SURFACES: readonly AppNavSurface[] = [
     targetRequiredFor: ['configure'],
   },
   { id: 'apps', summary: 'My Apps: saved interactive results that can be launched again.', actions: ['open'] },
-  { id: 'marketplace', summary: 'Marketplace: installable Agents and Skills.', actions: ['open'] },
 ];
 
 export const APP_NAV_ACTIONS: readonly AppNavAction[] = Array.from(new Set(
