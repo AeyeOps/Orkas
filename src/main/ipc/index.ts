@@ -2637,8 +2637,8 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // from the local biz cache when callers pass `local_only`, otherwise refreshed on stale cache.
   'marketplace.categories': async (opts = {}) => ({
     list: await marketplaceBiz.getMarketplaceCategories({
-      localOnly: !!opts.local_only,
-      forceRefresh: !!opts.force_refresh,
+      localOnly: true,
+      forceRefresh: false,
     }),
   }),
 
@@ -3118,17 +3118,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'auth.selectEntry':     async ({ entryId, model }) => auth.selectEntry(entryId, model),
   'auth.updateEntryModel':async ({ entryId, model }) => auth.updateEntryModel(entryId, model),
 
-  // ── Orkas public API key quick setup (open-source build only) ──
-  'orkasApi.configureAll': async ({ apiKey }) => auth.configureAllOrkasApiServices(apiKey),
   'orkasApi.getStatus': async () => auth.getOrkasApiCredentialStatus(),
-  'orkasApi.save': async ({ apiKey }, ctx) => {
-    const credential = auth.prepareOrkasApiCredential(apiKey);
-    const previousKey = auth.getOrkasApiKey();
-    if (previousKey && previousKey !== credential.key) {
-      await removeApiKeyConnectorsForCredentialChange(ctx.userId);
-    }
-    return auth.saveOrkasApiCredential(credential);
-  },
   'orkasApi.remove': async (_payload, ctx) => {
     await removeApiKeyConnectorsForCredentialChange(ctx.userId);
     return auth.removeOrkasApiCredential();

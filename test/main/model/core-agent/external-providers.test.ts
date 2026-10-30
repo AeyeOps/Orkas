@@ -5,7 +5,6 @@ import {
   buildDeepSeekModel,
   buildDoubaoModel,
   buildMoonshotModel,
-  buildOrkasApiModel,
   createMoonshotProvider,
   repairDeepSeekPayload,
 } from '../../../../src/main/model/core-agent/external-providers';
@@ -74,18 +73,6 @@ describe('external-providers › custom Anthropic model', () => {
       input: ['text', 'image'],
       contextWindow: 200_000,
       maxTokens: 8_192,
-    });
-  });
-});
-
-describe('external-providers › Orkas API model', () => {
-  it('uses the public chat endpoint and preserves the selected public model id', () => {
-    expect(buildOrkasApiModel('orkas-llm-1.5-pro')).toMatchObject({
-      api: 'openai-completions',
-      provider: 'orkas-api',
-      id: 'orkas-llm-1.5-pro',
-      baseUrl: 'https://orkas.ai/v1',
-      input: ['text', 'image'],
     });
   });
 });

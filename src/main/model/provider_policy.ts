@@ -18,6 +18,7 @@ export function isDeepSeekModelId(modelId: string): boolean {
 }
 
 export function isModelProviderAllowed(providerId: string, modelId?: string): boolean {
+  if (providerId === 'orkas-api') return false;
   if (isDeepSeekIntegrationEnabled()) return true;
   if (isDeepSeekProviderId(providerId)) return false;
   if (modelId && isDeepSeekModelId(modelId)) return false;
@@ -26,6 +27,6 @@ export function isModelProviderAllowed(providerId: string, modelId?: string): bo
 
 export function assertModelProviderAllowed(providerId: string, modelId?: string): void {
   if (!isModelProviderAllowed(providerId, modelId)) {
-    throw new Error('DeepSeek is disabled in this build');
+    throw new Error(`${providerId} is disabled in this build`);
   }
 }

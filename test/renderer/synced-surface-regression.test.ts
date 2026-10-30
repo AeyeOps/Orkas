@@ -89,7 +89,7 @@ describe('synced PC surface regressions', () => {
     expect(css).toContain('.agents-grid-subtitle');
   });
 
-  it('keeps the named AI Team and Skills header entries aligned with the commercial copy', () => {
+  it('keeps named local AI Team and Skills creation entries without the vendor marketplace', () => {
     const html = read('src/renderer/index.html');
     const locales = Object.fromEntries(['en', 'zh', 'ja', 'pt'].map((locale) => [
       locale,
@@ -98,15 +98,14 @@ describe('synced PC surface regressions', () => {
 
     expect(html).toContain('data-i18n="agents.connect_cli_btn"');
     expect(html).toContain('data-i18n="agents.connect_cli_sub"');
-    expect(html).toContain('data-i18n="skills.more_btn"');
+    expect(html).toContain('id="create-skill-btn"');
+    expect(html).toContain('data-i18n="skills.add"');
+    expect(html).not.toContain('data-i18n="skills.more_btn"');
     expect(locales.en['agents.connect_cli_btn']).toBe('Connect an agent');
-    expect(locales.en['skills.more_btn']).toBe('Skill marketplace');
     expect(locales.zh['agents.connect_cli_btn']).toBe('接入智能体');
-    expect(locales.zh['skills.more_btn']).toBe('技能市场');
     expect(locales.ja['agents.connect_cli_btn']).toBe('エージェントを接続');
-    expect(locales.ja['skills.more_btn']).toBe('スキルマーケット');
     expect(locales.pt['agents.connect_cli_btn']).toBe('Conectar agente');
-    expect(locales.pt['skills.more_btn']).toBe('Mercado de habilidades');
+    for (const locale of Object.values(locales)) expect(locale['skills.add']).toBeTruthy();
   });
 
   it('exposes the local Commander profile to the renderer', () => {
@@ -163,7 +162,7 @@ describe('synced PC surface regressions', () => {
     }
   });
 
-  it('restores user-owned speech key configuration with the public Orkas voice preset', () => {
+  it('keeps user-owned speech key configuration without the Orkas vendor voice preset', () => {
     const html = read('src/renderer/index.html');
     const settings = read('src/renderer/modules/settings.js');
     const auth = read('src/main/features/auth.ts');
@@ -190,8 +189,10 @@ describe('synced PC surface regressions', () => {
     expect(ipc).toContain("'ttsAuth.list'");
     expect(ttsAuth).toContain("id: 'doubao'");
     expect(ttsAuth).toContain("id: 'openai'");
-    expect(ttsAuth).toContain('ORKAS_API_PROVIDER');
-    expect(ttsAuth).toContain('Orkas · Voice');
+    expect(ttsAuth).toContain("id: 'elevenlabs'");
+    expect(ttsAuth).toContain("id: 'custom'");
+    expect(ttsAuth).not.toContain('ORKAS_API_PROVIDER');
+    expect(ttsAuth).not.toContain('Orkas · Voice');
     expect(ttsAuth).not.toContain('ORKAS_VOICE');
   });
 

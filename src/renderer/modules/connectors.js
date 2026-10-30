@@ -1925,7 +1925,6 @@ function _customConnectorMarkup() {
           <label>${escapeHtml(t('connectors.custom.auth_label'))}</label>
           <select data-f="auth_mode">
             <option value="none">${escapeHtml(t('connectors.custom.auth_none'))}</option>
-            <option value="oauth">${escapeHtml(t('connectors.custom.auth_oauth'))}</option>
           </select>
         </div>
         <div class="form-row">

@@ -21,6 +21,7 @@ class FakeClassList {
 }
 
 class FakeTab {
+  hidden = false;
   dataset: Record<string, string>;
   classList = new FakeClassList();
   tabIndex = -1;
@@ -59,7 +60,7 @@ function loadHarness() {
     t: (key: string) => key,
     escapeHtml: (value: unknown) => String(value ?? ''),
     document: {
-      getElementById: () => null,
+      getElementById: (id: string) => tabs.find(tab => id === `settings-model-tab-${tab.dataset.settingsModelTab}`) || null,
       querySelectorAll: (selector: string) => {
         if (selector === '[data-settings-model-tab]') return tabs;
         if (selector === '[data-settings-model-panel]') return panels;
@@ -128,12 +129,15 @@ describe('Settings → Models purpose sub-tabs', () => {
     expect(click).not.toHaveBeenCalled();
   });
 
-  it('keeps programmatic activation silent and falls back to chat for unknown kinds', () => {
-    const { sandbox, panels, click } = loadHarness();
+  it('keeps programmatic activation silent and falls back to chat for hidden or unknown kinds', () => {
+    const { sandbox, tabs, panels, click } = loadHarness();
     sandbox._settingsBindModelTabsOnce();
 
     sandbox._settingsActivateModelTab('video');
     expect(visibleKinds(panels)).toEqual(['video']);
+    tabs[3].hidden = true;
+    sandbox._settingsActivateModelTab('video');
+    expect(visibleKinds(panels)).toEqual(['chat']);
     sandbox._settingsActivateModelTab('bogus');
     expect(visibleKinds(panels)).toEqual(['chat']);
     expect(click).not.toHaveBeenCalled();

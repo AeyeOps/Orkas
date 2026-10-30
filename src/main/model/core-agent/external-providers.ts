@@ -47,7 +47,7 @@ import {
 import { repairOpenAIToolMessageOrder } from './openai-payload';
 import { createCustomOutputLimitCompatibility } from './custom-output-limit';
 import {
-  ORKAS_API_BASE_URL,
+  orkasApiBaseUrl,
   ORKAS_API_PROVIDER,
   orkasApiUsageHeaders,
   type OrkasApiUsageContext,
@@ -158,7 +158,7 @@ export function buildOrkasApiModel(modelId: string): Model<'openai-completions'>
     name: curated?.name || modelId,
     api: 'openai-completions',
     provider: ORKAS_API_PROVIDER as any,
-    baseUrl: ORKAS_API_BASE_URL,
+    baseUrl: orkasApiBaseUrl(),
     reasoning: true,
     compat: {
       supportsDeveloperRole: false,

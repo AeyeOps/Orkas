@@ -4,26 +4,11 @@
   let dialog = null;
   const text = key => t(key);
   const isFailure = value => value?.ok === false && value?.code === 'E_COMMERCIAL_REQUIRED' && value?.feature === 'web_apps';
-  function webLanguage() {
-    const language = typeof getLang === 'function' ? getLang() : 'en';
-    if (language === 'zh' || language === 'zh-tw') return 'zh';
-    if (language === 'pt-pt') return 'pt';
-    return ['en', 'ja', 'pt'].includes(language) ? language : 'en';
-  }
-  async function download() {
-    const url = new URL('https://orkas.ai/download/');
-    url.searchParams.set('lang', webLanguage());
-    try {
-      const result = await window.orkas.invoke('auth.openExternal', { url: url.href });
-      if (!result?.ok) throw new Error('open_failed');
-    } catch (_) { await uiAlert(text('apps.commercial_open_failed')); }
-  }
   function show() {
     if (dialog) return dialog;
     const focus = document.activeElement;
     dialog = (async () => {
-      if (await uiConfirm({ message: text('apps.commercial_required'),
-        okLabel: text('apps.commercial_download'), cancelLabel: text('common.cancel') })) await download();
+      await uiAlert(text('app.vendor_services_unavailable'));
     })().finally(() => {
       dialog = null;
       if (focus?.isConnected) focus.focus({ preventScroll: true });
@@ -50,14 +35,9 @@
     const row = document.createElement('div');
     row.className = 'chat-app-nav-row';
     const label = document.createElement('span');
-    label.dataset.i18n = 'apps.commercial_required';
-    label.textContent = text('apps.commercial_required');
-    const button = document.createElement('button');
-    button.type = 'button'; button.className = 'chat-app-nav-btn';
-    button.dataset.i18n = 'apps.commercial_download';
-    button.textContent = text('apps.commercial_download');
-    button.addEventListener('click', download);
-    row.append(label, button); host.appendChild(row);
+    label.dataset.i18n = 'app.vendor_services_unavailable';
+    label.textContent = text('app.vendor_services_unavailable');
+    row.append(label); host.appendChild(row);
     return row;
   }
   function observeToolResult(message, event) {
@@ -74,5 +54,5 @@
     } else seenMessages.add(message);
     appendNotice(message.querySelector('.chat-bubble') || message);
   }
-  window.OrkasCommercialEntry = { show, download, isFailure, appendNotice, observeToolResult };
+  window.OrkasCommercialEntry = { show, isFailure, appendNotice, observeToolResult };
 })();

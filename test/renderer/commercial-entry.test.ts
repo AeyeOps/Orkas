@@ -10,14 +10,10 @@ class Element {
   isConnected = true;
   textContent = '';
   className = '';
-  type = '';
   focus = vi.fn();
-  events = new Map<string, () => unknown>();
   append(...children: Element[]) { this.children.push(...children); }
   appendChild(child: Element) { this.children.push(child); return child; }
   querySelector() { return null; }
-  addEventListener(name: string, handler: () => unknown) { this.events.set(name, handler); }
-  async click() { await this.events.get('click')?.(); }
 }
 function harness(language = 'en') {
   const focus = new Element();
@@ -31,41 +27,42 @@ function harness(language = 'en') {
   vm.runInNewContext(source, context);
   return { api: context.window.OrkasCommercialEntry, invoke, confirm, alert, focus, table };
 }
-describe('commercial entry actions', () => {
-  it('cancels without opening a link and restores the invoking control', async () => {
+describe('unavailable vendor feature notices', () => {
+  it('explains the unavailable feature and restores the invoking control', async () => {
     const h = harness();
     await h.api.show();
-    expect(h.confirm).toHaveBeenCalledWith({ message: h.table['apps.commercial_required'],
-      okLabel: h.table['apps.commercial_download'], cancelLabel: h.table['common.cancel'] });
+    expect(h.alert).toHaveBeenCalledExactlyOnceWith(h.table['app.vendor_services_unavailable']);
+    expect(h.confirm).not.toHaveBeenCalled();
     expect(h.invoke).not.toHaveBeenCalled();
     expect(h.focus.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
   });
-  it.each(['zh', 'zh-tw', 'en', 'fr', 'de', 'hi', 'id', 'it', 'ja', 'ko', 'pt', 'pt-pt', 'ru', 'es', 'es-419', 'th', 'tr', 'vi', 'ar'])('opens the official download page only after confirmation (%s)', async language => {
+  it.each(['zh', 'zh-tw', 'en', 'fr', 'de', 'hi', 'id', 'it', 'ja', 'ko', 'pt', 'pt-pt', 'ru', 'es', 'es-419', 'th', 'tr', 'vi', 'ar'])('uses the localized notice without offering a vendor link (%s)', async language => {
     const h = harness(language);
-    h.confirm.mockResolvedValue(true);
+    await h.api.show();
+    expect(h.table['app.vendor_services_unavailable']).toEqual(expect.any(String));
+    expect(h.table['app.vendor_services_unavailable'].trim()).not.toBe('');
+    expect(h.alert).toHaveBeenCalledExactlyOnceWith(h.table['app.vendor_services_unavailable']);
+    expect(h.confirm).not.toHaveBeenCalled();
     expect(h.invoke).not.toHaveBeenCalled();
-    await h.api.show();
-    const webLanguage = language.startsWith('zh') ? 'zh' : language.startsWith('pt') ? 'pt' : language === 'ja' ? 'ja' : 'en';
-    expect(h.invoke).toHaveBeenCalledExactlyOnceWith('auth.openExternal', { url: `https://orkas.ai/download/?lang=${webLanguage}` });
-    for (const key of ['apps.commercial_required', 'apps.commercial_download', 'apps.commercial_open_failed']) {
-      expect(typeof h.table[key]).toBe('string'); expect(h.table[key].trim()).not.toBe('');
-    }
   });
-  it.each(['rejection', 'exception'])('keeps a failed opener recoverable without app operations: %s', async mode => {
-    const h = harness(); h.confirm.mockResolvedValue(true);
-    if (mode === 'exception') h.invoke.mockRejectedValueOnce(new Error('Fixture opener failure'));
-    else h.invoke.mockResolvedValueOnce({ ok: false });
+  it.each(['rejection', 'exception'])('restores focus and allows another notice after an alert %s', async mode => {
+    const h = harness();
+    const error = new Error('Fixture alert failure');
+    if (mode === 'exception') h.alert.mockImplementationOnce(() => { throw error; });
+    else h.alert.mockRejectedValueOnce(error);
+    await expect(h.api.show()).rejects.toBe(error);
+    expect(h.focus.focus).toHaveBeenCalledExactlyOnceWith({ preventScroll: true });
     await h.api.show();
-    expect(h.alert).toHaveBeenCalledExactlyOnceWith(h.table['apps.commercial_open_failed']);
-    await h.api.show();
-    expect(h.invoke.mock.calls.map(call => call[0])).toEqual(['auth.openExternal', 'auth.openExternal']);
+    expect(h.alert).toHaveBeenCalledTimes(2);
+    expect(h.focus.focus).toHaveBeenCalledTimes(2);
+    expect(h.invoke).not.toHaveBeenCalled();
   });
   it('coalesces simultaneous entry actions into one standard dialog', async () => {
-    const h = harness(); let finish!: (accepted: boolean) => void;
-    h.confirm.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
+    const h = harness(); let finish!: () => void;
+    h.alert.mockImplementation(() => new Promise(resolve => { finish = resolve; }));
     const a = h.api.show(), b = h.api.show();
-    expect(a).toBe(b); expect(h.confirm).toHaveBeenCalledOnce();
-    finish(false); await a; expect(h.invoke).not.toHaveBeenCalled();
+    expect(a).toBe(b); expect(h.alert).toHaveBeenCalledOnce();
+    finish(); await a; expect(h.invoke).not.toHaveBeenCalled();
   });
   it('shows one independent notice per turn for the structured rejected tool receipt', async () => {
     const h = harness();
@@ -77,10 +74,10 @@ describe('commercial entry actions', () => {
     expect(first.children).toHaveLength(1); expect(second.children).toHaveLength(0);
     const row = first.children[0];
     expect(row.className).toBe('chat-app-nav-row');
-    expect(row.children[0].textContent).toBe(h.table['apps.commercial_required']);
+    expect(row.children[0].textContent).toBe(h.table['app.vendor_services_unavailable']);
+    expect(row.children[0].dataset.i18n).toBe('app.vendor_services_unavailable');
+    expect(row.children).toHaveLength(1);
     expect(h.confirm).not.toHaveBeenCalled(); expect(h.invoke).not.toHaveBeenCalled();
-    await row.children[1].click();
-    expect(h.invoke).toHaveBeenCalledOnce();
     const next = new Element(); next.dataset.turnId = 'next-turn'; h.api.observeToolResult(next, event);
     expect(next.children).toHaveLength(1);
   });

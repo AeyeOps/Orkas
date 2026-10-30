@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "この機能には Orkas の提供サービスが必要なため、このビルドでは利用できません。",
   "dialog.context.application": "アプリからのリクエスト",
   "dialog.context.background": "バックグラウンドのリクエスト",
   "dialog.context.requester": "リクエスト元: {name}",

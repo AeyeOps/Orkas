@@ -85,41 +85,6 @@ describe('runner › buildRunner auth gate', () => {
     expect(createPiProvider).toHaveBeenCalledWith(expect.objectContaining({ provider: 'custom', customModel: expect.objectContaining({ api: 'anthropic-messages', contextWindow: 200000, maxTokens: 8192 }) }));
   });
 
-
-  it('keeps BYO provider windows aligned with the public catalog across a remote refresh', async ({ signal }) => {
-    const createPiProvider = vi.fn(({ customModel }: any) => ({
-      id: 'anthropic', name: 'Anthropic',
-      async *stream() {
-        yield { type: 'text_delta' as const, text: 'ok' };
-        yield { type: 'message_end' as const, model: customModel.id, stopReason: 'end_turn' as const };
-      },
-      complete: vi.fn(), validateAuth: vi.fn(),
-    }));
-    vi.doMock('#core-agent', async () => ({ ...(await vi.importActual<any>('#core-agent')), createPiProvider }));
-    const uid = 'runner-public-windows';
-    const users = await import('../../../src/main/features/users');
-    const auth = await import('../../../src/main/features/auth');
-    const { clientConfig } = await import('../../../src/main/features/client_config');
-    users.activateUser(uid);
-    const profile = await auth.addApiKey('anthropic', 'fixture-key', 'Fixture');
-    await auth.addEntry({ provider: 'anthropic', model: 'claude-opus-5', profileId: profile.profileId });
-    const apply = (window: number) => clientConfig.applyServerPayload({ immediate: { model_catalog: { providers: {
-      anthropic: [{ id: 'claude-opus-5', contextWindow: window, maxTokens: 32_000 }],
-    } } }, restart: {} }, 'public-window-fixture');
-    apply(272_000);
-    const { buildRunner } = await loadRunner();
-    signal.throwIfAborted();
-    const first = await buildRunner({ sessionId: 'gconv-public-window', userId: uid });
-    expect((first.runner as any).config.models.catalog).toMatchObject({
-      'claude-opus-5': { contextWindow: 272_000, maxOutputTokens: 32_000 },
-    });
-    apply(192_000);
-    const next = await buildRunner({ sessionId: 'gconv-public-window', userId: uid });
-    expect((next.runner as any).config.models.catalog).toMatchObject({
-      'claude-opus-5': { contextWindow: 192_000, maxOutputTokens: 32_000 },
-    });
-  });
-
   it('throws a clear "no model configured" error when no entries exist and no env fallback', async () => {
     // The isolated active account has no saved profiles, so pickChatEntry
     // returns null. ANTHROPIC_API_KEY is cleared in beforeEach.
@@ -482,13 +447,9 @@ describe('runner › buildRunner auth gate', () => {
     });
     const users = await import('../../../src/main/features/users');
     users.activateUser('runner-reasoning-parity');
-    const { clientConfig } = await import('../../../src/main/features/client_config');
-    clientConfig.applyServerPayload({ immediate: { model_catalog: { providers: {
-      'openai-codex': [{ id: 'gpt-5.5', name: 'GPT-5.5' }],
-    } } } }, 'reasoning-parity-fixture');
     const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
     const auth = await import('../../../src/main/features/auth');
-    await auth.addApiKeyEntry('openai-codex', 'gpt-5.5', `fixture.${token}.fixture`, 'Fixture');
+    await auth.addApiKeyEntry('openai-codex', 'gpt-5.6-sol', `fixture.${token}.fixture`, 'Fixture');
     const { buildRunner } = await loadRunner();
     const built = await buildRunner({ sessionId: 'gconv-reasoning-parity', userId: 'runner-reasoning-parity' });
     const provider = (built.runner as any).providers.get('openai-codex');
@@ -1726,12 +1687,6 @@ describe('runner › scoped tool loading', () => {
           async execute() { return { content: JSON.stringify({ ok: true, rows: [] }) }; },
         },
         {
-          name: 'marketplace_search',
-          description: 'Search marketplace resources.',
-          inputSchema: { type: 'object', properties: {}, additionalProperties: false },
-          async execute() { return { content: JSON.stringify({ ok: true, rows: [] }) }; },
-        },
-        {
           name: 'open_app_view',
           description: 'Stage app navigation.',
           inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -1755,13 +1710,11 @@ describe('runner › scoped tool loading', () => {
     expect(toolNames).toContain('tool_load');
     expect(toolNames).toContain('run_program');
     expect(toolNames).not.toContain('manage_execution_plan');
-    expect(toolNames).not.toContain('marketplace_search');
     expect(toolNames).toEqual(
       commander.runner.getActiveToolDefinitions().map((tool) => tool.name).sort(),
     );
     expect(commander.resolvedSystemPrompt).toContain('## Loadable tool groups');
     expect(commander.resolvedSystemPrompt).not.toContain('Tools:');
-    expect(commander.resolvedSystemPrompt).toContain('`marketplace_search` — Search the marketplace.');
     expect(commander.resolvedSystemPrompt).not.toContain('`manage_execution_plan`');
     expect(commander.resolvedSystemPrompt).not.toMatch(/execution Plan/i);
     expect(commander.resolvedSystemPrompt).toContain('`management.app`');
@@ -1794,7 +1747,6 @@ describe('runner › scoped tool loading', () => {
     });
     const loadedNames = runner.getActiveToolDefinitions().map((tool) => tool.name);
     expect(loadedNames).toContain('skill_search');
-    expect(loadedNames).not.toContain('marketplace_search');
     expect(loadedNames).not.toContain('app_health');
     const appLoadResult = await runner.tools.get('tool_load')?.execute(
       { groups: ['management.app'] },
@@ -1808,7 +1760,6 @@ describe('runner › scoped tool loading', () => {
     expect(appLoadedNames).toContain('open_app_view');
     expect(appLoadedNames).toContain('app_health');
     expect(appLoadedNames).toContain('skill_search');
-    expect(appLoadedNames).not.toContain('marketplace_search');
     expect(commander.resolvedSystemPrompt).toBe(initialPrompt);
   });
 
@@ -1818,8 +1769,8 @@ describe('runner › scoped tool loading', () => {
     await configureUser(uid);
     let schemaReads = 0;
     const deferredTool = {
-      name: 'marketplace_search',
-      description: 'Search marketplace resources.',
+      name: 'project_setup',
+      description: 'Create or undo a project.',
       get inputSchema() {
         schemaReads += 1;
         return { type: 'object', properties: {}, additionalProperties: false };
@@ -1834,8 +1785,8 @@ describe('runner › scoped tool loading', () => {
       extraTools: [deferredTool],
     });
 
-    expect(built.toolDefs.map((tool) => tool.name)).not.toContain('marketplace_search');
-    expect(built.resolvedSystemPrompt).toContain('`marketplace_search` — Search the marketplace.');
+    expect(built.toolDefs.map((tool) => tool.name)).not.toContain('project_setup');
+    expect(built.resolvedSystemPrompt).toContain('`project_setup` —');
     expect(schemaReads).toBe(0);
 
     const runner = built.runner as unknown as {
@@ -1851,7 +1802,7 @@ describe('runner › scoped tool loading', () => {
     expect(schemaReads).toBe(0);
     const activeNames = runner.getActiveToolDefinitions().map((tool) => tool.name);
     expect(schemaReads).toBe(1);
-    expect(activeNames).toContain('marketplace_search');
+    expect(activeNames).toContain('project_setup');
   });
 
   it('builds process labels from lightweight Agent summaries without full enrichment', async () => {
@@ -2511,7 +2462,7 @@ describe('runner › scoped tool loading', () => {
     await configureUser(uid);
     const { buildRunner } = await loadRunner();
     const managementCalls: string[] = [];
-    const managementTools = ['marketplace_search'].map((name) => ({
+    const managementTools = ['project_setup'].map((name) => ({
       name,
       description: `Test ${name} boundary.`,
       inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -2531,35 +2482,35 @@ describe('runner › scoped tool loading', () => {
       activeTools(): Array<{ name: string }>;
     };
 
-    expect(runner.activeTools().map((tool) => tool.name)).not.toContain('marketplace_search');
+    expect(runner.activeTools().map((tool) => tool.name)).not.toContain('project_setup');
     expect(runner.activeTools().map((tool) => tool.name)).toContain('run_program');
     expect(built.resolvedSystemPrompt)
-      .toContain('`management.marketplace` — Marketplace management.');
+      .toContain('`management.projects` —');
     expect(built.resolvedSystemPrompt)
       .toContain('`management.automation`');
     expect(managementCalls).toEqual([]);
 
     const loadResult = await runner.tools.get('tool_load')?.execute(
-      { groups: ['management.marketplace'] },
+      { groups: ['management.projects'] },
       { workingDir: tmpDir, state: {}, signal: undefined },
     );
     expect(JSON.parse(loadResult?.content || '{}')).toMatchObject({
       ok: true,
-      newly_loaded: ['management.marketplace'],
+      newly_loaded: ['management.projects'],
     });
-    expect(runner.activeTools().map((tool) => tool.name)).toContain('marketplace_search');
+    expect(runner.activeTools().map((tool) => tool.name)).toContain('project_setup');
     expect(runner.activeTools().map((tool) => tool.name)).not.toContain('auto_tasks');
     expect(managementCalls).toEqual([]);
 
-    const searchResult = await runner.tools.get('marketplace_search')?.execute(
+    const searchResult = await runner.tools.get('project_setup')?.execute(
       {},
       { workingDir: tmpDir, state: {}, signal: undefined },
     );
     expect(JSON.parse(searchResult?.content || '{}')).toMatchObject({
       ok: true,
-      name: 'marketplace_search',
+      name: 'project_setup',
     });
-    expect(managementCalls).toEqual(['marketplace_search']);
+    expect(managementCalls).toEqual(['project_setup']);
     expect(runner.tools.has('auto_tasks_list')).toBe(false);
     const automationLoad = await runner.tools.get('tool_load')?.execute(
       { groups: ['management.automation'] },
@@ -2588,7 +2539,7 @@ describe('runner › scoped tool loading', () => {
       userId: uid,
       extraTools: managementTools,
     });
-    expect(nextTurn.toolDefs.map((tool) => tool.name)).not.toContain('marketplace_search');
+    expect(nextTurn.toolDefs.map((tool) => tool.name)).not.toContain('project_setup');
   });
 
   it('recomputes configured groups each turn without retaining removed Agent dependencies', async () => {

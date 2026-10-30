@@ -5,7 +5,7 @@ import * as path from 'node:path';
 
 import { loadVideoProfiles } from './auth';
 import {
-  ORKAS_API_BASE_URL,
+  orkasApiBaseUrl,
   ORKAS_API_PROVIDER,
   ORKAS_API_VIDEO_MODEL,
   orkasApiUsageHeaders,
@@ -283,7 +283,7 @@ async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResu
   throwIfAborted(req.signal);
   emitProgress(req.onProgress, 'create_task', 'Creating Orkas API video task');
   const { body: createdData } = await fetchAndReadWithTimeout(
-    `${ORKAS_API_BASE_URL}/videos`,
+    `${orkasApiBaseUrl()}/videos`,
     {
       method: 'POST',
       headers: {
@@ -343,7 +343,7 @@ async function callOrkasApiVideo(req: OrkasVideoRequest): Promise<OrkasVideoResu
     await sleep(req.pollIntervalMs, req.signal);
     try {
       const { body: statusData } = await fetchAndReadWithTimeout(
-        `${ORKAS_API_BASE_URL}/videos/${encodeURIComponent(taskId)}`,
+        `${orkasApiBaseUrl()}/videos/${encodeURIComponent(taskId)}`,
         {
           method: 'GET',
           headers: {

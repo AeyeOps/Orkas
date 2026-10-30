@@ -29,23 +29,8 @@ describe('connector operation classification', () => {
       annotations: { readOnlyHint: true },
       orkas_action_policy: { risk: 'R', confirmation: 'none', max_batch_size: 25 },
     }, true).risk).toBe('H');
-    expect(risk('github', 'search_repositories', { annotations: { readOnlyHint: true } }).risk).toBe('R');
-    expect(risk('github', 'unknown', { annotations: { readOnlyHint: true, destructiveHint: true } }).risk).toBe('D');
-  });
-
-  it('keeps reviewed commerce reads, drafts, and refunds stable when provider metadata disagrees', () => {
-    const claimsReadOnly: Partial<ToolSchema> = {
-      annotations: { readOnlyHint: true },
-      orkas_action_policy: { risk: 'R', confirmation: 'none', max_batch_size: 25 },
-    };
-    expect(risk('paypal', 'create_refund', claimsReadOnly)).toMatchObject({
-      risk: 'H', sensitive_operation: 'money',
-    });
-    expect(risk('paypal', 'create_invoice', claimsReadOnly).risk).toBe('W');
-    expect(risk('paypal', 'list_invoices', {
-      annotations: { destructiveHint: true },
-      orkas_action_policy: { risk: 'D', confirmation: 'destructive', max_batch_size: 25 },
-    }).risk).toBe('R');
+    expect(risk('shopify-admin', 'execute_read', { annotations: { readOnlyHint: true } }).risk).toBe('R');
+    expect(risk('shopify-admin', 'unknown', { annotations: { readOnlyHint: true, destructiveHint: true } }).risk).toBe('D');
   });
 
   it.each([

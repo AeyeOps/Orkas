@@ -73,13 +73,7 @@ const IS_PACKAGED_LAUNCH_SMOKE = !!PACKAGED_LAUNCH_SMOKE_FILE;
 let appTray: Tray | null = null;
 const mainWindows = new Set<BrowserWindow>();
 let isQuitting = false;
-const MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS = 12 * 60 * 60 * 1000;
-const MARKETPLACE_SERVER_CHECK_INTERVAL_MS = 12 * 60 * 60 * 1000;
-const MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS = [3_000, 3_000, 3_000] as const;
 
-// Source and packaged builds share one app identity and one server
-// environment: global prod. This keeps local data paths and OS app grouping
-// stable across run modes.
 app.setName('Orkas');
 try {
   if (IS_PACKAGED_LAUNCH_SMOKE) {
@@ -218,7 +212,6 @@ import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
 import { appResource, hasIsolatedBrowserStorage } from './features/web_apps/host';
-import * as clientConfigFeature from './features/client_config';
 import * as connectorsFeature from './features/connectors';
 import * as windowState from './features/window_state';
 import { startIdleSleepGuard } from './features/idle_sleep_guard';
@@ -226,10 +219,6 @@ import { installWindowCloseConfirmation } from './features/window_close_confirma
 import * as taskNotifications from './features/task_notifications';
 import * as taskUnreadTray from './features/task_unread_tray';
 import * as notificationPermissions from './features/notification_permissions';
-import {
-  startOpenLifecycleTracking,
-  type OpenLifecycleTracking,
-} from './features/open_lifecycle';
 import {
   consumeColdLaunchConnectorCallback,
   registerConnectorProtocol,
@@ -239,7 +228,6 @@ import {
 // through the open server bridge.
 
 let windowsTaskBadgeIcon: ReturnType<typeof nativeImage.createFromDataURL> | null = null;
-let openLifecycleTracking: OpenLifecycleTracking | null = null;
 
 function setTaskNotificationBadgeCount(count: number): void {
   const normalized = Math.max(0, Math.trunc(count));
@@ -757,20 +745,6 @@ async function runBootMaintenanceSweeps(): Promise<void> {
   } catch (err) { log.warn('workspace empty-dir sweep failed', { error: (err as Error).message }); }
 }
 
-let marketplaceReconcileStatusSubscribed = false;
-let marketplaceReconcileInFlight: Promise<void> | null = null;
-let marketplaceReconcileInFlightKey = '';
-const marketplaceDefaultsRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
-const marketplaceDefaultsRetryAttempts = new Map<string, number>();
-
-function subscribeMarketplaceReconcileStatus(m: typeof import('./features/marketplace_reconcile')): void {
-  if (marketplaceReconcileStatusSubscribed) return;
-  marketplaceReconcileStatusSubscribed = true;
-  m.subscribeReconcileStatus((status) => {
-    ipc.broadcastToRenderer('marketplace:reconcile-status', status);
-  });
-}
-
 function broadcastBuiltinMarketplaceSeedChanged(result: BuiltinMarketplaceSeedResult): void {
   const pulledAgents = Math.max(0, Number(result.seeded_agents || 0) + Number(result.manifest_agents || 0));
   const pulledSkills = Math.max(0, Number(result.seeded_skills || 0) + Number(result.manifest_skills || 0));
@@ -808,155 +782,6 @@ async function seedBuiltinMarketplaceForCurrentUser(
     shouldContinue,
     onChanged: broadcastBuiltinMarketplaceSeedChanged,
   });
-}
-
-function marketplaceBootContextStillActive(uid: string): boolean {
-  if (!uid || users.isAnonymousLocalId(uid)) return false;
-  try { return users.getActiveUserId() === uid; }
-  catch { return false; }
-}
-
-function clearMarketplaceDefaultsRetry(runKey: string): void {
-  const timer = marketplaceDefaultsRetryTimers.get(runKey);
-  if (timer) clearTimeout(timer);
-  marketplaceDefaultsRetryTimers.delete(runKey);
-  marketplaceDefaultsRetryAttempts.delete(runKey);
-}
-
-function scheduleMarketplaceDefaultsRetry(runKey: string, uid: string, error: string): void {
-  if (marketplaceDefaultsRetryTimers.has(runKey)) return;
-  const attempt = marketplaceDefaultsRetryAttempts.get(runKey) || 0;
-  const delayMs = MARKETPLACE_DEFAULTS_RETRY_DELAYS_MS[attempt];
-  if (delayMs === undefined) {
-    marketplaceBootLog.warn('marketplace default installs retry exhausted', { error });
-    marketplaceDefaultsRetryAttempts.delete(runKey);
-    return;
-  }
-  marketplaceDefaultsRetryAttempts.set(runKey, attempt + 1);
-  const timer = setTimeout(() => {
-    marketplaceDefaultsRetryTimers.delete(runKey);
-    if (!marketplaceBootContextStillActive(uid)) {
-      marketplaceDefaultsRetryAttempts.delete(runKey);
-      return;
-    }
-    runMarketplaceInstallReconcile('marketplace-defaults-retry').catch((err) => {
-      marketplaceBootLog.warn('marketplace default installs retry failed', {
-        error: (err as Error).message,
-      });
-    });
-  }, delayMs);
-  timer.unref?.();
-  marketplaceDefaultsRetryTimers.set(runKey, timer);
-  marketplaceBootLog.info('scheduled marketplace default installs retry', {
-    attempt: attempt + 1,
-    delay_ms: delayMs,
-    error,
-  });
-}
-
-async function runMarketplaceInstallReconcile(reason: string): Promise<void> {
-  const uid = users.getActiveUserId();
-  if (!marketplaceBootContextStillActive(uid)) {
-    marketplaceBootLog.info('skip marketplace reconcile: local user unavailable', { reason });
-    return;
-  }
-
-  const runKey = uid;
-  if (marketplaceReconcileInFlight && marketplaceReconcileInFlightKey === runKey) {
-    await marketplaceReconcileInFlight;
-    return;
-  }
-
-  const shouldContinue = (): boolean => marketplaceBootContextStillActive(uid);
-  marketplaceReconcileInFlightKey = runKey;
-  marketplaceReconcileInFlight = (async () => {
-    let defaultSeedStatusActive = false;
-    let marketplaceReconcileModule: typeof import('./features/marketplace_reconcile') | null = null;
-    const clearDefaultSeedStatus = (): void => {
-      if (marketplaceReconcileModule && defaultSeedStatusActive) {
-        marketplaceReconcileModule.setDefaultInstallSeedStatus(false);
-        defaultSeedStatusActive = false;
-      }
-    };
-
-    try {
-      const [mp, m] = await Promise.all([
-        import('./features/marketplace'),
-        import('./features/marketplace_reconcile'),
-      ]);
-      marketplaceReconcileModule = m;
-      subscribeMarketplaceReconcileStatus(m);
-
-      await seedBuiltinMarketplaceForCurrentUser(reason, shouldContinue);
-
-      if (await mp.hasKnownDefaultInstallWork(uid)) {
-        m.setDefaultInstallSeedStatus(true);
-        defaultSeedStatusActive = true;
-      }
-
-      if (!shouldContinue()) {
-        clearDefaultSeedStatus();
-        return;
-      }
-
-      const builtinMarketplace = await import('./features/builtin_marketplace');
-      await builtinMarketplace.resolveBuiltinMarketplaceInstalls(uid, { shouldContinue }).catch((err) => {
-        marketplaceBootLog.warn('builtin marketplace resolve failed', { error: logErrorSummary(err) });
-      });
-      if (!shouldContinue()) {
-        clearDefaultSeedStatus();
-        return;
-      }
-
-      const forceMarketplaceNetwork = reason === 'marketplace-defaults-retry';
-      const seeded = await mp.ensureDefaultInstalls(uid, {
-        shouldContinue,
-        minIntervalMs: forceMarketplaceNetwork ? 0 : MARKETPLACE_DEFAULTS_REFRESH_INTERVAL_MS,
-        force: forceMarketplaceNetwork,
-      });
-      if (seeded.failed) {
-        clearDefaultSeedStatus();
-        scheduleMarketplaceDefaultsRetry(runKey, uid, seeded.error || 'unknown error');
-      } else {
-        clearMarketplaceDefaultsRetry(runKey);
-      }
-      if ((seeded.seeded_agents || seeded.seeded_skills) && !defaultSeedStatusActive) {
-        m.setDefaultInstallSeedStatus(true);
-        defaultSeedStatusActive = true;
-      }
-
-      if (!shouldContinue()) {
-        clearDefaultSeedStatus();
-        return;
-      }
-
-      await m.checkServerUpdatesForInstalls(uid, {
-        shouldContinue,
-        minIntervalMs: MARKETPLACE_SERVER_CHECK_INTERVAL_MS,
-      });
-      const result = await m.reconcileInstalls(uid, { shouldContinue });
-      if (
-        result.pulled_agents || result.pulled_skills
-        || result.pruned_agents || result.pruned_skills
-        || result.restored_agents || result.restored_skills
-        || result.patched_agents || result.patched_skills
-      ) {
-        marketplaceBootLog.info('marketplace install reconcile completed', { reason, ...result });
-      }
-    } catch (err) {
-      clearDefaultSeedStatus();
-      marketplaceBootLog.warn('marketplace install reconcile failed', {
-        reason,
-        error: (err as Error).message,
-      });
-    }
-  })().finally(() => {
-    if (marketplaceReconcileInFlightKey === runKey) {
-      marketplaceReconcileInFlight = null;
-      marketplaceReconcileInFlightKey = '';
-    }
-  });
-  await marketplaceReconcileInFlight;
 }
 
 // `kb-file://<relpath>` — maps a KB-relative path to the active user's
@@ -1423,7 +1248,6 @@ if (!gotLock) {
 
   const shutdown = createShutdownCoordinator({
     localTasks: [
-      { name: 'open-lifecycle', run: async () => { await openLifecycleTracking?.flushQuit(); } },
       { name: 'search', run: () => searchFeature.flushAll() },
       { name: 'kb_vector', run: async () => { (await import('./features/kb_vector')).closeAllKb(); } },
       { name: 'kb_embed', run: async () => { (await import('./features/kb_embed')).closeEmbedder(); } },
@@ -1549,14 +1373,10 @@ if (!gotLock) {
     // Running Agent work keeps the machine out of idle sleep; an idle app holds nothing.
     const idleSleepGuard = startIdleSleepGuard({ blocker: powerSaveBlocker, hasActiveWork });
     app.once('before-quit', idleSleepGuard.stop);
-    clientConfigFeature.clientConfig.subscribeAll((keys) => {
-      ipc.broadcastToRenderer('client-config:changed', { keys });
-    });
     const BOOT_BACKGROUND_DEFER_MS = 6_000;
     const bootDevice = getBootDeviceProfile();
     const BOOT_HEAVY_DISK_DELAY_MS = bootDevice.heavyDiskOffsetMs;
     const BOOT_POST_STARTUP_DELAY_MS = bootDevice.postStartupOffsetMs;
-    const CLIENT_CONFIG_STARTUP_DELAY_MS = 8_000;
     const CONNECTORS_BOOTSTRAP_DELAY_MS = bootDevice.connectorBootstrapDelayMs;
     log.info('boot device profile', {
       tier: bootDevice.tier,
@@ -1565,10 +1385,6 @@ if (!gotLock) {
       heavy_disk_delay_ms: BOOT_HEAVY_DISK_DELAY_MS,
       post_startup_delay_ms: BOOT_POST_STARTUP_DELAY_MS,
     });
-    clientConfigFeature.start({
-      startupDelayMs: CLIENT_CONFIG_STARTUP_DELAY_MS,
-      forceStartupRefresh: false,
-    });
     const connectorsTimer = setTimeout(() => {
       connectorsFeature.bootstrap(users.getActiveUserId()).catch(() => {
         /* errors logged inside the feature; never block app startup */
@@ -1576,20 +1392,6 @@ if (!gotLock) {
     }, CONNECTORS_BOOTSTRAP_DELAY_MS);
     connectorsTimer.unref?.();
     createWindow();
-    openLifecycleTracking = startOpenLifecycleTracking({
-      app,
-      getActiveUserId: () => users.getActiveUserId(),
-      hasFocusedWindow: () => BrowserWindow.getAllWindows().some((win) => (
-        !win.isDestroyed() && win.isFocused()
-      )),
-      // Test and packaged-smoke launches use synthetic workspaces and must not
-      // write lifecycle reports. Normal source and packaged runs behave alike.
-      enabled: !E2E_USER_DATA_DIR && !IS_PACKAGED_LAUNCH_SMOKE,
-    });
-    app.once('will-quit', () => {
-      openLifecycleTracking?.stop();
-      openLifecycleTracking = null;
-    });
     await consumeColdLaunchConnectorCallback();
     createAppTray();
     if (process.platform === 'darwin' && appTray) {
@@ -1678,7 +1480,7 @@ if (!gotLock) {
       }));
       projectDriverRunner.startDriverScheduler();
     });
-    registerDeferred('marketplace:reconcile', () => runMarketplaceInstallReconcile('startup'));
+    registerDeferred('marketplace:builtin', () => seedBuiltinMarketplaceForCurrentUser('startup'));
 
     registerDeferred('boot:maintenance-sweeps', () => runBootMaintenanceSweeps(), 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
     registerDeferred('browser:http-cache', async (signal) => {

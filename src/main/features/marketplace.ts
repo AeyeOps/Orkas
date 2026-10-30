@@ -104,15 +104,8 @@ function _assertSafeMarketplaceId(id: unknown): asserts id is string {
   if (!safeId(id)) throw new Error('invalid marketplace id');
 }
 
-// ── server URL ────────────────────────────────────────────────────────────
-// The open-source build has exactly one server environment: global prod. Use the apex host
-// directly so marketplace POST calls do not first hit a www -> apex 301 redirect.
-const GLOBAL_PROD_API_BASE = 'https://orkas.ai' + '/api';
-
-export function apiBase(): string {
-  const e2eBase = String(process.env.ORKAS_E2E_MARKETPLACE_API_BASE || '').trim();
-  if (process.env.ORKAS_E2E_USER_DATA_DIR && e2eBase) return e2eBase.replace(/\/$/, '');
-  return GLOBAL_PROD_API_BASE;
+export function apiBase(): never {
+  throw new Error('Orkas vendor services are unavailable in this build');
 }
 
 // ── envelope ──────────────────────────────────────────────────────────────
@@ -394,73 +387,14 @@ function _listLocalMarketplaceProjects(
     total,
     categories: categories.map((c) => ({ ...c })),
     source: 'bundled',
-    stale: true,
+    stale: false,
   };
-}
-
-// Main-process conditional cache for the OSS projects list: store the last
-// ETag + parsed body per query so PC's per-launch home-strip revalidation costs
-// a 304 instead of re-downloading the (small) catalog. In-memory only — a fresh
-// process re-establishes the ETag on its first call; bounded so ad-hoc searches
-// can't grow it without limit.
-// INVARIANT: the cache key is the request body ONLY. This is correct because the
-// OSS projects list is public / account-independent and `apiBase()` is pinned for
-// the process lifetime. If either ever becomes user/profile-scoped at runtime,
-// fold the account/profile (and apiBase) into the key or a 304 could replay
-// another scope's body.
-const _projectsConditional = new Map<string, { etag: string; result: MarketplaceProjectsListResult }>();
-const _PROJECTS_CONDITIONAL_MAX = 64;
-
-async function _fetchProjectsListConditional(body: Record<string, unknown>): Promise<MarketplaceProjectsListResult> {
-  const key = JSON.stringify(body);
-  const prior = _projectsConditional.get(key);
-  const headers: Record<string, string> = withCommonHeaders({
-    'Content-Type': 'application/json',
-    'Accept-Language': getLanguage(),
-  });
-  if (prior) headers['If-None-Match'] = prior.etag;
-  const res = await fetchWithRetry(
-    'marketplace:/marketplace/projects/list',
-    `${apiBase()}/marketplace/projects/list`,
-    { method: 'POST', headers, body: JSON.stringify(body) },
-    {
-      timeoutMs: MARKETPLACE_JSON_TIMEOUT_MS,
-      timeoutMessage: `marketplace:/marketplace/projects/list timed out after ${Math.round(MARKETPLACE_JSON_TIMEOUT_MS / 1000)}s`,
-    },
-  );
-  if (res.status === 304 && prior) return prior.result;
-  const text = await res.text();
-  let data: Envelope;
-  try { data = JSON.parse(text); } catch { throw new Error(`bad response (${res.status}): ${text.slice(0, 200)}`); }
-  if (data.code !== 0) throw new Error(data.msg || `marketplace /marketplace/projects/list failed (code=${data.code})`);
-  const result = data as unknown as MarketplaceProjectsListResult;
-  const etag = res.headers.get('etag');
-  if (etag) {
-    if (_projectsConditional.size >= _PROJECTS_CONDITIONAL_MAX) _projectsConditional.clear();
-    _projectsConditional.set(key, { etag, result });
-  }
-  return result;
 }
 
 export async function listMarketplaceProjects(
   opts: { category?: string; q?: string; page?: number; size?: number; home_only?: boolean; local_only?: boolean } = {},
 ): Promise<MarketplaceProjectsListResult> {
-  if (opts.local_only === true) return _listLocalMarketplaceProjects(opts);
-  try {
-    const fresh = await _fetchProjectsListConditional({
-      category: opts.category || null,
-      q: opts.q || null,
-      page: opts.page || 1,
-      ...(typeof opts.size === 'number' ? { size: opts.size } : {}),
-      home_only: opts.home_only === true,
-    });
-    return { ...fresh, source: fresh.source || 'server', stale: false };
-  } catch (err) {
-    log.warn('marketplace projects server list failed; using bundled catalog', {
-      error: (err as Error)?.message || String(err),
-    });
-    return _listLocalMarketplaceProjects(opts);
-  }
+  return _listLocalMarketplaceProjects(opts);
 }
 
 // ── detail (cache-aware) ──────────────────────────────────────────────────
@@ -715,6 +649,7 @@ export async function getAgentDetail(
   expect: MarketplaceFreshness,
   uid = getActiveUserId(),
 ): Promise<AgentDetail> {
+  apiBase();
   _assertSafeMarketplaceId(agentId);
   if (await isCacheFresh('agent', agentId, expect, uid)) {
     const cached = await readAgentCache(agentId, uid);
@@ -754,6 +689,7 @@ export async function getSkillDetail(
   expect: MarketplaceFreshness,
   uid = getActiveUserId(),
 ): Promise<SkillDetail> {
+  apiBase();
   _assertSafeMarketplaceId(skillId);
   if (await isCacheFresh('skill', skillId, expect, uid)) {
     await touchCacheEntry('skill', skillId, uid);
@@ -830,6 +766,7 @@ function _bundleHost(bundleUrl: string): string {
 export async function installMarketplaceAgent(
   agentId: string, expect: MarketplaceFreshness, opts: MarketplaceInstallOpts = {},
 ): Promise<MarketplaceInstallResult> {
+  apiBase();
   _assertSafeMarketplaceId(agentId);
   const uid = getActiveUserId();
   return withMarketplaceInstallLock(
@@ -1016,6 +953,7 @@ async function _installMarketplaceAgentLocked(
 export async function installMarketplaceSkill(
   skillId: string, expect: MarketplaceFreshness, opts: MarketplaceInstallOpts = {},
 ): Promise<MarketplaceInstallResult> {
+  apiBase();
   _assertSafeMarketplaceId(skillId);
   return _installMarketplaceSkillForUser(getActiveUserId(), skillId, expect, opts);
 }

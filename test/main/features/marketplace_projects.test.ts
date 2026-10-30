@@ -12,10 +12,9 @@ describe('marketplace projects catalog', () => {
   afterEach(() => {
     vi.unstubAllGlobals();
     vi.resetModules();
-    delete process.env.ORKAS_API_BASE_URL;
   });
 
-  it('keeps the bundled fallback catalog self-consistent', () => {
+  it('keeps the bundled catalog self-consistent', () => {
     const bundled = JSON.parse(fs.readFileSync(
       path.join(__dirname, '../../../src/main/data/oss-projects.json'),
       'utf8',
@@ -36,9 +35,9 @@ describe('marketplace projects catalog', () => {
       .toBe(true);
   });
 
-  it('falls back to bundled projects when the Server catalog is unavailable', async () => {
-    process.env.ORKAS_API_BASE_URL = 'https://marketplace.test/api';
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('not found', { status: 404 })));
+  it('uses bundled projects without contacting vendor services', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
 
     const marketplace = await loadMarketplace();
     const home = await marketplace.listMarketplaceProjects({ home_only: true });
@@ -46,12 +45,13 @@ describe('marketplace projects catalog', () => {
     expect(home.list.map((p) => p.id)).toEqual(['hyperframes', 'ppt-master', 'OfficeCLI', 'Lark-CLI', 'crawl4ai']);
     expect(home.categories.map((c) => c.code)).toEqual(['anim', 'browser', 'office', 'slides']);
     expect(home.source).toBe('bundled');
-    expect(home.stale).toBe(true);
+    expect(home.stale).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('applies category, search, and pagination to the bundled fallback', async () => {
-    process.env.ORKAS_API_BASE_URL = 'https://marketplace.test/api';
-    vi.stubGlobal('fetch', vi.fn(async () => new Response('not found', { status: 404 })));
+  it('applies category, search, and pagination to the bundled catalog', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
 
     const marketplace = await loadMarketplace();
     const browser = await marketplace.listMarketplaceProjects({ category: 'browser', q: '结构化', size: 1 });
@@ -59,25 +59,7 @@ describe('marketplace projects catalog', () => {
     expect(browser.total).toBe(1);
     expect(browser.list).toHaveLength(1);
     expect(browser.list[0].id).toBe('crawl4ai');
-  });
-
-  it('uses Server results when the catalog request succeeds', async () => {
-    process.env.ORKAS_API_BASE_URL = 'https://marketplace.test/api';
-    const fetchMock = vi.fn(async () => new Response(JSON.stringify({
-      code: 0,
-      list: [{ id: 'server-project', name: 'Server Project' }],
-      total: 1,
-      categories: [{ code: 'server', name_zh: '服务端', name_en: 'Server', sort_order: 1 }],
-    })));
-    vi.stubGlobal('fetch', fetchMock);
-
-    const marketplace = await loadMarketplace();
-    const data = await marketplace.listMarketplaceProjects({ home_only: true });
-
-    expect(data.list.map((p) => p.id)).toEqual(['server-project']);
-    expect(data.source).toBe('server');
-    expect(data.stale).toBe(false);
-    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it('searches translated descriptions in the offline catalog', async () => {
@@ -86,41 +68,5 @@ describe('marketplace projects catalog', () => {
       const data = await marketplace.listMarketplaceProjects({ local_only: true, q: query });
       expect(data.list.map((p) => p.id), query).toContain('ppt-master');
     }
-  });
-
-  it('sends If-None-Match and replays the cached list on a 304', async () => {
-    process.env.ORKAS_API_BASE_URL = 'https://marketplace.test/api';
-    const fetchMock = vi.fn(async (_url: unknown, init: RequestInit) => {
-      const headers = (init.headers || {}) as Record<string, string>;
-      if (!headers['If-None-Match']) {
-        return new Response(JSON.stringify({
-          code: 0,
-          list: [{ id: 'server-project', name: 'Server Project' }],
-          total: 1,
-          categories: [],
-        }), { status: 200, headers: { ETag: '"abc123"' } });
-      }
-      // Conditional revalidation: the client must echo the prior ETag.
-      expect(headers['If-None-Match']).toBe('"abc123"');
-      // undici's Response constructor rejects a 304 (null-body status), so hand
-      // back a minimal response shape — the client only reads `.status` here.
-      return {
-        status: 304,
-        headers: { get: (k: string) => (k.toLowerCase() === 'etag' ? '"abc123"' : null) },
-        text: async () => '',
-      } as unknown as Response;
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    const marketplace = await loadMarketplace();
-    const first = await marketplace.listMarketplaceProjects({ home_only: true });
-    const second = await marketplace.listMarketplaceProjects({ home_only: true });
-
-    expect(first.list.map((p) => p.id)).toEqual(['server-project']);
-    // 304 → replay the cached body, still flagged as a fresh Server result.
-    expect(second.list.map((p) => p.id)).toEqual(['server-project']);
-    expect(second.source).toBe('server');
-    expect(second.stale).toBe(false);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });

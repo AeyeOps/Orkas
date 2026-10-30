@@ -425,7 +425,7 @@ function bindStaticHandlers() {
   document.getElementById('agents-more-btn')?.addEventListener('click', () => {
     const load = typeof loadRendererFeature === 'function' ? loadRendererFeature : window.loadRendererFeature;
     if (typeof load !== 'function') return;
-    load('marketplace').then(() => openMarketplace('agent')).catch(() => {});
+    load('marketplace').then(() => openMarketplace('oss')).catch(() => {});
   });
   // AI Team header CLI entry. Opens the external-only dialog — no tab bar, just
   // the CLI flow — rather than the tabbed create dialog, so the page matches

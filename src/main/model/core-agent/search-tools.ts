@@ -151,7 +151,7 @@ export async function createWebSearchOverrideTool(context?: SearchExecutionConte
       const count = Math.min(Math.max(1, requested), MAX_COUNT);
       if (!query) return { content: 'Error: query is required', isError: true };
 
-      const profiles = listSearchProfiles();
+      const profiles = listSearchProfiles().filter((profile) => profile.provider !== 'orkas-api');
       if (profiles.length) {
         const userId = getActiveUserId();
         const candidates = profiles.map(profile => ({ profile, key: searchCooldownKey(userId, profile) }));

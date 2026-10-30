@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "此功能需要 Orkas 官方服務，在此版本中無法使用。",
   "dialog.context.application": "來源：應用程式",
   "dialog.context.background": "來源：背景請求",
   "dialog.context.requester": "發起者：{name}",

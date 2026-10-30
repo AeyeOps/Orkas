@@ -365,10 +365,6 @@
                 <span data-ui-icon="plus" data-ui-icon-class="header-entry-icon"></span>
                 <span data-i18n="skills.add">Create skill</span>
               </button>
-              <button class="btn header-entry-btn header-entry-btn-market" id="skills-more-btn">
-                <span data-ui-icon="shopping-cart" data-ui-icon-class="header-entry-icon"></span>
-                <span data-i18n="skills.more_btn">Skill marketplace</span>
-              </button>
             </div>
           </div>
           <div class="marketplace-reconcile-banner" data-reconcile-banner data-reconcile-kind="skill" style="display:none"></div>
@@ -476,12 +472,6 @@
               <span class="agents-grid-title" data-i18n="agents.title">AI Team</span>
               <span class="agents-grid-subtitle" data-i18n="agents.subtitle">Every member is an agent — @ it, form squads, assign tasks.</span>
             </div>
-            <!-- AI Team entry cluster. The old icon-less `+ Create` / `More`
-                 chips were too small to find, so each entry now names what it
-                 opens and the coding-CLI flow — previously only the create
-                 dialog's second tab — gets its own button. Ids and targets are
-                 unchanged: `agents-more-btn` still opens the agent
-                 marketplace. -->
             <div class="header-actions header-entry-actions">
               <button class="btn header-entry-btn header-entry-btn-create" id="create-agent-btn">
                 <span data-ui-icon="plus" data-ui-icon-class="header-entry-icon"></span>
@@ -495,8 +485,8 @@
                 </span>
               </button>
               <button class="btn header-entry-btn header-entry-btn-market" id="agents-more-btn">
-                <span data-ui-icon="shopping-cart" data-ui-icon-class="header-entry-icon"></span>
-                <span data-i18n="agents.market_btn">Agent marketplace</span>
+                <span data-ui-icon="code" data-ui-icon-class="header-entry-icon"></span>
+                <span data-i18n="marketplace.tab_oss">Open Source</span>
               </button>
             </div>
           </div>
@@ -619,17 +609,12 @@
         </div>
       </section>
 
-      <!-- Marketplace (entered via the More button on agents / skills tabs;
-           closes back to its origin view via openMarketplace's return-stack).
-           Two sub-views — grid (browse + categories) and detail (full content + install). -->
       <section class="panel" id="panel-marketplace">
         <!-- Grid view (default) -->
         <div class="marketplace-grid-view" id="marketplace-grid-view">
           <div class="marketplace-header">
             <button type="button" class="btn btn-sm" data-mp-close data-i18n="common.back">Back</button>
             <div class="marketplace-tabs">
-              <button type="button" class="marketplace-tab" data-mp-tab="agent" data-i18n="marketplace.tab_agent">Agents</button>
-              <button type="button" class="marketplace-tab" data-mp-tab="skill" data-i18n="marketplace.tab_skill">Skills</button>
               <button type="button" class="marketplace-tab marketplace-tab--oss" data-mp-tab="oss"><span data-i18n="marketplace.tab_oss">Open Source</span><span class="marketplace-tab-new" data-i18n="marketplace.tab_new">NEW</span></button>
             </div>
             <div class="marketplace-search-wrap">
@@ -1290,31 +1275,19 @@
                   <p data-i18n="settings.models.page_sub">按用途配置服务，设置默认模型与备用顺序。</p>
                 </header>
 
-                <div class="settings-group settings-orkas-api-group" id="settings-orkas-api-group">
+                <div class="settings-group settings-orkas-api-group" id="settings-orkas-api-group" hidden>
                   <div class="settings-group-head settings-orkas-api-head">
                     <div class="settings-group-head-main">
-                      <div class="settings-orkas-api-title-row">
-                        <div class="settings-group-title" data-i18n="settings.orkas_api.title">Orkas API Key</div>
-                        <span class="settings-orkas-api-savings" data-i18n="price_comparison.maximum">Model costs up to ~60% less than provider APIs</span>
-                      </div>
-                      <div class="settings-group-sub" data-i18n="settings.orkas_api.sub">Shared by Orkas models, search, images, speech, video, and credit-based connectors. The key is encrypted on this device.</div>
+                      <div class="settings-group-title" data-i18n="settings.orkas_api.title">Orkas API Key</div>
+                      <div class="settings-group-sub" data-i18n="app.vendor_services_unavailable">This feature requires Orkas vendor services and is unavailable in this build.</div>
                     </div>
-                    <button type="button" class="btn btn-sm" id="settings-orkas-api-create-key" data-i18n="settings.orkas_api.create_key">Create API Key</button>
                   </div>
-                  <div class="settings-orkas-api-saved" id="settings-orkas-api-saved" hidden>
+                  <div class="settings-orkas-api-saved" id="settings-orkas-api-saved">
                     <div class="settings-orkas-api-key-summary">
                       <code id="settings-orkas-api-key-masked"></code>
                     </div>
                     <div class="settings-orkas-api-actions">
-                      <button type="button" class="btn btn-sm" id="settings-orkas-api-edit" data-i18n="settings.orkas_api.edit">Edit</button>
                       <button type="button" class="btn btn-sm btn-danger" id="settings-orkas-api-delete" data-i18n="settings.orkas_api.delete">Delete</button>
-                    </div>
-                  </div>
-                  <div class="settings-row settings-orkas-api-configure-row" id="settings-orkas-api-editor">
-                    <input type="password" class="form-input" id="settings-orkas-api-key-input" autocomplete="new-password" spellcheck="false" data-i18n-placeholder="settings.orkas_api.key_placeholder" placeholder="Enter API Key" />
-                    <div class="settings-orkas-api-editor-actions">
-                      <button type="button" class="btn" id="settings-orkas-api-cancel" data-i18n="common.cancel" hidden>Cancel</button>
-                      <button type="button" class="btn btn-primary" id="settings-orkas-api-configure" data-i18n="settings.orkas_api.configure">Configure</button>
                     </div>
                   </div>
                   <div class="settings-status settings-orkas-api-status" id="settings-orkas-api-status" aria-live="polite"></div>
@@ -1329,7 +1302,7 @@
                   <button type="button" class="settings-subnav-tab is-active" role="tab" id="settings-model-tab-chat" aria-selected="true" aria-controls="settings-model-panel-chat" data-settings-model-tab="chat" data-i18n="settings.models.chat">对话</button>
                   <button type="button" class="settings-subnav-tab" role="tab" id="settings-model-tab-search" aria-selected="false" tabindex="-1" aria-controls="settings-model-panel-search" data-settings-model-tab="search" data-i18n="settings.models.search">搜索</button>
                   <button type="button" class="settings-subnav-tab" role="tab" id="settings-model-tab-image" aria-selected="false" tabindex="-1" aria-controls="settings-model-panel-image" data-settings-model-tab="image" data-i18n="settings.models.image">图片</button>
-                  <button type="button" class="settings-subnav-tab" role="tab" id="settings-model-tab-video" aria-selected="false" tabindex="-1" aria-controls="settings-model-panel-video" data-settings-model-tab="video" data-i18n="settings.models.video">视频</button>
+                  <button type="button" class="settings-subnav-tab" role="tab" id="settings-model-tab-video" aria-selected="false" tabindex="-1" aria-controls="settings-model-panel-video" hidden data-settings-model-tab="video" data-i18n="settings.models.video">视频</button>
                   <button type="button" class="settings-subnav-tab" role="tab" id="settings-model-tab-tts" aria-selected="false" tabindex="-1" aria-controls="settings-model-panel-tts" data-settings-model-tab="tts" data-i18n="settings.models.tts">语音</button>
                 </div>
 
@@ -1381,7 +1354,6 @@
                       <h2 data-i18n="settings.models.video_title">视频生成</h2>
                       <p class="settings-section-sub" data-i18n="settings.models.video_sub">管理视频服务及其备用顺序。</p>
                     </div>
-                    <button type="button" class="btn btn-sm btn-primary settings-add-btn" data-settings-add="video" data-i18n="settings.models.add_video">添加视频服务</button>
                   </div>
                   <div class="settings-sheet settings-entries" id="settings-video-entries">
                     <div class="settings-empty" data-i18n="settings.loading">Loading…</div>

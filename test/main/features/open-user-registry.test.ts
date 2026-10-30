@@ -47,7 +47,7 @@ function openRegistry() {
 
 describe('open-source user directory selection', () => {
   it.each(['login-record', 'hosted-encryption', 'anonymous'])(
-    'isolates %s data and allows offline Key setup without changing hosted files', async (kind) => {
+    'isolates %s data and allows offline provider setup without changing hosted files', async (kind) => {
       const oldUid = kind === 'anonymous' ? 'anonymous' : 'commercial-user';
       const { registry, config } = seedLegacy(oldUid);
       if (kind === 'login-record') {
@@ -67,9 +67,15 @@ describe('open-source user directory selection', () => {
       expect(process.env.CORE_AGENT_AUTH_DIR).toBe(path.join(root, rec.user_id, 'local', 'config'));
 
       const auth = await import('../../../src/main/features/auth');
-      expect(auth.saveOrkasApiCredential(auth.prepareOrkasApiCredential('open-test-key-xxxxxxxx')))
-        .toMatchObject({ configured: true });
-      expect(auth.getOrkasApiKey()).toBe('open-test-key-xxxxxxxx');
+      const credential = await auth.addApiKeyEntry('deepseek', 'deepseek-flash', 'open-test-key-xxxxxxxx');
+      expect(auth.listApiKeyEntries()).toEqual([
+        expect.objectContaining({
+          profileId: credential.profileId,
+          provider: 'deepseek',
+          model: 'deepseek-flash',
+          apiKey: 'open-test-key-xxxxxxxx',
+        }),
+      ]);
       expect(fs.readFileSync(path.join(root, 'users.json'), 'utf8')).toBe(registry);
       expect(fs.readdirSync(config)).toEqual(before);
       if (kind === 'hosted-encryption') {

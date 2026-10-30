@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "Для этой функции требуются сервисы Orkas, и она недоступна в этой сборке.",
   "dialog.context.application": "Запрос приложения",
   "dialog.context.background": "Фоновый запрос",
   "dialog.context.requester": "Инициатор: {name}",

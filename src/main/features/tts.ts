@@ -367,6 +367,9 @@ class HttpAudioTtsBackend implements TtsBackend {
   }
 
   async synthesize(p: TtsParams): Promise<TtsResult> {
+    if (this.profile.provider === ORKAS_API_PROVIDER) {
+      throw new Error('Orkas vendor services are unavailable in this build');
+    }
     const base = this.profile.baseUrl.replace(/\/+$/, '');
     const voice = p.voice || this.profile.voice;
     const format = (p.format || this.profile.format || 'mp3').toLowerCase();

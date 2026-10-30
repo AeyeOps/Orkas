@@ -102,7 +102,6 @@ describe('injected tool surface budget', () => {
         allowedGroupIds: surface.loadableGroups(),
       });
       expect(directory).toContain('`create_pptx` —');
-      expect(directory).toContain('`marketplace_search` —');
       expect(directory).not.toContain('`image_studio`');
       expect(directory).not.toContain('`bash`');
       expect(estimateBudgetTokens(directory)).toBeLessThanOrEqual(COMMANDER_DIRECTORY_BUDGET_TOKENS);

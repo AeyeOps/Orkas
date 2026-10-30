@@ -130,7 +130,7 @@ function _startLocalApiAuthorization(
   const state = _localizedState();
   return new Promise((resolve, reject) => {
     const pending: PendingLocalApiFlow = {
-      kind: 'local_api', catalogId, state, relayBase: 'https://orkas.ai/api', exchange, resolve, reject,
+      kind: 'local_api', catalogId, state, relayBase: buildAuthorizeUrl ? accountApiBase() : '', exchange, resolve, reject,
       controller: new AbortController(),
       ...(opts.attemptId ? { attemptId: opts.attemptId } : {}),
       timer: setTimeout(() => {

@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "Tính năng này yêu cầu các dịch vụ của Orkas và không khả dụng trong bản dựng này.",
   "dialog.context.application": "Yêu cầu từ ứng dụng",
   "dialog.context.background": "Yêu cầu chạy nền",
   "dialog.context.requester": "Người yêu cầu: {name}",

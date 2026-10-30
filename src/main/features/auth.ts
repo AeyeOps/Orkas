@@ -98,7 +98,7 @@ import { t } from '../i18n';
 import { logErrorSummary } from '../util/log-redact';
 import { sanitizeLogTextForUpload } from '../util/log-sanitize';
 import {
-  ORKAS_API_BASE_URL,
+  orkasApiBaseUrl,
   ORKAS_API_DEFAULT_VOICE,
   ORKAS_API_IMAGE_MODEL,
   ORKAS_API_LLM_MODELS,
@@ -762,7 +762,7 @@ export function configureAllOrkasApiServices(rawApiKey: string): { configured: t
     () => ({
       id: nextOrkasServiceProfileId('tts'),
       provider: ORKAS_API_PROVIDER,
-      baseUrl: ORKAS_API_BASE_URL,
+      baseUrl: orkasApiBaseUrl(),
       model: ORKAS_API_TTS_MODEL,
       apiKey,
       voice: ORKAS_API_DEFAULT_VOICE,
@@ -772,7 +772,7 @@ export function configureAllOrkasApiServices(rawApiKey: string): { configured: t
     }),
     (profile) => ({
       ...profile,
-      baseUrl: ORKAS_API_BASE_URL,
+      baseUrl: orkasApiBaseUrl(),
       model: ORKAS_API_TTS_MODEL,
       apiKey,
     }),
@@ -1627,7 +1627,8 @@ function entryToView(
     model: e.model,
     modelName: modelNameLookup(e.provider, e.model),
     modelEditable: e.provider !== ORKAS_API_PROVIDER && !providerUsesCustomOpenAIConfig(e.provider),
-    modelAvailable: isSelectableModel(e.provider, e.model) && runtimeResolvable,
+    modelAvailable: isModelProviderAllowed(e.provider, e.model)
+      && isSelectableModel(e.provider, e.model) && runtimeResolvable,
     includedModels: catalogModel?.includedModels ? [...catalogModel.includedModels] : [],
     ...(e.provider === ORKAS_API_PROVIDER && catalogModel ? { official: true } : {}),
     ...(catalogModel?.recommended ? { recommended: true } : {}),

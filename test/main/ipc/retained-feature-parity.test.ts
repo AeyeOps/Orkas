@@ -115,7 +115,7 @@ it('reports unsupported legacy video credentials without exposing them as an act
   const auth = await import('../../../src/main/features/auth');
   auth.saveVideoProfiles([{ id: 'legacy', provider: 'doubao', model: 'doubao-seedance-2-0-260128', apiKey: 'legacy-private-key', label: 'Legacy', createdAt: 1 }]);
   const result = await invoke('videoAuth.list', {});
-  expect(result.providers.map((provider: any) => provider.provider)).toEqual(['orkas-api']);
+  expect(result.providers).toEqual([]);
   expect(result.profiles).toEqual([expect.objectContaining({ id: 'legacy', available: false })]);
   expect(result.profiles[0]).not.toHaveProperty('apiKey');
   expect(auth.loadVideoProfiles()[0]?.apiKey).toBe('legacy-private-key');

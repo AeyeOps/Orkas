@@ -54,51 +54,29 @@ describe('video auth profiles', () => {
       provider: 'orkas-api',
       model: 'orkas-video',
       apiKey: '',
-    })).toEqual({ ok: false, error: 'apiKey required' });
+    })).toEqual({ ok: false, error: 'unsupported video model "orkas-api/orkas-video"' });
     expect(mocks.profiles).toEqual([]);
   });
 
-  it('keeps explicit ordering and bounded labels deterministic', () => {
-    const first = addVideoProfile({
-      provider: 'orkas-api',
-      model: 'orkas-video',
-      apiKey: 'first',
-      label: `  ${'x'.repeat(60)}  `,
-    });
-    const second = addVideoProfile({
-      provider: 'orkas-api',
-      model: 'orkas-video',
-      apiKey: 'second',
-      label: 'second',
-    });
-    expect(first.ok && second.ok).toBe(true);
-    if (!first.ok || !second.ok) return;
-
-    reorderVideoProfiles([first.id, second.id]);
-    expect(listVideoProfiles().map((profile) => profile.id)).toEqual([
-      first.id,
-      second.id,
-    ]);
-    expect(listVideoProfiles()[0]?.label).toHaveLength(40);
-
-    expect(removeVideoProfile(second.id)).toEqual({ ok: true });
-    expect(listVideoProfiles().map((profile) => profile.id)).toEqual([first.id]);
+  it('keeps explicit ordering and removal of stored profiles deterministic', () => {
+    mocks.profiles = [
+      { id: 'second', provider: 'orkas-api', model: 'orkas-video', apiKey: 'second', label: 'second', createdAt: 2 },
+      { id: 'first', provider: 'orkas-api', model: 'orkas-video', apiKey: 'first', label: 'first', createdAt: 1 },
+    ];
+    reorderVideoProfiles(['first', 'second']);
+    expect(listVideoProfiles().map(profile => profile.id)).toEqual(['first', 'second']);
+    expect(removeVideoProfile('second')).toEqual({ ok: true });
+    expect(listVideoProfiles().map(profile => profile.id)).toEqual(['first']);
   });
 
-  it('exposes the concrete open-source video model in the picker', () => {
+  it('keeps unsupported video providers out of the picker', () => {
     const options = flattenVideoProviderOptions([
       { id: 'orkas-api', label: 'Orkas' },
       { id: 'doubao', label: 'DouBao' },
     ]);
 
-    expect(options[0]).toMatchObject({
-      id: 'orkas-api',
-      provider: 'orkas-api',
-      model: 'orkas-video',
-      label: 'Orkas · Video',
-    });
-    expect(options).toHaveLength(1);
-    expect(listVideoProviderOptions().map((option) => option.id)).toEqual(['orkas-api']);
+    expect(options).toEqual([]);
+    expect(listVideoProviderOptions()).toEqual([]);
   });
 });
 

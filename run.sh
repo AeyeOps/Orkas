@@ -7,7 +7,6 @@
 # Usage:
 #   ./run.sh
 #
-# Orkas source builds use exactly one server environment: global prod.
 set -e
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -39,7 +38,7 @@ EOF
   exit 1
 fi
 
-echo "[Orkas] Starting Orkas (global prod)"
+echo "[Orkas] Starting Orkas"
 
 wait_for_relaunch_owner() {
   local owner_pid="${ORKAS_RELAUNCH_OWNER_PID:-}"

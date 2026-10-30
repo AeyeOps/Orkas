@@ -9430,16 +9430,6 @@ const _APP_NAV_SURFACES = {
     }),
   },
   apps: { nameKey: 'sidebar.apps', fallback: 'Apps', actions: ['open'], open: () => { setView('apps'); return true; } },
-  marketplace: {
-    nameKey: 'marketplace.title',
-    fallback: 'Marketplace',
-    actions: ['open'],
-    open: () => _appNavLoadFeature('marketplace', () => {
-      if (typeof openMarketplace !== 'function') return false;
-      openMarketplace('agent', { returnView: 'conversation' });
-      return true;
-    }),
-  },
 };
 
 function _appNavLoadFeature(feature, afterLoad) {

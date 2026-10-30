@@ -30,8 +30,7 @@ import { t } from '../i18n';
 import { composeAbortSignal, fetchAndReadWithTimeout, throwIfAborted } from '../util/abort';
 import { downloadBinaryWithProxyPolicy } from '../util/proxy-dispatcher';
 import {
-  ORKAS_API_BASE_URL,
-  ORKAS_API_PROVIDER,
+  orkasApiBaseUrl,
   orkasApiUsageHeaders,
   type OrkasApiUsageContext,
 } from './orkas_api';
@@ -281,9 +280,6 @@ export interface AdapterResult {
 }
 
 export const IMAGE_MODELS_BY_PROVIDER: Readonly<Record<string, Array<{ id: string; name: string }>>> = {
-  [ORKAS_API_PROVIDER]: [
-    { id: 'orkas-image', name: 'Image' },
-  ],
   openai: [
     { id: 'gpt-image-2', name: 'GPT Image 2' },
   ],
@@ -337,7 +333,7 @@ async function waitForOrkasImageTask(
   while (!signal.aborted) {
     await sleepWithSignal(3_000, signal);
     const { body: statusData } = await fetchAndReadWithTimeout(
-      `${ORKAS_API_BASE_URL}/images/generations/${encodeURIComponent(taskId)}`,
+      `${orkasApiBaseUrl()}/images/generations/${encodeURIComponent(taskId)}`,
       {
         method: 'GET',
         headers: {
@@ -384,7 +380,7 @@ export async function callOrkasImage(req: AdapterRequest): Promise<AdapterResult
   );
   try {
     const { body: createdData } = await fetchAndReadWithTimeout(
-      `${ORKAS_API_BASE_URL}/images/generations`,
+      `${orkasApiBaseUrl()}/images/generations`,
       {
         method: 'POST',
         headers: {

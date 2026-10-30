@@ -2,7 +2,6 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { clientConfig } from './client_config';
 import { isVerifiedPublicMaterial } from '../util/public-material';
 
 export type LocalAccessRiskCategory =
@@ -95,71 +94,8 @@ const DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY: LocalAccessSensitivePolicy = {
   ],
 };
 
-function isRiskCategory(v: unknown): v is LocalAccessRiskCategory {
-  return typeof v === 'string' && (RISK_CATEGORIES as readonly string[]).includes(v);
-}
-
-function normalizedStringList(v: unknown): string[] | undefined {
-  if (!Array.isArray(v)) return undefined;
-  return v.map((x) => (typeof x === 'string' ? x.trim() : '')).filter(Boolean);
-}
-
-function normalizedCategoryList(v: unknown): LocalAccessRiskCategory[] | undefined {
-  if (!Array.isArray(v)) return undefined;
-  const out: LocalAccessRiskCategory[] = [];
-  for (const x of v) if (isRiskCategory(x) && !out.includes(x)) out.push(x);
-  return out.length ? out : undefined;
-}
-
-function normalizedCommandPatterns(v: unknown): SensitiveCommandPattern[] | undefined {
-  if (!Array.isArray(v)) return undefined;
-  const out: SensitiveCommandPattern[] = [];
-  for (const x of v) {
-    if (!x || typeof x !== 'object') continue;
-    const r = x as Record<string, unknown>;
-    if (!isRiskCategory(r.category) || typeof r.pattern !== 'string' || !r.pattern.trim()) continue;
-    out.push({ category: r.category, pattern: r.pattern.trim() });
-  }
-  return out.length ? out : undefined;
-}
-
-function normalizePolicy(raw: unknown): Partial<LocalAccessSensitivePolicy> {
-  if (!raw || typeof raw !== 'object') return {};
-  const r = raw as Record<string, unknown>;
-  const enabledCategories = normalizedCategoryList(r.enabled_categories);
-  const sensitivePathPatterns = normalizedStringList(r.sensitive_path_patterns);
-  const sensitiveWritePathPatterns = normalizedStringList(r.sensitive_write_path_patterns);
-  const sensitiveCommandPatterns = normalizedCommandPatterns(r.sensitive_command_patterns);
-  return {
-    ...(enabledCategories ? { enabled_categories: enabledCategories } : {}),
-    ...(sensitivePathPatterns ? { sensitive_path_patterns: sensitivePathPatterns } : {}),
-    ...(sensitiveWritePathPatterns ? { sensitive_write_path_patterns: sensitiveWritePathPatterns } : {}),
-    ...(sensitiveCommandPatterns ? { sensitive_command_patterns: sensitiveCommandPatterns } : {}),
-  };
-}
-
-function mergeLocalAccessSensitivePolicy(baseRaw: unknown, overrideRaw: unknown): LocalAccessSensitivePolicy {
-  const base = { ...DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY, ...normalizePolicy(baseRaw) };
-  const override = normalizePolicy(overrideRaw);
-  return {
-    enabled_categories: override.enabled_categories ?? base.enabled_categories,
-    sensitive_path_patterns: override.sensitive_path_patterns ?? base.sensitive_path_patterns,
-    sensitive_write_path_patterns: override.sensitive_write_path_patterns ?? base.sensitive_write_path_patterns,
-    sensitive_command_patterns: override.sensitive_command_patterns ?? base.sensitive_command_patterns,
-  };
-}
-
-clientConfig.registerDefault<LocalAccessSensitivePolicy>(
-  'local_access.sensitive_policy',
-  DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY,
-  { effect: 'immediate', merge: mergeLocalAccessSensitivePolicy },
-);
-
 export function getLocalAccessSensitivePolicy(): LocalAccessSensitivePolicy {
-  return clientConfig.get<LocalAccessSensitivePolicy>(
-    'local_access.sensitive_policy',
-    DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY,
-  ) || DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY;
+  return DEFAULT_LOCAL_ACCESS_SENSITIVE_POLICY;
 }
 
 function compile(pattern: string): RegExp | null {

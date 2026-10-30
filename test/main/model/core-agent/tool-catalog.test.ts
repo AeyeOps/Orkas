@@ -246,7 +246,6 @@ describe('tool-catalog', () => {
       'management.app',
       'management.projects',
       'management.skills',
-      'management.marketplace',
       'management.automation',
     ]));
     expect(AGENT_DEPENDENCY_TOOL_GROUP_IDS).not.toContain('management');
@@ -259,7 +258,6 @@ describe('tool-catalog', () => {
         'management.app',
         'management.projects',
         'management.skills',
-        'management.marketplace',
         'management.automation',
       ]);
     expect(TOOL_GROUPS.filter((group) => group.parent === 'management'))
@@ -288,9 +286,6 @@ describe('tool-catalog', () => {
     expect(toolNamesForGroups(['management.skills'])).toEqual([
       'skill_search', 'import_skill_package',
     ]);
-    expect(toolNamesForGroups(['management.marketplace'])).toEqual([
-      'marketplace_search', 'marketplace_request_install',
-    ]);
     // Creating a project and relocating the conversation is Commander's call, so
     // the shared backlog group must not carry it into an Agent dependency.
     expect(toolNamesForGroups(['management.projects'])).toEqual(['todo_tasks', 'project_setup']);
@@ -308,7 +303,6 @@ describe('tool-catalog', () => {
       'management.app',
       'management.projects',
       'management.skills',
-      'management.marketplace',
       'management.automation',
     ]);
     expect(toolNamesForGroups(['management'])).toEqual([
@@ -316,8 +310,6 @@ describe('tool-catalog', () => {
       'project_setup',
       'skill_search',
       'import_skill_package',
-      'marketplace_search',
-      'marketplace_request_install',
       'auto_tasks',
       'open_app_view',
       'app_health',

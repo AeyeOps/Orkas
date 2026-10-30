@@ -64,8 +64,6 @@ const BEHAVIOR_SUITE_BY_TOOL: Record<string, string> = {
   skill_manage: 'src/core-agent/test/evolution.test.ts',
   skill_search: 'test/main/features/group_chat/bus-integration.test.ts',
   import_skill_package: 'test/main/features/group_chat/bus-integration.test.ts',
-  marketplace_search: 'test/main/features/group_chat/bus-integration.test.ts',
-  marketplace_request_install: 'test/main/features/group_chat/bus-integration.test.ts',
   auto_tasks: 'test/main/features/auto_tasks_tool.test.ts',
   dispatch_to: 'test/main/features/group_chat/bus-integration.test.ts',
   hand_off_to: 'test/main/features/group_chat/bus-integration.test.ts',

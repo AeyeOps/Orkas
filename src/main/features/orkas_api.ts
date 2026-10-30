@@ -1,8 +1,7 @@
-/** Public Orkas API identifiers used by the open-source BYO-key adapters. */
-
 export const ORKAS_API_PROVIDER = 'orkas-api';
-export const ORKAS_API_BASE_URL = 'https://orkas.ai/v1';
-export const ORKAS_API_KEYS_URL = 'https://orkas.ai/views/account/account.html#api-keys';
+export function orkasApiBaseUrl(): never {
+  throw new Error('Orkas vendor services are unavailable in this build');
+}
 
 export const ORKAS_API_DEFAULT_LLM_MODEL = 'orkas-llm-1.5';
 export const ORKAS_API_LLM_MODELS = [

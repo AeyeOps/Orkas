@@ -652,7 +652,7 @@ describe('tool-surface', () => {
   it('maps deferred names and purposes to loadable groups without repeating active tool descriptions', () => {
     const options = {
       availableToolNames: [
-        'read_files', 'write_file', 'publish_outputs', 'create_pdf', 'web_search', 'marketplace_search',
+        'read_files', 'write_file', 'publish_outputs', 'create_pdf', 'web_search', 'app_health',
       ],
       hostPreloadGroups: ['workspace.read', 'web'],
       hostRequiredToolNames: ['publish_outputs'],
@@ -687,7 +687,7 @@ describe('tool-surface', () => {
     expect(block).not.toContain('Fallback only');
     expect(block).toContain('`workspace.write.output` — Workspace output.\n      - `write_file` — Write a text file.');
     expect(block).toContain('`office.pdf` — PDF.\n    - `create_pdf` — Create a PDF from Markdown or HTML.');
-    expect(block).toContain('`management.marketplace` — Marketplace management.\n    - `marketplace_search` — Search the marketplace.');
+    expect(block).toContain('`management.app` — App support.\n    - `app_health` — Read-only sanitized app diagnosis snapshot.');
     expect(block).not.toContain('`read_files`');
     expect(block).not.toContain('`publish_outputs`');
     expect(block).not.toContain('`web_search`');

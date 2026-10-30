@@ -237,11 +237,10 @@ describe('prompts › Commander Skill ownership boundary', () => {
     const commander = prompts.load('chat_commander', {});
     const listed = commander.indexOf("For Commander-owned work, read a matching listed Skill's `SKILL.md` and follow it");
     const otherAvailable = commander.indexOf('if none matches, use `skill_search`');
-    const marketplace = commander.indexOf('the marketplace only if no available Skill fits');
 
     expect(listed).toBeGreaterThanOrEqual(0);
     expect(otherAvailable).toBeGreaterThan(listed);
-    expect(marketplace).toBeGreaterThan(otherAvailable);
+    expect(commander).toContain('find an available local or bundled Skill');
     expect(commander).not.toMatch(/listed external Skills|installed\/global Skills/i);
   });
 });

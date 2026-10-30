@@ -1,5 +1,3 @@
-import * as fs from 'node:fs';
-import * as path from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { getBuiltinModel } from '@earendil-works/pi-ai/providers/all';
 import {
@@ -32,7 +30,6 @@ describe('provider_catalog › CATALOG', () => {
     // OpenAI / Google / Anthropic），CN 主流（Zhipu / Moonshot / Kimi-Coding /
     // MiniMax × 3 / Doubao），最后聚合器（OpenRouter）。
     expect(ids).toEqual([
-      'orkas-api',
       'deepseek',
       'openai-codex',
       'openai',
@@ -86,23 +83,6 @@ describe('provider_catalog › CATALOG', () => {
 });
 
 describe('provider_catalog › CURATED_MODELS', () => {
-  it('describes both Orkas official models with their product-facing names', () => {
-    expect(providerLabel('orkas-api')).toBe('Orkas');
-    expect(curatedModelsFor('orkas-api')).toEqual([
-      expect.objectContaining({
-        id: 'orkas-llm-1.5',
-        name: 'Orkas-1.5',
-        recommended: true,
-        includedModels: ['DeepSeek V4', 'GPT-5.6 Luna', 'Claude-Sonnet-5', 'Gemini-3.6 Flash'],
-      }),
-      expect.objectContaining({
-        id: 'orkas-llm-1.5-pro',
-        name: 'Orkas-1.5 Pro',
-        includedModels: ['GPT-5.6 Sol', 'Claude Opus 5', 'Kimi K3'],
-      }),
-    ]);
-  });
-
   it('curates every visible non-oauth-only provider', () => {
     // Every visible provider should have a curated list — no silent fall-
     // through to pickLatestGenerations for providers we advertise.
@@ -378,160 +358,10 @@ describe('provider_catalog › CURATED_MODELS', () => {
     } as any)).toBe(20);
   });
 
-  it('accepts the capability-field matrix and rejects conflicts or invalid field types', async () => {
-    const users = await import('../../../src/main/features/users');
-    const paths = await import('../../../src/main/paths');
-    const storage = await import('../../../src/main/storage');
-    const uid = 'configuredcapabilitymatrix';
-    users.activateUser(uid);
-    const file = paths.userRemoteConfigFile(uid);
-    const cases: Array<{
-      id: string;
-      supportsVision?: unknown;
-      maxInputImages?: unknown;
-      accepted: boolean;
-    }> = [
-      { id: 'omitted-omitted', accepted: true },
-      { id: 'omitted-zero', maxInputImages: 0, accepted: true },
-      { id: 'omitted-positive', maxInputImages: 12, accepted: true },
-      { id: 'true-omitted', supportsVision: true, accepted: true },
-      { id: 'true-zero', supportsVision: true, maxInputImages: 0, accepted: false },
-      { id: 'true-positive', supportsVision: true, maxInputImages: 12, accepted: true },
-      { id: 'false-omitted', supportsVision: false, accepted: true },
-      { id: 'false-zero', supportsVision: false, maxInputImages: 0, accepted: true },
-      { id: 'false-positive', supportsVision: false, maxInputImages: 12, accepted: false },
-      { id: 'invalid-omitted', supportsVision: 'yes', accepted: false },
-      { id: 'invalid-zero', supportsVision: 'yes', maxInputImages: 0, accepted: false },
-      { id: 'invalid-positive', supportsVision: 'yes', maxInputImages: 12, accepted: false },
-      { id: 'invalid-invalid', supportsVision: 'yes', maxInputImages: '12', accepted: false },
-      { id: 'omitted-invalid', maxInputImages: '12', accepted: false },
-      { id: 'true-invalid', supportsVision: true, maxInputImages: '12', accepted: false },
-      { id: 'false-invalid', supportsVision: false, maxInputImages: '12', accepted: false },
-      { id: 'negative-limit', maxInputImages: -1, accepted: false },
-      { id: 'fractional-limit', maxInputImages: 1.5, accepted: false },
-      { id: 'boolean-limit', maxInputImages: true, accepted: false },
-      { id: 'null-limit', maxInputImages: null, accepted: false },
-      { id: 'object-limit', maxInputImages: { count: 12 }, accepted: false },
-    ];
-    const providers = Object.fromEntries(cases.map((entry) => [entry.id, [{
-      id: `${entry.id}-model`,
-      ...('supportsVision' in entry ? { supportsVision: entry.supportsVision } : {}),
-      ...('maxInputImages' in entry ? { maxInputImages: entry.maxInputImages } : {}),
-    }]]));
-    storage.writeJsonSync(file, {
-      version: 1,
-      active: { immediate: { model_catalog: { providers } } },
-    });
-    try {
-      for (const entry of cases) {
-        const models = curatedModelsFor(entry.id);
-        if (entry.accepted) {
-          expect(models, entry.id).toHaveLength(1);
-        } else {
-          expect(models, entry.id).toEqual([]);
-        }
-      }
-      expect(curatedModelsFor('false-zero')).toEqual([{
-        id: 'false-zero-model',
-        name: 'false-zero-model',
-        supportsVision: false,
-        maxInputImages: 0,
-      }]);
-    } finally {
-      fs.rmSync(path.dirname(file), { recursive: true, force: true });
-    }
-  });
-
-  it('curatedModelsFor can be overridden by Server remote-config cache', async () => {
-    const users = await import('../../../src/main/features/users');
-    const paths = await import('../../../src/main/paths');
-    const storage = await import('../../../src/main/storage');
-    const uid = 'modelcfgtest';
-    users.activateUser(uid);
-    const file = paths.userRemoteConfigFile(uid);
-    storage.writeJsonSync(file, {
-      version: 1,
-      active: {
-        immediate: {
-          model_catalog: {
-            providers: {
-              openai: [{ id: 'gpt-test-next', name: 'GPT Test Next' }],
-            },
-          },
-        },
-      },
-    });
-    try {
-      expect(curatedModelsFor('openai')).toEqual([
-        { id: 'gpt-test-next', name: 'GPT Test Next' },
-      ]);
-      expect(curatedModelsFor('anthropic').length).toBeGreaterThan(0);
-      expect(CURATED_MODELS.openai?.[0]?.id).not.toBe('gpt-test-next');
-    } finally {
-      fs.rmSync(path.dirname(file), { recursive: true, force: true });
-    }
-  });
-
-  it('curatedModelsFor reflects a Server model upgrade and removal', async () => {
-    const users = await import('../../../src/main/features/users');
-    const paths = await import('../../../src/main/paths');
-    const storage = await import('../../../src/main/storage');
-    const uid = 'modelcfgupgrade';
-    users.activateUser(uid);
-    const file = paths.userRemoteConfigFile(uid);
-    storage.writeJsonSync(file, {
-      version: 1,
-      active: {
-        immediate: {
-          model_catalog: {
-            providers: {
-              anthropic: [
-                { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
-                { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
-              ],
-            },
-          },
-        },
-      },
-    });
-    try {
-      expect(curatedModelsFor('anthropic').map((m) => m.id)).toEqual([
-        'claude-opus-4-8',
-        'claude-opus-4-7',
-      ]);
-      expect(curatedModelsFor('anthropic').map((m) => m.id)).not.toContain('claude-opus-4-6');
-      expect(curatedModelsFor('anthropic').map((m) => m.id)).not.toContain('claude-sonnet-4-6');
-      expect(curatedModelsFor('openai').length).toBeGreaterThan(0);
-    } finally {
-      fs.rmSync(path.dirname(file), { recursive: true, force: true });
-    }
-  });
-
-  it('resolves configured model ids by cloning a same-family pi-ai template', async () => {
-    const users = await import('../../../src/main/features/users');
-    const paths = await import('../../../src/main/paths');
-    const storage = await import('../../../src/main/storage');
-    const uid = 'modelcfgfallback';
-    users.activateUser(uid);
-    const file = paths.userRemoteConfigFile(uid);
-    storage.writeJsonSync(file, {
-      version: 1,
-      active: {
-        immediate: {
-          model_catalog: {
-            providers: {
-              anthropic: [
-                { id: 'claude-opus-4-8', name: 'Claude Opus 4.8' },
-                { id: 'claude-opus-4-7', name: 'Claude Opus 4.7' },
-              ],
-            },
-          },
-        },
-      },
-    });
+  it('resolves bundled model ids by cloning a same-family pi-ai template', () => {
     const template = {
-      id: 'claude-opus-4-7',
-      name: 'Claude Opus 4.7',
+      id: 'claude-opus-5',
+      name: 'Claude Opus 5',
       api: 'anthropic-messages',
       provider: 'anthropic',
       baseUrl: 'https://api.anthropic.com',
@@ -543,44 +373,35 @@ describe('provider_catalog › CURATED_MODELS', () => {
     };
     const catalog = {
       getPiModel(provider: string, model: string) {
-        return provider === 'anthropic' && model === 'claude-opus-4-7'
-          ? template as any
-          : undefined;
+        return provider === 'anthropic' && model === template.id ? template as any : undefined;
       },
     };
-    try {
-      const resolved = resolveConfiguredPiModel(catalog, 'anthropic', 'claude-opus-4-8');
-      expect(resolved?.needsCustomModel).toBe(true);
-      expect(resolved?.isConfiguredFallback).toBe(true);
-      expect(resolved?.templateModelId).toBe('claude-opus-4-7');
-      expect(resolved?.model.id).toBe('claude-opus-4-8');
-      expect(resolved?.model.name).toBe('Claude Opus 4.8');
-      expect(resolved?.model.api).toBe(template.api);
-
-      const exactCatalog = {
-        getPiModel(provider: string, model: string) {
-          return provider === 'anthropic' && model === 'claude-opus-4-8'
-            ? { ...template, id: 'claude-opus-4-8', name: 'Claude Opus 4.8' } as any
-            : undefined;
-        },
-      };
-      const exact = resolveConfiguredPiModel(exactCatalog, 'anthropic', 'claude-opus-4-8');
-      expect(exact?.needsCustomModel).toBe(false);
-      expect(exact?.isConfiguredFallback).toBe(false);
-      expect(exact?.templateModelId).toBe('claude-opus-4-8');
-
-      const wrongFamilyCatalog = {
-        getPiModel(provider: string, model: string) {
-          return provider === 'anthropic' && model === 'claude-haiku-4-8'
-            ? { ...template, id: 'claude-haiku-4-8', name: 'Claude Haiku 4.8' } as any
-            : undefined;
-        },
-      };
-      expect(resolveConfiguredPiModel(wrongFamilyCatalog, 'anthropic', 'claude-opus-4-8')).toBeNull();
-      expect(resolveConfiguredPiModel(catalog, 'anthropic', 'claude-opus-4-9')).toBeNull();
-    } finally {
-      fs.rmSync(path.dirname(file), { recursive: true, force: true });
-    }
+    const resolved = resolveConfiguredPiModel(catalog, 'anthropic', 'claude-opus-5-5');
+    expect(resolved).toMatchObject({
+      needsCustomModel: true,
+      isConfiguredFallback: true,
+      templateModelId: template.id,
+      model: { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', api: template.api },
+    });
+    const exactCatalog = {
+      getPiModel(provider: string, model: string) {
+        return provider === 'anthropic' && model === 'claude-opus-5-5'
+          ? { ...template, id: 'claude-opus-5-5', name: 'Claude Opus 5.5' } as any : undefined;
+      },
+    };
+    expect(resolveConfiguredPiModel(exactCatalog, 'anthropic', 'claude-opus-5-5')).toMatchObject({
+      needsCustomModel: true,
+      isConfiguredFallback: false,
+      templateModelId: 'claude-opus-5-5',
+    });
+    const wrongFamilyCatalog = {
+      getPiModel(provider: string, model: string) {
+        return provider === 'anthropic' && model === 'claude-haiku-5-5'
+          ? { ...template, id: 'claude-haiku-5-5', name: 'Claude Haiku 5.5' } as any : undefined;
+      },
+    };
+    expect(resolveConfiguredPiModel(wrongFamilyCatalog, 'anthropic', 'claude-opus-5-5')).toBeNull();
+    expect(resolveConfiguredPiModel(catalog, 'anthropic', 'claude-opus-future')).toBeNull();
   });
 });
 
@@ -630,9 +451,7 @@ describe('provider_catalog › EXTERNAL_API_PROVIDERS', () => {
     // `auth.ts::testConnection` 的分发依据——名单必须和 CATALOG 里真实
     // 标记为"外部"的 provider 严格一致，否则会出现"能选但调用报
     // No model found for provider"。
-    // 当前外部适配层还包含公开 Orkas API（OpenAI-compatible chat）。
     expect([...EXTERNAL_API_PROVIDERS]).toEqual([
-      'orkas-api',
       'moonshot',
       'deepseek',
       'doubao',

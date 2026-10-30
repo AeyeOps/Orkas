@@ -159,39 +159,21 @@ describe('clearable cache', () => {
     expect(protectedFiles.every((file) => fs.readFileSync(file, 'utf8') === 'keep')).toBe(true);
   });
 
-  it('turns the next Marketplace detail open into a refetch and rebuilds the cleared cache', async () => {
+  it('keeps cleared vendor detail caches empty when remote browsing is unavailable', async () => {
     const uid = 'rebuild';
     const { feature } = await loadForUser(uid);
     const cache = await import('../../../src/main/features/marketplace_cache');
     const marketplace = await import('../../../src/main/features/marketplace');
     const freshness = { version: '1.2.3', published_at: 123 };
     await cache.writeAgentCache('writer', { name: 'stale local copy' }, freshness, uid);
-
     await feature.clearBucket(uid, 'marketplace');
     expect(await cache.readAgentCache('writer', uid)).toBeNull();
-
-    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
-      code: 0,
-      agent_json: { name: 'fresh server copy' },
-      version: freshness.version,
-      category: 'writing',
-      published_at: freshness.published_at,
-      agent_json_url: 'https://cdn.example.test/writer.json',
-      create_uid: 'publisher',
-      status: 'approved',
-    }), {
-      status: 200,
-      headers: { 'content-type': 'application/json' },
-    }));
+    const fetchSpy = vi.spyOn(globalThis, 'fetch');
     try {
-      await expect(marketplace.getAgentDetail('writer', freshness, uid)).resolves.toMatchObject({
-        agent_json: { name: 'fresh server copy' },
-      });
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
-      await expect(cache.readAgentCache('writer', uid)).resolves.toEqual({
-        name: 'fresh server copy',
-      });
-      await expect(cache.isCacheFresh('agent', 'writer', freshness, uid)).resolves.toBe(true);
+      await expect(marketplace.getAgentDetail('writer', freshness, uid))
+        .rejects.toThrow('Orkas vendor services are unavailable in this build');
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(await cache.readAgentCache('writer', uid)).toBeNull();
     } finally {
       fetchSpy.mockRestore();
     }

@@ -13,20 +13,6 @@
 const _settingsLog = createLogger('settings');
 const _OPENROUTER_CUSTOM_MODEL_VALUE = '__openrouter_custom_model__';
 const _ORKAS_API_PROVIDER_ID = 'orkas-api';
-const _ORKAS_API_KEYS_URL = 'https://orkas.ai/views/account/account.html#api-keys';
-
-function _settingsLocalizedOrkasWebUrl(rawUrl) {
-  try {
-    const url = new URL(String(rawUrl || ''));
-    if (url.origin !== 'https://orkas.ai') return String(rawUrl || '');
-    const current = String(typeof getLang === 'function' ? getLang() : 'en').trim().toLowerCase();
-    const lang = ['zh', 'en', 'ja', 'pt'].includes(current) ? current : 'en';
-    url.searchParams.set('lang', lang);
-    return url.toString();
-  } catch (_) {
-    return String(rawUrl || '');
-  }
-}
 
 function _settingsIsOpenRouterCustomModel(providerId, modelId) {
   return providerId === 'openrouter' && modelId === _OPENROUTER_CUSTOM_MODEL_VALUE;
@@ -62,7 +48,7 @@ let _settingsState = {
   clientConfigBound: false,
   recycleBound: false,
   orkasApiCredential: null,
-  orkasApiEditing: false,
+  orkasApiBound: false,
 };
 
 function _settingsLogOperationResult(eventAction, startedAt, result, data, errorCode = '', errorType = 'operation') {
@@ -1001,7 +987,6 @@ window.addEventListener('i18n-change', () => {
   _settingsRenderImageSection();
   _settingsRenderVideoSection();
   _settingsRenderTtsEntries();
-  _settingsRenderOrkasApiCard();
   _settingsRenderMetacognition();
   _settingsRenderAddModalTitle();
 });
@@ -1028,7 +1013,7 @@ function _settingsBindModelTabsOnce() {
     });
     btn.addEventListener('keydown', (e) => {
       if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(e.key)) return;
-      const list = _settingsQueryAll('[data-settings-model-tab]');
+      const list = _settingsQueryAll('[data-settings-model-tab]').filter((tab) => !tab.hidden);
       const idx = list.indexOf(btn);
       if (idx < 0) return;
       e.preventDefault();
@@ -1043,11 +1028,8 @@ function _settingsBindModelTabsOnce() {
 }
 
 function _settingsActivateModelTab(kind, opts = {}) {
-  const target = _SETTINGS_MODEL_KINDS.includes(kind) ? kind : 'chat';
-  // `click_settings_model_tab` — explicit user selection of a Models purpose
-  // sub-tab (mouse or arrow keys). Bounded payload: the purpose id only.
-  if (opts.explicit) {
-  }
+  const tab = document.getElementById(`settings-model-tab-${kind}`);
+  const target = _SETTINGS_MODEL_KINDS.includes(kind) && tab && !tab.hidden ? kind : 'chat';
   _settingsState.modelTab = target;
   _settingsQueryAll('[data-settings-model-tab]').forEach((btn) => {
     const active = btn.dataset.settingsModelTab === target;
@@ -1160,24 +1142,16 @@ async function _settingsRefreshProviders() {
 async function _settingsRefreshEntries() {
   const res = await window.orkas.invoke('auth.listEntries', { includeUnavailable: true });
   _settingsState.entries = (res && res.ok && Array.isArray(res.entries)) ? res.entries : [];
-  _settingsRenderOrkasApiCard();
   _settingsEmitModelEntriesChanged();
 }
 
 function _settingsRenderOrkasApiCard() {
   const credential = _settingsState.orkasApiCredential;
   const configured = !!(credential && credential.configured);
-  const saved = document.getElementById('settings-orkas-api-saved');
-  const editor = document.getElementById('settings-orkas-api-editor');
+  const group = document.getElementById('settings-orkas-api-group');
   const masked = document.getElementById('settings-orkas-api-key-masked');
-  const cancel = document.getElementById('settings-orkas-api-cancel');
-  if (saved) saved.hidden = !configured;
-  if (editor) editor.hidden = configured && !_settingsState.orkasApiEditing;
-  if (cancel) cancel.hidden = !configured || !_settingsState.orkasApiEditing;
+  if (group) group.hidden = !configured;
   if (masked) masked.textContent = configured ? String(credential.keyMasked || '') : '';
-  const status = document.getElementById('settings-orkas-api-status');
-  const key = status && status.getAttribute('data-i18n');
-  if (status && key) status.textContent = t(key);
 }
 
 async function _settingsRefreshOrkasApiCredential() {
@@ -1202,40 +1176,13 @@ async function _settingsRefreshAllCredentialSections() {
   _settingsRenderImageSection();
   _settingsRenderVideoSection();
   _settingsRenderTtsEntries();
-  _settingsRenderOrkasApiCard();
 }
 
 function _settingsBindOrkasApiOnce() {
   if (_settingsState.orkasApiBound) return;
-  const createBtn = document.getElementById('settings-orkas-api-create-key');
-  const configureBtn = document.getElementById('settings-orkas-api-configure');
-  const editBtn = document.getElementById('settings-orkas-api-edit');
   const deleteBtn = document.getElementById('settings-orkas-api-delete');
-  const cancelBtn = document.getElementById('settings-orkas-api-cancel');
-  const keyInput = document.getElementById('settings-orkas-api-key-input');
-  if (!createBtn || !configureBtn || !editBtn || !deleteBtn || !cancelBtn || !keyInput) return;
+  if (!deleteBtn) return;
   _settingsState.orkasApiBound = true;
-
-  createBtn.addEventListener('click', async () => {
-    const url = _settingsLocalizedOrkasWebUrl(_ORKAS_API_KEYS_URL);
-    const res = await window.orkas.invoke('auth.openExternal', { url });
-    if (!res || !res.ok) {
-      _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.open_failed');
-    }
-  });
-
-  editBtn.addEventListener('click', () => {
-    _settingsState.orkasApiEditing = true;
-    keyInput.value = '';
-    _settingsRenderOrkasApiCard();
-    keyInput.focus();
-  });
-
-  cancelBtn.addEventListener('click', () => {
-    _settingsState.orkasApiEditing = false;
-    keyInput.value = '';
-    _settingsRenderOrkasApiCard();
-  });
 
   deleteBtn.addEventListener('click', async () => {
     if (!(await uiConfirm(t('settings.orkas_api.delete_confirm')))) return;
@@ -1244,11 +1191,8 @@ function _settingsBindOrkasApiOnce() {
       const res = await window.orkas.invoke('orkasApi.remove');
       if (!res || !res.ok) throw new Error((res && res.error) || t('settings.orkas_api.delete_failed'));
       _settingsState.orkasApiCredential = null;
-      _settingsState.orkasApiEditing = false;
       await _settingsRefreshAllCredentialSections();
-      if (typeof refreshModelGuard === 'function') {
-        await Promise.resolve(refreshModelGuard()).catch(() => {});
-      }
+      if (typeof refreshModelGuard === 'function') await refreshModelGuard();
       _settingsSetStatus('settings-orkas-api-status', '', '');
     } catch (err) {
       _settingsSetStatus(
@@ -1259,49 +1203,6 @@ function _settingsBindOrkasApiOnce() {
     } finally {
       deleteBtn.disabled = false;
     }
-  });
-
-  const configure = async () => {
-    const apiKey = String(keyInput.value || '').trim();
-    if (!apiKey) {
-      _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.key_required');
-      return;
-    }
-    configureBtn.disabled = true;
-    _settingsSetI18nStatus('settings-orkas-api-status', 'busy', 'settings.orkas_api.configuring');
-    try {
-      const res = await window.orkas.invoke('orkasApi.save', { apiKey });
-      if (!res || !res.ok) {
-        if (res && res.error) {
-          _settingsSetStatus('settings-orkas-api-status', 'error', res.error);
-        } else {
-          _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.configure_failed');
-        }
-        return;
-      }
-      keyInput.value = '';
-      _settingsState.orkasApiCredential = res;
-      _settingsState.orkasApiEditing = false;
-      await _settingsRefreshAllCredentialSections();
-      if (typeof refreshModelGuard === 'function') {
-        await Promise.resolve(refreshModelGuard()).catch(() => {});
-      }
-      _settingsSetStatus('settings-orkas-api-status', '', '');
-    } catch (err) {
-      if (err && err.message) {
-        _settingsSetStatus('settings-orkas-api-status', 'error', err.message);
-      } else {
-        _settingsSetI18nStatus('settings-orkas-api-status', 'error', 'settings.orkas_api.configure_failed');
-      }
-    } finally {
-      configureBtn.disabled = false;
-    }
-  };
-  configureBtn.addEventListener('click', configure);
-  keyInput.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter' || event.isComposing) return;
-    event.preventDefault();
-    void configure();
   });
 }
 
@@ -2084,8 +1985,9 @@ function _settingsRenderEntries() {
   const displayedEntries = _settingsState.entries.filter((entry) => (
     entry && entry.profileType !== 'managed'
   ));
+  const defaultEntry = displayedEntries.find((entry) => !_settingsEntryProblem(entry));
   displayedEntries.forEach((entry, idx) => {
-    container.appendChild(_settingsRenderEntryRow(entry, idx));
+    container.appendChild(_settingsRenderEntryRow(entry, idx, entry === defaultEntry));
   });
 }
 
@@ -2145,17 +2047,17 @@ async function _settingsUpdateEntryModel(entry, model, modelSel) {
   return true;
 }
 
-function _settingsRenderEntryRow(entry, priorityIdx) {
+function _settingsRenderEntryRow(entry, priorityIdx, isDefault) {
+  const entryProblem = _settingsEntryProblem(entry);
   const row = document.createElement('div');
-  row.className = 'entry-row' + (priorityIdx === 0 ? ' is-default' : '');
+  row.className = 'entry-row' + (isDefault ? ' is-default' : '');
   row.dataset.entryId = entry.entryId;
   row.draggable = true;
 
   const rank = document.createElement('div');
   rank.className = 'entry-rank';
-  rank.textContent = priorityIdx === 0
-    ? t('settings.entries.default_tag')
-    : `#${priorityIdx + 1}`;
+  rank.textContent = entryProblem ? t('new_chat.model_picker.unavailable')
+    : isDefault ? t('settings.entries.default_tag') : `#${priorityIdx + 1}`;
   row.appendChild(rank);
 
   const main = document.createElement('div');
@@ -2239,7 +2141,6 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
 
   const status = document.createElement('div');
   status.className = 'entry-status';
-  const entryProblem = _settingsEntryProblem(entry);
   if (entryProblem) {
     status.className += ' error';
     status.textContent = entryProblem;
@@ -2269,9 +2170,8 @@ function _settingsRenderEntryRow(entry, priorityIdx) {
     id: entry.entryId,
     getIds: () => _settingsState.entries.map((e) => e.entryId),
     ipcName: 'auth.reorderEntries',
-    onSuccess: (res) => {
-      _settingsState.entries = Array.isArray(res.entries) ? res.entries : _settingsState.entries;
-      _settingsEmitModelEntriesChanged();
+    onSuccess: async () => {
+      await _settingsRefreshEntries();
       _settingsRenderEntries();
     },
   });
@@ -2493,7 +2393,6 @@ function _settingsOrkasServiceLabel(service) {
 }
 
 const _SEARCH_PROVIDER_OPTIONS = [
-  { id: 'orkas-api',          label: _settingsOrkasServiceLabel('Search'), docs: _ORKAS_API_KEYS_URL },
   { id: 'tavily',            label: 'Tavily', docs: 'https://tavily.com/' },
   { id: 'serper',            label: 'Serper', docs: 'https://serper.dev/' },
   { id: 'brave-search',      label: 'Brave', docs: 'https://brave.com/search/api/' },
@@ -2509,7 +2408,6 @@ function _searchProviderLabel(id) {
 async function _settingsRefreshSearchProfiles() {
   const res = await window.orkas.invoke('searchAuth.list');
   _settingsState.searchProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
-  _settingsRenderOrkasApiCard();
 }
 
 function _settingsRenderSearchSection() {
@@ -2573,12 +2471,15 @@ function _settingsRenderSearchEntries() {
   }
   list.forEach((p, idx) => {
     const row = document.createElement('div');
-    row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
+    const available = p.provider !== _ORKAS_API_PROVIDER_ID;
+    const isDefault = available && list.find((profile) => profile.provider !== _ORKAS_API_PROVIDER_ID)?.id === p.id;
+    row.className = 'entry-row' + (isDefault ? ' is-default' : '');
     row.dataset.profileId = p.id;
 
     const rank = document.createElement('div');
     rank.className = 'entry-rank';
-    rank.textContent = idx === 0 ? t('settings.search.active_tag') : `#${idx + 1}`;
+    rank.textContent = !available ? t('new_chat.model_picker.unavailable')
+      : isDefault ? t('settings.search.active_tag') : `#${idx + 1}`;
     row.appendChild(rank);
 
     const main = document.createElement('div');
@@ -2596,6 +2497,12 @@ function _settingsRenderSearchEntries() {
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
     `;
     main.appendChild(primary);
+    if (!available) {
+      const reason = document.createElement('div');
+      reason.className = 'form-hint';
+      reason.textContent = t('app.vendor_services_unavailable');
+      main.appendChild(reason);
+    }
     row.appendChild(main);
 
     const actions = document.createElement('div');
@@ -2637,7 +2544,6 @@ function _settingsRenderSearchEntries() {
 // still persists provider=doubao plus the selected model id.
 
 const _IMAGE_PROVIDER_OPTIONS = [
-  { id: 'orkas-api', label: _settingsOrkasServiceLabel('Image'), docs: _ORKAS_API_KEYS_URL },
   { id: 'openai',  label: 'OpenAI · GPT Image 2', docs: 'https://platform.openai.com/api-keys' },
   { id: 'google',  label: 'Google · Nano Banana 2', docs: 'https://aistudio.google.com/app/apikey' },
   { id: 'doubao',  label: 'DouBao · Seedream', docs: 'https://console.volcengine.com/ark/region:ark+cn-beijing/apiKey' },
@@ -2655,7 +2561,6 @@ async function _settingsRefreshImageProfiles() {
   const res = await window.orkas.invoke('imageAuth.list');
   _settingsState.imageProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
   _settingsState.imageProviderOptions = res?.ok && res.providers?.length ? res.providers : _IMAGE_PROVIDER_OPTIONS;
-  _settingsRenderOrkasApiCard();
 }
 
 function _settingsRenderImageSection() {
@@ -2719,12 +2624,15 @@ function _settingsRenderImageEntries() {
   }
   list.forEach((p, idx) => {
     const row = document.createElement('div');
-    row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
+    const available = p.provider !== _ORKAS_API_PROVIDER_ID;
+    const isDefault = available && list.find((profile) => profile.provider !== _ORKAS_API_PROVIDER_ID)?.id === p.id;
+    row.className = 'entry-row' + (isDefault ? ' is-default' : '');
     row.dataset.profileId = p.id;
 
     const rank = document.createElement('div');
     rank.className = 'entry-rank';
-    rank.textContent = idx === 0 ? t('settings.image.active_tag') : `#${idx + 1}`;
+    rank.textContent = !available ? t('new_chat.model_picker.unavailable')
+      : isDefault ? t('settings.image.active_tag') : `#${idx + 1}`;
     row.appendChild(rank);
 
     const main = document.createElement('div');
@@ -2742,6 +2650,12 @@ function _settingsRenderImageEntries() {
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
     `;
     main.appendChild(primary);
+    if (!available) {
+      const reason = document.createElement('div');
+      reason.className = 'form-hint';
+      reason.textContent = t('app.vendor_services_unavailable');
+      main.appendChild(reason);
+    }
     row.appendChild(main);
 
     const actions = document.createElement('div');
@@ -2781,9 +2695,7 @@ function _settingsRenderImageEntries() {
 // Dedicated BYO video-generation credentials. The open-source build exposes
 // User-owned provider keys only; bundled video providers stay stripped.
 
-const _VIDEO_AUTH_PROVIDER_OPTIONS = [
-  { id: 'orkas-api', label: _settingsOrkasServiceLabel('Video'), docs: _ORKAS_API_KEYS_URL },
-];
+const _VIDEO_AUTH_PROVIDER_OPTIONS = [];
 
 function _settingsVideoProviderOptions() {
   return Array.isArray(_settingsState.videoAuthProviderOptions) && _settingsState.videoAuthProviderOptions.length
@@ -2805,10 +2717,12 @@ function _settingsSelectedVideoProvider() {
 async function _settingsRefreshVideoProfiles() {
   const res = await window.orkas.invoke('videoAuth.list');
   _settingsState.videoProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
+  const tab = document.getElementById('settings-model-tab-video');
+  if (tab) tab.hidden = !_settingsVisibleApiProfiles(_settingsState.videoProfiles).length;
+  _settingsActivateModelTab(_settingsState.modelTab);
   _settingsState.videoAuthProviderOptions = (res && res.ok && Array.isArray(res.providers) && res.providers.length)
     ? res.providers
     : _VIDEO_AUTH_PROVIDER_OPTIONS;
-  _settingsRenderOrkasApiCard();
 }
 
 function _settingsRenderVideoSection() {
@@ -2906,7 +2820,7 @@ function _settingsRenderVideoEntries() {
     if (!available) {
       const reason = document.createElement('div');
       reason.className = 'form-hint';
-      reason.textContent = t('settings.video.provider_unavailable');
+      reason.textContent = t('app.vendor_services_unavailable');
       main.appendChild(reason);
     }
     row.appendChild(main);
@@ -2950,7 +2864,6 @@ async function _settingsRefreshTtsProfiles() {
   if (!res || !res.ok) return;
   _settingsState.ttsPresets = Array.isArray(res.presets) ? res.presets : [];
   _settingsState.ttsProfiles = Array.isArray(res.profiles) ? res.profiles : [];
-  _settingsRenderOrkasApiCard();
   const providerEl = document.getElementById('settings-tts-provider');
   if (providerEl && !_settingsState.ttsProviderSel) {
     _settingsState.ttsProviderSel = _aiSelectMount(providerEl, { placeholder: t('settings.tts.pick_provider') });
@@ -3085,12 +2998,15 @@ function _settingsRenderTtsEntries() {
   }
   list.forEach((p, idx) => {
     const row = document.createElement('div');
-    row.className = 'entry-row' + (idx === 0 ? ' is-default' : '');
+    const available = p.provider !== _ORKAS_API_PROVIDER_ID;
+    const isDefault = available && list.find((profile) => profile.provider !== _ORKAS_API_PROVIDER_ID)?.id === p.id;
+    row.className = 'entry-row' + (isDefault ? ' is-default' : '');
     row.dataset.profileId = p.id;
 
     const rank = document.createElement('div');
     rank.className = 'entry-rank';
-    rank.textContent = idx === 0 ? t('settings.tts.active_tag') : `#${idx + 1}`;
+    rank.textContent = !available ? t('new_chat.model_picker.unavailable')
+      : isDefault ? t('settings.tts.active_tag') : `#${idx + 1}`;
     row.appendChild(rank);
 
     const main = document.createElement('div');
@@ -3112,6 +3028,12 @@ function _settingsRenderTtsEntries() {
       ${p.apiKeyMasked ? `<span class="account-mask">${escapeHtml(p.apiKeyMasked)}</span>` : ''}
     `;
     main.appendChild(primary);
+    if (!available) {
+      const reason = document.createElement('div');
+      reason.className = 'form-hint';
+      reason.textContent = t('app.vendor_services_unavailable');
+      main.appendChild(reason);
+    }
     row.appendChild(main);
 
     const actions = document.createElement('div');

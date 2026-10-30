@@ -135,8 +135,6 @@ export function enumerateAllInjectedToolNames(): Set<string> {
     'skill_search',
     'import_skill_package',
     'auto_tasks',
-    'marketplace_search',
-    'marketplace_request_install',
     'dispatch_to',
     'hand_off_to',
     'run_worker',

@@ -29,14 +29,14 @@ describe('connector setup assistance context', () => {
     const setup = await import('../../../src/main/features/connector_setup_context');
     const conv = await chats.createConversation('u1', {
       title: 'Keep my title',
-      assistance: { kind: 'connector_setup', connector_id: 'notion' },
+      assistance: { kind: 'connector_setup', connector_id: 'feishu' },
     });
     const chatRoot = path.join(root, 'u1', 'cloud', 'chats');
     const files = ['_index.json', `${conv.conversation_id}/meta.json`, `${conv.conversation_id}.jsonl`];
     const before = files.map(file => fs.readFileSync(path.join(chatRoot, file), 'utf8'));
     const update = vi.spyOn(chats, 'updateConversation');
-    await setup.bindConnectorSetupAssistance('u1', conv.conversation_id, 'notion');
-    await setup.bindConnectorSetupAssistance('u1', conv.conversation_id, 'notion');
+    await setup.bindConnectorSetupAssistance('u1', conv.conversation_id, 'feishu');
+    await setup.bindConnectorSetupAssistance('u1', conv.conversation_id, 'feishu');
     expect(update).not.toHaveBeenCalled();
     expect(files.map(file => fs.readFileSync(path.join(chatRoot, file), 'utf8'))).toEqual(before);
     expect((await chats.getConversationMetadata('u1', conv.conversation_id))?.title).toBe('Keep my title');
@@ -47,7 +47,7 @@ describe('connector setup assistance context', () => {
     const chats = await import('../../../src/main/features/chats');
     const setup = await import('../../../src/main/features/connector_setup_context');
     const conv = await chats.createConversation('u1', {
-      assistance: { kind: 'connector_setup', connector_id: 'notion' },
+      assistance: { kind: 'connector_setup', connector_id: 'feishu' },
     });
     const first = await setup.formatConnectorSetupForTurn('u1', conv.conversation_id);
     // Older clients do not send the optional assistance field on ordinary edits.
@@ -55,7 +55,7 @@ describe('connector setup assistance context', () => {
     expect(await setup.formatConnectorSetupForTurn('u1', conv.conversation_id)).toBe(first);
     expect(first).toContain('proves neither an active setup nor a successful connection');
     await chats.deleteConversation('u1', conv.conversation_id);
-    await expect(setup.bindConnectorSetupAssistance('u1', conv.conversation_id, 'notion')).rejects.toThrow();
+    await expect(setup.bindConnectorSetupAssistance('u1', conv.conversation_id, 'feishu')).rejects.toThrow();
     expect(await setup.formatConnectorSetupForTurn('u1', conv.conversation_id)).toBe('');
     expect(await chats.getConversationMetadata('u1', conv.conversation_id)).toBeNull();
   });
@@ -86,7 +86,7 @@ describe('connector setup assistance context', () => {
     expect(fs.readFileSync(path.join(chatRoot, '_index.json'), 'utf8')).not.toContain(setup.connectorSetupGuidance());
     const fetched = await chats.getConversation('u1', conv.conversation_id);
     if (fetched?.assistance?.kind !== 'connector_setup') throw new Error('Missing connector association');
-    fetched.assistance.connector_id = 'notion';
+    fetched.assistance.connector_id = 'feishu';
     expect(await setup.formatConnectorSetupForTurn('u1', conv.conversation_id)).toBe(first);
 
     vi.resetModules();
@@ -99,18 +99,18 @@ describe('connector setup assistance context', () => {
     reloadedChats.invalidateConversationCaches('u1');
     await reloadedChats.repairConversationIndex('u1');
     expect(await reloaded.formatConnectorSetupForTurn('u1', conv.conversation_id)).toBe(first);
-    await reloaded.bindConnectorSetupAssistance('u1', conv.conversation_id, 'notion');
+    await reloaded.bindConnectorSetupAssistance('u1', conv.conversation_id, 'feishu');
     const next = await reloaded.formatConnectorSetupForTurn('u1', conv.conversation_id);
-    expect(next).toContain('"connector_id":"notion"');
+    expect(next).toContain('"connector_id":"feishu"');
     expect(next).not.toContain('xiaohongshu-seller');
-    await expect(reloaded.bindConnectorSetupAssistance('u2', conv.conversation_id, 'notion')).rejects.toThrow();
+    await expect(reloaded.bindConnectorSetupAssistance('u2', conv.conversation_id, 'feishu')).rejects.toThrow();
   });
 
   it('rejects invalid entry targets, while old or unavailable metadata cannot break ordinary conversation reads', async () => {
     const chats = await import('../../../src/main/features/chats');
     const setup = await import('../../../src/main/features/connector_setup_context');
-    for (const input of [null, {}, { kind: 'other', connector_id: 'notion' },
-      { kind: 'connector_setup', connector_id: '../notion' },
+    for (const input of [null, {}, { kind: 'other', connector_id: 'feishu' },
+      { kind: 'connector_setup', connector_id: '../feishu' },
       { kind: 'connector_setup', connector_id: 'unknown-provider' }]) {
       expect(() => setup.validateConnectorSetupAssistance(input)).toThrow();
     }
@@ -122,7 +122,7 @@ describe('connector setup assistance context', () => {
       kind: 'connector_setup', connector_id: 'removed-provider',
     });
     await chats.updateConversation('u1', conv.conversation_id, { assistance: {
-      kind: 'connector_setup', connector_id: 'notion', secret: 'must-not-persist',
+      kind: 'connector_setup', connector_id: 'feishu', secret: 'must-not-persist',
     } as any });
     const disk = fs.readFileSync(path.join(root, 'u1', 'cloud', 'chats', '_index.json'), 'utf8');
     expect(disk).not.toContain('must-not-persist');

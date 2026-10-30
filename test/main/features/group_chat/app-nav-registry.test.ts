@@ -386,7 +386,6 @@ describe('group_chat app_nav registry', () => {
 
   it('loads cold-start feature modules before invoking action-specific handlers', () => {
     const source = fs.readFileSync(RENDERER_CONVERSATION, 'utf8');
-    expect(source).toContain("_appNavLoadFeature('marketplace'");
     expect(source).toContain('window.openConnectorSetupById');
     expect(source).toContain('window.focusConnectorById');
     expect(source).toContain('window.openAgentModal');
@@ -425,9 +424,6 @@ describe('group_chat app_nav registry', () => {
 
     await surfaces.apps.open({ action: 'open' });
     expect(calls.splice(0)).toEqual(['view:apps']);
-
-    await surfaces.marketplace.open({ action: 'open' });
-    expect(calls.splice(0)).toEqual(['load:marketplace', 'marketplace:agent']);
   });
 
   it('executes every declared surface/action pair through its production owner', async () => {
@@ -455,7 +451,6 @@ describe('group_chat app_nav registry', () => {
       { surface: 'auto', request: { action: 'create' }, expected: ['view:auto', 'load:auto', 'auto:create'] },
       { surface: 'auto', request: { action: 'configure', target_id: 'task-1' }, expected: ['view:auto', 'load:auto', 'auto:configure:task-1'] },
       { surface: 'apps', request: { action: 'open' }, expected: ['view:apps'] },
-      { surface: 'marketplace', request: { action: 'open' }, expected: ['load:marketplace', 'marketplace:agent'] },
     ];
 
     for (const testCase of cases) {

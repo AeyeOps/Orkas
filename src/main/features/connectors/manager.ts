@@ -1924,7 +1924,7 @@ export async function removeInstance(
 export async function removeApiKeyConnectors(uid: string): Promise<number> {
   if (!uid) return 0;
   const ids = Object.values(registry.load(uid).connections)
-    .filter((instance) => findCatalogEntry(instance.id)?.auth_mode === 'composio')
+    .filter((instance) => !!instance.composio_grant)
     .map((instance) => instance.id);
   let removed = 0;
   for (const id of ids) {

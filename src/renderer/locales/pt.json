@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "Este recurso requer os serviços da Orkas e não está disponível nesta versão.",
   "dialog.context.application": "Solicitação do aplicativo",
   "dialog.context.background": "Solicitação em segundo plano",
   "dialog.context.requester": "Solicitado por: {name}",
