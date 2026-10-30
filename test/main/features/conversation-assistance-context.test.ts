@@ -70,7 +70,7 @@ describe('conversation entry assistance', () => {
       );
     }
     const conv = await chats.createConversation('u1', {
-      assistance: { kind: 'connector_setup', connector_id: 'notion' },
+      assistance: { kind: 'connector_setup', connector_id: 'feishu' },
     });
     const cid = conv.conversation_id;
     const original = await setup.formatConnectorSetupForTurn('u1', cid);

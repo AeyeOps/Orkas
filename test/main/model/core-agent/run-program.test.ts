@@ -53,7 +53,6 @@ const EXPECTED_PROGRAMMATIC_TOOL_NAMES = [
   'todo_tasks',
   'auto_tasks',
   'skill_search',
-  'marketplace_search',
   'app_health',
   'tool_result',
 ] as const;
@@ -85,7 +84,6 @@ const VALID_PROGRAMMATIC_INPUTS: Record<ProgrammaticToolName, Record<string, unk
   todo_tasks: { action: 'list' },
   auto_tasks: { action: 'list' },
   skill_search: { query: 'pdf' },
-  marketplace_search: { query: 'pdf' },
   app_health: {},
   tool_result: {},
 };
@@ -540,9 +538,7 @@ describe('run_program Host policy', () => {
       .resolves.toEqual({ allowed: true });
 
     await expect(policy.authorize('marketplace_search', { query: 'pdf' }, context()))
-      .resolves.toEqual({ allowed: true });
-    await expect(policy.authorize('marketplace_search', { query: 'pdf', install: true }, context()))
-      .resolves.toMatchObject({ allowed: false, code: 'E_PROGRAM_CATALOG_MUTATION_NOT_ALLOWED' });
+      .resolves.toMatchObject({ allowed: false, code: 'E_PROGRAM_CALLER_NOT_ALLOWED' });
   });
 
   it('exposes run_program only in normal task runtimes', () => {

@@ -73,56 +73,19 @@ afterEach(() => {
 });
 
 describe('video_gen › Orkas public API', () => {
-  it('creates, downloads, and saves a public API video without sending a model', async () => {
-    const fetchStub = vi.fn(async () => new Response(JSON.stringify({
-      id: 'video_public_test',
-      status: 'succeeded',
-      url: 'https://cdn.example.test/video.mp4',
-      duration: 5,
-      ratio: '16:9',
-      resolution: '720p',
-    }), { status: 202 }));
+  it('refuses a stored vendor profile before dispatch or writing an artifact', async () => {
+    const fetchStub = vi.fn();
     vi.stubGlobal('fetch', fetchStub);
-    const requestedPath = path.join(tmpDir, 'result.mov');
-
-    const result = await generateVideo({
-      prompt: 'a paper boat crosses a pond',
-      outputAbsPath: requestedPath,
-      quality: 'economy',
-      generateAudio: false,
-      usageContext: { conversationId: 'conv_123', turnId: 'turn-456' },
+    const outputAbsPath = path.join(tmpDir, 'result.mp4');
+    await expect(generateVideo({ prompt: 'a paper boat crosses a pond', outputAbsPath })).resolves.toMatchObject({
+      ok: false,
+      errorCode: 'PROVIDER_API_ERROR',
+      message: 'Orkas vendor services are unavailable in this build',
     });
-
-    expect(result).toMatchObject({
-      ok: true,
-      path: path.join(tmpDir, 'result.mp4'),
-      provider: 'orkas-api',
-      model: 'orkas-video',
-      taskId: 'video_public_test',
-    });
-    expect(fs.readFileSync(path.join(tmpDir, 'result.mp4'))).toEqual(mp4Fixture());
-    expect(fetchStub).toHaveBeenCalledTimes(1);
-    expect(fetchStub).toHaveBeenCalledWith(
-      'https://orkas.ai/v1/videos',
-      expect.objectContaining({
-        method: 'POST',
-        headers: expect.objectContaining({
-          'X-Orkas-Conversation-Id': 'conv_123',
-          'X-Orkas-Turn-Id': 'turn-456',
-        }),
-      }),
-    );
-    const body = JSON.parse(String(fetchStub.mock.calls[0]?.[1]?.body));
-    expect(body).toMatchObject({
-      prompt: 'a paper boat crosses a pond',
-      quality: 'balanced',
-      generate_audio: false,
-    });
-    expect(body).not.toHaveProperty('model');
-    expect(mocks.registerGeneratedMediaUrl).toHaveBeenCalledWith(
-      path.join(tmpDir, 'result.mp4'),
-      'https://cdn.example.test/video.mp4',
-    );
+    expect(fetchStub).not.toHaveBeenCalled();
+    expect(mocks.downloadBinaryWithProxyPolicy).not.toHaveBeenCalled();
+    expect(mocks.registerGeneratedMediaUrl).not.toHaveBeenCalled();
+    expect(fs.existsSync(outputAbsPath)).toBe(false);
   });
 
   it('fails before dispatch when edit mode has no reference video', async () => {
@@ -151,33 +114,5 @@ describe('video_gen › Orkas public API', () => {
 
   it('rejects non-MP4 downloads', () => {
     expect(() => validateDownloadedVideo(Buffer.from('not a video'))).toThrow(/invalid or unsupported MP4/);
-  });
-});
-
-describe('video request body lifetime', () => {
-  it.each(['cancel', 'deadline'] as const)('keeps %s active after create response headers arrive', async (mode) => {
-    vi.useFakeTimers();
-    const controller = new AbortController();
-    let bodyRead!: () => void;
-    const reading = new Promise<void>((resolve) => { bodyRead = resolve; });
-    const fetchStub = vi.fn(async (_url, init) => ({
-      ok: true,
-      status: 202,
-      text: () => new Promise<string>((_resolve, reject) => {
-        init.signal.addEventListener('abort', () => reject(init.signal.reason), { once: true });
-        bodyRead();
-      }),
-    }));
-    vi.stubGlobal('fetch', fetchStub);
-    try {
-      const pending = generateVideo({ prompt: 'test', outputAbsPath: path.join(tmpDir, 'pending.mp4'), signal: controller.signal });
-      await reading;
-      if (mode === 'cancel') controller.abort();
-      else await vi.advanceTimersByTimeAsync(60_001);
-      expect(await pending).toMatchObject({ ok: false, message: expect.stringMatching(mode === 'cancel' ? /abort/i : /timed out/i) });
-      expect(fetchStub).toHaveBeenCalledTimes(1);
-      expect(mocks.downloadBinaryWithProxyPolicy).not.toHaveBeenCalled();
-      expect(fs.existsSync(path.join(tmpDir, 'pending.mp4'))).toBe(false);
-    } finally { vi.useRealTimers(); }
   });
 });
