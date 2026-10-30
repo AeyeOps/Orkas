@@ -1967,7 +1967,7 @@ describe('group_chat bus integration › Commander utility tools', () => {
       properties: {
         surface_id: { enum: [
           'settings.models', 'settings.general', 'settings.data',
-          'connectors', 'library', 'projects', 'agents', 'skills', 'auto', 'apps', 'marketplace',
+          'connectors', 'library', 'projects', 'agents', 'skills', 'auto', 'apps',
         ] },
         action: { enum: ['open', 'add_custom', 'configure', 'create'] },
         target_id: { type: 'string', maxLength: 160 },
