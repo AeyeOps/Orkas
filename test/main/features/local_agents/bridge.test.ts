@@ -1603,8 +1603,8 @@ describe('local_agents/bridge › auth + skills', () => {
 
   it('runs a catalog-declared read without any connector or native CLI approval', async () => {
     bridgeConnectorMock.resolveVisibleConnectors.mockResolvedValue([{
-      instance: { id: 'slack', display_name: 'Slack' },
-      tools: [{ name: 'search', description: 'Search', input_schema: {}, annotations: { readOnlyHint: true } }],
+      instance: { id: 'shopify-admin', display_name: 'Shopify Admin' },
+      tools: [{ name: 'execute_read', description: 'Read', input_schema: {}, annotations: { readOnlyHint: true } }],
     }] as any);
     const cliPermissions = await import('../../../../src/main/features/local_agents/cli_permissions');
     const prompts: any[] = [];
@@ -1619,7 +1619,7 @@ describe('local_agents/bridge › auth + skills', () => {
         id: 45,
         token: bridge.token,
         method: 'connectors.call',
-        params: { connector_id: 'slack', tool_name: 'search', args: {} },
+        params: { connector_id: 'shopify-admin', tool_name: 'execute_read', args: { action: 'products.list' } },
       });
       expect(allowed.reply).toMatchObject({ ok: true });
       expect(prompts).toHaveLength(0);

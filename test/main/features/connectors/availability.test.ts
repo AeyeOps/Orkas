@@ -114,28 +114,39 @@ describe('connector availability gates', () => {
     expect(refreshStaleToolCaches).not.toHaveBeenCalled();
   });
 
-  it('does not surface stale remote MCP tools outside the built-in product allowlist', async () => {
-    vi.doMock('../../../../src/main/features/connectors/manager', () => ({
-      listInstances: vi.fn(() => [{
-        ...connectedInstance('paypal'),
-        tools_cache: [
-          { name: 'list_transactions', description: 'Reviewed.', input_schema: {} },
-          { name: 'unreviewed_future_admin_action', description: 'Not reviewed.', input_schema: {} },
-        ],
-      }]),
-    }));
+  it('does not expose or dispatch cached tools from a retired catalog connection', async () => {
+    const registry = await import('../../../../src/main/features/connectors/registry');
+    const now = new Date().toISOString();
+    await registry.upsert(TEST_UID, {
+      ...connectedInstance('paypal'),
+      transport: { kind: 'streamable-http', url: 'https://mcp.paypal.com/http' },
+      tools_cache: [
+        { name: 'list_transactions', description: 'Reviewed.', input_schema: {} },
+        { name: 'unreviewed_future_admin_action', description: 'Not reviewed.', input_schema: {} },
+      ],
+      created_at: now,
+      updated_at: now,
+    });
     vi.doMock('../../../../src/main/features/component_enabled', () => ({
       readEnabledMap: vi.fn(() => ({ connectors: {} })),
       isConnectorEnabledFromSnapshot: vi.fn(() => true),
     }));
 
     const toolsAdapter = await import('../../../../src/main/features/connectors/tools-adapter');
-    const visible = await toolsAdapter.resolveVisibleConnectors(TEST_UID);
-
-    expect(visible).toHaveLength(1);
-    expect(visible[0].tools.map((tool) => tool.name)).toEqual(['list_transactions']);
-    expect(visible[0].tools[0].orkas_action_policy).toMatchObject({
-      risk: 'R', confirmation: 'none', max_batch_size: 25,
-    });
+    const manager = await import('../../../../src/main/features/connectors/manager');
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    try {
+      expect(manager.listInstances(TEST_UID)).toEqual([]);
+      expect(manager.getInstance(TEST_UID, 'paypal')).toBeNull();
+      await manager.bootstrap(TEST_UID);
+      expect(await toolsAdapter.resolveVisibleConnectors(TEST_UID)).toEqual([]);
+      await expect(manager.callTool(TEST_UID, 'paypal', 'unreviewed_future_admin_action', {}))
+        .rejects.toThrow('instance not found');
+      expect(fetchMock).not.toHaveBeenCalled();
+      expect(registry.load(TEST_UID).connections.paypal.tools_cache).toHaveLength(2);
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 });

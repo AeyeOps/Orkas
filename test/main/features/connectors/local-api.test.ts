@@ -106,7 +106,6 @@ describe('device-local commerce API credentials', () => {
   it.each([
     { id: 'shopee', parameters: { region: 'global', shop_id: '456', partner_id: '12345', partner_key: 'partner-test-secret' } },
     { id: 'ebay-seller', parameters: { marketplace_id: 'EBAY_US', content_language: 'en-US', client_id: 'ebay-client', client_secret: 'ebay-secret', ru_name: 'Merchant-RuName' } },
-    { id: 'woocommerce', parameters: { store_url: 'https://shop.example.com' } },
   ])('preserves $id authorization expiry without saving credentials or rewriting it as a failure', async ({ id, parameters }) => {
     const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
     const expired = Object.assign(new Error('Authorization timed out'), { code: 'flow_timeout' });
@@ -441,14 +440,14 @@ describe('device-local commerce API credentials', () => {
     })).toThrow('unknown connector parameter: redirect_uri');
   });
 
-  it('allows WooCommerce owner consent without keys and rejects incomplete manual pairs', () => {
-    expect(normalizeLocalApiConnectionInput(entry('woocommerce'), {
+  it('requires both WooCommerce keys for a manually authorized store', () => {
+    expect(() => normalizeLocalApiConnectionInput(entry('woocommerce'), {
       store_url: 'https://shop.example.com/wordpress',
-    })).toEqual({ metadata: { store_url: 'https://shop.example.com/wordpress' }, credentials: {} });
+    })).toThrow('consumer_key');
     for (const field of ['consumer_key', 'consumer_secret']) {
       expect(() => normalizeLocalApiConnectionInput(entry('woocommerce'), {
         store_url: 'https://shop.example.com', [field]: `${field === 'consumer_key' ? 'ck' : 'cs'}_${'a'.repeat(40)}`,
-      })).toThrow('Provide both WooCommerce credentials');
+      })).toThrow(`connector parameter required: ${field === 'consumer_key' ? 'consumer_secret' : 'consumer_key'}`);
     }
   });
 
