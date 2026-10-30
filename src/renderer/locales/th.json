@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "ฟีเจอร์นี้ต้องใช้บริการจาก Orkas และไม่พร้อมใช้งานในรุ่นนี้",
   "dialog.context.application": "คำขอจากแอปพลิเคชัน",
   "dialog.context.background": "คำขอเบื้องหลัง",
   "dialog.context.requester": "ร้องขอโดย: {name}",

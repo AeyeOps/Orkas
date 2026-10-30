@@ -50,16 +50,16 @@ describe('My Apps list refresh', () => {
   });
 });
 
-describe('My Apps commercial entry', () => {
-  it('keeps the local view, focus and cards when a web-tab request is cancelled', async () => {
+describe('My Apps unavailable web features', () => {
+  it('keeps the local view, focus and cards after dismissing a web-tab notice', async () => {
     const h = await openPanel(apps([budget, { id: 'historic-web', appType: 'web', title: 'Historic', savedAt }]));
     const tab = h.$('[data-app-filter="web"]')!; tab.focus();
     await h.showTab('web');
     const [dialog] = h.openDialogs();
-    expect(h.dialogText(dialog)).toBe('网页应用需要 Orkas 商业版。下载商业版即可继续。');
+    expect(h.dialogText(dialog)).toBe('此功能需要 Orkas 官方服务，在此版本中不可用。');
     expect(h.$('[data-app-filter="local"]')!.getAttribute('aria-selected')).toBe('true');
     expect(h.cards()).toEqual(['app-budget']);
-    dialog.querySelector('[data-act="cancel"]')!.click(); await flush();
+    dialog.querySelector('[data-act="ok"]')!.click(); await flush();
     expect(h.openDialogs()).toHaveLength(0);
     expect(h.document.activeElement).toBe(tab);
     expect(h.channels()).toEqual(['savedApps.list']);
@@ -153,7 +153,7 @@ describe('My Apps creation type', () => {
     panel.querySelector('[data-app-type="web"]')!.click();
     await flush();
     expect(h.openDialogs().filter(dialog => dialog.querySelector('.ui-dialog-message'))).toHaveLength(1);
-    h.openDialogs().find(dialog => dialog.querySelector('.ui-dialog-message'))!.querySelector('[data-act="cancel"]')!.click(); await flush();
+    h.openDialogs().find(dialog => dialog.querySelector('.ui-dialog-message'))!.querySelector('[data-act="ok"]')!.click(); await flush();
     h.input(panel.querySelector('textarea')!, '  Family meals\n购物清单 <b>raw</b>  ');
     if (dismissal === 'cancel') panel.querySelector('[data-create-cancel]')!.click();
     else if (dismissal === 'escape') h.press('Escape');

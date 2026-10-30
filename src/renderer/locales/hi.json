@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "इस सुविधा के लिए Orkas की सेवाएँ आवश्यक हैं और यह इस संस्करण में उपलब्ध नहीं है।",
   "dialog.context.application": "ऐप का अनुरोध",
   "dialog.context.background": "बैकग्राउंड अनुरोध",
   "dialog.context.requester": "अनुरोधकर्ता: {name}",

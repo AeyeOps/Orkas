@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "Cette fonctionnalité nécessite les services d’Orkas et n’est pas disponible dans cette version.",
   "dialog.context.application": "Demande de l’application",
   "dialog.context.background": "Demande en arrière-plan",
   "dialog.context.requester": "Demande de : {name}",

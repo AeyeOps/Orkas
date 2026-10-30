@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "Bu özellik Orkas hizmetlerini gerektirir ve bu sürümde kullanılamaz.",
   "dialog.context.application": "Uygulama isteği",
   "dialog.context.background": "Arka plan isteği",
   "dialog.context.requester": "İsteyen: {name}",

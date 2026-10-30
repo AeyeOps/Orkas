@@ -1,4 +1,5 @@
 {
+  "app.vendor_services_unavailable": "Fitur ini memerlukan layanan Orkas dan tidak tersedia dalam versi ini.",
   "dialog.context.application": "Permintaan aplikasi",
   "dialog.context.background": "Permintaan latar belakang",
   "dialog.context.requester": "Diminta oleh: {name}",

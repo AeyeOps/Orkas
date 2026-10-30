@@ -776,5 +776,5 @@ it('shows legacy unsupported video profiles as unavailable instead of active', a
   expect(row.className).not.toContain('is-default');
   expect(row.children.find((child) => child.className === 'entry-rank')?.textContent).toBe('new_chat.model_picker.unavailable');
   const main = row.children.find((child) => child.className === 'entry-main');
-  expect(main?.children.find((child) => child.className === 'form-hint')?.textContent).toBe('settings.video.provider_unavailable');
+  expect(main?.children.find((child) => child.className === 'form-hint')?.textContent).toBe('app.vendor_services_unavailable');
 });
