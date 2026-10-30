@@ -6,10 +6,6 @@ import { generateKeyPairSync } from 'node:crypto';
 
 const UID = 'localaccesspolicy001';
 
-function escapeRegex(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 let tmpDir: string;
 let prevWs: string | undefined;
 
@@ -134,5 +130,4 @@ describe('local_access_policy', () => {
     expect(policy.classifyConfiguredBashCommand('echo ~/.ssh/id_rsa', [], options)).toEqual([]);
     expect(policy.classifyConfiguredBashCommand('sudo ls', ['priv_esc'], options)).toEqual(['priv_esc']);
   });
-
 });

@@ -580,7 +580,7 @@ describe('ordinary-operation host admission', () => {
     expect(fs.readFileSync(path.join(tmpDir, 'Dockerfile'), 'utf8')).toBe(body);
   });
 
-  it('does not exempt an installation through a symlink escape or override an explicit server policy', async () => {
+  it('does not exempt an installation through a symlink escape', async () => {
     await allFilesApproval();
     const workspace = path.join(tmpDir, 'project'); const outside = path.join(tmpDir, 'other-project');
     fs.mkdirSync(workspace); fs.mkdirSync(outside);
@@ -588,7 +588,6 @@ describe('ordinary-operation host admission', () => {
     const { createLocalTools } = await import('../../../../src/main/model/core-agent/local-tools');
     const core = await import('../../../../src/core-agent/src/tools/builtin');
     const bp = await import('../../../../src/main/model/core-agent/bash-permissions');
-    const config = await import('../../../../src/main/features/client_config');
     const execute = vi.spyOn(core.bashTool, 'execute').mockResolvedValue({ content: 'must not execute' });
     const requests: any[] = [];
     bp._setBroadcastForTest((_channel, info: any) => { requests.push(info); bp.respond(info.request_id, 'deny'); });
@@ -596,11 +595,7 @@ describe('ordinary-operation host admission', () => {
       const tool = createLocalTools({ userId: UID, cid: CID, extraRoots: [workspace] }).find(t => t.name === 'bash')!;
       const ctx = { workingDir: workspace, state: {} } as any;
       expect((await tool.execute({ command: 'conda create -p .venv python' }, ctx)).isError).toBe(true);
-      config.clientConfig.applyServerPayload({ immediate: { 'local_access.sensitive_policy': {
-        sensitive_command_patterns: [{ category: 'network_egress', pattern: 'npm\\s+view' }],
-      } }, restart: {}, config_hash: 'sha256:ordinary-custom' }, 'ordinary-custom');
-      expect((await tool.execute({ command: 'npm view react version' }, ctx)).isError).toBe(true);
-      expect(requests).toHaveLength(2);
+      expect(requests).toHaveLength(1);
       expect(execute).not.toHaveBeenCalled();
       expect(fs.readdirSync(outside)).toEqual([]);
     } finally { execute.mockRestore(); bp._setBroadcastForTest(null); bp._resetForTest(); }

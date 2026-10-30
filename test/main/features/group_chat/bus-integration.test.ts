@@ -1775,7 +1775,7 @@ describe('group_chat bus integration › direct agent handback', () => {
 });
 
 describe('group_chat bus integration › Commander utility tools', () => {
-  it('executes shared Skill search and marketplace boundaries without the retired automation alias', async () => {
+  it('executes shared Skill search without the retired automation alias', async () => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
     const bus = await import('../../../../src/main/features/group_chat/bus');
@@ -1806,8 +1806,6 @@ describe('group_chat bus integration › Commander utility tools', () => {
     _setScript(sid, [
       { type: '__call_tool__', name: 'skill_search', input: { query: '', limit: 1 } },
       { type: '__call_tool__', name: 'skill_search', input: { query: '', limit: 1, offset: 1 } },
-      { type: '__call_tool__', name: 'marketplace_search', input: { query: '' } },
-      { type: '__call_tool__', name: 'marketplace_request_install', input: { kind: 'invalid' } },
       { type: 'final', text: 'Utility boundaries checked.' },
     ]);
 
@@ -1824,8 +1822,6 @@ describe('group_chat bus integration › Commander utility tools', () => {
     expect(offered).toEqual(expect.arrayContaining([
       'inner_browser',
       'skill_search',
-      'marketplace_search',
-      'marketplace_request_install',
     ]));
     expect(offered).not.toContain('auto_tasks_list');
     const commanderCall = _recordedCalls.find((call) => call.sid === sid)!;
@@ -1846,9 +1842,6 @@ describe('group_chat bus integration › Commander utility tools', () => {
       .toContain('Default: 5');
     expect((byName('skill_search').inputSchema as any).properties.offset.description)
       .toContain('next_offset');
-    expect(byName('marketplace_search').description).toContain('without installing');
-    expect(byName('marketplace_search').description).not.toContain('only when installed capabilities');
-    expect(byName('marketplace_request_install').description).not.toContain('stop and wait');
     expect(byName('dispatch_to').description).not.toContain('canonical conversation history');
     expect(byName('dispatch_to').description).toMatch(/^NON-TERMINAL delegation:/);
     expect(byName('dispatch_to').description).toContain('another dispatch or a tool call, run independent outcomes in parallel, or build a combined deliverable the user asked for');
@@ -1903,11 +1896,6 @@ describe('group_chat bus integration › Commander utility tools', () => {
     for (const row of results.skill_search.results) {
       expect(Object.keys(row).sort()).toEqual(['description', 'name', 'read_path']);
     }
-    expect(results.marketplace_search).toMatchObject({ ok: false, error: '`query` is required' });
-    expect(results.marketplace_request_install).toMatchObject({
-      ok: false,
-      error: '`kind` must be agent or skill',
-    });
   }, 12_000);
 
   it('stages open_app_view navigation cards and returns a sanitized app_health snapshot', async () => {

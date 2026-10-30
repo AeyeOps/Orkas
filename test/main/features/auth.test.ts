@@ -1011,7 +1011,6 @@ describe('auth › listModels', () => {
       'gpt-5.6-luna',
     ]);
   });
-
 });
 
 describe('auth › DeepSeek policy gate', () => {
@@ -1021,7 +1020,6 @@ describe('auth › DeepSeek policy gate', () => {
     expect(providers.map((p) => p.id)).toContain('deepseek');
     expect((await a.listModels('deepseek')).models.length).toBeGreaterThan(0);
   });
-
 });
 
 describe('auth › getConfig', () => {

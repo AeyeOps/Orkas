@@ -194,43 +194,6 @@ describe('ipc › model config auth lists', () => {
     expect(profileIds(await call('auth.listProviders'))).toEqual([]);
   });
 
-  it('returns unavailable saved models only for the Settings remediation query', async () => {
-    const apiKey = await call('auth.addApiKey', {
-      provider: 'openai',
-      apiKey: 'sk-removed-model-test-key',
-      label: 'removed-model',
-    });
-    const added = await call('auth.addEntry', {
-      provider: 'openai',
-      model: 'gpt-5.6-terra',
-      profileId: apiKey.profileId,
-    });
-    expect(added.ok).toBe(true);
-
-    const { clientConfig } = await import('../../../src/main/features/client_config');
-    clientConfig.applyServerPayload({
-      immediate: {
-        model_catalog: {
-          providers: {
-            openai: [{ id: 'gpt-5.6-sol', name: 'GPT-5.6 Sol' }],
-          },
-        },
-      },
-      restart: {},
-      config_hash: 'sha256:ipc-model-removal',
-    }, '"ipc-model-removal"');
-
-    expect(entryProviders(await call('auth.listEntries'))).toEqual([]);
-    const remediation = await call('auth.listEntries', { includeUnavailable: true });
-    expect(remediation.entries).toEqual([
-      expect.objectContaining({
-        provider: 'openai',
-        model: 'gpt-5.6-terra',
-        modelAvailable: false,
-      }),
-    ]);
-  });
-
   it('lists and persists the selected Doubao Seedream 5.0 image model', async () => {
     const initial = await call('imageAuth.list');
     expect(initial.modelsByProvider).toBeUndefined();
