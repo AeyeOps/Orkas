@@ -116,3 +116,22 @@ describe('video_gen › Orkas public API', () => {
     expect(() => validateDownloadedVideo(Buffer.from('not a video'))).toThrow(/invalid or unsupported MP4/);
   });
 });
+
+describe('video_gen expired provider tasks', () => {
+  const adapterRequest = {
+    model: 'doubao-seedance-2-0-260128', prompt: 'x', referenceImageUrls: [], referenceVideoUrls: [],
+    operation: 'generate', ratio: '16:9', duration: 5, resolution: '720p', generateAudio: false,
+    watermark: false, pollIntervalMs: 1, timeoutMs: 600_000,
+  } as any;
+  it('stops the user-key Doubao tracker on the first expired status', async () => {
+    let polls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init?: RequestInit) => {
+      if (init?.method === 'POST') return new Response(JSON.stringify({ id: 'expired-task', status: 'queued' }));
+      polls += 1;
+      return new Response(JSON.stringify({ status: polls < 3 ? 'expired' : 'failed' }));
+    }));
+    const { callDoubaoVideo } = await import('../../../src/main/features/video_gen');
+    await expect(callDoubaoVideo({ ...adapterRequest, apiKey: 'sk-user' })).rejects.toThrow(/expired-task expired/);
+    expect(polls).toBe(1);
+  });
+});
