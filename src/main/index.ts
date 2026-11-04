@@ -186,7 +186,7 @@ void installEnvProxyDispatcher();
 import { installFetchDiag } from './model/core-agent/fetch-diag';
 installFetchDiag();
 
-import { hasActiveWork, prepareForShutdown, subscribeTaskTerminals, type TaskTerminalEvent } from './features/group_chat/bus';
+import { hasActiveWork, prepareForShutdown, resumeAfterFailedShutdown, subscribeTaskTerminals, type TaskTerminalEvent } from './features/group_chat/bus';
 import { setFetchImplementation } from './util/retry';
 setFetchImplementation((input, init) => net.fetch(input as Parameters<typeof net.fetch>[0], init));
 
@@ -201,7 +201,7 @@ import * as conversationTaskBoard from './features/group_chat/task_board';
 import * as searchFeature from './features/search';
 import * as projectFilesFeature from './features/project_files';
 import * as appConfig from './features/config';
-import { getRendererBootTables } from './i18n';
+import { getRendererBootTables, t } from './i18n';
 import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as autoTasks from './features/auto_tasks';
 import * as projectDriverRunner from './features/project_driver_runner';
@@ -212,6 +212,7 @@ import * as systemSkills from './features/system_skills';
 import * as bundledContentStartup from './features/bundled_content_startup';
 import * as builtinMarketplaceStartup from './features/builtin_marketplace_startup';
 import type { BuiltinMarketplaceSeedResult } from './features/builtin_marketplace';
+import { createLoginStartup, setLoginStartup, shouldHideStartupWindow } from './features/login_startup';
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
@@ -219,8 +220,9 @@ import { appResource, hasIsolatedBrowserStorage } from './features/web_apps/host
 import * as connectorsFeature from './features/connectors';
 import * as windowState from './features/window_state';
 import { startIdleSleepGuard } from './features/idle_sleep_guard';
-import { installWindowCloseConfirmation } from './features/window_close_confirmation';
+import { createDesktopWindowController, getDesktopWindowController, setDesktopWindowController } from './features/desktop_windows';
 import * as taskNotifications from './features/task_notifications';
+import { installWindowCloseConfirmation } from './features/window_close_confirmation';
 import * as taskUnreadTray from './features/task_unread_tray';
 import * as notificationPermissions from './features/notification_permissions';
 import {
@@ -276,7 +278,7 @@ function emitTaskTerminalToRenderer(event: TaskTerminalEvent): void {
 
 let modelApiPreloadScheduled = false;
 
-function createWindow(): BrowserWindow {
+function createWindow(startupHidden = false): BrowserWindow {
   const dev = !app.isPackaged;
   const restored = windowState.restoreWindowState();
   const win = new BrowserWindow({
@@ -284,7 +286,7 @@ function createWindow(): BrowserWindow {
     height: 800,
     ...restored.bounds,
     title: '',
-    show: !IS_PACKAGED_LAUNCH_SMOKE && !E2E_HIDE_WINDOW,
+    show: !IS_PACKAGED_LAUNCH_SMOKE && !E2E_HIDE_WINDOW && !startupHidden,
     focusable: !E2E_HIDE_WINDOW,
     backgroundColor: '#ffffff',
     icon: path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png'),
@@ -303,10 +305,11 @@ function createWindow(): BrowserWindow {
   mainWindows.add(win);
   installWindowPresentationEvents(win);
   win.on('focus', () => taskUnreadTray.refreshTaskUnreadTray());
-  installWindowCloseConfirmation(win, hasActiveWork, () => isQuitting);
+  getDesktopWindowController()?.install(win, () => isQuitting);
+  if (process.platform === 'linux') installWindowCloseConfirmation(win, hasActiveWork, () => isQuitting);
   windowState.watchWindowState(win);
   // maximize() also shows a hidden native window.
-  if (restored.isMaximized && !E2E_HIDE_WINDOW) win.maximize();
+  if (restored.isMaximized && !E2E_HIDE_WINDOW && !startupHidden) win.maximize();
 
   win.loadFile(path.join(paths.SRC_ROOT, 'renderer', 'index.html'));
   win.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
@@ -395,6 +398,8 @@ function createAppTray(): void {
     iconPath,
     displayName: APP_DISPLAY_NAME,
     onActivate: () => { showMainWindow(); },
+    onQuit: () => { setImmediate(() => app.quit()); },
+    labels: () => ({ open: t('desktop.open'), quit: t('desktop.exit') }),
     warn: message => log.warn(message),
   });
 }
@@ -1302,9 +1307,14 @@ if (!gotLock) {
   const shutdown = createShutdownCoordinator({
     captureProcesses: () => captureWindowsShutdownProcesses(),
     quiesce: async () => {
+      autoTasks.stopScheduler();
+      projectDriverRunner.stopDriverScheduler();
       await Promise.all([
         prepareForShutdown(),
         import('./features/local_agents/runner.js').then(runner => runner.stopBackgroundRuns('the app is quitting')),
+        import('../core-agent/src/tools/process-session')
+          .then(sessions => sessions.stopAllProcessSessions())
+          .catch(() => createLogger('process-sessions').warn('stopping retained commands failed')),
       ]);
       const boot = await import('./util/boot_init');
       boot.stopBootWork();
@@ -1346,13 +1356,22 @@ if (!gotLock) {
     ],
     onFailure: name => createLogger(name).warn('shutdown preparation failed'),
     onIncomplete: async () => {
+      await resumeAfterFailedShutdown();
       const library = await import('./features/library_corpus');
       await library.resumeLibraryAdmission();
       const boot = await import('./util/boot_init');
       boot.resumeBootAdmission();
+      autoTasks.startScheduler();
+      projectDriverRunner.startDriverScheduler();
     },
   });
   const flushForShutdown = shutdown.prepare;
+  const desktopWindows = createDesktopWindowController({
+    isShutdownComplete: () => shutdown.complete,
+    canHide: () => process.platform === 'darwin' || !!appTray,
+    nativeClose: () => process.platform === 'linux',
+  });
+  setDesktopWindowController(desktopWindows);
 
   // Account login is stripped, but connector OAuth still returns through the OS protocol. Keep
   // this connector-only receiver outside the removed account protocol module.
@@ -1457,12 +1476,12 @@ if (!gotLock) {
       },
       openConversation: openConversationFromTaskNotification,
     });
-    app.once('before-quit', stopTaskNotifications);
+    app.once('will-quit', stopTaskNotifications);
     const stopTaskTerminalUi = subscribeTaskTerminals(emitTaskTerminalToRenderer);
-    app.once('before-quit', stopTaskTerminalUi);
+    app.once('will-quit', stopTaskTerminalUi);
     // Running Agent work keeps the machine out of idle sleep; an idle app holds nothing.
     const idleSleepGuard = startIdleSleepGuard({ blocker: powerSaveBlocker, hasActiveWork });
-    app.once('before-quit', idleSleepGuard.stop);
+    app.once('will-quit', idleSleepGuard.stop);
     const BOOT_BACKGROUND_DEFER_MS = 6_000;
     const bootDevice = getBootDeviceProfile();
     const BOOT_HEAVY_DISK_DELAY_MS = bootDevice.heavyDiskOffsetMs;
@@ -1478,9 +1497,28 @@ if (!gotLock) {
     scheduleBootBackground('connectors:bootstrap', async () => {
       await connectorsFeature.bootstrap(users.getActiveUserId());
     }, CONNECTORS_BOOTSTRAP_DELAY_MS, { resourceClass: 'process', preferIdle: true, maxSliceMs: 30_000 });
-    createWindow();
+    const startupAvailable = app.isPackaged && !IS_PACKAGED_LAUNCH_SMOKE && !E2E_HIDE_WINDOW;
+    setLoginStartup(createLoginStartup({
+      platform: process.platform, available: startupAvailable, executable: process.execPath,
+      get: options => app.getLoginItemSettings(options),
+      set: settings => app.setLoginItemSettings(settings),
+      getUser: () => users.getActiveUserId(),
+      hasEnabledAutomations: async uid => (await autoTasks.listTasks(uid)).some(task => task.enabled === true),
+    }));
+    let startupHidden = false;
+    if (startupAvailable) {
+      try {
+        startupHidden = shouldHideStartupWindow({
+          platform: process.platform, argv: process.argv,
+          wasOpenedAtLogin: process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin,
+        });
+      } catch { log.warn('startup presentation unavailable; showing the main window'); }
+    }
+    createWindow(startupHidden);
     await consumeColdLaunchConnectorCallback();
     createAppTray();
+    // A silent launch must always retain an existing way to recover its window.
+    if (startupHidden && process.platform !== 'darwin' && !appTray) showMainWindow();
     if (process.platform === 'darwin' && appTray) {
       const stopTaskUnreadTray = taskUnreadTray.startTaskUnreadTray({
         tray: appTray,
@@ -1492,7 +1530,7 @@ if (!gotLock) {
         },
         warn: message => log.warn(message),
       });
-      app.once('before-quit', stopTaskUnreadTray);
+      app.once('will-quit', stopTaskUnreadTray);
     }
     // A scheduled fire or driver advance can reach the task browser with every
     // window closed, which is routine on macOS. Hand Web Assist the ability to
@@ -1625,7 +1663,7 @@ if (!gotLock) {
     void runBootPhases(BOOT_BACKGROUND_DEFER_MS);
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      showMainWindow();
     });
   });
 
@@ -1634,14 +1672,16 @@ if (!gotLock) {
   });
 
   app.on('before-quit', async (e) => {
-    isQuitting = true;
-    if (shutdown.complete) return;
+    if (shutdown.complete) { isQuitting = true; return; }
     e.preventDefault();
+    if (isQuitting) return;
+    isQuitting = true;
     try {
       await flushForShutdown();
       app.quit();
     } catch (error) {
       isQuitting = false;
+      showMainWindow();
       log.error('quit preparation failed', { error: logErrorSummary(error) });
     }
   });

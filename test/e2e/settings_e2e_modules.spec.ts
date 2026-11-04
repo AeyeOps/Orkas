@@ -17,6 +17,30 @@ async function openAddModelDialog(page: import('@playwright/test').Page): Promis
 }
 
 test.describe('settings modules and model guard', () => {
+  test('offers native GPT-6.1 Terra through every public OpenAI model picker', async ({ orkas }, testInfo) => {
+    const page = orkas.page!;
+    await openSettingsTab(page, 'credentials');
+    await openAddModelDialog(page);
+    for (const [provider, id] of [
+      ['openai-codex', 'gpt-6.1-terra'], ['openai', 'gpt-6.1-terra'], ['openrouter', 'openai/gpt-6.1-terra'],
+    ] as const) {
+      const catalog = await orkas.invoke<any>('auth.listModels', { provider });
+      expect(catalog.models).toContainEqual(expect.objectContaining({ id, name: 'GPT-6.1 Terra' }));
+      await page.locator('#settings-picker-provider .ai-select-trigger').click();
+      await page.locator(`body > .ai-select-popover:not([hidden]) .ai-select-item[data-value="${provider}"]`).click();
+      await expect(page.locator('#settings-picker-provider')).toHaveAttribute('data-value', provider);
+      await page.locator('#settings-picker-model .ai-select-trigger').click();
+      const terra = page.locator(`body > .ai-select-popover:not([hidden]) .ai-select-item[data-value="${id}"]`);
+      await expect(terra).toHaveText('GPT-6.1 Terra');
+      await expect(terra).toBeVisible();
+      await terra.scrollIntoViewIfNeeded();
+      await page.screenshot({ path: testInfo.outputPath(`terra-${provider}-picker.png`) });
+      await terra.click();
+      await expect(page.locator('#settings-picker-model')).toHaveAttribute('data-value', id);
+    }
+    expect(orkas.modelRequests).toHaveLength(0);
+  });
+
   test('Escape closes the model picker before the dialog and returns focus to Add', async ({ appPage }) => {
     await openSettingsTab(appPage, 'credentials');
     await openAddModelDialog(appPage);
@@ -338,9 +362,9 @@ for (const kind of ['image', 'video'] as const) {
       await expect(modal).toHaveClass(/\bopen\b/);
       await page.locator(`#settings-${kind}-provider .ai-select-trigger`).click();
       const menu = page.locator('.ai-select-popover:visible');
-      await expect(menu.locator('.ai-select-item')).toHaveCount(choices.length + 1);
+      await expect(menu.locator('.ai-select-item')).toHaveCount(choices.length);
       expect(await menu.locator('.ai-select-item').evaluateAll(items => items.map(item => (item as HTMLElement).dataset.value)))
-        .toEqual(['orkas-api', ...choices.map(choice => choice[0])]);
+        .toEqual(choices.map(choice => choice[0]));
       if (index === 0) {
         await menu.screenshot({ path: testInfo.outputPath(`${kind}-public-picker-top.png`) });
         await menu.locator('.ai-select-item').last().scrollIntoViewIfNeeded();

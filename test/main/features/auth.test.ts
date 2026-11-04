@@ -39,6 +39,7 @@ afterEach(() => {
   vi.doUnmock('node:fs');
   vi.doUnmock('@earendil-works/pi-ai/oauth');
   vi.doUnmock('#core-agent');
+  vi.doUnmock('../../../src/main/model/core-agent/external-providers');
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -1185,6 +1186,7 @@ describe('auth › listModels', () => {
     expect((await a.listModels('openai-codex')).models.map((model) => model.id)).toEqual([
       'gpt-6-astra',
       'gpt-6.1-sol',
+      'gpt-6.1-terra',
       'gpt-6-sol',
       'gpt-6-luna',
       'gpt-5.6-sol',
