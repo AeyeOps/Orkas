@@ -43,6 +43,7 @@ describe('application shutdown durability and latency', () => {
     expect(compositions).toHaveLength(1);
     const archived = gate();
     const browserSaved = gate();
+    const historyExited = gate();
     const appDataDrained = gate();
     const exited = gate();
     const events: string[] = [];
@@ -55,6 +56,7 @@ describe('application shutdown durability and latency', () => {
       './features/kb_vector': { closeAllKb: mark('kb-database') },
       './features/kb_embed': { closeEmbedder: mark('embed-worker') },
       './util/sharp-runtime': { closeImageRuntime: mark('image-worker') },
+      './features/conversation-history-client': { closeConversationHistoryWorker: () => { events.push('history-workers'); return historyExited.promise; } },
       './util/office-extract': { closeOfficeExtraction: mark('office-extract') },
       './features/office/office_engine': { closeAllOfficeResidents: mark('office') },
       './features/web_assist_session': { flushWebAssistSessions: () => { events.push('browser-save'); return browserSaved.promise; } },
@@ -89,6 +91,7 @@ describe('application shutdown durability and latency', () => {
     expect(events).toEqual(mode === 'quit' ? ['capture', 'auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions'] : ['auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions']);
     archived.release();
     await vi.waitFor(() => expect(events).toContain('browser-save'));
+    expect(events).toContain('history-workers');
     expect(events.indexOf('library-owners')).toBeLessThan(events.indexOf('kb-database'));
     expect(events.indexOf('library-owners')).toBeLessThan(events.indexOf('embed-worker'));
     expect(events.indexOf('boot-work')).toBeLessThan(events.indexOf('library-owners'));
@@ -100,6 +103,9 @@ describe('application shutdown durability and latency', () => {
     expect(events).not.toContain('terminate');
     expect(events.indexOf('app-close')).toBeLessThan(events.indexOf('app-databases'));
     appDataDrained.release();
+    await Promise.resolve();
+    expect(shutdown.complete).toBe(false);
+    historyExited.release();
     if (mode === 'quit') {
       await vi.waitFor(() => expect(events).toContain('terminate'));
       expect(shutdown.complete).toBe(false);
@@ -107,7 +113,7 @@ describe('application shutdown durability and latency', () => {
       exited.release();
     }
     await pending;
-    const owners = ['auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions', 'boot-work', 'library-owners', 'connectors', 'search-workers', 'kb-database', 'embed-worker', 'image-worker', 'office-extract', 'office', 'browser-save', 'app-close', 'app-databases'];
+    const owners = ['auto-scheduler', 'driver-scheduler', 'archive', 'background-cli', 'process-sessions', 'boot-work', 'library-owners', 'connectors', 'search-workers', 'kb-database', 'embed-worker', 'image-worker', 'history-workers', 'office-extract', 'office', 'browser-save', 'app-close', 'app-databases'];
     expect([...events].sort()).toEqual([...owners, ...(mode === 'quit' ? ['capture', 'terminate', 'dispose'] : [])].sort());
     expect(shutdown.complete).toBe(true);
   });
@@ -133,6 +139,7 @@ describe('application shutdown durability and latency', () => {
       './features/kb_vector': { closeAllKb: vi.fn() },
       './features/kb_embed': { closeEmbedder: vi.fn() },
       './util/sharp-runtime': { closeImageRuntime: vi.fn() },
+      './features/conversation-history-client': { closeConversationHistoryWorker: vi.fn() },
       './util/office-extract': { closeOfficeExtraction: vi.fn() },
       './features/office/office_engine': { closeAllOfficeResidents: vi.fn() },
       './features/web_assist_session': { flushWebAssistSessions: vi.fn() },

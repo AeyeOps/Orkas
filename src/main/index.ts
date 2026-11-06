@@ -1322,6 +1322,10 @@ if (!gotLock) {
       library.closeAllLibraryCorpora();
     },
     localTasks: [
+      { name: 'conversation-history', run: async () => {
+        const history = await import('./features/conversation-history-client');
+        await history.closeConversationHistoryWorker();
+      } },
       { name: 'connectors', run: () => connectorsFeature.shutdown() },
       { name: 'search', run: () => searchFeature.flushAll() },
       { name: 'kb_vector', run: async () => {
