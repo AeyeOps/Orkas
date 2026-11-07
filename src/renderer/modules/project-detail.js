@@ -4858,12 +4858,11 @@ async function _openAddPicker() {
   setTimeout(() => searchEl.focus(), 0);
 }
 
-// ── Header actions: "⋯" menu with Invite members / Rename / Delete ─────
+// ── Header actions: "⋯" menu with Rename / Delete ──────────────────────
 
 function _projectHeaderMenuItems() {
   if (!_projectDetailPid || !_projectDetailMeta?.project) return [];
   return [
-    { label: t('project.menu.invite_members'), onClick: () => _showProjectMemberInviteGate() },
     { label: t('project.action.rename'), onClick: () => _onRenameAction() },
     { label: t('project.action.delete'), onClick: () => _onDeleteAction() },
   ];

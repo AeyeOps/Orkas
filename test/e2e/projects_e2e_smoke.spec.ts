@@ -109,87 +109,6 @@ test.describe('projects', () => {
     }
   });
 
-  test('keeps member invitation visible as a commercial download guide', async ({ orkas }, testInfo) => {
-    const projectName = 'E2E Invite Guide';
-    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
-    const page = orkas.page;
-    const rendererRequests: string[] = [];
-    page.on('request', request => {
-      const url = new URL(request.url());
-      if (url.protocol === 'http:' || url.protocol === 'https:') rendererRequests.push(url.origin + url.pathname);
-    });
-    await orkas.electronApp!.evaluate(({ shell, net }) => {
-      const root = globalThis as any;
-      root.__projectInviteExternalUrls = [];
-      root.__projectEntryRequests = [];
-      root.__projectBackgroundRequests = [];
-      const backgroundRequests = new Set([
-        'GET /api/config/client',
-        'POST /api/marketplace/defaults',
-        'POST /api/marketplace/agents/list',
-        'POST /api/marketplace/agents/detail',
-        'POST /api/marketplace/skills/list',
-      ]);
-      shell.openExternal = async (url: string) => { root.__projectInviteExternalUrls.push(url); };
-      for (const owner of [root, net]) {
-        const original = owner.fetch;
-        owner.fetch = function (input: any, ...args: any[]) {
-          const url = new URL(typeof input === 'string' ? input : input.url || String(input));
-          const method = String(args[0]?.method || input?.method || 'GET').toUpperCase();
-          // Startup refreshes can overlap this local project journey. Keep every
-          // other endpoint, origin and method in the prohibited-request ledger.
-          const isBackground = url.origin === 'https://orkas.ai'
-            && backgroundRequests.has(`${method} ${url.pathname}`);
-          (isBackground ? root.__projectBackgroundRequests : root.__projectEntryRequests)
-            .push(url.origin + url.pathname);
-          return original.call(this, input, ...args);
-        };
-      }
-    });
-    await createProject(orkas, projectName);
-    await expect(page.locator('#project-detail-content')).toHaveAttribute('aria-busy', 'false');
-    await expect(page.locator('#project-detail-content')).not.toHaveClass(/\bis-loading\b/);
-    expect(await page.locator('#panel-project .project-detail-header').evaluate(header =>
-      getComputedStyle(header, '::after').animationName)).toBe('none');
-    const row = page.locator('.project-row', {
-      has: page.locator('.project-name', { hasText: projectName }),
-    });
-    const cancelGuide = async () => {
-      const guidance = await page.evaluate(() => (globalThis as any).t('project.invite_members.commercial_only'));
-      const dialog = page.locator('.ui-dialog-overlay:visible');
-      await expect(dialog.locator('.ui-dialog-message')).toHaveText(guidance);
-      await expect(dialog.locator('[data-act="ok"]')).toBeVisible();
-      await dialog.locator('[data-act="cancel"]').click();
-      await expect(page.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
-      expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__projectInviteExternalUrls)).toEqual([]);
-      expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__projectEntryRequests)).toEqual([]);
-      expect(rendererRequests).toEqual([]);
-      await expect(page.locator('#project-detail-title')).toHaveText(projectName);
-      await expect(row).toHaveCount(1);
-    };
-    for (const { locale, width, inviteLabel } of [
-      { locale: 'en', width: 1280, inviteLabel: 'Invite members' },
-      { locale: 'zh', width: 800, inviteLabel: '邀请成员' },
-    ]) {
-      await page.setViewportSize({ width, height: 800 });
-      await page.evaluate(lang => (globalThis as any).setLang(lang), locale);
-      await page.locator('#project-action-more').click();
-      const headerInvite = page.locator('.context-menu-item').getByText(inviteLabel, { exact: true });
-      await expect(headerInvite).toBeVisible();
-      await page.screenshot({ path: testInfo.outputPath(`project-header-invite-${locale}.png`) });
-      await headerInvite.click();
-      await cancelGuide();
-
-      await row.hover();
-      await row.locator('[data-project-menu]').click();
-      const invite = page.locator('#project-row-menu [data-action="invite-members"]');
-      await expect(invite).toHaveText(inviteLabel);
-      await page.screenshot({ path: testInfo.outputPath(`project-sidebar-invite-${locale}.png`) });
-      await invite.click();
-      await cancelGuide();
-    }
-  });
-
   test('creates a project and keeps it after an app relaunch', async ({ orkas }) => {
     const projectName = 'E2E Persistent Project';
     await createProject(orkas, projectName);
@@ -881,7 +800,7 @@ test.describe('projects', () => {
     await expect(more).toBeVisible();
     await expect(done).toBeHidden();
     await more.click();
-    await expect(page.locator('.context-menu-item')).toHaveText(['Invite members', 'Rename', 'Delete']);
+    await expect(page.locator('.context-menu-item')).toHaveText(['Rename', 'Delete']);
     await page.screenshot({ path: testInfo.outputPath('project-header-local-actions.png') });
     await page.locator('.context-menu-item', { hasText: 'Rename' }).click();
     const input = page.locator('#project-detail-title-input');
