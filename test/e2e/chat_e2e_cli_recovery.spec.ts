@@ -494,7 +494,7 @@ test.describe('CLI failed-turn recovery', () => {
       const cliReason = 'Error: no inference provider configured. Run hermes setup, then try again.';
       const failedBubble = page.locator('#chat-history .chat-message.assistant');
       await expect(failedBubble).toContainText(failureText, { timeout: 30_000 });
-      await expect(failedBubble).not.toContainText(cliReason);
+      await (fault === 'initialize_exit' ? expect(failedBubble) : expect(failedBubble).not).toContainText(cliReason);
       await expect(failedBubble.locator('[data-private-diagnostic]')).toHaveCount(0);
       await expect(failedBubble.locator('.bubble-retry-btn')).toBeVisible();
       await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
@@ -511,7 +511,7 @@ test.describe('CLI failed-turn recovery', () => {
         failure_code: fault === 'version_unknown' ? 'version_unknown' : 'cli_failed_before_output',
       });
       expect(failures[0].text).toContain(failureText);
-      expect(failures[0].text).not.toContain(cliReason);
+      (fault === 'initialize_exit' ? expect(failures[0].text) : expect(failures[0].text).not).toContain(cliReason);
       if (fault === 'initialize_exit') {
         const runsDir = path.join(cliOrkas.workspaceRoot, 'account-e2e', 'local', 'file_cache', 'local-agent-runs');
         const runDirs = readdirSync(runsDir).map(id => path.join(runsDir, id));
@@ -528,7 +528,8 @@ test.describe('CLI failed-turn recovery', () => {
       const reopened = await cliOrkas.relaunch();
       await reopened.locator(`#conversation-list .conv-item[data-cid="${cid}"]`).click();
       await expect(reopened.locator('#chat-history .chat-message.assistant')).toContainText(failureText);
-      await expect(reopened.locator('#chat-history .chat-message.assistant')).not.toContainText(cliReason);
+      const reopenedBubble = reopened.locator('#chat-history .chat-message.assistant');
+      await (fault === 'initialize_exit' ? expect(reopenedBubble) : expect(reopenedBubble).not).toContainText(cliReason);
       expect(cliOrkas.readCliState().hermesInitializations || 0).toBe(before.hermesInitializations || 0);
       await reopened.screenshot({ path: testInfo.outputPath(`hermes-${fault}-reopened.png`) });
       writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), hermesFault: undefined }));
