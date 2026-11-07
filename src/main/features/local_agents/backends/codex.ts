@@ -40,6 +40,7 @@ import {
   type LocalEvent,
   type LocalCliPermissionDecision,
   StderrTail,
+  withStderrReason,
   spawnCli,
   killProcessTree,
   reapCliAfterProtocolTerminal,
@@ -1292,7 +1293,7 @@ if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), 
         return finish('completed', { output });
       }
       finish('failed', {
-        error: `codex exited with code ${code}` + (turnCompleted ? '' : ' (turn never completed)'),
+        error: withStderrReason(`codex exited with code ${code}` + (turnCompleted ? '' : ' (turn never completed)'), tail),
         output,
         stderrTail: tail.toString(),
         ...(!turnStarted ? { failureKind: 'cli_spawn', retrySafe: !turnStartSent } : {}),

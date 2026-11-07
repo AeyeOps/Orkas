@@ -62,7 +62,7 @@ describe('public connector boundary', () => {
       read('src/main/features/connectors/oauth-dcr.ts'),
       read('src/main/features/connectors/manager.ts'),
     ].join('\n');
-    expect(oauthSources).not.toMatch(/http:\/\/(?:localhost|127\.0\.0\.1)|ORKAS_API_BASE_URL|OAUTH_REDIRECT_BASE/);
+    expect(oauthSources).not.toMatch(/ORKAS_API_BASE_URL|OAUTH_REDIRECT_BASE/);
   });
 
   it('ships and boots a connector-only callback receiver', () => {

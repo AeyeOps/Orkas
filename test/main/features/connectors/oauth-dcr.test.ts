@@ -1,3 +1,4 @@
+import * as http from 'node:http';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const electronMock = vi.hoisted(() => ({
@@ -30,6 +31,8 @@ vi.mock('../../../../src/main/features/connectors/_server_bridge', () => ({
     authHeaders: () => ({ user_id: 'uid-1', session_id: 'sid-1' }),
   },
 }));
+
+vi.mock('../../../../src/main/features/connectors/focus-main-window', () => ({ focusMainWindow: vi.fn() }));
 
 vi.mock('../../../../src/main/features/config', () => ({
   getLanguage: () => localeMock.lang,
@@ -117,13 +120,30 @@ function jsonResponse(body: unknown, ok = true, status = ok ? 200 : 500) {
   };
 }
 
+async function loopbackCallback(parameters: Record<string, string> = {}, authorizeUrl = String(electronMock.openExternal.mock.calls.at(-1)![0])): Promise<{ status: number; body: string }> {
+  const authorize = new URL(authorizeUrl);
+  const callback = new URL(authorize.searchParams.get('redirect_uri')!);
+  callback.search = new URLSearchParams({ state: authorize.searchParams.get('state')!, code: 'provider-code', ...parameters }).toString();
+  return new Promise((resolve, reject) => {
+    http.get(callback, { agent: false }, response => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', chunk => { body += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode!, body }));
+      response.on('error', reject);
+    }).on('error', reject);
+  });
+}
+
 beforeEach(() => {
   localeMock.lang = 'en';
   vi.clearAllMocks();
   vi.resetModules();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+  oauth.cancelDcrOAuth();
   vi.useRealTimers();
   vi.unstubAllGlobals();
 });
@@ -155,7 +175,7 @@ describe('features/connectors/oauth-dcr', () => {
     const flow = oauth.startMcpDcrOAuth('uid-1', notionEntry()).catch(error => error);
     try {
       await vi.advanceTimersByTimeAsync(60_000);
-      expect(electronMock.openExternal).toHaveBeenCalledOnce();
+      await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledOnce());
       expect(fetchMock.mock.calls[1][0]).toBe('https://mcp.notion.example/.well-known/oauth-protected-resource/mcp');
       expect(new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('resource')).toBe(resource.resource);
     } finally {
@@ -264,13 +284,15 @@ describe('features/connectors/oauth-dcr', () => {
     vi.stubGlobal('fetch', fetchMock);
     const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
     const exchange = vi.fn();
+    let openedAt = 0;
+    electronMock.openExternal.mockImplementationOnce(async () => { openedAt = Date.now(); });
     const flow = kind === 'dcr' ? oauth.startMcpDcrOAuth('uid-1', notionEntry())
       : oauth.startLocalApiBrowserOAuth('shopee', () => 'https://open.shopee.com/auth', exchange);
     let rejected = false;
     const outcome = flow.catch(error => { rejected = true; return error; });
     await vi.advanceTimersByTimeAsync(0);
-    expect(electronMock.openExternal).toHaveBeenCalledOnce();
-    await vi.advanceTimersByTimeAsync(10 * 60 * 1000 - 1);
+    await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledOnce());
+    await vi.advanceTimersByTimeAsync(10 * 60 * 1000 - 1 - (Date.now() - openedAt));
     expect(rejected).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     expect(await outcome).toMatchObject({ code: 'flow_timeout' });
@@ -299,8 +321,7 @@ describe('features/connectors/oauth-dcr', () => {
         registration_endpoint: 'https://login.example.com/register',
       });
       if (url.pathname === '/register') return jsonResponse({ client_id: 'dynamic-client' });
-      if (url.pathname.endsWith('/dcr-exchange')) return jsonResponse({ code: 0, oauth_code: 'auth-code',
-        oauth_state: new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('state') });
+
       if (url.pathname === '/token') {
         expect(String(init?.body)).toContain('code_verifier=');
         return jsonResponse({ access_token: 'private-access', refresh_token: 'private-refresh', expires_in: 3600 });
@@ -314,12 +335,11 @@ describe('features/connectors/oauth-dcr', () => {
     const opened = new URL(String(electronMock.openExternal.mock.calls[0][0]));
     expect(opened.searchParams.get('code_challenge_method')).toBe('S256');
     expect(opened.searchParams.get('resource')).toBe('https://mcp.example.com/mcp');
-    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=receipt');
+    await loopbackCallback();
     await expect(flow).resolves.toMatchObject({ grant: { access_token: 'private-access', refresh_token: 'private-refresh' },
       client: { client_id: 'dynamic-client' } });
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/dcr-store'))).toBe(false);
-    expect(fetchMock.mock.calls.filter(([url]) => !String(url).endsWith('/dcr-exchange'))
-      .every(([, init]) => init?.redirect === 'error')).toBe(true);
+    expect(fetchMock.mock.calls.every(([, init]) => init?.redirect === 'error')).toBe(true);
   });
 
   it('rejects a custom OAuth authorization server that advertises an insecure URL', async () => {
@@ -372,7 +392,7 @@ describe('features/connectors/oauth-dcr', () => {
     await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
     expect(new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('resource'))
       .toBe('https://mcp.example.com/mcp');
-    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+    await loopbackCallback({ error: 'access_denied' });
     await outcome;
     expect(fetchMock.mock.calls.some(([url]) => String(url) === 'https://login.example.com/.well-known/openid-configuration/tenant'))
       .toBe(true);
@@ -406,7 +426,7 @@ describe('features/connectors/oauth-dcr', () => {
     await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
     expect(new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('resource'))
       .toBe('https://mcp.example.com/api/mcp/mcp');
-    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+    await loopbackCallback({ error: 'access_denied' });
     await outcome;
   });
 
@@ -434,7 +454,7 @@ describe('features/connectors/oauth-dcr', () => {
     const outcome = expect(pending).rejects.toThrow();
     await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
     expect(new URL(String(electronMock.openExternal.mock.calls[0][0])).origin).toBe('https://login.example.com');
-    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+    await loopbackCallback({ error: 'access_denied' });
     await outcome;
   });
 
@@ -477,7 +497,7 @@ describe('features/connectors/oauth-dcr', () => {
     expect(electronMock.openExternal).not.toHaveBeenCalled();
   });
 
-  it('prefers CIMD when advertised and rejects an issuer mismatch before token exchange', async () => {
+  it('uses local DCR when metadata documents are advertised and rejects an issuer mismatch', async () => {
     const fetchMock = vi.fn(async (raw: string) => {
       const url = new URL(raw);
       if (url.pathname.includes('oauth-protected-resource')) return jsonResponse({
@@ -486,13 +506,13 @@ describe('features/connectors/oauth-dcr', () => {
       if (url.pathname.includes('oauth-authorization-server')) return jsonResponse({
         issuer: 'https://login.example.com', authorization_response_iss_parameter_supported: true,
         client_id_metadata_document_supported: true,
+        registration_endpoint: 'https://login.example.com/register',
         authorization_endpoint: 'https://login.example.com/authorize',
         token_endpoint: 'https://login.example.com/token',
       });
-      if (url.pathname.endsWith('/dcr-exchange')) return jsonResponse({ code: 0, oauth_code: 'auth-code',
-        oauth_state: new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('state'),
-        oauth_issuer: 'https://other.example.com' });
-      throw new Error('CIMD must not register or exchange a mismatched issuer');
+      if (url.pathname === '/register') return jsonResponse({ client_id: 'native-client' });
+
+      throw new Error('A mismatched issuer must not exchange a token');
     });
     vi.stubGlobal('fetch', fetchMock);
     const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
@@ -500,13 +520,13 @@ describe('features/connectors/oauth-dcr', () => {
     const outcome = expect(flow).rejects.toThrow('issuer mismatch');
     await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
     const opened = new URL(String(electronMock.openExternal.mock.calls[0][0]));
-    expect(opened.searchParams.get('client_id')).toBe('https://account.example/api/connectors/oauth/client-metadata');
-    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=receipt');
+    expect(opened.searchParams.get('client_id')).toBe('native-client');
+    await loopbackCallback({ iss: 'https://other.example.com' });
     await outcome;
-    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/register'))).toBe(false);
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/register'))).toBe(true);
   });
 
-  it('completes a CIMD authorization without dynamic registration', async () => {
+  it('completes local DCR when metadata documents are advertised', async () => {
     const fetchMock = vi.fn(async (raw: string, init?: RequestInit) => {
       const url = new URL(raw);
       if (url.pathname.includes('oauth-protected-resource')) return jsonResponse({
@@ -515,27 +535,27 @@ describe('features/connectors/oauth-dcr', () => {
       if (url.pathname.includes('oauth-authorization-server')) return jsonResponse({
         issuer: 'https://login.example.com', authorization_response_iss_parameter_supported: true,
         client_id_metadata_document_supported: true,
+        registration_endpoint: 'https://login.example.com/register',
         authorization_endpoint: 'https://login.example.com/authorize',
         token_endpoint: 'https://login.example.com/token',
       });
-      if (url.pathname.endsWith('/dcr-exchange')) return jsonResponse({ code: 0, oauth_code: 'auth-code',
-        oauth_state: new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('state'),
-        oauth_issuer: 'https://login.example.com' });
+      if (url.pathname === '/register') return jsonResponse({ client_id: 'native-client' });
+
       if (url.pathname === '/token') {
         expect(new URLSearchParams(String(init?.body)).get('client_id'))
-          .toBe('https://account.example/api/connectors/oauth/client-metadata');
+          .toBe('native-client');
         return jsonResponse({ access_token: 'cimd-access', refresh_token: 'cimd-refresh', expires_in: 3600 });
       }
-      throw new Error('CIMD must not register a dynamic client');
+      throw new Error('Unexpected DCR request');
     });
     vi.stubGlobal('fetch', fetchMock);
     const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
     const flow = oauth.startCustomMcpOAuth('custom-example', 'https://mcp.example.com/mcp');
     await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
-    await oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=receipt');
+    await loopbackCallback({ iss: 'https://login.example.com' });
     await expect(flow).resolves.toMatchObject({ grant: { access_token: 'cimd-access', refresh_token: 'cimd-refresh' },
-      client: { client_id: 'https://account.example/api/connectors/oauth/client-metadata', token_endpoint_auth_method: 'none' } });
-    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/register'))).toBe(false);
+      client: { client_id: 'native-client' } });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/register'))).toBe(true);
   });
 
   it.each(['zh', 'en', 'ja', 'pt'])('carries %s in fresh opaque states without changing registered callback URLs', async (lang) => {
@@ -563,7 +583,7 @@ describe('features/connectors/oauth-dcr', () => {
     await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
     const url = new URL(String(electronMock.openExternal.mock.calls[0][0]));
     states.push(url.searchParams.get('state')!);
-    expect(url.searchParams.get('redirect_uri')).toBe('https://account.example/api/connectors/oauth/dcr-callback');
+    expect(url.searchParams.get('redirect_uri')).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/callback$/);
     expect(url.searchParams.has('lang')).toBe(false);
     expect(states[0]).not.toBe(states[1]);
     for (const state of states) expect(state).toMatch(new RegExp(`^orkas1_${lang}_[A-Za-z0-9_-]{43}$`));
@@ -594,7 +614,7 @@ describe('features/connectors/oauth-dcr', () => {
     const oldFlow = oauth.startMcpDcrOAuth('uid-1', notionEntry());
     const cancelled = expect(oldFlow).rejects.toMatchObject({ code: 'user_cancelled' });
     await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
-    const oldCallback = oauth.handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=old');
+    const oldCallback = loopbackCallback();
     await vi.waitFor(() => expect(fetchMock.mock.calls.some(([url]) => url.endsWith('/token'))).toBe(true));
     const sellerExchange = vi.fn(async () => ({ access_token: 'seller-grant' }));
     const next = oauth.startLocalApiBrowserOAuth('shopee', (state) => `https://open.shopee.com/auth?state=${state}`, sellerExchange);
@@ -649,14 +669,7 @@ describe('features/connectors/oauth-dcr', () => {
       if (rawUrl === 'https://auth.notion.example/register') {
         return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
       }
-      if (rawUrl === 'https://account.example/api/connectors/oauth/dcr-exchange') {
-        const opened = new URL(String(electronMock.openExternal.mock.calls[0][0]));
-        return jsonResponse({
-          code: 0,
-          oauth_code: 'provider-code',
-          oauth_state: opened.searchParams.get('state'),
-        });
-      }
+
       if (rawUrl === 'https://auth.notion.example/token') {
         return jsonResponse({ error: 'invalid_grant', detail: providerSentinel }, false, 400);
       }
@@ -664,17 +677,10 @@ describe('features/connectors/oauth-dcr', () => {
     });
     vi.stubGlobal('fetch', tokenFetch);
     const oauthDcr = await import('../../../../src/main/features/connectors/oauth-dcr');
-    const pending = oauthDcr.startMcpDcrOAuth('uid-1', notionEntry());
+    const pending = oauthDcr.startMcpDcrOAuth('uid-1', notionEntry()).catch(error => error);
     await vi.waitFor(() => expect(electronMock.openExternal).toHaveBeenCalledTimes(1));
-    await oauthDcr.handleDcrCallbackUrl(
-      'orkas://connectors/oauth/dcr-callback?exchange_code=exchange-1',
-    );
-    let tokenError = '';
-    try {
-      await pending;
-    } catch (err) {
-      tokenError = String((err as Error).message || err);
-    }
+    await loopbackCallback();
+    const tokenError = String((await pending).message);
     expect(tokenError).toContain('token exchange failed');
     const tokenEvidence = JSON.stringify({
       error: tokenError,
@@ -702,7 +708,8 @@ describe('features/connectors/oauth-dcr', () => {
       }
       if (String(url) === 'https://auth.notion.example/register') {
         const body = JSON.parse(String(init?.body || '{}'));
-        expect(body.redirect_uris).toEqual(['https://account.example/api/connectors/oauth/dcr-callback']);
+        expect(body.redirect_uris).toEqual([expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/callback$/)]);
+        expect(body.application_type).toBe('native');
         expect(body.grant_types).toContain('authorization_code');
         return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
       }
@@ -710,7 +717,7 @@ describe('features/connectors/oauth-dcr', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const { startMcpDcrOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
     void startMcpDcrOAuth('uid-1', notionEntry()).catch(() => {});
     await vi.waitFor(() => {
       expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
@@ -720,12 +727,12 @@ describe('features/connectors/oauth-dcr', () => {
     expect(opened.href.startsWith('https://auth.notion.example/authorize?')).toBe(true);
     expect(opened.searchParams.get('response_type')).toBe('code');
     expect(opened.searchParams.get('client_id')).toBe('client-1');
-    expect(opened.searchParams.get('redirect_uri')).toBe('https://account.example/api/connectors/oauth/dcr-callback');
+    expect(opened.searchParams.get('redirect_uri')).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/callback$/);
     expect(opened.searchParams.get('resource')).toBe('https://mcp.notion.example/mcp');
     expect(opened.searchParams.get('code_challenge_method')).toBe('S256');
     expect(opened.searchParams.get('code_challenge')).toBeTruthy();
     expect(opened.searchParams.get('state')).toBeTruthy();
-    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+    await loopbackCallback({ error: 'access_denied' });
   });
 
   it('discovers providers that publish path-based protected-resource and auth-server metadata', async () => {
@@ -749,7 +756,8 @@ describe('features/connectors/oauth-dcr', () => {
       }
       if (rawUrl === 'https://auth.atlassian.example/as-1/dcr/register') {
         const body = JSON.parse(String(init?.body || '{}'));
-        expect(body.redirect_uris).toEqual(['https://account.example/api/connectors/oauth/dcr-callback']);
+        expect(body.redirect_uris).toEqual([expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+\/callback$/)]);
+        expect(body.application_type).toBe('native');
         expect(body.token_endpoint_auth_method).toBe('client_secret_post');
         return jsonResponse({ client_id: 'atl-client-1', client_secret: 'atl-secret-1' });
       }
@@ -757,7 +765,7 @@ describe('features/connectors/oauth-dcr', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const { startMcpDcrOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
     void startMcpDcrOAuth('uid-1', atlassianEntry()).catch(() => {});
     await vi.waitFor(() => {
       expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
@@ -768,7 +776,7 @@ describe('features/connectors/oauth-dcr', () => {
     expect(opened.searchParams.get('client_id')).toBe('atl-client-1');
     expect(opened.searchParams.get('resource')).toBe('https://mcp.atlassian.example/v1/mcp/authv2');
     expect(fetchMock.mock.calls.some(([url]) => String(url) === 'https://auth.atlassian.example/.well-known/oauth-authorization-server')).toBe(false);
-    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+    await loopbackCallback({ error: 'access_denied' });
   });
 
   it('falls back to MCP-host authorization metadata when the advertised auth-server host omits it', async () => {
@@ -802,7 +810,7 @@ describe('features/connectors/oauth-dcr', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const { startMcpDcrOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
     void startMcpDcrOAuth('uid-1', stripeEntry()).catch(() => {});
     await vi.waitFor(() => {
       expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
@@ -812,11 +820,10 @@ describe('features/connectors/oauth-dcr', () => {
     expect(opened.href.startsWith('https://access.stripe.example/mcp/oauth2/authorize?')).toBe(true);
     expect(opened.searchParams.get('client_id')).toBe('stripe-client-1');
     expect(opened.searchParams.get('resource')).toBe('https://mcp.stripe.example');
-    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+    await loopbackCallback({ error: 'access_denied' });
   });
 
   it('uses client_secret_basic when the provider does not support client_secret_post', async () => {
-    let openedState = '';
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       const rawUrl = String(url);
       if (rawUrl === 'https://mcp.airtable.example/mcp/.well-known/oauth-protected-resource') {
@@ -848,9 +855,7 @@ describe('features/connectors/oauth-dcr', () => {
           token_endpoint_auth_method: 'client_secret_basic',
         });
       }
-      if (rawUrl === 'https://account.example/api/connectors/oauth/dcr-exchange') {
-        return jsonResponse({ code: 0, oauth_code: 'provider-code', oauth_state: openedState });
-      }
+
       if (rawUrl === 'https://airtable.example/oauth2/v1/token') {
         const headers = init?.headers as Record<string, string>;
         const body = new URLSearchParams(String(init?.body || ''));
@@ -870,14 +875,13 @@ describe('features/connectors/oauth-dcr', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const { startMcpDcrOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
     const pending = startMcpDcrOAuth('uid-1', airtableEntry(), { attemptId: 'attempt-dcr-return' });
     await vi.waitFor(() => {
       expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
     });
-    openedState = new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('state') || '';
 
-    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=exchange-1');
+    await loopbackCallback();
     const result = await pending;
     expect(result.grant).toMatchObject({
       access_token: 'airtable-access-local',
@@ -910,11 +914,7 @@ describe('features/connectors/oauth-dcr', () => {
       if (String(url) === 'https://auth.notion.example/register') {
         return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
       }
-      if (String(url) === 'https://account.example/api/connectors/oauth/dcr-exchange') {
-        const body = JSON.parse(String(init?.body || '{}'));
-        expect(body.exchange_code).toBe('exchange-1');
-        return jsonResponse({ code: 0, oauth_code: 'provider-code', oauth_state: 'wrong-state' });
-      }
+
       if (String(url) === 'https://auth.notion.example/token') {
         throw new Error('token endpoint must not be called after state mismatch');
       }
@@ -922,19 +922,21 @@ describe('features/connectors/oauth-dcr', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const { startMcpDcrOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
     const pending = startMcpDcrOAuth('uid-1', notionEntry());
     await vi.waitFor(() => {
       expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
     });
 
-    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=exchange-1');
-    await expect(pending).rejects.toThrow(/state mismatch/);
+    expect((await loopbackCallback({ state: 'wrong-state' })).status).toBe(400);
+    const cancelled = expect(pending).rejects.toMatchObject({ code: 'user_cancelled' });
+    const oauth = await import('../../../../src/main/features/connectors/oauth-dcr');
+    oauth.cancelDcrOAuth();
+    await cancelled;
     expect(fetchMock.mock.calls.some(([url]) => String(url) === 'https://auth.notion.example/token')).toBe(false);
   });
 
   it('keeps a completed DCR grant and client credentials local', async () => {
-    let openedState = '';
     const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
       if (String(url).endsWith('/mcp/.well-known/oauth-protected-resource')) {
         return jsonResponse({
@@ -952,9 +954,7 @@ describe('features/connectors/oauth-dcr', () => {
       if (String(url) === 'https://auth.notion.example/register') {
         return jsonResponse({ client_id: 'client-1', client_secret: 'secret-1' });
       }
-      if (String(url) === 'https://account.example/api/connectors/oauth/dcr-exchange') {
-        return jsonResponse({ code: 0, oauth_code: 'provider-code', oauth_state: openedState });
-      }
+
       if (String(url) === 'https://auth.notion.example/token') {
         const body = new URLSearchParams(String(init?.body || ''));
         expect(body.get('code')).toBe('provider-code');
@@ -971,14 +971,13 @@ describe('features/connectors/oauth-dcr', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const { startMcpDcrOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
     const pending = startMcpDcrOAuth('uid-1', notionEntry());
     await vi.waitFor(() => {
       expect(electronMock.openExternal).toHaveBeenCalledTimes(1);
     });
-    openedState = new URL(String(electronMock.openExternal.mock.calls[0][0])).searchParams.get('state') || '';
 
-    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?exchange_code=exchange-1');
+    await loopbackCallback();
     const result = await pending;
 
     expect(result.grant).toMatchObject({
@@ -1016,7 +1015,7 @@ describe('features/connectors/oauth-dcr', () => {
     });
     vi.stubGlobal('fetch', fetchMock);
 
-    const { startMcpDcrOAuth, handleDcrCallbackUrl } = await import('../../../../src/main/features/connectors/oauth-dcr');
+    const { startMcpDcrOAuth } = await import('../../../../src/main/features/connectors/oauth-dcr');
     void startMcpDcrOAuth('uid-1', {
       id: 'gitlab',
       display_name: 'GitLab',
@@ -1033,7 +1032,7 @@ describe('features/connectors/oauth-dcr', () => {
 
     const opened = new URL(String(electronMock.openExternal.mock.calls[0][0]));
     expect(opened.searchParams.get('resource')).toBe('https://gitlab.example/api/v4/mcp');
-    await handleDcrCallbackUrl('orkas://connectors/oauth/dcr-callback?status=cancelled');
+    await loopbackCallback({ error: 'access_denied' });
   });
 
   it('refreshes stale DCR grants with resource and persists rotated refresh_token fields', async () => {

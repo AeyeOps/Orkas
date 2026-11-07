@@ -1,27 +1,18 @@
 /**
- * MCP-spec OAuth client (Client ID Metadata Document or Dynamic Client Registration).
+ * MCP-spec OAuth client using Dynamic Client Registration (RFC 7591).
  *
  * For providers that host their own OAuth authorization server per the MCP authorization spec
- * (Notion, Atlassian, Cloudflare suite, …). Orkas has no pre-registered OAuth App at the
- * provider — PC uses a public Client ID Metadata Document when available, otherwise
- * self-registers via DCR (RFC 7591), then drives OAuth from the PC side.
+ * (Notion, Atlassian, Cloudflare suite, …). Each authorization registers a client whose
+ * redirect_uri is a loopback listener on this device (RFC 8252), then exchanges the code with
+ * PKCE directly against the provider's `token_endpoint`.
  *
  * The Server-bridge in `oauth.ts` handles a different class of providers (GitHub Copilot MCP
  * today) where Orkas registered an OAuth App and Server holds the secret. The two flows live
  * side-by-side and `manager.ts::connectViaOAuth` dispatches by `catalog.auth_mode`.
- *
- * Server serves `/api/connectors/oauth/dcr-callback` as a stable HTTPS redirect_uri (DCR
- * clients must declare one at registration), stashes the {code, state} pair under a one-time
- * exchange_code, and deep-links back to PC. PC then does the first token POST against the
- * provider's `token_endpoint` using the DCR-issued credentials. The public build then keeps the
- * DCR client credentials and rotating refresh grant in its local encrypted connector registry.
- * Server is only the short-lived HTTPS callback intermediary; it never receives those secrets.
- *
- * The public build never starts a loopback callback listener. Its bridge base is pinned to the
- * global production HTTPS origin, and the landing page returns through the connector-only OS
- * protocol receiver.
  */
 import * as crypto from 'node:crypto';
+import * as http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { URL, URLSearchParams } from 'node:url';
 import { shell } from 'electron';
 import { buildDiscoveryUrls, extractWWWAuthenticateParams } from '@modelcontextprotocol/sdk/client/auth.js';
@@ -30,10 +21,11 @@ import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
 import { accountApiBase, tokenStore } from './_server_bridge';
 import { withCommonHeaders } from '../api_common';
 import { getLanguage } from '../config';
-import { normalizeLang } from '../../i18n';
+import { getLocaleMeta, normalizeLang, t } from '../../i18n';
 import { createLogger } from '../../logger';
 import { logErrorSummary } from '../../util/log-redact';
 import { fetchAndReadWithTimeout, fetchWithTimeout } from '../../util/abort';
+import { focusMainWindow } from './focus-main-window';
 import { broadcastOAuthConnectProgress } from './oauth-events';
 import { LOCAL_API_REDIRECT_URI } from './oauth-redirect';
 export { LOCAL_API_REDIRECT_URI } from './oauth-redirect';
@@ -53,7 +45,9 @@ const DCR_HTTP_TIMEOUT_MS = 60_000;
 // provider-controlled 200 from streaming into main-process memory.
 const DCR_MAX_JSON_BODY_BYTES = 1024 * 1024;
 const REFRESH_BUFFER_MS = 5 * 60 * 1000;
-const CLIENT_NAME = 'Orkas';
+const CLIENT_NAME = 'AeyeOps Orkas';
+const LOOPBACK_HOST = '127.0.0.1';
+const LOOPBACK_CALLBACK_PATH = '/callback';
 
 interface PendingDcrFlow {
   kind: 'dcr';
@@ -69,6 +63,7 @@ interface PendingDcrFlow {
   resource: string;         // RFC 8707 canonical resource URI
   requiredScopes: string[];
   client: DcrClientCredentials;
+  server: http.Server;
   resolve: (out: { grant: OAuthGrant; client: DcrClientCredentials }) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
@@ -98,6 +93,7 @@ export function cancelDcrOAuth(): boolean {
   _pending = null;
   clearTimeout(pending.timer);
   if (pending.kind === 'local_api') pending.controller.abort();
+  if (pending.kind === 'dcr' && pending.server.listening) pending.server.close();
   pending.reject(Object.assign(new Error('Authorization cancelled'), { code: 'user_cancelled' }));
   return true;
 }
@@ -181,6 +177,7 @@ function _cancelPending(reason: string, code?: string): void {
   _pending = null;
   clearTimeout(p.timer);
   if (p.kind === 'local_api') p.controller.abort();
+  if (p.kind === 'dcr' && p.server.listening) p.server.close();
   p.reject(Object.assign(new Error(reason), code ? { code } : {}));
 }
 
@@ -194,7 +191,6 @@ interface ProtectedResourceMetadata {
 interface AuthServerMetadata {
   issuer?: string;
   authorization_response_iss_parameter_supported?: boolean;
-  client_id_metadata_document_supported?: boolean;
   authorization_endpoint: string;
   token_endpoint: string;
   registration_endpoint?: string;
@@ -513,7 +509,7 @@ async function _registerClient(
         redirect_uris: [redirectUri],
         grant_types: ['authorization_code', 'refresh_token'],
         response_types: ['code'],
-        application_type: 'web',
+        application_type: 'native',
         token_endpoint_auth_method: tokenEndpointAuthMethod,
       }),
     }));
@@ -579,25 +575,27 @@ async function _startDcrOAuth(
   if (storeLocally && meta.authorization_response_iss_parameter_supported && !meta.issuer) {
     throw new Error('OAuth metadata missing issuer');
   }
-  const redirectUri = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/dcr-callback`;
-  const metadataUrl = `${accountApiBase().replace(/\/+$/, '')}/connectors/oauth/client-metadata`;
-  const useMetadata = storeLocally && meta.client_id_metadata_document_supported === true
-    && metadataUrl.startsWith('https://');
-  if (!useMetadata && !meta.registration_endpoint) throw new Error('provider does not support client metadata or DCR registration');
-  const tokenEndpointAuthMethod = useMetadata ? 'none' : _chooseTokenAuthMethod(meta);
+  if (!meta.registration_endpoint) throw new Error('provider does not support DCR registration');
+  const tokenEndpointAuthMethod = _chooseTokenAuthMethod(meta);
   log.info('DCR endpoints discovered', {
     catalog_id: storeLocally ? 'custom' : id,
-    has_registration_endpoint: !!meta.registration_endpoint,
-    client_metadata: useMetadata,
     has_resource: !!resource,
     token_auth: tokenEndpointAuthMethod,
   });
 
-  // Source and packaged builds both use the production HTTPS callback bridge.
-  const registered = useMetadata
-    ? { client_id: metadataUrl, token_endpoint_auth_method: 'none' as const }
-    : await _registerClient(meta.registration_endpoint!, redirectUri, tokenEndpointAuthMethod, storeLocally);
-  if (generation !== _startGeneration) throw Object.assign(new Error('Authorization superseded'), { code: 'user_cancelled' });
+  const server = await _listenLoopback();
+  const redirectUri = `http://${LOOPBACK_HOST}:${(server.address() as AddressInfo).port}${LOOPBACK_CALLBACK_PATH}`;
+  let registered: Awaited<ReturnType<typeof _registerClient>>;
+  try {
+    registered = await _registerClient(meta.registration_endpoint, redirectUri, tokenEndpointAuthMethod, storeLocally);
+  } catch (err) {
+    server.close();
+    throw err;
+  }
+  if (generation !== _startGeneration) {
+    server.close();
+    throw Object.assign(new Error('Authorization superseded'), { code: 'user_cancelled' });
+  }
   log.info('DCR registration done', { catalog_id: storeLocally ? 'custom' : id });
 
   const registeredTokenAuthMethod = registered.token_endpoint_auth_method === 'client_secret_basic'
@@ -649,15 +647,70 @@ async function _startDcrOAuth(
       resource,
       requiredScopes,
       client: dcrClient,
+      server,
       resolve,
       reject,
       timer,
     };
     _pending = pending;
+    server.on('request', (req, res) => _handleLoopbackRequest(pending, req, res));
     shell.openExternal(authUrl.toString()).catch(() => {
       if (_pending === pending) _cancelPending('failed to open authorization browser');
     });
   });
+}
+
+function _listenLoopback(): Promise<http.Server> {
+  return new Promise((resolve, reject) => {
+    const server = http.createServer();
+    server.once('error', reject);
+    server.listen(0, LOOPBACK_HOST, () => {
+      server.off('error', reject);
+      resolve(server);
+    });
+  });
+}
+
+function _respondLoopbackPage(res: http.ServerResponse, status: number, titleKey: string, messageKey: string): void {
+  const lang = getLanguage();
+  const title = t(titleKey, {}, lang);
+  const message = t(messageKey, {}, lang);
+  res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'close' });
+  res.end(`<!doctype html><html lang="${getLocaleMeta(lang).htmlLang}"><head><meta charset="utf-8"><title>${title}</title></head>`
+    + `<body style="font-family:system-ui,sans-serif;max-width:32rem;margin:15vh auto;padding:0 1rem">`
+    + `<h1>${title}</h1><p>${message}</p></body></html>`);
+}
+
+function _handleLoopbackRequest(pending: PendingDcrFlow, req: http.IncomingMessage, res: http.ServerResponse): void {
+  const url = new URL(req.url || '/', pending.redirectUri);
+  if (req.method !== 'GET' || url.pathname !== LOOPBACK_CALLBACK_PATH) {
+    res.writeHead(404, { Connection: 'close' }).end();
+    return;
+  }
+  if (_pending !== pending || pending.callbackStarted || url.searchParams.get('state') !== pending.state) {
+    _respondLoopbackPage(res, 400, 'connectors.oauth.loopback_failed_title', 'connectors.oauth.loopback_failed_message');
+    return;
+  }
+  pending.callbackStarted = true;
+  pending.server.close();
+  const error = url.searchParams.get('error');
+  const code = url.searchParams.get('code');
+  if (error || !code) {
+    _respondLoopbackPage(res, 400, 'connectors.oauth.loopback_failed_title', 'connectors.oauth.loopback_failed_message');
+    focusMainWindow();
+    if (error === 'access_denied') cancelDcrOAuth();
+    else _cancelPending(error ? `provider error: ${error}` : 'missing authorization code');
+    return;
+  }
+  _respondLoopbackPage(res, 200, 'connectors.oauth.loopback_done_title', 'connectors.oauth.loopback_done_message');
+  focusMainWindow();
+  if (pending.attemptId) {
+    broadcastOAuthConnectProgress({
+      attempt_id: pending.attemptId,
+      catalog_id: pending.catalogId,
+    });
+  }
+  void _completeDcrAuthorization(pending, code, url.searchParams.get('iss'));
 }
 
 /** Called by the protocol handler when `orkas://connectors/oauth/dcr-callback?...` arrives. */
@@ -668,6 +721,10 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
     return;
   }
   const pending = _pending;
+  if (pending.kind !== 'local_api') {
+    log.warn('ignored relay callback for a loopback DCR flow');
+    return;
+  }
   if (pending.callbackStarted) return;
   let url: URL;
   try { url = new URL(rawUrl); } catch (err) {
@@ -691,10 +748,9 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
   // Pull {oauth_code, oauth_state} from Server. Server uses the namespaced keys (not bare
   // `code`/`state`) because `json_response` spreads data flat — a bare `code` key would
   // collide with the response status `code` field. See Server `api/connectors.py` comment.
-  let payload: { code: string; state: string; issuer?: string };
+  let payload: { code: string; state: string };
   try {
-    const relayBase = pending.kind === 'local_api' ? pending.relayBase : accountApiBase();
-    const { response: res, body: rawBody } = await _fetchDcrJson('DCR exchange', `${relayBase}/connectors/oauth/dcr-exchange`, {
+    const { response: res, body: rawBody } = await _fetchDcrJson('DCR exchange', `${pending.relayBase}/connectors/oauth/dcr-exchange`, {
       method: 'POST',
       headers: withCommonHeaders({
         'Content-Type': 'application/json',
@@ -708,13 +764,11 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
       msg?: string;
       oauth_code?: string;
       oauth_state?: string;
-      oauth_issuer?: string;
     };
     if (body.code !== 0 || !body.oauth_code || !body.oauth_state) {
       throw new Error(body.msg || 'dcr exchange response invalid');
     }
-    payload = { code: body.oauth_code, state: body.oauth_state,
-      ...(body.oauth_issuer ? { issuer: body.oauth_issuer } : {}) };
+    payload = { code: body.oauth_code, state: body.oauth_state };
   } catch (err) {
     if (_pending === pending) _cancelPending(`dcr exchange failed: ${_fmtFetchErr('', err).message}`);
     return;
@@ -727,25 +781,24 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
     _cancelPending('state mismatch (CSRF guard)');
     return;
   }
-  if (pending.kind === 'dcr' && ((payload.issuer && payload.issuer !== pending.issuer)
-    || (pending.issuerRequired && !payload.issuer))) {
-    _cancelPending('authorization issuer mismatch');
-    return;
-  }
 
-  if (pending.kind === 'local_api') {
-    try {
-      const credentials = await pending.exchange(payload.code, pending.controller.signal);
-      if (_pending !== pending) return;
-      _pending = null;
-      clearTimeout(pending.timer);
-      pending.resolve(credentials);
-    } catch (error) {
-      if (_pending !== pending) return;
-      _pending = null;
-      clearTimeout(pending.timer);
-      pending.reject(error instanceof Error ? error : new Error('Shop authorization failed'));
-    }
+  try {
+    const credentials = await pending.exchange(payload.code, pending.controller.signal);
+    if (_pending !== pending) return;
+    _pending = null;
+    clearTimeout(pending.timer);
+    pending.resolve(credentials);
+  } catch (error) {
+    if (_pending !== pending) return;
+    _pending = null;
+    clearTimeout(pending.timer);
+    pending.reject(error instanceof Error ? error : new Error('Shop authorization failed'));
+  }
+}
+
+async function _completeDcrAuthorization(pending: PendingDcrFlow, code: string, issuer: string | null): Promise<void> {
+  if ((issuer && issuer !== pending.issuer) || (pending.issuerRequired && !issuer)) {
+    _cancelPending('authorization issuer mismatch');
     return;
   }
 
@@ -753,7 +806,7 @@ export async function handleDcrCallbackUrl(rawUrl: string): Promise<void> {
   try {
     const tokenReq = _buildTokenRequest(pending.client, {
       grant_type: 'authorization_code',
-      code: payload.code,
+      code,
       redirect_uri: pending.redirectUri,
       code_verifier: pending.codeVerifier,
       resource: pending.resource,
