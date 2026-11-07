@@ -2797,9 +2797,6 @@ function _settingsSelectedVideoProvider() {
 async function _settingsRefreshVideoProfiles() {
   const res = await window.orkas.invoke('videoAuth.list');
   _settingsState.videoProfiles = (res && res.ok && Array.isArray(res.profiles)) ? res.profiles : [];
-  const tab = document.getElementById('settings-model-tab-video');
-  if (tab) tab.hidden = !_settingsVisibleApiProfiles(_settingsState.videoProfiles).length;
-  _settingsActivateModelTab(_settingsState.modelTab);
   _settingsState.videoAuthProviderOptions = (res && res.ok && Array.isArray(res.providers) && res.providers.length)
     ? res.providers
     : _VIDEO_AUTH_PROVIDER_OPTIONS;
