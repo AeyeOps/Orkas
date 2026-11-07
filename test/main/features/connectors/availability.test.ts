@@ -118,10 +118,10 @@ describe('connector availability gates', () => {
     const registry = await import('../../../../src/main/features/connectors/registry');
     const now = new Date().toISOString();
     await registry.upsert(TEST_UID, {
-      ...connectedInstance('paypal'),
-      transport: { kind: 'streamable-http', url: 'https://mcp.paypal.com/http' },
+      ...connectedInstance('retired-connector'),
+      transport: { kind: 'streamable-http', url: 'https://mcp.example.com/mcp' },
       tools_cache: [
-        { name: 'list_transactions', description: 'Reviewed.', input_schema: {} },
+        { name: 'list_items', description: 'Reviewed.', input_schema: {} },
         { name: 'unreviewed_future_admin_action', description: 'Not reviewed.', input_schema: {} },
       ],
       created_at: now,
@@ -138,13 +138,13 @@ describe('connector availability gates', () => {
     vi.stubGlobal('fetch', fetchMock);
     try {
       expect(manager.listInstances(TEST_UID)).toEqual([]);
-      expect(manager.getInstance(TEST_UID, 'paypal')).toBeNull();
+      expect(manager.getInstance(TEST_UID, 'retired-connector')).toBeNull();
       await manager.bootstrap(TEST_UID);
       expect(await toolsAdapter.resolveVisibleConnectors(TEST_UID)).toEqual([]);
-      await expect(manager.callTool(TEST_UID, 'paypal', 'unreviewed_future_admin_action', {}))
+      await expect(manager.callTool(TEST_UID, 'retired-connector', 'unreviewed_future_admin_action', {}))
         .rejects.toThrow('instance not found');
       expect(fetchMock).not.toHaveBeenCalled();
-      expect(registry.load(TEST_UID).connections.paypal.tools_cache).toHaveLength(2);
+      expect(registry.load(TEST_UID).connections['retired-connector'].tools_cache).toHaveLength(2);
     } finally {
       vi.unstubAllGlobals();
     }
