@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import sharp from 'sharp';
+import sharp from '../../../helpers/bundled-node-sharp';
 
 // Preparation checks browser availability but never opens a render window.
 vi.mock('electron', () => ({ BrowserWindow: function BrowserWindow() {} }));

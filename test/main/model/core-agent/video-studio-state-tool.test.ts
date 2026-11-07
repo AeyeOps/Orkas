@@ -6,7 +6,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import sharp from 'sharp';
+import sharp from '../../../helpers/bundled-node-sharp';
 
 import {
   SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS,

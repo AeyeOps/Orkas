@@ -4,13 +4,14 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import sharp from 'sharp';
+import { runInBundledNode } from '../../helpers/bundled-node';
+import sharp from '../../helpers/bundled-node-sharp';
 
 const require = createRequire(import.meta.url);
 const structuredVisual = require('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/structured_visual.js') as
   ((input: { args: string[] }) => Promise<Record<string, unknown>>);
-const imageAsset = require('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/image_asset.js') as
-  ((input: { args: string[] }) => Promise<Record<string, unknown>>);
+const imageAssetPath = require.resolve('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/image_asset.js');
+const imageAsset = (input: { args: string[] }): Promise<Record<string, unknown>> => runInBundledNode(imageAssetPath, input);
 
 let root = '';
 

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
-import sharp from 'sharp';
+import sharp from '../../../helpers/bundled-node-sharp';
 import { readFileSync } from 'node:fs';
 
 const require = createRequire(import.meta.url);

@@ -2,11 +2,13 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { createRequire } from 'node:module';
-import sharp from 'sharp';
+import { runInBundledNode } from '../../helpers/bundled-node';
+import sharp from '../../helpers/bundled-node-sharp';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { imageStudioFileHash, isImageStudioGeneration } from '../../../src/main/features/image_studio_provenance';
 const require = createRequire(import.meta.url);
-const imageAsset = require('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/image_asset.js');
+const imageAssetPath = require.resolve('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/image_asset.js');
+const imageAsset = (input: { args: string[] }): Promise<Record<string, unknown>> => runInBundledNode(imageAssetPath, input);
 let root: string;
 let outputs: Array<{ output_path: string; output_sha256: string }>;
 beforeEach(async () => {

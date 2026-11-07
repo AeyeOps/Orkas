@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import sharp from 'sharp';
+import sharp from '../../../helpers/bundled-node-sharp';
 import { COMPOSIO_MANAGED_ENTRIES } from '../../../../src/main/features/connectors/catalog-managed';
 import { CONNECTOR_CATALOG, findCatalogEntry } from '../../../../src/main/features/connectors/catalog';
 import { connectorActionRisk } from '../../../../src/main/features/connectors/action_policy';
