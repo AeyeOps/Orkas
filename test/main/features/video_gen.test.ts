@@ -79,8 +79,7 @@ describe('video_gen › Orkas public API', () => {
     const outputAbsPath = path.join(tmpDir, 'result.mp4');
     await expect(generateVideo({ prompt: 'a paper boat crosses a pond', outputAbsPath })).resolves.toMatchObject({
       ok: false,
-      errorCode: 'PROVIDER_API_ERROR',
-      message: 'Orkas vendor services are unavailable in this build',
+      errorCode: 'NO_CAPABLE_MODEL',
     });
     expect(fetchStub).not.toHaveBeenCalled();
     expect(mocks.downloadBinaryWithProxyPolicy).not.toHaveBeenCalled();
@@ -89,6 +88,10 @@ describe('video_gen › Orkas public API', () => {
   });
 
   it('fails before dispatch when edit mode has no reference video', async () => {
+    mocks.profiles = [{
+      id: 'vid-doubao', provider: 'doubao', model: 'doubao-seedance-2-0-260128',
+      apiKey: 'user-key', label: 'Doubao', createdAt: 1,
+    }];
     const fetchStub = vi.fn();
     vi.stubGlobal('fetch', fetchStub);
 
