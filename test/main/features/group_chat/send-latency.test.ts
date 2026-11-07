@@ -4,6 +4,7 @@ import * as path from 'node:path';
 import { createRequire } from 'node:module';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 import { checkLatencyBudget, FIRST_REQUEST_LATENCY_LIMIT_MS, type LatencySample } from '../../../helpers/latency-budget';
+import type { CatalogEntry } from '../../../../src/main/features/connectors/types';
 
 // Measure the real send -> bus -> client -> Runner -> SDK fetch path. Only the external
 // model response is simulated; configuration, connectors, sessions, and tools stay real.
@@ -50,6 +51,7 @@ let bus: typeof import('../../../../src/main/features/group_chat/bus');
 let state: typeof import('../../../../src/main/features/group_chat/state');
 let paths: typeof import('../../../../src/main/paths');
 let storage: typeof import('../../../../src/main/storage');
+let connectorCatalog: typeof import('../../../../src/main/features/connectors/catalog');
 const cids: string[] = [];
 let onRequest: ((body: Record<string, any>) => void) | undefined;
 const unexpectedRequests: string[] = [];
@@ -105,13 +107,14 @@ beforeAll(async () => {
   // timer. Keep provider APIs lazy: their real first-use cost stays measured.
   require('../../../../src/main/features/skills');
   require('../../../../src/main/features/auto_tasks');
-  [chats, groupChat, bus, state, paths, storage] = await Promise.all([
+  [chats, groupChat, bus, state, paths, storage, connectorCatalog] = await Promise.all([
     import('../../../../src/main/features/chats'),
     import('../../../../src/main/features/group_chat'),
     import('../../../../src/main/features/group_chat/bus'),
     import('../../../../src/main/features/group_chat/state'),
     import('../../../../src/main/paths'),
     import('../../../../src/main/storage'),
+    import('../../../../src/main/features/connectors/catalog'),
   ]);
   vi.stubEnv('ORKAS_MODEL_EVAL_GLOBAL_SKILLS_ROOT', path.join(paths.WS_ROOT, 'fixture-global-skills'));
   vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -157,7 +160,8 @@ function seedConnectors(count: number): void {
     auth_mode: 'mcp_dcr', icon_svg: `<svg>${'x'.repeat(28_000)}</svg>`,
     transport_template: { kind: 'streamable-http', url: 'https://example.com/mcp' },
   }));
-  storage.writeJsonSync(paths.userRemoteConfigFile(UID), { active: { immediate: { 'connectors.catalog': catalog } } });
+  const bundled = connectorCatalog.CONNECTOR_CATALOG.filter(entry => !entry.id.startsWith('latency-service-'));
+  connectorCatalog.CONNECTOR_CATALOG.splice(0, connectorCatalog.CONNECTOR_CATALOG.length, ...bundled, ...catalog as CatalogEntry[]);
   storage.writeJsonSync(paths.userConnectorsConfigFile(UID), {
     version: 2, oauth_hints: {}, _deleted_at: {},
     connections: Object.fromEntries(catalog.slice(0, count).map(entry => [entry.id, {
@@ -321,14 +325,14 @@ describe('initial model request latency', () => {
     const cid = conversation.conversation_id;
     cids.push(cid);
     seedConnectors(10);
-    const read = storage.readJsonSync;
+    const read = storage.readJson;
     let injected = false;
-    vi.spyOn(storage, 'readJsonSync').mockImplementation(target => {
-      if (!injected && target === paths.userRemoteConfigFile(UID)) {
+    vi.spyOn(storage, 'readJson').mockImplementation((target, opts) => {
+      if (!injected && target.endsWith('members.json')) {
         injected = true;
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, BUDGET_MS + 100);
       }
-      return read(target);
+      return read(target, opts);
     });
     const result = await sendUntilRequest(cid);
     expect(injected).toBe(true);
