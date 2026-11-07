@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "content_tree_sha256": "263b90b3afc15b42d1381522df746244b5dcf3bec5d035287f980e77f467c737",
+  "content_tree_sha256": "58daa973a437b94e0476952d74e391bb650d3d317ed342f5bc529e4c28c7675d",
   "files": [
     {
       "path": "marketplace/agents/1040b336306f/agent.json",
@@ -1909,8 +1909,8 @@
     },
     {
       "path": "system/skills/orkas-guide/references/settings-data-and-safety.md",
-      "bytes": 19229,
-      "sha256": "597cc254cb7bac71ca8a3eff2987121859f45034b803d6da57e0bf048d723f33"
+      "bytes": 19236,
+      "sha256": "d6e315e39d30f6dc423e4b4978bcd50494babaa92dec8a25618c3047058af1a6"
     },
     {
       "path": "system/skills/orkas-guide/references/tasks-and-conversations.md",
