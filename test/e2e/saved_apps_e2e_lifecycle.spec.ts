@@ -911,7 +911,7 @@ for(const manifest of [false,true])test(`legacy local app opens and reopens with
   expect(readFileSync(metaFile,'utf8')).toBe(before);expect(orkas.modelRequests).toHaveLength(0);
 });
 
-test('publication guidance preserves the app and direct publication refuses without changes', async ({ orkas }, testInfo) => {
+test('the publication notice preserves the app and direct publication refuses without changes', async ({ orkas }, testInfo) => {
   const entry = orkas.createWorkspaceFile('publication-boundary/index.html', '<h1>Keep locally available</h1>');
   const saved = await orkas.invoke<any>('savedApps.saveFromPath', { path: entry, title: 'Long app title kept while publishing requires the commercial version' });
   expect(saved.ok).toBe(true);
@@ -934,10 +934,10 @@ test('publication guidance preserves the app and direct publication refuses with
     await page.locator('.app-row-menu').screenshot({path:testInfo.outputPath(`publication-menu-${language}.png`)});
     await page.locator('.app-row-menu [data-action="publish"]').click();
     const dialog = page.locator('.ui-dialog-overlay.open');
-    await expect(dialog).toContainText(language === 'zh' ? '发布' : 'publish', {ignoreCase:true});
+    await expect(dialog).toContainText(await page.evaluate(() => (window as any).t('app.vendor_services_unavailable')));
     expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
-    await dialog.screenshot({path:testInfo.outputPath(`publication-guidance-${language}-${width}.png`)});
-    await dialog.locator('[data-act="cancel"]').click();
+    await dialog.screenshot({path:testInfo.outputPath(`publication-notice-${language}-${width}.png`)});
+    await dialog.locator('[data-act="ok"]').click();
     await expect(card).toBeVisible();
     await expect(card.locator('[data-app-more]')).toBeFocused();
     expect(readFileSync(metadata, 'utf8')).toBe(before);
