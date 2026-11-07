@@ -5,15 +5,16 @@
  *   - orkas://connectors/oauth/callback
  *   - orkas://connectors/oauth/dcr-callback
  *
- * OAuth redirects always land on the public HTTPS Server first. Its landing page then opens one
+ * Relayed OAuth redirects land on the public HTTPS Server first. Its landing page then opens one
  * of the URLs above so the exact app instance that started the flow can finish the exchange. This
  * module owns that final OS-protocol hop without restoring any account/session behavior.
  */
 import * as path from 'node:path';
-import { app, BrowserWindow } from 'electron';
+import { app } from 'electron';
 
 import { createLogger } from '../../logger';
 import { safeUrlAction } from '../../util/log-redact';
+import { focusMainWindow } from './focus-main-window';
 import { handleCallbackUrl, handleDcrCallbackUrl } from './index';
 
 const log = createLogger('connectors:protocol');
@@ -41,16 +42,6 @@ function _extractConnectorCallback(argv: readonly string[] | undefined): string 
   return null;
 }
 
-function _focusMainWindow(): void {
-  const win = BrowserWindow.getAllWindows().find((candidate) => !candidate.isDestroyed());
-  // Background windows deliberately opt out of desktop activation. Keep
-  // callback delivery independent from showing that window.
-  if (!win || !win.isFocusable()) return;
-  if (win.isMinimized()) win.restore();
-  win.show();
-  win.focus();
-}
-
 async function _dispatch(rawUrl: string): Promise<void> {
   const kind = _connectorCallbackKind(rawUrl);
   if (!kind) {
@@ -62,7 +53,7 @@ async function _dispatch(rawUrl: string): Promise<void> {
     return;
   }
   log.info('connector deep link received', { action: safeUrlAction(rawUrl), kind });
-  _focusMainWindow();
+  focusMainWindow();
   try {
     if (kind === 'dcr') await handleDcrCallbackUrl(rawUrl);
     else await handleCallbackUrl(rawUrl);
@@ -97,7 +88,7 @@ export function registerConnectorProtocol(): void {
   app.on('second-instance', (_event, argv) => {
     const rawUrl = _extractConnectorCallback(argv);
     if (rawUrl) void _dispatch(rawUrl);
-    else _focusMainWindow();
+    else focusMainWindow();
   });
 
   const cold = _extractConnectorCallback(process.argv);

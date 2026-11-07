@@ -26,6 +26,7 @@ import {
   type LocalEvent,
   type LocalCliPermissionDecision,
   StderrTail,
+  withStderrReason,
   spawnCli,
   reapCliAfterProtocolTerminal,
   armKillWatchdog,
@@ -743,7 +744,7 @@ export const claudeBackend: LocalBackend = {
         }
         // Non-zero exit OR result subtype indicated error — surface tail.
         const err = resultError
-          || (code !== 0 ? `claude exited with code ${code}` : 'claude reported error in result');
+          || (code !== 0 ? withStderrReason(`claude exited with code ${code}`, tail) : 'claude reported error in result');
         finish('failed', { error: err, output: combinedOutput, finalMessageText: resultText, stderrTail: tail.toString(), usage: resultUsage });
       });
     });

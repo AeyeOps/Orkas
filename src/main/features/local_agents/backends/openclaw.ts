@@ -41,6 +41,7 @@ import {
   type BackendRunOptions,
   type LocalEvent,
   StderrTail,
+  withStderrReason,
   spawnCli,
   bindAbort,
   armKillWatchdog,
@@ -180,7 +181,7 @@ export const openclawBackend: LocalBackend = {
             });
           }
           finish('failed', {
-            error: parsed?.error || `openclaw exited with code ${code}`,
+            error: parsed?.error || withStderrReason(`openclaw exited with code ${code}`, tail),
             output: replyText,
             sessionId: sid,
             stderrTail: tail.toString(),

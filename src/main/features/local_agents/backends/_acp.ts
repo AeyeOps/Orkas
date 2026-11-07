@@ -23,6 +23,7 @@ import {
   type LocalBackend,
   type BackendRunOptions,
   StderrTail,
+  withStderrReason,
   spawnCli,
   bindAbort,
   armKillWatchdog,
@@ -455,7 +456,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           processState = 'close';
           if (opts.signal.aborted) return finish('cancelled', { output: resultText });
           if (watchdog.fired()) return finish('timeout', { timeoutKind: watchdog.fired(), error: `cli ${watchdog.reason()}`, output: resultText, stderrTail: tail.toString() });
-          const err = resultError || (code !== 0 ? `cli exited with code ${code}` : 'cli closed without prompt result');
+          const err = resultError || (code !== 0 ? withStderrReason(`cli exited with code ${code}`, tail) : 'cli closed without prompt result');
           finish('failed', { error: err, output: resultText, stderrTail: tail.toString() });
         });
       });

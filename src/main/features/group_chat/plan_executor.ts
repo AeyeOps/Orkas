@@ -192,17 +192,20 @@ function errorBubble(msg: string, failureKind?: GroupMessageFailureKind, failure
   } else {
     visible = t('model.call_failed', { message: normalizeRunError(msg) });
   }
-  return `<span style="color:var(--danger)">${escapeHtmlForBubble(visible)}</span>`;
+  return `<span style="color:var(--danger)">${escapeBubbleText(visible)}</span>`;
 }
 
 function normalizeRunError(msg: string): string {
   return String(msg || '').replace(/^Error:\s*/i, '').replace(/\s+/g, ' ').trim() || 'unknown error';
 }
 
-function escapeHtmlForBubble(s: string): string {
+/** The bubble is rendered as Markdown with inline HTML, so plain text must
+ *  neutralize Markdown punctuation as well as HTML. */
+function escapeBubbleText(s: string): string {
   return String(s)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/[`*_~[\]\\]/g, (c) => `&#${c.charCodeAt(0)};`);
 }

@@ -311,6 +311,22 @@ export class StderrTail {
   toString(): string {
     return this.chunks.join('');
   }
+
+  lastLine(): string {
+    const lines = stripAnsi(this.toString()).split(/\r?\n/);
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (line) return line;
+    }
+    return '';
+  }
+}
+
+/** Appends the CLI's last stderr line to a bare process-exit error, so a
+ *  launcher that refuses to start the CLI is shown with its own reason. */
+export function withStderrReason(error: string, tail: StderrTail): string {
+  const reason = tail.lastLine();
+  return reason ? `${error}: ${reason}` : error;
 }
 
 /** Standard spawn options. Returns a child with stdio: pipe/pipe/pipe.

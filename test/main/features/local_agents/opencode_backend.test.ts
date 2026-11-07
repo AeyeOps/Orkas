@@ -88,7 +88,7 @@ describe('OpenCode prompt pipe transport', () => {
     if (mode === 'fail') expect(terminals[0].error).toBe('opencode exited with code 7');
   });
 
-  it('retains content-free evidence for a CLI that exits before its first protocol record', async () => {
+  it('surfaces the CLI reason when it exits before its first protocol record', async () => {
     const events: LocalEvent[] = [];
     await opencodeBackend.run({
       binPath: process.env.ORKAS_TEST_NODE || process.execPath,
@@ -100,6 +100,7 @@ describe('OpenCode prompt pipe transport', () => {
     expect(done).toMatchObject({
       status: 'failed', exitCode: 1, protocolRecordCount: 0,
       protocolErrorSeen: false,
+      error: 'opencode exited with code 1: startup failed before JSON output',
     });
     expect(events.some(event => event.type === 'stderr-line')).toBe(true);
   });

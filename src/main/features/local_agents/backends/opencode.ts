@@ -30,6 +30,7 @@ import {
   type BackendRunOptions,
   type LocalEvent,
   StderrTail,
+  withStderrReason,
   spawnCli,
   bindAbort,
   armKillWatchdog,
@@ -160,7 +161,7 @@ const opencodeRunBackend: LocalBackend = {
           return finish('completed', { output: textOut, ...exitDiagnostic });
         }
         const err = resultError
-          || (code !== 0 ? `opencode exited with code ${code}` : 'opencode closed without final event');
+          || (code !== 0 ? withStderrReason(`opencode exited with code ${code}`, tail) : 'opencode closed without final event');
         finish('failed', { error: err, output: textOut, stderrTail: tail.toString(), ...exitDiagnostic });
       });
     });

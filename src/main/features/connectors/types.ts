@@ -311,10 +311,9 @@ export interface CatalogConnectionVariant extends LocalizedCatalogCopy<'label' |
 //
 //  - 'mcp_dcr'        — Provider hosts an MCP-spec OAuth authorization server. Client (PC)
 //    self-registers via Dynamic Client Registration (RFC 7591) at runtime, runs the OAuth
-//    handshake from PC, uses the `/api/connectors/oauth/dcr-callback` Server endpoint **only**
-//    as an HTTPS callback intermediate (Server stashes code+state in a 5-min KV, deep-links
-//    PC). The DCR client and rotating refresh grant remain encrypted on this device; Server is
-//    never a credential store for this mode. Used for Notion, Atlassian, Cloudflare suite, … .
+//    handshake from PC, and receives the authorization code on a loopback redirect URI
+//    (RFC 8252). The DCR client and rotating refresh grant remain encrypted on this device.
+//    Used for Notion, Atlassian, Cloudflare suite, … .
 //
 //  - 'composio'       — Orkas Server creates a Composio Connect Link for a server-configured
 //    toolkit/auth_config, stores the resulting connected_account_id, and PC keeps only an opaque
