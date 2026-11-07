@@ -1,5 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import path from 'node:path';
+import { writeFileSync } from 'node:fs';
 import { expect, test } from './fixtures/orkas';
 import { checkLatencyBudget, LATENCY_LIMIT_MS } from '../helpers/latency-budget';
 
@@ -33,18 +32,13 @@ for (const injectedStallMs of [0, LATENCY_LIMIT_MS + 100]) {
       auth_mode: 'mcp_dcr', icon_svg: `<svg>${'x'.repeat(28_000)}</svg>`,
       transport_template: { kind: 'streamable-http', url: 'https://example.com/mcp' },
     }));
-    const { remoteFile, connectorsFile } = await app.evaluate(({ app }) => {
+    const { connectorsFile } = await app.evaluate(({ app }, catalog) => {
       const require = (process as any).mainModule.require.bind((process as any).mainModule);
       const paths = require(`${app.getAppPath()}/src/main/paths`);
       const { getActiveUserId } = require(`${app.getAppPath()}/src/main/features/users`);
-      const uid = getActiveUserId();
-      return { remoteFile: paths.userRemoteConfigFile(uid), connectorsFile: paths.userConnectorsConfigFile(uid) };
-    });
-    let remote: any = {};
-    try { remote = JSON.parse(readFileSync(remoteFile, 'utf8')); } catch { /* Empty fixture config. */ }
-    remote.active = { ...remote.active, immediate: { ...remote.active?.immediate, 'connectors.catalog': catalog } };
-    mkdirSync(path.dirname(remoteFile), { recursive: true });
-    writeFileSync(remoteFile, JSON.stringify(remote));
+      require(`${app.getAppPath()}/src/main/features/connectors/catalog`).CONNECTOR_CATALOG.push(...catalog);
+      return { connectorsFile: paths.userConnectorsConfigFile(getActiveUserId()) };
+    }, catalog);
     writeFileSync(connectorsFile, JSON.stringify({
       version: 2, oauth_hints: {}, _deleted_at: {},
       connections: Object.fromEntries(catalog.slice(0, 10).map(entry => [entry.id, {
@@ -55,7 +49,7 @@ for (const injectedStallMs of [0, LATENCY_LIMIT_MS + 100]) {
       }])),
     }));
     const requestsBefore = modelOrkas.modelRequests.length;
-    await app.evaluate(({ app }, { remoteFile, injectedStallMs }) => {
+    await app.evaluate((_electron, { injectedStallMs }) => {
       const g = globalThis as any;
       const pulse = { last: performance.now(), maxGapMs: 0, injected: false, timer: null as any };
       pulse.timer = setInterval(() => {
@@ -66,20 +60,18 @@ for (const injectedStallMs of [0, LATENCY_LIMIT_MS + 100]) {
       g.__sendLatencyPulse = pulse;
       if (injectedStallMs) {
         const require = (process as any).mainModule.require.bind((process as any).mainModule);
-        // Hook the native file-version check: TS module exports can be getter-only,
-        // and a prior read may already have populated the parsed config cache.
-        const fs = require('node:fs');
-        const original = fs.statSync;
-        fs.statSync = function (file: string, ...args: any[]) {
-          if (file === remoteFile && !pulse.injected) {
+        const fsp = require('node:fs/promises');
+        const original = fsp.readFile;
+        fsp.readFile = function (file: unknown, ...args: any[]) {
+          if (typeof file === 'string' && file.endsWith('members.json') && !pulse.injected) {
             pulse.injected = true;
-            fs.statSync = original;
+            fsp.readFile = original;
             Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, injectedStallMs);
           }
           return original(file, ...args);
         };
       }
-    }, { remoteFile, injectedStallMs });
+    }, { injectedStallMs });
 
     // Schedule the click immediately after Send inside the renderer. Sequential
     // Playwright clicks could wait out the stall before starting the measurement.
