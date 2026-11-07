@@ -272,7 +272,7 @@ function createServer() {
         args: z.array(z.string()).optional().describe('For run, arguments passed to the script'),
         output_ref: z.string().optional().describe('Required for read: opaque outputRef from the run result'),
         stream: z.enum(['stdout', 'stderr']).optional().describe('Required for read'),
-        offset: z.number().int().min(0).optional()
+        offset: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional()
           .describe('For read, byte offset returned as stdoutNextOffset or stderrNextOffset; default 0'),
         limit: z.preprocess(value => defaultNumericRange(value, RUN_SKILL_READ_BYTES, 1, RUN_SKILL_MAX_READ_BYTES), z.number().int().min(1).max(RUN_SKILL_MAX_READ_BYTES).optional())
           .describe(`For read, maximum bytes; default ${RUN_SKILL_READ_BYTES}`),
@@ -349,7 +349,7 @@ function createServer() {
         action: z.enum(['call', 'read']).optional().describe('Default call. read retrieves a page from an earlier output_ref without calling the service.'),
         connector_id: z.string().optional().describe('Connector id returned by orkas_list_connector_tools; required for call.'),
         tool_name: z.string().optional().describe('Action name returned for that connector; required for call.'),
-        args: z.record(z.unknown()).optional().describe('Arguments matching the action input schema; defaults to {}'),
+        args: z.record(z.string(), z.unknown()).optional().describe('Arguments matching the action input schema; defaults to {}'),
         output_ref: z.string().optional().describe('Required for read: opaque output_ref returned by an earlier call in this run.'),
         offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional().describe('Read only: byte offset, default 0; continue with next_offset.'),
         limit: z.preprocess(value => defaultNumericRange(value, 60000, 4, 60000), z.number().int().min(4).max(60000).optional()).describe('Read only: maximum bytes, default 60000.'),
@@ -395,8 +395,8 @@ function createServer() {
         status: z.enum(['pending', 'processing', 'ready', 'failed']).optional().describe('For list, restrict to one indexing status.'),
         limit: z.number().int().min(1).max(300).optional().describe('For list, maximum files to return.'),
         scope: z.enum(['all', 'project', 'global']).optional().describe('Library scope. Default all when a project is active, otherwise global.'),
-        chunk: z.number().int().min(1).optional().describe('1-based chunk index; omit for the full body'),
-        window: z.number().int().min(0).optional().describe('Include ±window neighbour chunks around `chunk`'),
+        chunk: z.number().min(1).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional().describe('1-based chunk index; omit for the full body'),
+        window: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional().describe('Include ±window neighbour chunks around `chunk`'),
       },
       async (params) => {
         try {
@@ -418,15 +418,15 @@ function createServer() {
         scope: z.literal('current').describe('Required capability scope; only current is available'),
         page: z.object({
           mode: z.enum(['latest', 'around', 'before', 'from']),
-          index: z.number().int().min(0).optional().describe('Required for around, before or from'),
+          index: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional().describe('Required for around, before or from'),
           count: z.preprocess(value => defaultNumericRange(value, undefined, 0, 30), z.number().int().min(0).max(30).optional()).describe('Around radius or latest/before page size'),
         }).strict().optional(),
         record_id: z.string().optional().describe('Exact message ID from search/read'),
         turn_id: z.string().optional().describe('User message ID or execution turn_id'),
         tool_call_id: z.string().optional().describe('Stored tool call and its input/output'),
         include_process: z.boolean().optional().describe('Public execution records; default true with tool_call_id, else false'),
-        cursor: z.number().int().min(0).optional().describe('Partial-read character cursor'),
-        output_cursor: z.number().int().min(0).optional().describe('Full output cursor; requires exact record_id and tool_call_id'),
+        cursor: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional().describe('Partial-read character cursor'),
+        output_cursor: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional().describe('Full output cursor; requires exact record_id and tool_call_id'),
         max_tokens: z.preprocess(value => defaultNumericRange(value, 10000, 1, 10000), z.number().int().min(1).max(10000).optional()).describe('Page token budget; default 10K'),
       },
       async (params) => {
