@@ -9,16 +9,17 @@ describe('managed OAuth expansion', () => {
     expect(COMPOSIO_MANAGED_ENTRIES).toHaveLength(69);
     for (const card of COMPOSIO_MANAGED_ENTRIES) {
       expect(CONNECTOR_CATALOG.filter(row => row.id === card.id), card.id).toHaveLength(1);
-      expect(findCatalogEntry(card.id)).toMatchObject({
+      expect(card).toMatchObject({
         auth_mode: 'composio', transport_template: null, requires_credits: true,
         usage_metering: { provider: 'composio', credits_milli_per_call: 420 },
       });
+      expect(findCatalogEntry(card.id)).toBeNull();
       expect(card.connection_setup?.fields || []).toEqual([]);
       for (const lang of ['zh', 'en', 'ja', 'pt'] as const) {
         expect(card[`description_${lang}`]?.trim().length, `${card.id}:${lang}`).toBeGreaterThan(10);
       }
     }
-    expect(findCatalogEntry('github')?.auth_mode).toBe('server_bridge');
+    expect(findCatalogEntry('github')).toBeNull();
     expect(findCatalogEntry('notion')?.auth_mode).toBe('mcp_dcr');
   });
 
