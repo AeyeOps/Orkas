@@ -403,14 +403,14 @@ test('finds connector cards without authorization and keeps every category reach
     await page.evaluate(() => (window as any).setLang('en'));
     await page.setViewportSize({ width: 900, height: 640 });
     await page.locator('#sidebar-search-btn').click();
-    await page.locator('#search-input').fill('GitHub');
+    await page.locator('#search-input').fill('Notion');
     await page.locator('#search-input').press('Enter');
     await page.locator('.search-tab[data-tab="connector"]').click();
-    const catalogResult = page.locator('#search-body .search-result').filter({ has: page.locator('.search-result-title[title="GitHub"]') });
+    const catalogResult = page.locator('#search-body .search-result').filter({ has: page.locator('.search-result-title[title="Notion"]') });
     await expect(catalogResult).toBeVisible();
-    await expect(catalogResult.locator('.search-result-snippet')).toContainText('repositories');
+    await expect(catalogResult.locator('.search-result-snippet')).toContainText('databases');
     await page.screenshot({ path: info.outputPath('search-connectors-catalog-en.png') });
-    await followConnectorResult(catalogResult, 'github');
+    await followConnectorResult(catalogResult, 'notion');
     expect(await app.electronApp!.evaluate(() => (globalThis as any).__searchConnectorAuthorizations)).toBe(0);
   } finally {
     await app.dispose();
@@ -493,10 +493,10 @@ test('expands connector results safely, recovers from empty categories, and pres
     await expect(page.locator('#search-body')).toContainText('No results');
     await expect(page.locator('#search-body .search-result')).toHaveCount(0);
     // An empty custom category must not be mistaken for an unavailable catalog.
-    await page.locator('#search-input').fill('GitHub');
+    await page.locator('#search-input').fill('Notion');
     await page.locator('#search-input').press('Enter');
     await page.locator('.search-tab[data-tab="connector"]').click();
-    await expect(page.locator('#search-body .search-result-title').filter({ hasText: /^GitHub$/ })).toBeVisible();
+    await expect(page.locator('#search-body .search-result-title').filter({ hasText: /^Notion$/ })).toBeVisible();
   } finally {
     await app.dispose();
   }
