@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
-import sharp from 'sharp';
+import sharp from '../../helpers/bundled-node-sharp';
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 

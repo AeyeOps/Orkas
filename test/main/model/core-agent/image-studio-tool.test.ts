@@ -3,7 +3,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import sharp from 'sharp';
+import sharp from '../../../helpers/bundled-node-sharp';
 
 const productionCredits = vi.hoisted(() => ({
   estimate: vi.fn(),

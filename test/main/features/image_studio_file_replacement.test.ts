@@ -1,15 +1,12 @@
-import { EventEmitter } from 'node:events';
-import { createRequire } from 'node:module';
+import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import sharp from 'sharp';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { runInBundledNode } from '../../helpers/bundled-node';
+import sharp from '../../helpers/bundled-node-sharp';
 
-const require = createRequire(import.meta.url);
-const fs = require('node:fs') as typeof import('node:fs');
-const childProcess = require('node:child_process') as typeof import('node:child_process');
-const scriptPath = require.resolve('../../../resources/builtin/marketplace/agents/814b61b027f0/skills/image-compose/scripts/image_asset.js');
+const driverPath = path.resolve(__dirname, '../../fixtures/image-asset-with-faults.cjs');
 const operations = ['process', 'remove_background', 'upscale'] as const;
 type Operation = typeof operations[number];
 let root = '';
@@ -25,38 +22,15 @@ beforeEach(async () => {
 });
 
 afterEach(() => {
-  vi.restoreAllMocks();
-  vi.unstubAllEnvs();
-  delete require.cache[scriptPath];
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-function runner(op: Operation, invalidPreparedImage = false) {
-  if (op !== 'process') {
-    vi.stubEnv('ORKAS_REMBG_BIN', 'fixture-image-transform');
-    vi.stubEnv('ORKAS_REALESRGAN_BIN', 'fixture-image-transform');
-    // Only external inference is simulated. The production script validates
-    // and replaces real files, including its error handling and cleanup.
-    vi.spyOn(childProcess, 'spawn').mockImplementation(((_command: string, args: string[]) => {
-      const child = Object.assign(new EventEmitter(), {
-        stdout: new EventEmitter(), stderr: new EventEmitter(), kill: vi.fn(),
-      });
-      queueMicrotask(() => {
-        const target = op === 'remove_background' ? args[2] : args[args.indexOf('-o') + 1];
-        fs.writeFileSync(target, invalidPreparedImage ? Buffer.from('invalid image') : fs.readFileSync(path.join(root, 'source.png')));
-        child.emit('close', 0);
-      });
-      return child;
-    }) as typeof childProcess.spawn);
-  }
-  // The CommonJS helper captures spawn when loaded.
-  delete require.cache[scriptPath];
-  const run = require(scriptPath) as (input: { args: string[] }) => Promise<Record<string, unknown>>;
-  return (overrides: Record<string, unknown> = {}) => {
+function runner(op: Operation, invalidPreparedImage = false, renameFault?: string) {
+  return (overrides: Record<string, unknown> = {}): Promise<Record<string, unknown>> => {
     fs.writeFileSync(path.join(root, 'request.json'), JSON.stringify({
       op, input_path: 'source.png', output_path: 'output.png', overwrite: true, ...overrides,
     }));
-    return run({ args: ['--project', root, '--request', 'request.json'] });
+    return runInBundledNode(driverPath, { op, invalidPreparedImage, renameFault, args: ['--project', root, '--request', 'request.json'] });
   };
 }
 
@@ -89,18 +63,9 @@ describe.each(operations)('ImageStudio %s file replacement', (op) => {
   });
 
   it.each(['EPERM', 'EACCES'])('preserves the original on %s and can retry after the obstruction is removed', async (code) => {
-    const run = runner(op);
-    const rename = fs.renameSync;
-    const fault = vi.spyOn(fs, 'renameSync').mockImplementation((from, to) => {
-      if (String(to) === path.join(root, 'output.png')) {
-        throw Object.assign(new Error('Synthetic replacement denial'), { code });
-      }
-      return rename(from, to);
-    });
-    await expect(run()).rejects.toMatchObject({ code });
+    await expect(runner(op, false, code)()).rejects.toMatchObject({ code });
     expectOriginalPreserved();
-    fault.mockRestore();
-    expect((await run()).ok).toBe(true);
+    expect((await runner(op)()).ok).toBe(true);
     await expectReplacement();
   });
 
