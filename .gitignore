@@ -20,3 +20,4 @@
 __pycache__/
 /userWorkSpace
 /.cache/
+**/AGENTS.md
