@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import sharp from 'sharp';
+import sharp from '../../../helpers/bundled-node-sharp';
 
 // A scripted page stands in for Chromium: the test owns the facts the page
 // reports and returns a solid image for every requested screenshot rectangle.

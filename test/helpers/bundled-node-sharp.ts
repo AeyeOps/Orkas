@@ -26,6 +26,12 @@ class BundledNodeSharp {
     return this;
   }
 
+  clone(): BundledNodeSharp {
+    const copy = new BundledNodeSharp(this.input);
+    copy.steps.push(...this.steps);
+    return copy;
+  }
+
   resize(...args: [widthOrOptions?: number | ResizeOptions | null, height?: number | null, options?: ResizeOptions]): this {
     return this.chain('resize', args);
   }
