@@ -3,6 +3,8 @@ import * as fs from 'node:fs';
 import { createServer } from 'node:http';
 import { EventEmitter } from 'node:events';
 import { connect } from 'node:net';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import {
   _resetProxyRoutingForTests,
   activeProxy,
@@ -23,6 +25,7 @@ import {
   startChildFetchBridge,
 } from '../../../src/main/util/proxy-dispatcher';
 import { classifyTransientNetworkError } from '../../../src/core-agent/src/shared/errors';
+
 
 const hostFetch = globalThis.fetch;
 const proxyEnvKeys = [
@@ -58,6 +61,41 @@ afterEach(() => {
 });
 
 describe('Electron system-proxy transport failures', () => {
+  it('survives a truncated response with excessive content encodings and can download again', async () => {
+    // GHSA-xjj6-f33q-929c kills the process even when fetch rejection is caught.
+    // Exercise the real address-checked download route in an isolated process.
+    const script = String.raw`
+      require('tsx/cjs');
+      const { createServer } = require('node:net');
+      const { downloadBinaryWithProxyPolicy } = require('./src/main/util/proxy-dispatcher.ts');
+      let requests = 0;
+      const server = createServer(socket => socket.once('data', () => {
+        requests++;
+        socket.end(requests === 1
+          ? 'HTTP/1.1 200 OK\r\nContent-Encoding: gzip,gzip,gzip,gzip,gzip,gzip\r\nContent-Length: 100\r\nConnection: close\r\n\r\n'
+          : 'HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok');
+      }));
+      server.listen(0, '127.0.0.1', async () => {
+        const url = 'http://127.0.0.1:' + server.address().port;
+        const options = { label: 'encoding-regression', isAllowedDirectAddress: ip => ip === '127.0.0.1', signal: AbortSignal.timeout(3000), retries: 0 };
+        try {
+          let rejected = false;
+          try { await downloadBinaryWithProxyPolicy(url, options); } catch { rejected = true; }
+          if (!rejected) throw new Error('Malformed response was accepted');
+          const result = await downloadBinaryWithProxyPolicy(url, options);
+          if (result.body.toString() !== 'ok' || requests !== 2) throw new Error('Recovery failed');
+          process.stdout.write('rejected-and-recovered');
+        } catch (error) { process.stderr.write(String(error)); process.exitCode = 1; }
+        finally { server.close(); }
+      });
+    `;
+    const result = await promisify(execFile)(process.execPath, ['-e', script], {
+      cwd: process.cwd(), env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, timeout: 10000,
+    });
+    expect(result.stderr).toBe('');
+    expect(result.stdout).toBe('rejected-and-recovered');
+  });
+
   it('uploads through the configured environment proxy with byte progress and no system-route lookup', async () => {
     const {getGlobalDispatcher, setGlobalDispatcher} = await import('undici');
     const original = getGlobalDispatcher();
@@ -154,6 +192,66 @@ describe('Electron system-proxy transport failures', () => {
     expect(normalizeElectronNetFetchError(structured)).toBe(structured);
     expect(normalizeElectronNetFetchError(aborted)).toBe(aborted);
     expect(normalizeElectronNetFetchError(prose)).toBe(prose);
+  });
+});
+
+describe('Electron system-proxy request headers', () => {
+  // Fixture of the behavior the real-Chromium case in
+  // proxy_e2e_routing.spec.ts proves: rejected before anything is sent.
+  const chromiumFetch = vi.fn(async (_url: unknown, init?: RequestInit) => {
+    if (new Headers(init?.headers).has('content-length')) throw new Error('net::ERR_INVALID_ARGUMENT');
+    return new Response('sent');
+  });
+  const signed = {
+    'Content-Type': 'image/png', 'Content-Length': '4', 'Content-MD5': 'bWQ1',
+    'Content-Disposition': 'attachment; filename="r.png"', 'x-cos-acl': 'private',
+  };
+  const body = new Uint8Array([1, 2, 3, 4]);
+
+  beforeEach(() => {
+    chromiumFetch.mockClear();
+    vi.doMock('electron', () => ({net: {fetch: chromiumFetch}, session: {defaultSession: {}}}));
+  });
+  afterEach(() => vi.doUnmock('electron'));
+
+  it.each([
+    ['a plain object', signed],
+    ['a lowercase name', {...signed, 'Content-Length': undefined, 'content-length': '4'}],
+    ['a Headers instance', new Headers(signed)],
+    ['header pairs', Object.entries(signed)],
+  ] as Array<[string, HeadersInit]>)('sends a signed upload given as %s without Content-Length', async (_label, source) => {
+    const headers = Array.isArray(source) || source instanceof Headers
+      ? source : Object.fromEntries(Object.entries(source).filter(([, value]) => value !== undefined));
+    await installSystemProxyDispatcher(undefined, async () => 'PROXY 127.0.0.1:7890');
+    const response = await globalThis.fetch('https://cos.example/object', {method: 'PUT', headers, body, redirect: 'error'});
+    expect(await response.text()).toBe('sent');
+    const sent = chromiumFetch.mock.calls[0][1] as RequestInit;
+    const received = new Headers(sent.headers);
+    expect(received.has('content-length')).toBe(false);
+    for (const name of ['content-type', 'content-md5', 'content-disposition', 'x-cos-acl']) {
+      expect(received.get(name)).toBe(new Headers(signed).get(name));
+    }
+    expect(sent.body).toBe(body);
+    expect(sent.method).toBe('PUT');
+    expect(sent.redirect).toBe('error');
+  });
+
+  it('leaves the caller\'s request unchanged', async () => {
+    await installSystemProxyDispatcher(undefined, async () => 'PROXY 127.0.0.1:7890');
+    const headers = {...signed};
+    const init = {method: 'PUT', headers, body};
+    await globalThis.fetch('https://cos.example/object', init);
+    expect(init.headers).toBe(headers);
+    expect(headers['Content-Length']).toBe('4');
+  });
+
+  it('keeps Content-Length on the direct Node route, which accepts it', async () => {
+    const direct = vi.fn(async () => new Response('direct')) as unknown as typeof fetch;
+    globalThis.fetch = direct;
+    await installSystemProxyDispatcher(undefined, async () => 'DIRECT');
+    await globalThis.fetch('https://cos.example/object', {method: 'PUT', headers: signed, body});
+    expect(chromiumFetch).not.toHaveBeenCalled();
+    expect(new Headers((direct as any).mock.calls[0][1].headers).get('content-length')).toBe('4');
   });
 });
 
@@ -387,6 +485,60 @@ describe('util/proxy-dispatcher child fetch bridge', () => {
     } finally {
       await bridge.close();
     }
+  });
+
+  it('keeps native bridge response bodies readable across settled garbage collection', async () => {
+    const script = String.raw`
+      const fs=require('node:fs'),os=require('node:os'),path=require('node:path'),assert=require('node:assert/strict');
+      const {createRequire}=require('node:module');
+      const root=fs.mkdtempSync(path.join(os.tmpdir(),'orkas-proxy-body-review-'));
+      process.env.ORKAS_WORKSPACE_ROOT=root;
+      const req=createRequire(path.resolve('package.json'));
+      req('tsx/cjs');
+      const logger=path.resolve('src/main/logger.ts');
+      require.cache[logger]={exports:{createLogger:()=>({debug(){},info(){},warn(){},error(){}})}};
+      const {startChildFetchBridge}=require(path.resolve('src/main/util/proxy-dispatcher.ts'));
+      const {createBridgeFetch}=req('./bin/proxy-bootstrap.cjs');
+      (async()=>{
+       const bridge=await startChildFetchBridge(async(input,init)=>new Response(String(input)+'|'+(init?.body?await new Response(init.body).text():'')));
+       try{
+        const fetchChild=createBridgeFetch(globalThis.fetch,bridge.url,bridge.token);
+        for(let i=0;i<20;i++){
+         const direct=await fetchChild('https://direct.example/path');
+         await new Promise(resolve=>setImmediate(resolve));if(global.gc)global.gc();await new Promise(resolve=>setImmediate(resolve));
+         const proxied=await fetchChild('https://proxy.example/upload',{method:'POST',body:'stream-me'});
+         await new Promise(resolve=>setImmediate(resolve));if(global.gc)global.gc();await new Promise(resolve=>setImmediate(resolve));
+         assert.equal(await direct.text(),'https://direct.example/path|');
+         assert.equal(await proxied.text(),'https://proxy.example/upload|stream-me');
+        }
+        console.log(JSON.stringify({iterations:20,requests:40,forced_gc:!!global.gc,body_reuse_failure:false}));
+       }finally{await bridge.close();fs.rmSync(root,{recursive:true,force:true});}
+      })().catch(error=>{console.error(error);process.exitCode=1;});
+    `;
+    const result = await promisify(execFile)(process.execPath, ['--expose-gc', '-e', script], {
+      cwd: process.cwd(), env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+      timeout: 15000, maxBuffer: 16 * 1024,
+    });
+    expect(result.stderr).toBe('');
+    expect(JSON.parse(result.stdout)).toEqual({ iterations: 20, requests: 40, forced_gc: true, body_reuse_failure: false });
+  });
+
+  it('preserves a bodyless bridge response and propagates a source stream failure', async () => {
+    const { createBridgeFetch } = require('../../../bin/proxy-bootstrap.cjs');
+    const meta = (status: number) => ({ 'x-orkas-fetch-meta': Buffer.from(JSON.stringify({
+      status, statusText: '', headers: [['x-upstream', 'fixture']],
+    })).toString('base64url') });
+    const emptyFetch = createBridgeFetch(async () => new Response(null, { headers: meta(204) }), 'http://localhost/bridge', 'fixture');
+    const empty = await emptyFetch('https://upstream.example');
+    expect(empty.status).toBe(204);
+    expect(empty.body).toBeNull();
+    expect(empty.headers.get('x-upstream')).toBe('fixture');
+    const failure = new Error('controlled upstream stream failure');
+    const failedFetch = createBridgeFetch(async () => new Response(new ReadableStream({
+      start(controller) { controller.error(failure); },
+    }), { headers: meta(200) }), 'http://localhost/bridge', 'fixture');
+    const failed = await failedFetch('https://upstream.example');
+    await expect(failed.text()).rejects.toBe(failure);
   });
 
   it('cancels the Electron response stream when the child stops reading', async () => {
@@ -744,7 +896,7 @@ describe('util/proxy-dispatcher startup ordering', () => {
     expect(source).toContain('setFetchImplementation((input, init) => net.fetch');
     expect(source).not.toContain('const accountBoot = account.bootstrap();');
     expect(source.indexOf('await installSystemProxyDispatcher();')).toBeGreaterThan(0);
-    expect(source.indexOf('await installSystemProxyDispatcher();')).toBeLessThan(source.lastIndexOf('    createWindow();'));
+    expect(source.indexOf('await installSystemProxyDispatcher();')).toBeLessThan(source.lastIndexOf('    createWindow(startupHidden);'));
     expect(source).not.toContain("registerImmediate('net:system-proxy'");
   });
 });

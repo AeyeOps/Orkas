@@ -18,7 +18,7 @@ exports.inputSchema = {
   additionalProperties: false,
 };
 exports.shape = z => Object.fromEntries(Object.entries(exports.inputSchema.properties).map(([key, field]) => {
-  let value = field.type === 'string' ? z.string() : z.number().int({ error: 'Expected safe integer' }).safe();
+  let value = field.type === 'string' ? z.string() : z.number().int().safe();
   if (field.minLength !== undefined) value = value.min(field.minLength);
   if (field.maxLength !== undefined) value = value.max(field.maxLength);
   if (field.minimum !== undefined) value = value.min(field.minimum);
@@ -29,7 +29,15 @@ exports.shape = z => Object.fromEntries(Object.entries(exports.inputSchema.prope
       // exact-schema conflicts and the search-versus-browse default choice.
       if (context.input === undefined) return undefined;
       if (defaultNumericRange(context.input, undefined, 1, 50) !== context.input) return context.input;
-      throw new z.ZodError(context.error.issues.map(issue => ({ ...issue, path: [key, ...issue.path] })));
+      // Zod 4 catch contexts carry a plain issue object with child-local paths.
+      // Preserve the previous Error envelope, field name and integer wording
+      // so MCP callers receive an actionable refusal before host discovery.
+      throw new z.ZodError(context.error.issues.map(issue => ({
+        ...issue,
+        path: [key, ...issue.path],
+        ...(issue.code === 'invalid_type' && issue.expected === 'int'
+          ? { message: 'Expected integer, received float' } : {}),
+      })));
     })
     : value.optional()).describe(field.description)];
 }));

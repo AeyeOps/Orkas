@@ -491,13 +491,11 @@ export const CONNECTOR_CATALOG: CatalogEntry[] = [
   },
 ];
 
-const catalogById = new Map(CONNECTOR_CATALOG
-  .filter(entry => (entry.auth_mode === 'local_api' || entry.auth_mode === 'local_cli' || entry.auth_mode === 'mcp_dcr')
-    && !entry.requires_credits)
-  .map(entry => [entry.id, entry]));
-
 function catalogIndex(): Map<string, CatalogEntry> {
-  return catalogById;
+  return new Map(CONNECTOR_CATALOG
+    .filter(entry => (entry.auth_mode === 'local_api' || entry.auth_mode === 'local_cli' || entry.auth_mode === 'mcp_dcr')
+      && !entry.requires_credits)
+    .map(entry => [entry.id, entry]));
 }
 
 const VENDOR_RELAY_LOCAL_API_PROVIDERS = new Set([
@@ -509,6 +507,11 @@ const VENDOR_RELAY_LOCAL_API_PROVIDERS = new Set([
 export function connectorCatalog(): CatalogEntry[] {
   return structuredClone(Array.from(catalogIndex().values())
     .filter(entry => !VENDOR_RELAY_LOCAL_API_PROVIDERS.has(entry.local_api?.provider)));
+}
+
+/** Membership checks must not clone catalog transport, policy or icon data. */
+export function isCatalogConnectorId(id: string): boolean {
+  return catalogIndex().has(id);
 }
 
 export function findCatalogEntry(id: string): CatalogEntry | null {

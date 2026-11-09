@@ -133,6 +133,62 @@ type DrainedEvent = {
   event?: { stream?: string; data?: Record<string, unknown> };
 };
 
+it.each(['answer', 'reasoning-only', 'missing-terminal'] as const)(
+  'retains %s outcome evidence through the real bounded log redactor', async (shape) => {
+    const { redact } = await vi.importActual<typeof import('../../../../src/main/logger')>(
+      '../../../../src/main/logger',
+    );
+    h.makeStream = async function* () {
+      const report = h.lastBuildRunnerParams!.onRequestFailure as (failure: unknown) => void;
+      report({ phase: 'after_response', code: 'unknown', httpStatus: 503, elapsedMs: 5,
+        aborted: false, source: 'http', lastEvent: 'none', requestSequence: 1 });
+      // More than a round's retained evidence must not hide the last response.
+      for (let i = 0; i < 40; i++) yield { type: 'provider_call', durationMs: 1,
+        outcome: 'completed', model: 'fixture', output: {
+          terminalSeen: true, stopReason: 'tool_use', textChars: 0, thinkingChars: 3, toolCalls: 1,
+        } };
+      if (shape !== 'missing-terminal') {
+        yield { type: 'provider_call', durationMs: 1, outcome: 'completed', model: 'fixture',
+          output: { terminalSeen: true, stopReason: 'end_turn', textChars: shape === 'answer' ? 6 : 0,
+            thinkingChars: shape === 'answer' ? 0 : 20, toolCalls: 0 } };
+        yield completedEvent(shape === 'answer' ? 'answer' : '');
+      }
+    };
+    const { events } = await drain({ cid: 'private-conversation-fixture', turnId: 'fixture-turn',
+      message: 'PRIVATE_USER_TEXT', systemPrompt: 'PRIVATE_SYSTEM_TEXT' });
+    expect(events.filter(e => e.type === 'final').map(e => e.text)).toEqual(shape === 'answer' ? ['answer'] : []);
+    if (shape !== 'answer') expect(events.find(e => e.type === 'error')).toMatchObject({ failureCode: 'empty_response' });
+    for (const message of ['model turn stream drained', 'model turn finish']) {
+      const entry = h.logEntries.find(e => e.message === message)!;
+      // Match the transport's array/depth/node budget, not just the pre-log object.
+      const [, data] = redact([message, entry.data]) as [string, any];
+      expect(data.session_kind).toBe('gconv');
+      expect(data.turn_id).toBeTruthy();
+      expect(data.has_error).toBe(shape !== 'answer');
+      expect(data.final_chars).toBe(shape === 'answer' ? 6 : 0);
+      expect(data.diagnostics.providerRequestFailures).toMatchObject({
+        provider_request_failure_count: 1, provider_last_failure_http_status: 503,
+      });
+      const beforeHostDone = message === 'model turn stream drained';
+      expect(data.diagnostics.terminal_output).toMatchObject({ version: 1,
+        output_kind: shape === 'answer' ? 'text' : shape === 'reasoning-only' ? 'reasoning_only'
+          : beforeHostDone ? 'tool_calls' : 'unknown',
+      });
+      if (shape === 'missing-terminal') {
+        expect(data.diagnostics.doneRawEventMs).toBeUndefined();
+        // Drain still describes the last observed call; host completion clears
+        // it because the newer unfinished call has no runner receipt.
+        if (!beforeHostDone) expect(data.diagnostics.terminal_output).not.toHaveProperty('provider_text_chars');
+      } else {
+        expect(data.diagnostics.terminal_output.provider_text_chars).toBe(shape === 'answer' ? 6 : 0);
+        expect(data.diagnostics.resultTextChars).toBe(shape === 'answer' ? 6 : 0);
+      }
+      expect(JSON.stringify(data)).not.toContain('PRIVATE_');
+      if (message === 'model turn finish') expect(data.status).toBe(shape === 'answer' ? 'completed' : 'error');
+    }
+  },
+);
+
 async function drain(opts: Record<string, unknown>): Promise<{ events: DrainedEvent[]; ms: number }> {
   const client = await import('../../../../src/main/model/core-agent/client');
   const events: DrainedEvent[] = [];
@@ -149,6 +205,43 @@ async function drain(opts: Record<string, unknown>): Promise<{ events: DrainedEv
 }
 
 describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
+  it.each(['wall', 'idle', 'cancel'] as const)('aborts a pending transport once on %s termination and settles the stream', async (termination) => {
+    await import('../../../../src/main/model/core-agent/client');
+    const transportAborted = vi.fn();
+    vi.useFakeTimers();
+    let started!: () => void;
+    const ready = new Promise<void>(resolve => { started = resolve; });
+    h.makeStream = async function* () {
+      const signal = h.lastRunStreamParams?.signal as AbortSignal;
+      started();
+      await new Promise<void>(resolve => signal.addEventListener('abort', () => {
+        transportAborted(); resolve();
+      }, {once:true}));
+      expect(signal.aborted).toBe(true);
+      throw new Error('Controlled transport abort');
+    };
+    const controller = new AbortController();
+    try {
+      const result = drain({ idleTimeout: termination === 'idle' ? 0.1 : 10,
+        abortSignal: controller.signal,
+        ...(termination === 'wall' ? { executionDeadlineAt: Date.now() + 200 } : {}) });
+      await ready;
+      if (termination === 'cancel') controller.abort();
+      await vi.advanceTimersByTimeAsync(200);
+      const { events } = await result;
+      expect(events.filter(event => event.type === 'error')).toEqual([
+        expect.objectContaining(termination === 'cancel' ? { aborted: true }
+          : { failureCode: termination === 'wall' ? 'execution_wall_timeout' : 'idle_timeout' }),
+      ]);
+      expect(transportAborted).toHaveBeenCalledTimes(1);
+      expect((h.lastRunStreamParams?.signal as AbortSignal).aborted).toBe(true);
+      expect(h.runStreamCalls).toBe(1);
+      expect(events.at(-1)?.type).toBe('done');
+    } finally {
+      controller.abort();
+    }
+  });
+
 
   it('does not charge the provider usage again when the enclosing run finishes', async () => {
     const meter = await import('../../../../src/main/util/conversation-cost-meter');
@@ -163,6 +256,12 @@ describe('streamChatWithModel — phase-aware idle watchdog (Phase 1)', () => {
       expect(events.find(event => event.type === 'final')).toMatchObject({ text: 'done' });
       expect(meter.taskTokens(cid)).toBe(2);
     } finally { meter.resetTaskTokens(cid); }
+  });
+
+  it.each(['final', 'process'] as const)('preserves host delivery ownership through the client adapter: %s', async (outputDelivery) => {
+    h.makeStream = async function* () { yield completedEvent('done'); };
+    await drain({ outputDelivery });
+    expect(h.lastBuildRunnerParams?.outputDelivery).toBe(outputDelivery);
   });
 
   it('localizes a directly thrown task backstop without suggesting a model retry', async () => {
@@ -1406,4 +1505,28 @@ it('lets the real inner tool watchdog recover after sleep before the host backst
     await vi.advanceTimersByTimeAsync(2000);
     expect(vi.getTimerCount()).toBe(0);
   } finally { power.resume(); controller.abort(); await run; }
+});
+
+
+it('keeps local provider failure summaries bounded, content-free and separate from cancellation', async () => {
+  h.makeStream = async function* () {
+    const report = h.lastBuildRunnerParams!.onRequestFailure as (failure: unknown) => void;
+    report({ phase: 'PRIVATE_PHASE', code: 'PRIVATE_CODE', elapsedMs: Infinity, httpStatus: 700,
+      source: 'PRIVATE_SOURCE', lastEvent: 'PRIVATE_EVENT', requestSequence: -1, aborted: false });
+    report({ phase: 'before_response', code: 'rate_limit_error', elapsedMs: 500,
+      source: 'http', lastEvent: 'none', requestSequence: 2, httpStatus: 429, aborted: true });
+    yield completedEvent('recovered');
+  };
+  const { events } = await drain({ message: 'PRIVATE_USER_INPUT' });
+  expect(events.filter(event => event.type === 'final').map(event => event.text)).toEqual(['recovered']);
+  const finish = h.logEntries.find(entry => entry.message === 'model turn finish')!;
+  expect(finish.data!.diagnostics).toMatchObject({ providerRequestFailures: {
+    provider_failure_breakdown_version: 1, provider_failure_unknown_count: 1,
+    provider_request_failure_count: 1, provider_request_abort_count: 1,
+    provider_request_failure_ms: 0, provider_last_failure_code: 'unknown',
+    provider_last_failure_phase: 'unknown', provider_last_failure_source: 'unknown',
+    provider_last_failure_event: 'unknown', provider_last_failure_request_sequence: 0,
+  } });
+  expect((finish.data!.diagnostics as any).providerRequestFailures).not.toHaveProperty('provider_last_failure_http_status');
+  expect(JSON.stringify(h.logEntries)).not.toContain('PRIVATE_');
 });

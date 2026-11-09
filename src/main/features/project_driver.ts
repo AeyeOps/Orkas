@@ -23,6 +23,7 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { compareDueFirst } from './project_tasks';
 
 import {
   projectDriverFile,
@@ -110,13 +111,14 @@ function _stateFile(uid: string, pid: string): string {
   return pid ? projectDriverStateFile(uid, pid) : userTodoDriverStateFile(uid);
 }
 
-export async function readConfig(uid: string, pid: string): Promise<DriverConfig> {
+export async function readConfig(uid: string, pid: string, strict = false): Promise<DriverConfig> {
   const f = _configFile(uid, pid);
-  if (!fs.existsSync(f)) return { enabled: false, max_advances_per_day: DEFAULT_MAX_ADVANCES_PER_DAY };
+  if (!strict && !fs.existsSync(f)) return { enabled: false, max_advances_per_day: DEFAULT_MAX_ADVANCES_PER_DAY };
   try {
-    const raw = await readJson(f) as {
+    const raw = await readJson(f, { strict }) as {
       enabled?: unknown; max_advances_per_day?: unknown; device_id?: unknown; device_name?: unknown;
     };
+    if (strict && (!raw || typeof raw.enabled !== 'boolean')) throw new Error('Invalid auto-advance configuration');
     const deviceId = typeof raw?.device_id === 'string' ? raw.device_id.trim() : '';
     const deviceName = typeof raw?.device_name === 'string' ? raw.device_name.trim() : '';
     return {
@@ -128,6 +130,10 @@ export async function readConfig(uid: string, pid: string): Promise<DriverConfig
       ...(deviceName ? { device_name: deviceName } : {}),
     };
   } catch (err) {
+    if (strict) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return { enabled: false, max_advances_per_day: DEFAULT_MAX_ADVANCES_PER_DAY };
+      throw err;
+    }
     log.warn(`read config uid=${uid} pid=${pid}: ${(err as Error).message}`);
     return { enabled: false, max_advances_per_day: DEFAULT_MAX_ADVANCES_PER_DAY };
   }
@@ -193,11 +199,8 @@ export async function writeState(uid: string, pid: string, s: DriverState): Prom
 
 // ── Pure decision layer (unit-tested; fires nothing) ────────────────────────
 
-/** The next backlog task the loop should advance: the first `todo` task (in
- *  backlog order — callers pass listTasks output, sorted created_at asc) whose
- *  every dependency is resolved. Only done dependencies count as resolved; a
- *  missing dep id is treated as resolved so a stale reference cannot deadlock
- *  the loop. Returns null when nothing is actionable. */
+/** Select the eligible to-do with the earliest due date, retaining backlog
+ * order for equal or absent dates. Missing dependencies cannot deadlock it. */
 export function nextActionableTask(tasks: readonly ProjectTask[]): ProjectTask | null {
   const byId = new Map(tasks.map((t) => [t.id, t]));
   const resolved = (depId: string): boolean => {
@@ -205,11 +208,13 @@ export function nextActionableTask(tasks: readonly ProjectTask[]): ProjectTask |
     if (!d) return true;
     return d.status === 'done';
   };
+  let pick: ProjectTask | null = null;
   for (const t of tasks) {
     if (t.status !== 'todo') continue;
-    if ((t.depends_on || []).every(resolved)) return t;
+    if (!(t.depends_on || []).every(resolved)) continue;
+    if (!pick || compareDueFirst(t, pick) < 0) pick = t;
   }
-  return null;
+  return pick;
 }
 
 /**

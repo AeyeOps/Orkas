@@ -88,16 +88,34 @@ export class ConversationHistoryWorker {
 }
 
 let worker: ConversationHistoryWorker | undefined;
+let closingHistory: Promise<void> | undefined;
+let lifetime = 0;
+export function conversationHistoryLifetime(): number { return lifetime; }
 export function historyRequest<T>(command: HistoryCommand): Promise<T> {
+  if (closingHistory) return Promise.reject(new Error('Conversation history worker stopped'));
   if (!worker?.available) worker = new ConversationHistoryWorker();
   return worker.request<T>(command);
 }
 
 let turnWorker: ConversationHistoryWorker | undefined;
+let liveWorker: ConversationHistoryWorker | undefined;
+/** Keep an active display projection out of the persisted-history queue.
+ * The command and returned representation remain identical. */
+export async function liveHistoryRequest<T>(command: HistoryCommand): Promise<T> {
+  while (closingHistory) await closingHistory;
+  if (!liveWorker?.available) {
+    const generation = lifetime;
+    if (liveWorker) await liveWorker.close();
+    if (generation !== lifetime) throw new Error('Conversation history worker stopped');
+    if (!liveWorker?.available) liveWorker = new ConversationHistoryWorker();
+  }
+  return liveWorker.request<T>(command);
+}
 let turnGeneration = 0;
 /** A separate bounded lane keeps navigation scans out of interactive paging.
  * Same bootstrap, queue cap, timeout, redacted errors and idle-release policy. */
 export async function turnIndexRequest<T>(command: HistoryCommand): Promise<T> {
+  while (closingHistory) await closingHistory;
   if (!turnWorker?.available) {
     // Do not overlap an interrupted writer with its replacement.
     const generation = turnGeneration;
@@ -108,13 +126,20 @@ export async function turnIndexRequest<T>(command: HistoryCommand): Promise<T> {
   return turnWorker.request<T>(command);
 }
 
-export async function closeConversationHistoryWorker(): Promise<void> {
-  const current = worker;
-  worker = undefined;
-  const navigation = turnWorker;
+export function closeConversationHistoryWorker(): Promise<void> {
+  lifetime++;
   turnGeneration++;
+  if (closingHistory) return closingHistory;
+  const current = worker;
+  const navigation = turnWorker;
+  const live = liveWorker;
   // Keep the stopped writer reachable until termination so an incoming read
   // cannot create a replacement while the old index is still being published.
-  await Promise.all([current?.close(), navigation?.close()]);
-  if (turnWorker === navigation) turnWorker = undefined;
+  const closing = Promise.all([current?.close(), navigation?.close(), live?.close()]).then(() => {
+    if (worker === current) worker = undefined;
+    if (liveWorker === live) liveWorker = undefined;
+    if (turnWorker === navigation) turnWorker = undefined;
+  }).finally(() => { if (closingHistory === closing) closingHistory = undefined; });
+  closingHistory = closing;
+  return closing;
 }

@@ -1,4 +1,5 @@
 import { createShutdownCoordinator } from './util/shutdown';
+import { scheduleChatApiPreload } from './features/model-api-preload';
 /**
  * Orkas — Electron main entry.
  *
@@ -42,6 +43,7 @@ import { installWindowPresentationEvents } from './util/window-presentation';
 import './install-data-root.cjs';
 import { resolveCliCommand } from './features/local_agents/spawn-command';
 import { createOptionalTray } from './util/app-tray';
+import { captureWindowsShutdownProcesses } from './util/windows-shutdown-processes';
 import { desktopPlatform, osVersion, preferredSystemLanguage } from './system_info';
 import {
   hardenedWebPreferences,
@@ -131,6 +133,7 @@ protocol.registerSchemesAsPrivileged([
 import * as paths from './paths';
 import { serveFileRange as serveFileRangeCore } from './util/http-range';
 import {
+  type BootResourceClass,
   configureBootAdmission,
   noteBootUserActivity,
   registerDeferred,
@@ -183,7 +186,7 @@ void installEnvProxyDispatcher();
 import { installFetchDiag } from './model/core-agent/fetch-diag';
 installFetchDiag();
 
-import { hasActiveWork, subscribeTaskTerminals, type TaskTerminalEvent } from './features/group_chat/bus';
+import { hasActiveWork, prepareForShutdown, resumeAfterFailedShutdown, subscribeTaskTerminals, type TaskTerminalEvent } from './features/group_chat/bus';
 import { setFetchImplementation } from './util/retry';
 setFetchImplementation((input, init) => net.fetch(input as Parameters<typeof net.fetch>[0], init));
 
@@ -198,16 +201,18 @@ import * as conversationTaskBoard from './features/group_chat/task_board';
 import * as searchFeature from './features/search';
 import * as projectFilesFeature from './features/project_files';
 import * as appConfig from './features/config';
-import { getRendererBootTables } from './i18n';
+import { getRendererBootTables, t } from './i18n';
 import * as reflectionOrchestrator from './features/reflection-orchestrator';
 import * as autoTasks from './features/auto_tasks';
 import * as projectDriverRunner from './features/project_driver_runner';
 import * as projectTasks from './features/project_tasks';
+import * as projects from './features/projects';
 import * as conversationFiling from './features/conversation_filing';
 import * as systemSkills from './features/system_skills';
 import * as bundledContentStartup from './features/bundled_content_startup';
 import * as builtinMarketplaceStartup from './features/builtin_marketplace_startup';
 import type { BuiltinMarketplaceSeedResult } from './features/builtin_marketplace';
+import { createLoginStartup, setLoginStartup, shouldHideStartupWindow } from './features/login_startup';
 import * as chatAttachments from './features/chat_attachments';
 import * as chatArtifacts from './features/chat_artifacts';
 import * as savedApps from './features/saved_apps';
@@ -215,8 +220,9 @@ import { appResource, hasIsolatedBrowserStorage } from './features/web_apps/host
 import * as connectorsFeature from './features/connectors';
 import * as windowState from './features/window_state';
 import { startIdleSleepGuard } from './features/idle_sleep_guard';
-import { installWindowCloseConfirmation } from './features/window_close_confirmation';
+import { createDesktopWindowController, getDesktopWindowController, setDesktopWindowController } from './features/desktop_windows';
 import * as taskNotifications from './features/task_notifications';
+import { installWindowCloseConfirmation } from './features/window_close_confirmation';
 import * as taskUnreadTray from './features/task_unread_tray';
 import * as notificationPermissions from './features/notification_permissions';
 import {
@@ -270,7 +276,9 @@ function emitTaskTerminalToRenderer(event: TaskTerminalEvent): void {
   taskTerminalUi.emit({ type: 'terminal', ...terminal }, ownerUserId);
 }
 
-function createWindow(): BrowserWindow {
+let modelApiPreloadScheduled = false;
+
+function createWindow(startupHidden = false): BrowserWindow {
   const dev = !app.isPackaged;
   const restored = windowState.restoreWindowState();
   const win = new BrowserWindow({
@@ -278,7 +286,7 @@ function createWindow(): BrowserWindow {
     height: 800,
     ...restored.bounds,
     title: '',
-    show: !IS_PACKAGED_LAUNCH_SMOKE && !E2E_HIDE_WINDOW,
+    show: !IS_PACKAGED_LAUNCH_SMOKE && !E2E_HIDE_WINDOW && !startupHidden,
     focusable: !E2E_HIDE_WINDOW,
     backgroundColor: '#ffffff',
     icon: path.join(paths.SRC_ROOT, 'resources', 'icons', 'icon.png'),
@@ -297,10 +305,11 @@ function createWindow(): BrowserWindow {
   mainWindows.add(win);
   installWindowPresentationEvents(win);
   win.on('focus', () => taskUnreadTray.refreshTaskUnreadTray());
-  installWindowCloseConfirmation(win, hasActiveWork, () => isQuitting);
+  getDesktopWindowController()?.install(win, () => isQuitting);
+  if (process.platform === 'linux') installWindowCloseConfirmation(win, hasActiveWork, () => isQuitting);
   windowState.watchWindowState(win);
   // maximize() also shows a hidden native window.
-  if (restored.isMaximized && !E2E_HIDE_WINDOW) win.maximize();
+  if (restored.isMaximized && !E2E_HIDE_WINDOW && !startupHidden) win.maximize();
 
   win.loadFile(path.join(paths.SRC_ROOT, 'renderer', 'index.html'));
   win.webContents.on('did-start-navigation', (_event, _url, isInPlace, isMainFrame) => {
@@ -312,6 +321,15 @@ function createWindow(): BrowserWindow {
   win.webContents.on('did-finish-load', () => {
     mainRendererReady = true;
     for (const channel of rendererChannels) channel.flush();
+    if (!modelApiPreloadScheduled) {
+      modelApiPreloadScheduled = true;
+      scheduleChatApiPreload(async () => {
+        if (win.isDestroyed() || win.webContents.isDestroyed() || win.webContents.isLoadingMainFrame()) return false;
+        return await win.webContents.executeJavaScript(
+          'document.documentElement.dataset.orkasBootReady === "true"',
+        ) === true;
+      });
+    }
   });
   win.webContents.on('render-process-gone', () => {
     mainRendererReady = false;
@@ -380,6 +398,8 @@ function createAppTray(): void {
     iconPath,
     displayName: APP_DISPLAY_NAME,
     onActivate: () => { showMainWindow(); },
+    onQuit: () => { setImmediate(() => app.quit()); },
+    labels: () => ({ open: t('desktop.open'), quit: t('desktop.exit') }),
     warn: message => log.warn(message),
   });
 }
@@ -415,7 +435,10 @@ function openConversationFromTaskNotification(
 
 /** `prepareShutdown` is the work a normal quit runs in `before-quit`; exits
  *  that bypass it (`app.exit`) run it themselves. */
-function registerIpc(prepareShutdown: () => Promise<void>): void {
+function registerIpc(
+  prepareShutdown: (mode?: 'quit' | 'relaunch') => Promise<void>,
+  isShutdownQuiescent: () => boolean,
+): void {
   ipc.register();
   // Subscribe before opening the renderer. The deferred driver scheduler must
   // not determine whether foreground or early background writes are visible.
@@ -430,6 +453,14 @@ function registerIpc(prepareShutdown: () => Promise<void>): void {
   });
   conversationFiling.onConversationFilingFailed(({ userId, ...receipt }) => {
     conversationFilingFailure.emit(receipt, userId);
+  });
+  conversationFiling.onConversationProjectRenamed((event) => {
+    if (!users.hasActiveUser() || users.getActiveUserId() !== event.userId) return;
+    ipc.broadcastToRenderer('projects:renamed', event);
+  });
+  projects.onProjectInstructionsChanged((event) => {
+    if (!users.hasActiveUser() || users.getActiveUserId() !== event.uid) return;
+    ipc.broadcastToRenderer('projects:instructions-changed', { projectId: event.projectId });
   });
   conversationTaskBoard.onBacklogExecutionChanged((e) => ipc.broadcastToRenderer('projects:tasks-changed', {
     projectId: e.pid,
@@ -544,6 +575,11 @@ function registerIpc(prepareShutdown: () => Promise<void>): void {
     ipcMain.handle('orkas.relaunch', async () => {
       const isWindows = process.platform === 'win32';
       const script = path.join(paths.PC_ROOT, isWindows ? 'run.cmd' : 'run.sh');
+      try {
+        if (!fs.statSync(script).isFile()) throw new Error('Invalid launcher');
+      } catch {
+        throw Object.assign(new Error('Relaunch could not start'), { code: 'E_RELAUNCH_START_FAILED' });
+      }
       const resolved = isWindows
         ? resolveCliCommand(script, [], process.platform, process.env)
         : { command: 'bash', args: [script], windowsVerbatimArguments: undefined };
@@ -554,17 +590,44 @@ function registerIpc(prepareShutdown: () => Promise<void>): void {
       delete childEnv.ORKAS_WORKSPACE_ROOT;
       delete childEnv.CORE_AGENT_AUTH_DIR;
       childEnv.ORKAS_RELAUNCH_OWNER_PID = String(process.pid);
-      const child = spawn(resolved.command, resolved.args, {
-        cwd: paths.PC_ROOT,
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: true,
-        windowsVerbatimArguments: resolved.windowsVerbatimArguments,
-        env: childEnv,
+      const child = await new Promise<ReturnType<typeof spawn>>((resolve, reject) => {
+        const launcher = spawn(resolved.command, resolved.args, {
+          cwd: paths.PC_ROOT,
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+          windowsVerbatimArguments: resolved.windowsVerbatimArguments,
+          env: childEnv,
+        });
+        launcher.once('error', reject);
+        launcher.once('spawn', () => { launcher.unref(); resolve(launcher); });
+      }).catch(() => {
+        throw Object.assign(new Error('Relaunch could not start'), { code: 'E_RELAUNCH_START_FAILED' });
       });
-      child.unref();
       log.info('relaunch via shell script');
-      await prepareShutdown();
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([
+          prepareShutdown('relaunch'),
+          new Promise<void>((resolve, reject) => {
+            // run.sh/run.cmd give this owner 15 seconds to leave. Only bound
+            // local cleanup once critical active-task archival has settled.
+            timer = setTimeout(() => {
+              let quiescent = false;
+              try { quiescent = isShutdownQuiescent(); } catch { /* unknown phase retains the app */ }
+              if (quiescent) resolve();
+              else reject(Object.assign(new Error('Active task archival failed'), {
+                code: 'E_SHUTDOWN_ARCHIVE_FAILED',
+              }));
+            }, 10_000);
+          }),
+        ]);
+      } catch (error) {
+        if (child.exitCode === null && child.signalCode === null) {
+          try { child.kill(); } catch { /* retain the original archival failure */ }
+        }
+        throw error;
+      } finally { if (timer) clearTimeout(timer); }
       app.exit(0);
       return { ok: true };
     });
@@ -771,6 +834,7 @@ function broadcastBuiltinMarketplaceSeedChanged(result: BuiltinMarketplaceSeedRe
     pulled,
     updated_at: Date.now(),
   });
+  ipc.broadcastToRenderer('marketplace:content-changed', {});
 }
 
 async function seedBuiltinMarketplaceForCurrentUser(
@@ -1143,7 +1207,7 @@ function registerChatAppProtocol(): void {
         log.warn('chat-app: unparseable URL', { error_code: 'invalid_url' });
         return new Response('bad request', { status: 400 });
       }
-      const sdkResource = appResource(request);
+      const sdkResource = await appResource(request);
       if (sdkResource) {
         if (sdkResource.status !== 200) return new Response('Application resource unavailable', { status: sdkResource.status });
         if ('body' in sdkResource) return new Response(sdkResource.body, {
@@ -1175,9 +1239,6 @@ function registerChatAppProtocol(): void {
           return new Response('bad request', { status: 400 });
         }
         const uid = users.getActiveUserId();
-        if (await savedApps.resolveSavedAppType(uid, appId) === 'web') {
-          return Response.json((await import('./features/web_apps/commercial-entry')).commercialWebAppFailure(), { status: 403 });
-        }
         if (hasIsolatedBrowserStorage(uid, { appId })) return new Response('Application origin required', { status: 403 });
         if (savedRelPath === chatArtifacts.BRIDGE_RELPATH) {
           return _withArtifactCors(new Response(chatArtifacts.BRIDGE_JS, {
@@ -1208,9 +1269,6 @@ function registerChatAppProtocol(): void {
       }
 
       const uid = users.getActiveUserId();
-      if (await savedApps.resolveArtifactAppType(uid, cid, artifactId) === 'web') {
-        return Response.json((await import('./features/web_apps/commercial-entry')).commercialWebAppFailure(), { status: 403 });
-      }
       if (hasIsolatedBrowserStorage(uid, { cid, artifactId })) return new Response('Application origin required', { status: 403 });
       // Reserved virtual path: the runtime bridge script (not on disk).
       if (relPath === chatArtifacts.BRIDGE_RELPATH) {
@@ -1247,17 +1305,77 @@ if (!gotLock) {
 } else {
 
   const shutdown = createShutdownCoordinator({
+    captureProcesses: () => captureWindowsShutdownProcesses(),
+    quiesce: async () => {
+      autoTasks.stopScheduler();
+      projectDriverRunner.stopDriverScheduler();
+      await Promise.all([
+        prepareForShutdown(),
+        import('./features/local_agents/runner.js').then(runner => runner.stopBackgroundRuns('the app is quitting')),
+        import('../core-agent/src/tools/process-session')
+          .then(sessions => sessions.stopAllProcessSessions())
+          .catch(() => createLogger('process-sessions').warn('stopping retained commands failed')),
+      ]);
+      const boot = await import('./util/boot_init');
+      boot.stopBootWork();
+      const library = await import('./features/library_corpus');
+      library.closeAllLibraryCorpora();
+    },
     localTasks: [
+      { name: 'conversation-history', run: async () => {
+        const history = await import('./features/conversation-history-client');
+        await history.closeConversationHistoryWorker();
+      } },
+      { name: 'connectors', run: () => connectorsFeature.shutdown() },
       { name: 'search', run: () => searchFeature.flushAll() },
-      { name: 'kb_vector', run: async () => { (await import('./features/kb_vector')).closeAllKb(); } },
-      { name: 'kb_embed', run: async () => { (await import('./features/kb_embed')).closeEmbedder(); } },
-      { name: 'image-runtime', run: async () => { (await import('./util/sharp-runtime')).closeImageRuntime(); } },
-      { name: 'office-engine', run: () => sweepOfficeResidents('quit') },
-      { name: 'web-assist-session', run: async () => { await (await import('./features/web_assist_session')).flushWebAssistSessions(); } },
+      { name: 'kb_vector', run: async () => {
+        const kb = await import('./features/kb_vector');
+        kb.closeAllKb();
+      } },
+      { name: 'kb_embed', run: async () => {
+        // Kill the isolated embedder worker so it releases its model promptly.
+        const kbEmbed = await import('./features/kb_embed');
+        kbEmbed.closeEmbedder();
+      } },
+      { name: 'image-runtime', run: async () => {
+        const images = await import('./util/sharp-runtime');
+        images.closeImageRuntime();
+      } },
+      { name: 'office-engine', run: async () => {
+        const extraction = await import('./util/office-extract');
+        await extraction.closeOfficeExtraction();
+        const oe = await import('./features/office/office_engine');
+        oe.closeAllOfficeResidents();
+      } },
+      { name: 'web-assist-session', run: async () => {
+        const webAssistSessions = await import('./features/web_assist_session');
+        await webAssistSessions.flushWebAssistSessions();
+      } },
+      { name: 'web-app-data', run: async () => {
+        // Checkpoint local app databases before closing the application.
+        const apps = await import('./features/web_apps/host');
+        apps.runtime.closeUser(users.getActiveUserId());
+        await apps.runtime.drainData();
+      } },
     ],
     onFailure: name => createLogger(name).warn('shutdown preparation failed'),
+    onIncomplete: async () => {
+      await resumeAfterFailedShutdown();
+      const library = await import('./features/library_corpus');
+      await library.resumeLibraryAdmission();
+      const boot = await import('./util/boot_init');
+      boot.resumeBootAdmission();
+      autoTasks.startScheduler();
+      projectDriverRunner.startDriverScheduler();
+    },
   });
   const flushForShutdown = shutdown.prepare;
+  const desktopWindows = createDesktopWindowController({
+    isShutdownComplete: () => shutdown.complete,
+    canHide: () => process.platform === 'darwin' || !!appTray,
+    nativeClose: () => process.platform === 'linux',
+  });
+  setDesktopWindowController(desktopWindows);
 
   // Account login is stripped, but connector OAuth still returns through the OS protocol. Keep
   // this connector-only receiver outside the removed account protocol module.
@@ -1306,10 +1424,15 @@ if (!gotLock) {
     registerChatAppProtocol();
     // Renderer permission gate. Voice input is stripped from the open-source build, so media
     // capture is denied; clipboard permissions are kept for copy/paste flows.
-    session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
+    session.defaultSession.setPermissionCheckHandler((_wc, permission) => (
+      permission === 'clipboard-read' || permission === 'clipboard-sanitized-write'
+    ));
+    session.defaultSession.setPermissionRequestHandler((wc, permission, callback, details) => {
+      const owner = wc ? BrowserWindow.fromWebContents(wc) : null;
+      if (!owner || !mainWindows.has(owner) || !details.isMainFrame) { callback(false); return; }
       callback(permission === 'clipboard-read' || permission === 'clipboard-sanitized-write');
     });
-    registerIpc(flushForShutdown);
+    registerIpc(flushForShutdown, () => shutdown.quiescent);
     const stopTaskNotifications = taskNotifications.startTaskNotifications({
       getActiveUserId: () => users.getActiveUserId(),
       isEnabled: () => appConfig.getTaskNotificationsEnabled(),
@@ -1357,22 +1480,12 @@ if (!gotLock) {
       },
       openConversation: openConversationFromTaskNotification,
     });
-    app.once('before-quit', stopTaskNotifications);
-    // A CLI agent's process is our child but its own process-group leader, so
-    // quitting without ending it leaves it running with nothing to report to.
-    // Fire-and-forget: Electron does not await this hook, and the deadline
-    // inside only decides whether the CLI gets to write a clean session state
-    // before the app goes.
-    app.once('before-quit', () => {
-      void import('./features/local_agents/runner.js')
-        .then(runner => runner.stopBackgroundRuns('the app is quitting'))
-        .catch(() => { /* nothing was running, or the module never loaded */ });
-    });
+    app.once('will-quit', stopTaskNotifications);
     const stopTaskTerminalUi = subscribeTaskTerminals(emitTaskTerminalToRenderer);
-    app.once('before-quit', stopTaskTerminalUi);
+    app.once('will-quit', stopTaskTerminalUi);
     // Running Agent work keeps the machine out of idle sleep; an idle app holds nothing.
     const idleSleepGuard = startIdleSleepGuard({ blocker: powerSaveBlocker, hasActiveWork });
-    app.once('before-quit', idleSleepGuard.stop);
+    app.once('will-quit', idleSleepGuard.stop);
     const BOOT_BACKGROUND_DEFER_MS = 6_000;
     const bootDevice = getBootDeviceProfile();
     const BOOT_HEAVY_DISK_DELAY_MS = bootDevice.heavyDiskOffsetMs;
@@ -1385,15 +1498,31 @@ if (!gotLock) {
       heavy_disk_delay_ms: BOOT_HEAVY_DISK_DELAY_MS,
       post_startup_delay_ms: BOOT_POST_STARTUP_DELAY_MS,
     });
-    const connectorsTimer = setTimeout(() => {
-      connectorsFeature.bootstrap(users.getActiveUserId()).catch(() => {
-        /* errors logged inside the feature; never block app startup */
-      });
-    }, CONNECTORS_BOOTSTRAP_DELAY_MS);
-    connectorsTimer.unref?.();
-    createWindow();
+    scheduleBootBackground('connectors:bootstrap', async () => {
+      await connectorsFeature.bootstrap(users.getActiveUserId());
+    }, CONNECTORS_BOOTSTRAP_DELAY_MS, { resourceClass: 'process', preferIdle: true, maxSliceMs: 30_000 });
+    const startupAvailable = app.isPackaged && !IS_PACKAGED_LAUNCH_SMOKE && !E2E_HIDE_WINDOW;
+    setLoginStartup(createLoginStartup({
+      platform: process.platform, available: startupAvailable, executable: process.execPath,
+      get: options => app.getLoginItemSettings(options),
+      set: settings => app.setLoginItemSettings(settings),
+      getUser: () => users.getActiveUserId(),
+      hasEnabledAutomations: async uid => (await autoTasks.listTasks(uid)).some(task => task.enabled === true),
+    }));
+    let startupHidden = false;
+    if (startupAvailable) {
+      try {
+        startupHidden = shouldHideStartupWindow({
+          platform: process.platform, argv: process.argv,
+          wasOpenedAtLogin: process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAtLogin,
+        });
+      } catch { log.warn('startup presentation unavailable; showing the main window'); }
+    }
+    createWindow(startupHidden);
     await consumeColdLaunchConnectorCallback();
     createAppTray();
+    // A silent launch must always retain an existing way to recover its window.
+    if (startupHidden && process.platform !== 'darwin' && !appTray) showMainWindow();
     if (process.platform === 'darwin' && appTray) {
       const stopTaskUnreadTray = taskUnreadTray.startTaskUnreadTray({
         tray: appTray,
@@ -1405,7 +1534,7 @@ if (!gotLock) {
         },
         warn: message => log.warn(message),
       });
-      app.once('before-quit', stopTaskUnreadTray);
+      app.once('will-quit', stopTaskUnreadTray);
     }
     // A scheduled fire or driver advance can reach the task browser with every
     // window closed, which is routine on macOS. Hand Web Assist the ability to
@@ -1480,7 +1609,11 @@ if (!gotLock) {
       }));
       projectDriverRunner.startDriverScheduler();
     });
-    registerDeferred('marketplace:builtin', () => seedBuiltinMarketplaceForCurrentUser('startup'));
+    registerDeferred('marketplace:builtin', async () => {
+      await seedBuiltinMarketplaceForCurrentUser('startup');
+      const skills = await import('./features/skills');
+      await skills.repairLegacySkillEnabledIdsForActiveUser();
+    });
 
     registerDeferred('boot:maintenance-sweeps', () => runBootMaintenanceSweeps(), 'serial', BOOT_HEAVY_DISK_DELAY_MS, idleDisk);
     registerDeferred('browser:http-cache', async (signal) => {
@@ -1534,7 +1667,7 @@ if (!gotLock) {
     void runBootPhases(BOOT_BACKGROUND_DEFER_MS);
 
     app.on('activate', () => {
-      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+      showMainWindow();
     });
   });
 
@@ -1543,9 +1676,17 @@ if (!gotLock) {
   });
 
   app.on('before-quit', async (e) => {
-    isQuitting = true;
-    if (shutdown.complete) return;
+    if (shutdown.complete) { isQuitting = true; return; }
     e.preventDefault();
-    try { await flushForShutdown(); } finally { app.quit(); }
+    if (isQuitting) return;
+    isQuitting = true;
+    try {
+      await flushForShutdown();
+      app.quit();
+    } catch (error) {
+      isQuitting = false;
+      showMainWindow();
+      log.error('quit preparation failed', { error: logErrorSummary(error) });
+    }
   });
 }

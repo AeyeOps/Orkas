@@ -1475,6 +1475,8 @@ describe("AgentRunner", () => {
       "B".repeat(12_001),
       "C".repeat(12_000),
     ];
+    const firstRevision = "file_rev_1111111111111111";
+    const secondRevision = "file_rev_2222222222222222";
     const firstSize = Buffer.byteLength(chunks[0], "utf8");
     const secondSize = firstSize + Buffer.byteLength(chunks[1], "utf8");
     const mockProvider = createMockProvider([
@@ -1494,7 +1496,7 @@ describe("AgentRunner", () => {
           type: "tool_use",
           id: "large-append-2",
           name: "append_file",
-          input: { path: "large.txt", content: chunks[1], expected_size: firstSize },
+          input: { path: "large.txt", content: chunks[1], base_revision: firstRevision },
         }],
         stopReason: "tool_use",
         usage: { inputTokens: 30, outputTokens: 3_100, totalTokens: 3_130 },
@@ -1505,7 +1507,7 @@ describe("AgentRunner", () => {
           type: "tool_use",
           id: "partial-large-append",
           name: "append_file",
-          input: { path: "large.txt", expected_size: secondSize },
+          input: { path: "large.txt", base_revision: secondRevision },
         }],
         stopReason: "max_tokens",
         usage: { inputTokens: 40, outputTokens: 32_768, totalTokens: 32_808 },
@@ -1516,7 +1518,7 @@ describe("AgentRunner", () => {
           type: "tool_use",
           id: "large-append-3",
           name: "append_file",
-          input: { path: "large.txt", content: chunks[2], expected_size: secondSize },
+          input: { path: "large.txt", content: chunks[2], base_revision: secondRevision },
         }],
         stopReason: "tool_use",
         usage: { inputTokens: 45, outputTokens: 3_100, totalTokens: 3_145 },
@@ -1531,7 +1533,8 @@ describe("AgentRunner", () => {
     ], (params) => requests.push(params));
     const registry = new ProviderRegistry();
     registry.registerFactory("mock", () => mockProvider);
-    const operations: Array<{ name: string; expectedSize?: number }> = [];
+    const operations: Array<{ name: string; baseRevision?: string }> = [];
+    let currentRevision = firstRevision;
     let fileBody = "";
     const writeFile = defineTool({
       name: "write_file",
@@ -1540,19 +1543,20 @@ describe("AgentRunner", () => {
       async execute(input) {
         fileBody = String(input.content ?? "");
         operations.push({ name: "write_file" });
-        return { content: `<file path="large.txt" total_bytes="${Buffer.byteLength(fileBody, "utf8")}"/>` };
+        return { content: `<file path="large.txt" total_bytes="${Buffer.byteLength(fileBody, "utf8")}" revision="${currentRevision}"/>` };
       },
     });
     const appendFile = defineTool({
       name: "append_file",
       description: "Append the next complete file chunk",
-      inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" }, expected_size: { type: "number" } } },
+      inputSchema: { type: "object", properties: { path: { type: "string" }, content: { type: "string" }, base_revision: { type: "string" } } },
       async execute(input) {
-        const expectedSize = Number(input.expected_size);
-        if (expectedSize !== Buffer.byteLength(fileBody, "utf8")) throw new Error("stale append offset");
-        operations.push({ name: "append_file", expectedSize });
+        const baseRevision = String(input.base_revision);
+        if (baseRevision !== currentRevision) throw new Error("stale append revision");
+        operations.push({ name: "append_file", baseRevision });
         fileBody += String(input.content ?? "");
-        return { content: `<file path="large.txt" total_bytes="${Buffer.byteLength(fileBody, "utf8")}"/>` };
+        currentRevision = baseRevision === firstRevision ? secondRevision : "file_rev_3333333333333333";
+        return { content: `<file path="large.txt" total_bytes="${Buffer.byteLength(fileBody, "utf8")}" revision="${currentRevision}"/>` };
       },
     });
     const session = new Session();
@@ -1578,10 +1582,12 @@ describe("AgentRunner", () => {
     expect(requests).toHaveLength(5);
     expect(JSON.stringify(requests[3].messages)).toContain("at or below 12000 characters");
     expect(JSON.stringify(requests[3].messages)).toContain(`total_bytes=\\"${secondSize}\\"`);
+    expect(JSON.stringify(requests[3].messages)).toContain(secondRevision);
+    expect(JSON.stringify(requests[3].messages)).not.toContain("expected_size");
     expect(operations).toEqual([
       { name: "write_file" },
-      { name: "append_file", expectedSize: firstSize },
-      { name: "append_file", expectedSize: secondSize },
+      { name: "append_file", baseRevision: firstRevision },
+      { name: "append_file", baseRevision: secondRevision },
     ]);
     expect(fileBody).toBe(chunks.join(""));
     expect(fileBody.length).toBeGreaterThan(32_768);
@@ -2111,7 +2117,7 @@ describe("AgentRunner", () => {
       .toBe(false);
   });
 
-  it("accepts common execution-plan aliases without spending a retry round", async () => {
+  it("accepts the current execution-plan snapshot without spending a retry round", async () => {
     const mockProvider = createMockProvider([
       {
         content: [{
@@ -2119,12 +2125,11 @@ describe("AgentRunner", () => {
           id: "call-plan-aliases",
           name: "manage_execution_plan",
           input: {
-            action: "replace",
             plan: [
-              { step: "Inspect", status: "done" },
-              { step: "Implement", status: "in-progress" },
-              { step: "Verify", status: "not_started" },
-              { step: "Publish", status: "unknown" },
+              { step: "Inspect", status: "completed" },
+              { step: "Implement", status: "in_progress" },
+              { step: "Verify", status: "pending" },
+              { step: "Publish", status: "pending" },
             ],
           },
         }],
@@ -2670,7 +2675,7 @@ describe("AgentRunner", () => {
     if (outcome === "nonterminal") expect(result.text).toBe("The Agent was not started.");
   });
 
-  it("treats a legacy Plan finish as an ordinary tool call before the final no-tool reply", async () => {
+  it("treats a completed Plan snapshot as an ordinary tool call before the final no-tool reply", async () => {
     const requests: CompletionParams[] = [];
     const provider = createMockProvider([
       {
@@ -2680,7 +2685,6 @@ describe("AgentRunner", () => {
             id: "plan-create",
             name: "manage_execution_plan",
             input: {
-              action: "update",
               plan: [{ step: "Produce and verify the artifact", status: "in_progress" }],
             },
           },
@@ -2698,10 +2702,7 @@ describe("AgentRunner", () => {
             id: "plan-finish",
             name: "manage_execution_plan",
             input: {
-              action: "set_status",
-              step_id: 1,
-              status: "completed",
-              finish: "completed",
+              plan: [{ step: "Produce and verify the artifact", status: "completed" }],
             },
           },
         ],
@@ -2749,7 +2750,7 @@ describe("AgentRunner", () => {
       .toEqual(["completed"]);
   });
 
-  it("keeps the normal active tool surface after a legacy Plan finish without reply text", async () => {
+  it("rejects legacy Plan finish without mutating progress or ending the turn", async () => {
     const requests: CompletionParams[] = [];
     const provider = createMockProvider([
       {
@@ -2759,7 +2760,6 @@ describe("AgentRunner", () => {
             id: "plan-create",
             name: "manage_execution_plan",
             input: {
-              action: "update",
               plan: [{ step: "Finish the verified work", status: "in_progress" }],
             },
           },
@@ -2813,6 +2813,8 @@ describe("AgentRunner", () => {
 
     const result = await runner.run({ message: "Track progress while finishing the verified work" });
 
+    expect(runner.getSession().getExecutionPlan()?.steps.map(step => step.status)).toEqual(["in_progress"]);
+    expect(JSON.stringify(requests[2].messages)).toContain("PLAN_INPUT_UNSUPPORTED_FIELDS");
     expect(result.text).toBe("Verified work is complete.");
     expect(result.text).not.toContain("must not be reached");
     expect(requests).toHaveLength(3);
@@ -2890,7 +2892,6 @@ describe("AgentRunner", () => {
           id: "plan-boundary",
           name: "manage_execution_plan",
           input: {
-            action: "update",
             plan: [
               { step: "Show the preview", status: "completed" },
               { step: "Render after the user's reply", status: "pending" },
@@ -4225,7 +4226,8 @@ describe("AgentRunner", () => {
   // recovery folds deterministically and retries the same request exactly
   // once. Before this path existed, a tracked session's overflow was a
   // terminal error — the one hole every peer product had covered.
-  it("recovers from a provider context overflow by folding and retrying once", async () => {
+  it.each(['context_length_exceeded', 'exceed_context_size_error'])(
+    'recovers from a provider context overflow by folding and retrying once (%s)', async type => {
     let streamCalls = 0;
     let summaryCalls = 0;
     const capturedRequests: Message[][] = [];
@@ -4258,8 +4260,8 @@ describe("AgentRunner", () => {
         if (call === 2) {
           // Exercise the structured provider boundary as well as recovery.
           throw wrapErrorForTest(new ProviderError(
-            '400: {"code":"context_length_exceeded","message":"Request rejected"}',
-            "mock", 400, Object.assign(new Error('opaque'), { code: 'context_length_exceeded' }),
+            'Request rejected',
+            "mock", 400, Object.assign(new Error('opaque'), { code: 400, type }),
           ), "mock");
         }
         yield { type: "text_delta" as const, text: "done" };
@@ -4278,11 +4280,14 @@ describe("AgentRunner", () => {
     // Modest by the estimator's measure — under every layered trigger — yet
     // the provider still refuses: exactly the blind-spot shape (image bytes,
     // a first call with no anchor) this recovery exists for.
+    const execute = vi.fn(async (input: Record<string, unknown>) => ({
+      content: `bulk\n${(input.round === 0 ? "z" : "y").repeat(20_000)}`,
+    }));
     const bulk = defineTool({
       name: "bulk",
       description: "emits a large observation",
       inputSchema: { type: "object", properties: { round: { type: "number" } } },
-      async execute(input) { return { content: `bulk\n${(input.round === 0 ? "z" : "y").repeat(20_000)}` }; },
+      execute,
     });
     const config = createConfig({
       agent: { defaultProvider: "mock", defaultModel: "mock-model", maxToolLoops: 10 },
@@ -4319,6 +4324,7 @@ describe("AgentRunner", () => {
     expect(retried).not.toContain("z".repeat(1_000));
     expect(retried).toContain("y".repeat(20_000));
     expect(streamCalls).toBe(4);
+    expect(execute.mock.calls.map(([input]) => input.round)).toEqual([0, 1]);
     // The user's message is committed exactly once as message text — the
     // second textual occurrence in a request is the plan anchor's
     // deterministically derived objective, which is projection, not a
@@ -4327,7 +4333,10 @@ describe("AgentRunner", () => {
     expect(runner.getSession().hasTurnTracking()).toBe(true);
   });
 
-  it.each([100, 100_000])("preserves the only unread parallel round on overflow (result chars: %i)", async (chars) => {
+  it.each([
+    [100, 'context_length_exceeded'], [100_000, 'context_length_exceeded'],
+    [100, 'exceed_context_size_error'], [100_000, 'exceed_context_size_error'],
+  ] as const)('preserves the only unread parallel round on overflow (result chars: %i / %s)', async (chars, type) => {
     // Asserted: done.meta.error.kind === 'context_overflow' with one request.
     expectTestLog({ level: 'error', source: 'console', message: /^\[agent-runner\] context overflow with nothing to recover \{/ });
     const session = new Session();
@@ -4344,7 +4353,8 @@ describe("AgentRunner", () => {
       async *stream(params) {
         requests.push(params);
         yield { type: "message_start" as const };
-        throw new ContextOverflowError("request exceeds context window");
+        throw wrapErrorForTest(new ProviderError('Request rejected', 'mock', 400,
+          Object.assign(new Error('opaque'), { code: 400, type })), 'mock');
       },
       async validateAuth() { return true; },
     };
@@ -4368,7 +4378,8 @@ describe("AgentRunner", () => {
     expect(events.filter(e => e.type === "compaction")).toHaveLength(0);
   });
 
-  it("declines a consecutive overflow after recovery with no completed call between", async () => {
+  it.each(['context_length_exceeded', 'exceed_context_size_error'])(
+    'declines a consecutive overflow after recovery with no completed call between (%s)', async type => {
     // Asserted: error kind context_overflow whose message names the recovery.
     expectTestLog({ level: 'error', source: 'console', message: /^\[agent-runner\] context overflow after recovery \{/ });
     let streamCalls = 0;
@@ -4395,7 +4406,8 @@ describe("AgentRunner", () => {
           };
           return;
         }
-        throw new ContextOverflowError("request exceeds context window");
+        throw wrapErrorForTest(new ProviderError('Request rejected', 'mock', 400,
+          Object.assign(new Error('opaque'), { code: 400, type })), 'mock');
       },
       async validateAuth() { return true; },
     };
@@ -7859,7 +7871,6 @@ describe("AgentRunner", () => {
           id: "plan-work",
           name: "manage_execution_plan",
           input: {
-            action: "update",
             plan: [{ step: "Process the files", status: "in_progress" }],
           },
         }],
@@ -7910,15 +7921,14 @@ describe("AgentRunner", () => {
     });
     const provider = createMockProvider([
       planCall("plan-create", {
-        action: "update",
         plan: [
           { step: "Implement the change", status: "in_progress" },
           { step: "Verify the change", status: "in_progress" },
         ],
       }),
-      planCall("plan-implement-done", { action: "set_status", step_id: 1, status: "completed" }),
-      planCall("plan-verify-start", { action: "set_status", step_id: 2, status: "in_progress" }),
-      planCall("plan-verify-done", { action: "set_status", step_id: 2, status: "completed" }),
+      planCall("plan-implement-done", { plan: [{ step: "Implement the change", status: "completed" }, { step: "Verify the change", status: "pending" }] }),
+      planCall("plan-verify-start", { plan: [{ step: "Implement the change", status: "completed" }, { step: "Verify the change", status: "in_progress" }] }),
+      planCall("plan-verify-done", { plan: [{ step: "Implement the change", status: "completed" }, { step: "Verify the change", status: "completed" }] }),
       {
         content: [{ type: "text", text: '{"plan":"complete"}' }],
         stopReason: "end_turn",
@@ -7958,7 +7968,6 @@ describe("AgentRunner", () => {
     });
     const provider = createMockProvider([
       planCall("plan-churn-create", {
-        action: "update",
         plan: [
           { step: "Implement the change", status: "in_progress" },
           { step: "Verify the change", status: "pending" },
@@ -9115,6 +9124,50 @@ describe("AgentRunner", () => {
     expect(seen[1].runScopedLedger).toBe(seen[0].runScopedLedger);
   });
 
+  it("copies host-seeded read stamps into the run-scoped map without sharing the host's map", async () => {
+    // A host that showed a file whole in the turn seeds its read stamp so the
+    // first edit is not refused as unread. The runtime copies the entries:
+    // reads during the run must not leak back into the host's object, and a
+    // later run starts from the host's seed again, not from this run's reads.
+    const mockProvider = createMockProvider([
+      {
+        content: [{ type: "tool_use", id: "c1", name: "capture_state", input: {} }],
+        stopReason: "tool_use",
+        usage: { inputTokens: 5, outputTokens: 5, totalTokens: 10 },
+        model: "mock-model",
+      },
+      {
+        content: [{ type: "text", text: "done" }],
+        stopReason: "end_turn",
+        usage: { inputTokens: 5, outputTokens: 2, totalTokens: 7 },
+        model: "mock-model",
+      },
+    ]);
+    const registry = new ProviderRegistry();
+    registry.registerFactory("mock", () => mockProvider);
+    const seen: Map<string, unknown>[] = [];
+    const captureTool = defineTool({
+      name: "capture_state",
+      description: "capture readFileState for assertion",
+      inputSchema: { type: "object", properties: {} },
+      async execute(_input, ctx) {
+        const state = ctx.state.readFileState as Map<string, unknown>;
+        seen.push(state);
+        state.set("/tmp/read-during-run.md", { mtimeMs: 2, size: 2 });
+        return { content: "ok" };
+      },
+    });
+    const config = createConfig({ agent: { defaultProvider: "mock", defaultModel: "mock-model" } });
+    const runner = new AgentRunner({ config, providers: registry, tools: [captureTool] });
+    const seed = new Map<string, unknown>([["/tmp/handoff/note.md", { mtimeMs: 1, size: 10, hash: "sha256:abc" }]]);
+    await runner.run({ message: "edit the note", initialReadFileState: seed });
+
+    expect(seen[0].get("/tmp/handoff/note.md")).toEqual({ mtimeMs: 1, size: 10, hash: "sha256:abc" });
+    expect(seen[0]).not.toBe(seed);
+    expect(seed.has("/tmp/read-during-run.md")).toBe(false);
+    expect(seed.size).toBe(1);
+  });
+
   it("omits sandboxEnv from state when not provided", async () => {
     // Preserves the pre-change default: sandboxEnv is absent from state when the
     // caller didn't opt in (the run-scoped readFileState map is always present).
@@ -9381,6 +9434,45 @@ describe("continuation-aware loop protection", () => {
 });
 
 describe("runner persistence barriers", () => {
+  it("stops on HTTP 451 after a completed tool and preserves its receipt across reload", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runner-451-"));
+    const file = path.join(dir, "session.jsonl");
+    const session = new PersistentSession({ sessionFile: file });
+    let calls = 0, writes = 0;
+    const first = createMockProvider([{
+      content: [{ type: "tool_use", id: "write-once", name: "write_fixture", input: {} }],
+      stopReason: "tool_use", model: "mock-model", usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+    }]);
+    const provider: LLMProvider = {
+      id: "mock", name: "Mock",
+      async complete() { throw new Error("must not summarize a rejected request"); },
+      async *stream(params) {
+        if (++calls === 1) yield* first.stream(params);
+        else throw new ProviderError("opaque rejection", "mock", 451);
+      },
+      async validateAuth() { return true; },
+    };
+    const providers = new ProviderRegistry();
+    providers.registerFactory("mock", () => provider);
+    const runner = new AgentRunner({ session, providers, config: createConfig({ agent: {
+      defaultProvider: "mock", defaultModel: "mock-model", maxRetries: 1,
+    } }), tools: [defineTool({ name: "write_fixture", description: "Commit one operation", inputSchema: { type: "object", properties: {} },
+      execute: async () => { writes++; return { content: "committed-operation-receipt" }; },
+    })] });
+    try {
+      const events = await collectRunEvents(runner, "Perform the operation and report its outcome");
+      expect(calls).toBe(2);
+      expect(writes).toBe(1);
+      expect(events.some(event => event.type === "retry")).toBe(false);
+      const terminal = events.filter(event => event.type === "done");
+      expect(terminal).toHaveLength(1);
+      expect(terminal[0].result.meta.error?.statusCode).toBe(451);
+      const reloaded = new PersistentSession({ sessionFile: file });
+      expect(JSON.stringify(reloaded.getMessages())).toContain("committed-operation-receipt");
+      expect(reloaded.getCompletedWorkLedger()).toContainEqual(expect.objectContaining({ tool: "write_fixture", status: "succeeded" }));
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it.each(["first request", "completion"])("does not hide save failure at %s", async (phase) => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "runner-save-boundary-"));
     const file = path.join(dir, "session.jsonl");

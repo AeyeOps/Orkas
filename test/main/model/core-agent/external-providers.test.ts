@@ -7,6 +7,7 @@ import {
   buildMoonshotModel,
   createMoonshotProvider,
   repairDeepSeekPayload,
+  repairDeepSeekRequest,
 } from '../../../../src/main/model/core-agent/external-providers';
 import { isSelectableModel, modelInputImageLimit } from '../../../../src/main/model/provider_catalog';
 
@@ -30,7 +31,7 @@ describe('external-providers › custom OpenAI-compatible model', () => {
     }).input).toEqual(['text']);
   });
 
-  it('keeps documented DeepSeek text aliases text-only without hiding vision variants', () => {
+  it('honors custom endpoint vision declarations independently of vendor-like model names', () => {
     for (const modelId of [
       'deepseek-chat',
       'deepseek-reasoner',
@@ -41,7 +42,7 @@ describe('external-providers › custom OpenAI-compatible model', () => {
       expect(buildCustomOpenAICompatibleModel(modelId, {
         ...runtimeConfig,
         supportsVision: true,
-      }).input).toEqual(['text']);
+      }).input).toEqual(['text', 'image']);
     }
     expect(buildCustomOpenAICompatibleModel(
       'deepseek-v4-flash-vision-exp',
@@ -83,8 +84,8 @@ describe('external-providers › DeepSeek model capabilities', () => {
       expect(buildDeepSeekModel(modelId)).toMatchObject({
         id: modelId,
         input: ['text'],
-        contextWindow: 1_048_576,
-        maxTokens: 384_000,
+        contextWindow: 1_000_000,
+        maxTokens: 128_000,
       });
     }
   });
@@ -94,8 +95,8 @@ describe('external-providers › DeepSeek model capabilities', () => {
     expect(model).toMatchObject({
       name: 'DeepSeek V4 Flash Vision',
       input: ['text', 'image'],
-      contextWindow: 1_048_576,
-      maxTokens: 384_000,
+      contextWindow: 1_000_000,
+      maxTokens: 128_000,
     });
     expect(modelInputImageLimit('deepseek', 'deepseek-v4-flash-vision-exp', model)).toBe(20);
   });
@@ -107,7 +108,7 @@ describe('external-providers › DeepSeek model capabilities', () => {
       id: 'deepseek-flash', name: 'DeepSeek V4.1 Flash',
       api: 'openai-completions', baseUrl: 'https://api.deepseek.com/v1',
       reasoning: true, input: ['text', 'image'],
-      contextWindow: 1_048_576, maxTokens: 384_000,
+      contextWindow: 1_000_000, maxTokens: 128_000,
     });
     expect(modelInputImageLimit('deepseek', 'deepseek-flash', model)).toBe(20);
   });
@@ -129,7 +130,7 @@ describe('external-providers › buildMoonshotModel', () => {
   });
 
   it('uses known context windows and falls back to 131072 for unknown ids', () => {
-    expect(buildMoonshotModel('kimi-k3').contextWindow).toBe(1048576);
+    expect(buildMoonshotModel('kimi-k3').contextWindow).toBe(1000000);
     expect(buildMoonshotModel('kimi-k3').maxTokens).toBe(131072);
     expect(buildMoonshotModel('kimi-k2.7-code').contextWindow).toBe(262144);
     expect(buildMoonshotModel('kimi-k2.6').contextWindow).toBe(262144);
@@ -253,3 +254,13 @@ describe('external-providers › DeepSeek request compatibility', () => {
     expect(mixed.reasoning_effort).toBe('medium');
     expect(mixed.thinking).toEqual({ type: 'enabled' });
   });
+
+describe('DeepSeek host reservation wire boundary',()=>{
+ it('drops only a marked model-default reservation, preserving explicit and auxiliary caps',()=>{
+  const request={max_tokens:128000,messages:[{role:'user',content:'Hello'}]};
+  expect(repairDeepSeekRequest(request,{maxTokens:128000},{outputLimitSource:'model_default'})).not.toHaveProperty('max_tokens');
+  expect(repairDeepSeekRequest(request,{maxTokens:128000})).toHaveProperty('max_tokens',128000);
+  expect(repairDeepSeekRequest({...request,max_tokens:512},{maxTokens:128000},{outputLimitSource:'model_default'})).toHaveProperty('max_tokens',512);
+  expect(request.max_tokens).toBe(128000);
+ });
+});

@@ -1,4 +1,6 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import nativeFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -35,6 +37,35 @@ function stubTool(name: string, result: ToolResult): AgentTool {
 const ctx: ToolContext = { state: {} };
 const makeTmpDir = () => fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-tool-cap-'));
 const cleanup = (dir: string) => fs.rmSync(dir, { recursive: true, force: true });
+
+describe('large output preview equivalence', () => {
+  it.each(['ordinary words ', '1234567890', '!@#$%^&*', '界かな한', '🙂abc', '\ud800x', 'a1界!🙂 '])('preserves exact source bytes and maximal head/tail for %j', unit => {
+    const dir = makeTmpDir();
+    try {
+      const content = unit.repeat(3000);
+      // Linear search is independent of production bisection/window selection.
+      // These budgets and split protect the existing visible 600-token preview.
+      const fit = (text: string, budget: number, suffix: boolean) => {
+        let best = '';
+        for (let n = 1; n <= Math.min(text.length, 2401); n++) {
+          const candidate = suffix ? text.slice(-n) : text.slice(0, n);
+          if (estimateToolResultTokens(candidate) > budget) break;
+          best = candidate;
+        }
+        return best;
+      };
+      const head = fit(content, 432, false);
+      const tail = fit(content.slice(head.length), 168, true);
+      const body = `${head}\n\n... [${content.length - head.length - tail.length} chars omitted; full result is stored] ...\n\n${tail}`;
+      const result = capToolResult('fixture', { content, isError: true }, { state: {} }, { maxInlineTokens: 100, toolResultsDir: dir });
+      expect(result.content).toContain(body + '\n');
+      expect(result.content).toContain(`estimated_tokens="${estimateToolResultTokens(content)}" status="error"`);
+      expect(nativeFs.readFileSync(result.persistedOutput!.path)).toEqual(Buffer.from(content, 'utf8'));
+      const cli = maybeSpillToolResult({ toolResultsDir: dir, toolName: 'fixture', callId: 'one', output: content, maxInlineTokens: 100 });
+      expect(cli.output).toBe(result.content.replace('status="error"', 'status="success"'));
+    } finally { cleanup(dir); }
+  });
+});
 
 describe('tool-result-cap configuration', () => {
   it('keeps ordinary output at 10K and Skill documents at 25K', () => {
@@ -597,6 +628,33 @@ describe('persisted result helpers', () => {
   let dir: string;
   beforeEach(() => { dir = makeTmpDir(); });
   afterEach(() => cleanup(dir));
+
+  it('keeps a successful publication intact when an overlapping writer fails after opening its temporary file', () => {
+    const write = nativeFs.writeFileSync;
+    const rename = nativeFs.renameSync;
+    let writes = 0, overlapped = false;
+    const writer = vi.spyOn(nativeFs, 'writeFileSync').mockImplementation(((file: any, ...args: any[]) => {
+      if (String(file).startsWith(dir) && ++writes === 2) {
+        write(file, '');
+        throw new Error('injected writer failure');
+      }
+      return (write as any)(file, ...args);
+    }) as any);
+    const publisher = vi.spyOn(nativeFs, 'renameSync').mockImplementation(((from: any, to: any) => {
+      if (!overlapped) {
+        overlapped = true;
+        expect(() => persistToolResult(dir, 'bash', 'complete receipt')).toThrow('injected writer failure');
+      }
+      return rename(from, to);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      const result = persistToolResult(dir, 'bash', 'complete receipt');
+      expect(overlapped).toBe(true);
+      expect(fs.readFileSync(result, 'utf8')).toBe('complete receipt');
+      expect(fs.readdirSync(dir)).toEqual([path.basename(result)]);
+    } finally { writer.mockRestore(); publisher.mockRestore(); syncBuiltinESMExports(); }
+  });
 
   it('uses a content-addressed name and deduplicates identical output', () => {
     const first = persistToolResult(dir, 'bash', 'same content');

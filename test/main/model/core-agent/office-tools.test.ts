@@ -281,38 +281,14 @@ describe('Office built-in tools', () => {
     });
   });
 
-  it('keeps historical flat create_xlsx calls executable but rejects mixed input forms', async () => {
+  it('rejects retired flat XLSX input before OfficeCLI or publication', async () => {
     const tool = getTool('create_xlsx');
-    const legacy = await tool.execute({
-      path: 'out/legacy.xlsx',
-      sheet: 'Legacy',
-      rows: [['Label', 'Value'], ['Total', { formula: '=SUM(B3:B4)', bold: true }]],
-      columns: [{ name: 'B', width: '14' }],
-      charts: [{ type: 'column', dataRange: 'Legacy!A1:B2', anchor: 'D2:J14' }],
-      preview: false,
-    }, ctx());
-
-    expect(legacy.isError).toBeUndefined();
-    expect(legacy.content).toContain('(4 cells)');
-    const batchCall = h.runOfficeCli.mock.calls.find(([args]) => args[0] === 'batch');
-    const operations = JSON.parse(batchCall?.[1]?.stdin as string);
-    expect(operations).toContainEqual({
-      command: 'set', path: '/Legacy/B2', props: { formula: 'SUM(B3:B4)', bold: 'true' },
-    });
-    expect(operations).toContainEqual(expect.objectContaining({
-      command: 'add', parent: '/Legacy', type: 'chart',
-    }));
-
-    h.runOfficeCli.mockClear();
-    const mixed = await tool.execute({
-      path: 'out/mixed.xlsx',
-      sheets: [{ name: 'Canonical', rows: [['ok']] }],
-      rows: [['legacy']],
-      preview: false,
-    }, ctx());
-    expect(mixed).toMatchObject({ isError: true });
-    expect(mixed.content).toContain('do not mix');
+    for (const input of [
+      { path: 'retired.xlsx', rows: [['old']] },
+      { path: 'mixed.xlsx', sheets: [{ name: 'Current', rows: [['ok']] }], rows: [['old']] },
+    ]) expect((await tool.execute(input, ctx())).isError).toBe(true);
     expect(h.runOfficeCli).not.toHaveBeenCalled();
+    expect(onFileWritten).not.toHaveBeenCalled();
   });
 
   it('exposes PPTX visual controls and emits native charts in the initial create batch', async () => {
@@ -414,11 +390,7 @@ describe('Office built-in tools', () => {
     h.runOfficeCli
       .mockResolvedValueOnce({ code: 0, stdout: '', stderr: '' })
       .mockResolvedValueOnce({ code: 3, stdout: '', stderr: 'batch failed' });
-    const batchFailed = await getTool('create_xlsx').execute({
-      path: 'failed.xlsx',
-      rows: [['value']],
-      preview: false,
-    }, ctx());
+    const batchFailed = await getTool('create_xlsx').execute({path: 'failed.xlsx', preview: false, sheets: [{name: 'Sheet1', rows: [['value']] }]}, ctx());
     expect(batchFailed.content).toContain('E_OFFICE_BATCH_FAILED: batch failed');
     expect(fs.existsSync(path.join(h.workspace, 'failed.xlsx'))).toBe(false);
     expect(h.closeOfficeFile).toHaveBeenCalledTimes(2);
@@ -473,9 +445,7 @@ describe('Office built-in tools', () => {
       }
       return { code: 0, stdout: 'ok', stderr: '' };
     });
-    const result = await getTool('create_xlsx').execute({
-      path: target, rows: [['value']], preview: false,
-    }, ctx());
+    const result = await getTool('create_xlsx').execute({path: target, preview: false, sheets: [{name: 'Sheet1', rows: [['value']] }]}, ctx());
     expect(batches).toBe(2);
     expect(inputStates).toEqual(['pristine', 'pristine']);
     expect(fs.readFileSync(target, 'utf8')).toBe(retryFails ? 'prior-owned-file' : 'pristine:one-sheet');
@@ -491,9 +461,7 @@ describe('Office built-in tools', () => {
       return { code: 0, stdout: '', stderr: '' };
     }).mockResolvedValueOnce({ code: 3, stdout: '', stderr: 'batch could not be delivered' });
     h.closeOfficeFile.mockImplementationOnce(async () => { abort.abort(); });
-    const result = await getTool('create_xlsx').execute({
-      path: 'cancelled.xlsx', rows: [['value']], preview: false,
-    }, ctx({ signal: abort.signal }));
+    const result = await getTool('create_xlsx').execute({path: 'cancelled.xlsx', preview: false, sheets: [{name: 'Sheet1', rows: [['value']] }]}, ctx({ signal: abort.signal }));
     expect(result.isError).toBe(true);
     expect(h.runOfficeCli).toHaveBeenCalledTimes(2);
     expect(onFileWritten).not.toHaveBeenCalled();
@@ -502,11 +470,7 @@ describe('Office built-in tools', () => {
 
   it('keeps a prior conversation-produced workbook intact when a recreate batch fails', async () => {
     const tool = getTool('create_xlsx');
-    const first = await tool.execute({
-      path: 'stable.xlsx',
-      rows: [['original']],
-      preview: false,
-    }, ctx());
+    const first = await tool.execute({path: 'stable.xlsx', preview: false, sheets: [{name: 'Sheet1', rows: [['original']] }]}, ctx());
     expect(first.isError).toBeUndefined();
     const stable = path.join(h.workspace, 'stable.xlsx');
     const before = fs.readFileSync(stable);
@@ -522,11 +486,7 @@ describe('Office built-in tools', () => {
       }
       return { code: 0, stdout: 'ok', stderr: '' };
     });
-    const failed = await tool.execute({
-      path: 'stable.xlsx',
-      rows: [['replacement']],
-      preview: false,
-    }, ctx());
+    const failed = await tool.execute({path: 'stable.xlsx', preview: false, sheets: [{name: 'Sheet1', rows: [['replacement']] }]}, ctx());
 
     expect(failed).toMatchObject({ isError: true });
     expect(failed.content).toContain('E_OFFICE_BATCH_FAILED');
@@ -1189,6 +1149,49 @@ describe('Office built-in tools', () => {
       structural_review_status: 'indeterminate',
       artifact_revision: artifactSha256.slice('sha256:'.length, 'sha256:'.length + 16),
       issues: { data: { count: 18, issues: [{ severity: 'warning' }] } },
+    });
+  });
+
+  it.each(['docx', 'xlsx', 'pptx'])('preserves native numeric issue severity for %s review', async (extension) => {
+    const file = path.join(h.workspace, `numeric-review.${extension}`);
+    fs.writeFileSync(file, 'fixture');
+    // Pinned OfficeCLI v1.0.139 DocumentIssue.cs: Error=0, Warning=1, Info=2.
+    // Native values take precedence over the legacy subtype fallback.
+    for (const includeError of [false, true]) {
+      h.runOfficeCli.mockReset();
+      const issues = [
+        { severity: 1, type: 0, message: 'Body paragraph missing first-line indent' },
+        { severity: 2, type: 0, message: 'Mixed CJK/Latin punctuation' },
+        ...(includeError ? [{ severity: 0, subtype: 'formula_cache_stale' }] : []),
+      ];
+      h.runOfficeCli.mockImplementation(async (args: string[]) => ({
+        code: 0, stderr: '', stdout: JSON.stringify(args[0] === 'validate' ? { valid: true }
+          : args[2] === 'issues' ? { success: true, data: { count: issues.length, issues } }
+            : args[2] === 'stats' ? { success: true, data: { sheets: 1, totalCells: 1, formulaCells: 0, errorCells: 0 } }
+              : { success: true, data: { results: [] } }),
+      }));
+      const result = await getTool('office_review').execute({ action: 'check', path: file }, ctx());
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content)).toMatchObject({
+        valid: true,
+        issue_severity_counts: { blocker: includeError ? 1 : 0, warning: 1, info: 1, unknown: 0 },
+        structural_review_status: includeError ? 'blockers_found' : 'reviewed',
+      });
+      expect(fs.readFileSync(file, 'utf8')).toBe('fixture');
+    }
+  });
+
+  it('keeps unrecognized severity values and unreturned issues indeterminate', async () => {
+    const file = path.join(h.workspace, 'unknown-severity.docx');
+    fs.writeFileSync(file, 'fixture');
+    const issues = [3, -1, 1.5, '1', null, false, {}].map(severity => ({ severity }));
+    h.runOfficeCli
+      .mockResolvedValueOnce({ code: 0, stdout: '{"valid":true}', stderr: '' })
+      .mockResolvedValueOnce({ code: 0, stdout: JSON.stringify({ count: issues.length + 1, issues }), stderr: '' });
+    const result = await getTool('office_review').execute({ action: 'check', path: file }, ctx());
+    expect(JSON.parse(result.content)).toMatchObject({
+      valid: true, issue_severity_counts: { blocker: 0, warning: 0, info: 0, unknown: 8 },
+      structural_review_status: 'indeterminate',
     });
   });
 

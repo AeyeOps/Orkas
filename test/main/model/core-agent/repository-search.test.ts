@@ -9,7 +9,8 @@ import { PassThrough } from 'node:stream';
 
 import {
   grepRepository,
-  isIgnoredByScopes,
+  isIgnoredByScopes as isIgnoredByAbsolutePath,
+  createDirectoryIgnoreMatcher,
   listRepositoryFiles,
   parseIgnoreRules,
   visitRepositoryFiles,
@@ -145,7 +146,10 @@ describe('repository search interruption', () => {
 // implementation these cases pin. A miss here means `search_files` starts
 // surfacing build output, logs and local config that the project ignored —
 // the model's context fills with noise nobody asked for.
-describe('repository-search › ignore rules', () => {
+describe.each(['absolute', 'directory'] as const)('repository-search › ignore rules (%s)', backend => {
+  const isIgnoredByScopes: typeof isIgnoredByAbsolutePath = backend === 'absolute'
+    ? isIgnoredByAbsolutePath
+    : (file, isDir, scopes) => createDirectoryIgnoreMatcher(path.dirname(file), scopes)(path.basename(file), isDir);
   function scope(dir: string, content: string) {
     return [{ dir, rules: parseIgnoreRules(content) }];
   }
@@ -186,11 +190,40 @@ describe('repository-search › ignore rules', () => {
     expect(isIgnoredByScopes(at('src', 'a.ts'), false, deep)).toBe(true);
   });
 
+  it('lets a trailing `**` ignore everything inside the directory, but not the directory itself', () => {
+    const rules = scope(ROOT, 'logs/**\n');
+    expect(isIgnoredByScopes(at('logs', 'today.txt'), false, rules)).toBe(true);
+    expect(isIgnoredByScopes(at('logs', 'old', 'jan.txt'), false, rules)).toBe(true);
+    expect(isIgnoredByScopes(at('logs', 'old'), true, rules)).toBe(true);
+    expect(isIgnoredByScopes(at('logs'), true, rules)).toBe(false);
+    expect(isIgnoredByScopes(at('logsheet.txt'), false, rules)).toBe(false);
+    expect(isIgnoredByScopes(at('src', 'logs', 'a.txt'), false, rules)).toBe(false);
+
+    // `**/` followed by nothing: only the directories inside.
+    const dirs = scope(ROOT, 'cache/**/\n');
+    expect(isIgnoredByScopes(at('cache', 'v1'), true, dirs)).toBe(true);
+    expect(isIgnoredByScopes(at('cache', 'index.json'), false, dirs)).toBe(false);
+
+    // A later negation can still re-include one file inside.
+    const keep = scope(ROOT, 'logs/**\n!logs/keep.txt\n');
+    expect(isIgnoredByScopes(at('logs', 'keep.txt'), false, keep)).toBe(false);
+    expect(isIgnoredByScopes(at('logs', 'drop.txt'), false, keep)).toBe(true);
+  });
+
   it('scopes a nested ignore file to its own subtree', () => {
     const nested = [{ dir: at('pkg'), rules: parseIgnoreRules('dist/\n') }];
     expect(isIgnoredByScopes(at('pkg', 'dist'), true, nested)).toBe(true);
     // A sibling tree is governed by its own file, not this one.
     expect(isIgnoredByScopes(at('other', 'dist'), true, nested)).toBe(false);
+  });
+
+  it('applies nested scope overrides in declaration order without leaking to sibling directories', () => {
+    const scopes = [...scope(ROOT, '*.log\n'), ...scope(at('pkg'), '!keep.log\nprivate/\n')];
+    expect(isIgnoredByScopes(at('pkg', 'keep.log'), false, scopes)).toBe(false);
+    expect(isIgnoredByScopes(at('pkg', 'drop.log'), false, scopes)).toBe(true);
+    expect(isIgnoredByScopes(at('peer', 'keep.log'), false, scopes)).toBe(true);
+    expect(isIgnoredByScopes(at('pkg', 'private'), true, scopes)).toBe(true);
+    expect(isIgnoredByScopes(at('pkg', 'private'), false, scopes)).toBe(false);
   });
 
   it('skips comments and blank lines instead of treating them as patterns', () => {
@@ -210,5 +243,31 @@ describe('repository-search › ignore rules', () => {
     const rules = scope(at('pkg'), 'secret\n');
     expect(isIgnoredByScopes(at('pkg', 'secret'), false, rules)).toBe(true);
     expect(isIgnoredByScopes(at('secret'), false, rules)).toBe(false);
+  });
+});
+
+// A plain project has the same search contract as a Git checkout. Otherwise
+// generated trees can dominate scans solely because the .git directory is absent.
+describe.runIf(RG_AVAILABLE)('project ignore parity', () => {
+  it.each(['plain', 'git'])('keeps list/grep exclusions and explicit overrides aligned in a %s project', async kind => {
+    const root = tempRepository();
+    if (kind === 'git') fs.mkdirSync(path.join(root, '.git'));
+    fs.mkdirSync(path.join(root, 'generated')); fs.mkdirSync(path.join(root, 'nested'));
+    fs.writeFileSync(path.join(root, '.gitignore'), 'generated/\n');
+    fs.writeFileSync(path.join(root, 'nested', '.gitignore'), 'hidden.txt\n');
+    const visible = ['visible.txt', path.join('nested', 'visible.txt')];
+    const excluded = [...Array.from({ length: 20 }, (_, n) => path.join('generated', `output-${n}.txt`)), path.join('nested', 'hidden.txt')];
+    for (const file of [...visible, ...excluded]) fs.writeFileSync(path.join(root, file), 'needle\n');
+    for (const includeIgnored of [false, true]) {
+      const expected = (includeIgnored ? [...visible, ...excluded] : visible).sort();
+      const listing = await listRepositoryFiles(root, 200, { includeIgnored });
+      expect(listing.error).toBeUndefined(); expect(listing.capped).toBe(false);
+      expect(listing.files.filter(file => file.endsWith('.txt')).map(file => path.relative(root, file)).sort()).toEqual(expected);
+      const content = await grepRepository(root, { pattern: 'needle', regex: false, caseSensitive: true,
+        contextLines: 0, maxResults: 200, includeGlobs: [], excludeGlobs: [], includeIgnored });
+      expect(content.error).toBeUndefined(); expect(content.capped).toBe(false);
+      expect(content.hits.map(hit => path.relative(root, hit.path)).sort()).toEqual(expected);
+      expect(content.hits.every(hit => hit.line === 1 && hit.text === 'needle')).toBe(true);
+    }
   });
 });

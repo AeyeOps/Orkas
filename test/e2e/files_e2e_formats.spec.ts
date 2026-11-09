@@ -1,4 +1,5 @@
-import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { appendFileSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { expect, test } from './fixtures/orkas';
 
@@ -56,14 +57,17 @@ test('CSV and TSV use the available preview height after resizing and switching 
     }, selector)).toBeLessThanOrEqual(1);
     expect(await body.locator(selector).evaluate(el => el.scrollHeight > el.clientHeight)).toBe(true);
   };
+  // Keep all 80 rows and 15 columns for vertical and horizontal overflow.
+  // One wide row determines column widths; repeating its padding text in every
+  // row adds embedding work without strengthening this layout scenario.
   for (const [name, delimiter] of [['height.csv', ','], ['height.tsv', '\t']]) {
-    const content = Array.from({ length: 30 }, (_, index) =>
-      [String(index + 1), '中文样本', `"${'Wide cell '.repeat(4)}\nSecond line"`,
-        ...Array.from({ length: 12 }, (_, column) => `field-${column}`)].join(delimiter)).join('\n');
+    const content = Array.from({ length: 80 }, (_, index) =>
+      [String(index + 1), '中文样本', `"${'Wide cell '.repeat(index ? 0 : 4)}\nSecond line"`,
+        ...Array.from({ length: 12 }, (_, column) => index ? '' : `field-${column}`)].join(delimiter)).join('\n');
     const file = orkas.createWorkspaceFile(name, content);
     const preview = await orkas.openPreview(() => page.evaluate(args =>
       (window as any).openChatFileViewer(args.file, args.name), { file, name }));
-    await expect(preview.locator('.delimited-preview tr')).toHaveCount(30);
+    await expect(preview.locator('.delimited-preview tr')).toHaveCount(80);
     const native = await orkas.electronApp!.browserWindow(preview);
     const body = preview.locator('.chat-file-viewer-body');
     for (const [width, height] of [[960, 720], [620, 900]]) {
@@ -85,13 +89,23 @@ test('CSV and TSV use the available preview height after resizing and switching 
     await page.locator('#contexts-btn').click();
     await page.locator(`.ctx-tree-wrap[data-path="${name}"] > .skill-tree-node`).click();
     const libraryBody = page.locator('#contexts-viewer-body');
-    await expect(libraryBody.locator('.delimited-preview tr')).toHaveCount(30);
+    await expect(libraryBody.locator('.delimited-preview tr')).toHaveCount(80);
     await assertFilled(libraryBody, '.delimited-preview-scroll');
     await libraryBody.locator('[data-delimited-toggle]').click();
     await assertFilled(libraryBody, 'pre');
     await expect(libraryBody.locator('pre')).toHaveText(content);
-    await expect.poll(async () => (await orkas.invoke<any>('kb.status')).files.find((f: any) => f.path === name)?.status,
-      { timeout: 30_000 }).toBe('ready');
+    let indexState: any;
+    const indexWaitStarted = performance.now();
+    try {
+      await expect.poll(async () => {
+        indexState = (await orkas.invoke<any>('kb.status')).files.find((f: any) => f.path === name);
+        return indexState?.status;
+      }, { timeout: 30_000 }).toBe('ready');
+    } finally {
+      await info.attach(`indexing-${name}`, { contentType: 'application/json', body: JSON.stringify({
+        bytes: Buffer.byteLength(content), waitMs: performance.now() - indexWaitStarted, state: indexState,
+      }) });
+    }
   }
 });
 
@@ -206,3 +220,43 @@ test('native local image previews decode common raster formats and aliases', asy
     await orkas.closePreview(preview);
   }
 });
+
+for (const language of ['en', 'zh'] as const) {
+  test.describe(`unsupported bubble files (${language})`, () => {
+    test('shows only the owner dialog and restores bubble focus when dismissed', async ({ orkas }, info) => {
+      const page = orkas.page!;
+      await page.evaluate(language => (window as any).setLang(language), language);
+      const name = `${'release-package-'.repeat(8)}2.5.0.zip`;
+      const file = orkas.createWorkspaceFile(name, 'unsupported preview fixture');
+      const created: any = await orkas.invoke('conversations.create', { title: 'Unsupported file preview' });
+      const cid = created.conversation.conversation_id;
+      appendFileSync(path.join(orkas.workspaceRoot, 'account-e2e', 'cloud', 'chats', `${cid}.jsonl`), JSON.stringify({
+        id: 'unsupported-file', from: 'commander', to: ['user'], ts: new Date().toISOString(),
+        text: `[${name}](${pathToFileURL(file).href})`,
+      }) + '\n');
+      await page.evaluate(async cid => {
+        await (window as any).loadConversations();
+        await (window as any).setView('conversation', cid);
+      }, cid);
+      const chip = page.locator('#chat-history [data-chat-md-file-open="1"]');
+      await expect(chip).toBeVisible();
+      const countWindows = () => orkas.electronApp!.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length);
+      const windows = await countWindows();
+      for (const [width, height] of [[1280, 800], [960, 640]]) {
+        await page.setViewportSize({ width, height });
+        await chip.click();
+        const dialog = page.locator('.ui-dialog-overlay.open');
+        await expect(dialog).toContainText(language === 'zh' ? '无法在应用内预览 .zip 文件' : 'Cannot preview .zip files in app.');
+        await expect(dialog.getByRole('button', { name: language === 'zh' ? '打开文件夹' : 'Open Folder', exact: true })).toBeFocused();
+        expect(await countWindows()).toBe(windows);
+        await expect(page.locator('.chat-file-viewer.is-open')).toHaveCount(0);
+        await page.screenshot({ path: info.outputPath(`unsupported-${language}-${width}.png`) });
+        if (width === 1280) await dialog.getByRole('button', { name: language === 'zh' ? '关闭' : 'Close', exact: true }).click();
+        else await page.keyboard.press('Escape');
+        await expect(dialog).toHaveCount(0);
+        await expect(chip).toBeFocused();
+        expect(await countWindows()).toBe(windows);
+      }
+    });
+  });
+}

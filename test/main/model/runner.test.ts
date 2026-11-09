@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { expectTestLog } from '../../helpers/test-log-analysis';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { captureMainLogWorkers } from '../../helpers/capture-main-log-workers';
@@ -47,6 +48,8 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.doUnmock('../../../src/main/features/auth');
+  await (await import('../../../src/main/features/search/indexer')).flushAll();
   await closeLogWorkers();
   vi.doUnmock('@earendil-works/pi-ai/oauth');
   vi.doUnmock('#core-agent');
@@ -67,6 +70,33 @@ async function loadRunner() {
 }
 
 describe('runner › buildRunner auth gate', () => {
+  it('forwards the caller failure observer through its real rotating provider without adding model metadata', async () => {
+    const failure = { code: 'rate_limit_error', phase: 'after_response', elapsedMs: 12,
+      httpStatus: 429, aborted: false, source: 'http', lastEvent: 'none', requestSequence: 1 };
+    const createPiProvider = vi.fn(() => ({
+      id: 'custom', name: 'Diagnostic fixture',
+      async *stream(params: any) {
+        params.onRequestFailure?.(failure);
+        yield { type: 'text_delta' as const, text: 'ok' };
+        yield { type: 'message_end' as const, model: 'fixture-alias', stopReason: 'end_turn' as const };
+      },
+      complete: vi.fn(), validateAuth: vi.fn(),
+    }));
+    vi.doMock('#core-agent', async () => ({ ...(await vi.importActual<any>('#core-agent')), createPiProvider }));
+    const uid = 'runner-local-diagnostic';
+    (await import('../../../src/main/features/users')).activateUser(uid);
+    const auth = await import('../../../src/main/features/auth');
+    await auth.addCustomModelEntry({ protocol: 'anthropic', baseUrl: 'https://gateway.example.test', model: 'fixture-alias',
+      apiKey: 'synthetic-diagnostic-key', contextWindow: 200000, maxTokens: 8192 });
+    const onRequestFailure = vi.fn();
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: 'gconv-local-diagnostic', userId: uid, onRequestFailure });
+    const provider = (built.runner as any).providers.get('custom');
+    for await (const _ of provider.stream({ messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] })) { }
+    expect(onRequestFailure).toHaveBeenCalledExactlyOnceWith(failure);
+    expect(built.resolvedSystemPrompt).not.toContain('rate_limit_error');
+  });
+
   it('propagates custom Anthropic metadata to the runner provider without catalog lookup', async () => {
     const createPiProvider = vi.fn(({ customModel }: any) => ({
       id: 'custom', name: 'Protocol fixture',
@@ -99,6 +129,13 @@ describe('runner › buildRunner auth gate', () => {
     await expect(buildRunner({ sessionId: 'u1-gconv-x' })).rejects.toThrow(
       /API key.*Settings|Settings.*API key/i,
     );
+  });
+
+  it('requires a configured candidate for image understanding even when a development key exists', async () => {
+    process.env.ANTHROPIC_API_KEY = 'sk-ant-test-placeholder';
+    const { buildRunner } = await loadRunner();
+    await expect(buildRunner({ sessionId: 'extract-img-empty-list', requireImageInput: true }))
+      .rejects.toThrow(/credential is not currently usable/);
   });
 
   it('skips the auth gate when ANTHROPIC_API_KEY is set (dev fallback)', async () => {
@@ -447,9 +484,10 @@ describe('runner › buildRunner auth gate', () => {
     });
     const users = await import('../../../src/main/features/users');
     users.activateUser('runner-reasoning-parity');
+    const modelId = 'gpt-6.1-sol';
     const token = Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': { chatgpt_account_id: 'fixture' } })).toString('base64url');
     const auth = await import('../../../src/main/features/auth');
-    await auth.addApiKeyEntry('openai-codex', 'gpt-5.6-sol', `fixture.${token}.fixture`, 'Fixture');
+    await auth.addApiKeyEntry('openai-codex', modelId, `fixture.${token}.fixture`, 'Fixture');
     const { buildRunner } = await loadRunner();
     const built = await buildRunner({ sessionId: 'gconv-reasoning-parity', userId: 'runner-reasoning-parity' });
     const provider = (built.runner as any).providers.get('openai-codex');
@@ -464,6 +502,7 @@ describe('runner › buildRunner auth gate', () => {
       expect(fetchStub).toHaveBeenCalledTimes(2);
     } finally { vi.unstubAllGlobals(); }
     expect(payloads).toHaveLength(2);
+    expect(payloads.map(payload => payload.model)).toEqual([modelId, modelId]);
     expect(payloads[0].reasoning?.effort).toBeUndefined();
     expect(payloads[1].reasoning?.effort).toBe('low');
   });
@@ -520,6 +559,32 @@ describe('runner › buildRunner auth gate', () => {
     }));
   });
 
+  it.each([false, true])('routes public native candidates through the registry with required image input %s', async requireImageInput => {
+    const createPiProvider = vi.fn(() => ({id:'anthropic',name:'Image requirement fixture',
+      async *stream() {yield {type:'text_delta' as const,text:'ok'};},
+      complete:vi.fn(),validateAuth:async () => true,
+    }));
+    vi.doMock('#core-agent',async () => ({...(await vi.importActual<any>('#core-agent')),createPiProvider}));
+    const uid='runner-image-requirement';
+    const users=await import('../../../src/main/features/users'); users.activateUser(uid);
+    const auth=await import('../../../src/main/features/auth');
+    const catalog=await import('../../../src/main/model/provider_catalog');
+    const limit=vi.spyOn(catalog,'modelInputImageLimit').mockImplementation((_provider,model) => model==='claude-sonnet-5'?0:12);
+    const choices=[{provider:'anthropic',model:'claude-opus-5',entryId:'vision',profileId:'vision',apiKey:'fixture-vision-key'}];
+    if(requireImageInput) choices.unshift({provider:'anthropic',model:'claude-sonnet-5',entryId:'text',profileId:'text',apiKey:'fixture-text-key'});
+    const pick=vi.spyOn(auth,'pickChatEntryGroup').mockResolvedValue(choices);
+    try {
+      const {buildRunner}=await loadRunner();
+      const built=await buildRunner({sessionId:'gconv-image-requirement',userId:uid,requireImageInput});
+      const provider=(built.runner as any).providers.get('anthropic');
+      const iterator=provider.stream({model:built.modelId,messages:[{role:'user',content:[{type:'image',data:'pixels',mediaType:'image/png'}]}]})[Symbol.asyncIterator]();
+      await iterator.next(); await iterator.return?.();
+      expect(built.modelId).toBe(requireImageInput?'claude-sonnet-5':'claude-opus-5');
+      expect(createPiProvider).toHaveBeenCalledTimes(1);
+      expect(createPiProvider).toHaveBeenCalledWith(expect.objectContaining({provider:'anthropic',apiKey:'fixture-vision-key',
+        customModel:expect.objectContaining({id:'claude-opus-5',input:['text','image']})}));
+    } finally {pick.mockRestore();limit.mockRestore();}
+  });
 });
 
 describe('runner › metacognition closed loop', () => {
@@ -676,6 +741,58 @@ describe('runner › generic host capabilities for built-in Agents', () => {
 });
 
 describe('runner › scoped tool loading', () => {
+  it.each(['gconv', 'gmember', 'gworker'])('starts %s with an explicit unavailable-project status and recovers the next turn', async kind => {
+    const uid = 'instructions-read-actor';
+    await configureUser(uid);
+    const projects = await import('../../../src/main/features/projects');
+    const created = await projects.createProject(uid, 'Project');
+    if (!created.ok) throw new Error('project fixture failed');
+    const pid = created.project.project_id;
+    const rule = 'Keep public APIs stable.';
+    await projects.writeProjectInstructions(uid, pid, rule);
+    const file = path.join(tmpDir, uid, 'cloud', 'projects', pid, 'ORKAS.md');
+    const originalRead = fs.readFileSync;
+    const nativeFs = (await import('node:fs')).default;
+    const read = vi.spyOn(nativeFs, 'readFileSync').mockImplementation(((target: any, ...args: any[]) => {
+      if (String(target) === file) throw Object.assign(new Error('injected private read failure'), { code: 'EIO' });
+      return (originalRead as any)(target, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    const { buildRunner } = await loadRunner();
+    const options = { userId: uid, projectId: pid, systemPrompt: 'Role.\n\n## Runtime injection\nRuntime facts.',
+      ...(kind !== 'gconv' ? { agentId: 'named-agent', toolList: [] } : {}) };
+    let unavailableSurfaceChars = 0;
+    try {
+      expectTestLog({ level: 'warn', source: 'projects', message: /project instructions unavailable for prompt/ });
+      const built = await buildRunner({ ...options, sessionId: `${kind}-instructions-unavailable` });
+      expect(built.runner).toBeDefined();
+      const prompt = built.resolvedSystemPrompt;
+      expect(prompt).toContain('Status: unavailable (read_failed)');
+      expect(prompt).toContain('Continue the task');
+      expect(prompt.match(/## Project instructions \(user-authored\)/g)).toHaveLength(1);
+      expect(prompt.indexOf('Status: unavailable')).toBeLessThan(prompt.indexOf('## Runtime injection'));
+      expect(prompt).not.toContain(rule);
+      expect(prompt).not.toContain(file);
+      expect(prompt).not.toContain('injected private read failure');
+      // Combined host prompt + active tool definitions, measured at the actual
+      // build boundary; the conditional status replaces a <=4K instruction body.
+      expect(prompt.length + JSON.stringify(built.toolDefs).length).toBeLessThan(160_000);
+      unavailableSurfaceChars = prompt.length + JSON.stringify(built.toolDefs).length;
+    } finally { read.mockRestore(); syncBuiltinESMExports(); }
+    const recovered = await buildRunner({ ...options, sessionId: `${kind}-instructions-recovered` });
+    expect(recovered.resolvedSystemPrompt).toContain(rule);
+    expect(recovered.resolvedSystemPrompt).not.toContain('Status: unavailable');
+    await projects.writeProjectInstructions(uid, pid, 'x'.repeat(projects.PROJECT_INSTRUCTIONS_CHAR_LIMIT));
+    const maximal = await buildRunner({ ...options, sessionId: `${kind}-instructions-maximal` });
+    const maximalSurfaceChars = maximal.resolvedSystemPrompt.length + JSON.stringify(maximal.toolDefs).length;
+    expect(maximalSurfaceChars).toBeLessThan(160_000);
+    expect(unavailableSurfaceChars).toBeLessThan(maximalSurfaceChars);
+    const unrelated = await buildRunner({ ...options, projectId: undefined, sessionId: `${kind}-no-project` });
+    expect(unrelated.resolvedSystemPrompt).not.toContain('## Project instructions');
+    const edit = await buildRunner({ ...options, sessionId: 'agent-instructions-absence' });
+    expect(edit.resolvedSystemPrompt).not.toContain('## Project instructions');
+  });
+
   it.each(['gconv', 'gmember'])('allows %s to update current-project context and create bound tasks', async (kind) => {
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
     const uid = 'project-context-parity';
@@ -802,10 +919,17 @@ describe('runner › scoped tool loading', () => {
         expect(result.isError).toBe(kind !== 'gconv');
       }
       expect(memory.listEntries(uid, scope).entries).toEqual([kind === 'gconv' ? 'Corrected global fact' : 'Original global fact']);
+      const current = memory.listEntries(uid, scope);
+      expect((await actor('cross_session_memory', { action: 'batch', target, expected_revision: current.revision,
+        operations: [{ action: 'replace', old_text: current.entries[0], content: current.entries[0] }] })).isError).toBe(kind !== 'gconv');
     }
     for (const target of inProject ? ['agent', 'project'] : ['agent']) {
       expect((await actor('cross_session_memory', { action: 'add', target, content: 'Local reusable fact' })).isError).toBe(false);
       expect(JSON.parse((await actor('cross_session_memory', { action: 'list', target })).content).entries).toEqual(['Local reusable fact']);
+      const snapshot = JSON.parse((await actor('cross_session_memory', { action: 'list', target })).content);
+      expect((await actor('cross_session_memory', { action: 'batch', target, expected_revision: snapshot.revision,
+        operations: [{ action: 'replace', old_text: 'Local reusable fact', content: 'Updated local fact' }, { action: 'add', content: 'Another local fact' }] })).isError).toBe(false);
+      expect(JSON.parse((await actor('cross_session_memory', { action: 'list', target })).content).entries).toEqual(['Updated local fact', 'Another local fact']);
     }
     if (!inProject) expect((await actor('cross_session_memory', { action: 'list', target: 'project' })).isError).toBe(true);
   });
@@ -932,10 +1056,27 @@ describe('runner › scoped tool loading', () => {
     ]);
   });
 
+  it('retains the automatic output grammar in the real Commander prompt', async () => {
+    const chats = await import('../../../src/main/features/chats');
+    await chats.createConversation(RUNNER_TEST_UID, { conversationId: 'rich-output-commander', title: 'Output grammar' });
+    const { _buildCommanderSystemPromptForTest } = await import('../../../src/main/features/group_chat/bus');
+    const prompt = await _buildCommanderSystemPromptForTest(RUNNER_TEST_UID, 'rich-output-commander', undefined, 'en');
+    expect(prompt).toContain('Automatic layout');
+    expect(prompt.match(/\{"schema_version":1,"root":\{"type":"Stack"/g)).toHaveLength(1);
+    expect(prompt).toContain('**`create_artifact`** is a sandboxed app');
+    expect(prompt.indexOf('**`:::dashboard`**')).toBeLessThan(prompt.indexOf('## Runtime injection'));
+    const handoff = 'If the remaining step needs the user in a supported app view, pair concise instructions with its entry card.';
+    expect(prompt).toContain(handoff);
+    expect(prompt.indexOf(handoff)).toBeLessThan(prompt.indexOf('## Runtime injection'));
+  });
+
   it.each([
-    { agentId: CONTENT_WRITER_AGENT_ID, maximal: false },
-    { agentId: VIDEO_STUDIO_AGENT_ID, maximal: true },
-  ])('keeps progress guidance in the assembled Agent surface ($agentId, maximal=$maximal)', async ({ agentId, maximal }) => {
+    { agentId: CONTENT_WRITER_AGENT_ID, maximal: false, outputFormat: undefined },
+    { agentId: VIDEO_STUDIO_AGENT_ID, maximal: true, outputFormat: undefined },
+    { agentId: CONTENT_WRITER_AGENT_ID, maximal: false, outputFormat: 'text' },
+    { agentId: CONTENT_WRITER_AGENT_ID, maximal: false, outputFormat: 'markdown_only' },
+    { agentId: VIDEO_STUDIO_AGENT_ID, maximal: false, outputFormat: 'artifact' },
+  ])('keeps progress guidance in the assembled Agent surface ($agentId, maximal=$maximal, output=$outputFormat)', async ({ agentId, maximal, outputFormat }) => {
     const uid = `runner-progress-surface-${agentId}`;
     await configureUser(uid);
     const paths = await import('../../../src/main/paths');
@@ -955,7 +1096,8 @@ describe('runner › scoped tool loading', () => {
       fs.mkdirSync(dest, { recursive: true });
       fs.copyFileSync(manifest, path.join(dest, 'SKILL.md'));
     }
-    const base = await _buildAgentInGroupSystemPromptForTest(agent, tmpDir, 'en');
+    const effectiveOutputFormat = outputFormat ?? agent.output_format;
+    const base = await _buildAgentInGroupSystemPromptForTest({ ...agent, output_format: effectiveOutputFormat }, tmpDir, 'en');
     const { buildRunner } = await loadRunner();
     const built = await buildRunner({
       sessionId: `gmember-progress-surface-${agentId}`, userId: uid, agentId,
@@ -964,6 +1106,9 @@ describe('runner › scoped tool loading', () => {
       toolList: maximal ? [...AGENT_FALLBACK_TOOL_GROUP_IDS] : agent.tool_list,
     });
     const prompt = built.resolvedSystemPrompt;
+    const richOutput = effectiveOutputFormat !== 'text' && effectiveOutputFormat !== 'markdown_only';
+    expect(prompt.includes('**`:::dashboard`**')).toBe(richOutput);
+    expect(prompt.includes('**`create_artifact`** is a sandboxed app')).toBe(richOutput);
     expect(prompt.match(/These updates are not final replies/g)).toHaveLength(1);
     expect(prompt).not.toContain('before the first tool call');
     expect(prompt).not.toContain('Once you output, your turn is done.');
@@ -975,14 +1120,10 @@ describe('runner › scoped tool loading', () => {
     expect(prompt).not.toMatch(/\$(?:workflow|inputs_schema|input_channel_protocol|plan_interaction_hint)/);
     const toolChars = JSON.stringify(built.toolDefs).length;
     const combined = prompt.length + built.turnEphemeral.length + toolChars;
-    console.log(`[agent-effective-progress-surface] ${agent.name}: system=${prompt.length}, ephemeral=${built.turnEphemeral.length}, tools=${toolChars}, combined=${combined}`);
-    // The merged action-specific tool contracts add 5,539 / 6,995 schema
-    // chars, while removing the active-group tail saves 162 / 382 chars.
-    // With the same OfficeCLI fixture, resident prompts remain unchanged:
-    // totals move from 38,370 / 91,255 to 43,747 / 97,868. Keep comparable
-    // headroom; the independent tool and resident-prompt budgets still apply.
-    // Global task and automation schemas are now eligible in the maximal explicit surface (+5.7k).
-    expect(combined).toBeLessThanOrEqual(maximal ? 106_000 : 45_500);
+    console.log(`[agent-effective-progress-surface] ${agent.name} output=${outputFormat ?? agent.output_format ?? 'auto'}: system=${prompt.length}, ephemeral=${built.turnEphemeral.length}, tools=${toolChars}, combined=${combined}`);
+    // Preserve this historical character measurement, including ephemeral and
+    // maximal explicit loading. The uniform default-initial token acceptance
+    // lives in agent-initial-overhead.test.ts and excludes those later controls.
   });
 
   it('defers unbound Commander project tasks and exposes bound reads without injecting backlog records', async () => {
@@ -1011,7 +1152,7 @@ describe('runner › scoped tool loading', () => {
 
     expect(nonProject.resolvedSystemPrompt).not.toContain('**todo-tasks**');
     expect(nonProject.toolDefs.map((tool) => tool.name)).not.toContain('todo_tasks');
-    expect(nonProject.resolvedSystemPrompt).toContain('`management.projects`');
+    expect(nonProject.resolvedSystemPrompt).toContain('`management.todos`');
     expect(nonProject.resolvedSystemPrompt).toContain('`todo_tasks` —');
     expect(nonProject.turnEphemeral).not.toContain('## Project status');
 
@@ -1026,108 +1167,121 @@ describe('runner › scoped tool loading', () => {
     expect(JSON.parse(listed.content).tasks).toContainEqual(expect.objectContaining({ content: 'BACKLOG_NOT_IN_PROMPT' }));
   });
 
-  it('loads tasks outside a project and writes only to an explicitly resolved project or global scope', async () => {
+  it('stamps an automation handoff note the turn shows whole as already read, and only then', async () => {
+    const uid = 'runner-automation-note-seed';
+    await configureUser(uid);
+    const { buildRunner } = await loadRunner();
+    const chats = await import('../../../src/main/features/chats');
+    const autoTasks = await import('../../../src/main/features/auto_tasks');
+    const created = await autoTasks.createTask(uid, {
+      content: 'Compare this week with last week', schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!created.ok) throw new Error(created.error);
+    const notePath = autoTasks.handoffNotePath(uid, created.task);
+    fs.mkdirSync(path.dirname(notePath), { recursive: true });
+    fs.writeFileSync(notePath, '# Week 41\nTotal 1,280 orders\n');
+    const run = await chats.createConversation(uid, { title: 'Weekly digest', originAutoTaskId: created.task.id });
+    await autoTasks.recordRunStart(uid, created.task.id, run.conversation_id, '2026-10-21T09:00:00.000Z');
+
+    const built = await buildRunner({ sessionId: 'gconv-automation-note-seed', userId: uid, cid: run.conversation_id });
+    expect(built.turnEphemeral).toContain('## This automation run');
+    // The stamp carries the digest edit_file computes, so a note rewritten by
+    // a command before the edit is still rejected as stale.
+    const digest = `sha256:${createHash('sha256').update(fs.readFileSync(notePath, 'utf8'), 'utf8').digest('hex')}`;
+    expect(built.initialReadFileState?.get(notePath)).toEqual({
+      mtimeMs: fs.statSync(notePath).mtimeMs, size: fs.statSync(notePath).size, hash: digest,
+    });
+    expect([...built.initialReadFileState!.keys()]).toEqual([notePath]);
+
+    // A note the turn had to cut is not stamped: its tail was never shown.
+    fs.writeFileSync(notePath, 'detail '.repeat(400));
+    const cut = await buildRunner({ sessionId: 'gconv-automation-note-seed-cut', userId: uid, cid: run.conversation_id });
+    expect(cut.turnEphemeral).toContain('[cut; read the file for the rest]');
+    expect(cut.initialReadFileState).toBeUndefined();
+    // An ordinary conversation seeds nothing.
+    const plain = await buildRunner({ sessionId: 'gconv-automation-note-seed-plain', userId: uid, cid: 'plain-conversation' });
+    expect(plain.initialReadFileState).toBeUndefined();
+  });
+
+  it('keeps non-project Commander to-dos global through loading, CRUD and denied project requests', async () => {
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
     const uid = 'runner-unbound-project-tasks';
     await configureUser(uid);
     const projects = await import('../../../src/main/features/projects');
     const tasks = await import('../../../src/main/features/project_tasks');
-    const target = await projects.createProject(uid, '测试项目');
-    const other = await projects.createProject(uid, 'Other');
-    const foreign = await projects.createProject('different-account', 'Foreign');
-    if (!target.ok || !other.ok || !foreign.ok) throw new Error('project fixture failed');
+    const project = await projects.createProject(uid, 'PRIVATE_PROJECT');
+    if (!project.ok) throw new Error('project fixture failed');
+    const privateTask = await tasks.createTask(uid, project.project.project_id, { content: 'PRIVATE_PROJECT_TASK' });
+    if (!privateTask.ok) throw new Error('task fixture failed');
+    const chats = await import('../../../src/main/features/chats');
+    await chats.createConversation(uid, { conversationId: 'outside-project', title: 'Direct work' });
+    const before = await tasks.listTasks(uid, project.project.project_id);
     const names = vi.spyOn(projects, 'listProjectNameRows');
     const { buildRunner } = await loadRunner();
     const built = await buildRunner({ sessionId: 'gconv-unbound-project-tasks', userId: uid, cid: 'outside-project' });
-    const runner = built.runner as any;
-    const initialPrompt = built.resolvedSystemPrompt;
-    const initialTail = built.turnEphemeral;
-    expect(names).not.toHaveBeenCalled();
-    expect(built.runner.getActiveToolDefinitions().map((tool) => tool.name)).not.toContain('todo_tasks');
+    const tools = (built.runner as any).tools;
+    expect(built.runner.getActiveToolDefinitions().map(tool => tool.name)).not.toContain('todo_tasks');
+    expect(built.turnEphemeral).not.toContain('## Global open work');
+    expect(built.turnEphemeral).toMatch(/explain that this non-project conversation cannot access them/);
+    expect(built.turnEphemeral.match(/## Global to-do scope/g)).toHaveLength(1);
     const context = { workingDir: tmpDir, state: {} };
-    const load = await runner.tools.get('tool_load').execute({ groups: ['management.projects'] }, context);
-    // The same group carries the project-creation tool for Commander; both are
-    // dormant until this load, and neither is resident.
-    expect(JSON.parse(load.content))
-      .toMatchObject({ ok: true, newly_activated_tools: ['todo_tasks', 'project_setup'] });
+    expect((await tools.get('tool_load').execute({ groups: ['management.todos'] }, context)).isError).toBeFalsy();
+    expect(built.runner.getActiveToolDefinitions().map(tool => tool.name)).not.toContain('project_setup');
+    const tool = tools.get('todo_tasks');
+    expect(tool.inputSchema.properties.project.enum).toEqual(['__global__']);
+    expect(tool.inputSchema.properties.action.enum).not.toContain('list_projects');
+    expect(tool.description).toContain('Project to-dos are unavailable');
+    expect(tool.description).not.toContain('When asked about them, explain');
+    const created = JSON.parse((await tool.execute({ action: 'create', project: '__global__', content: 'Global work' }, context)).content);
+    expect(created).toMatchObject({ ok: true, outcome: 'task_created' });
+    const id = created.task.id;
+    expect(await tasks.getTask(uid, '', id)).toMatchObject({ content: 'Global work', status: 'todo', origin_cid: 'outside-project' });
+    expect((await tool.execute({ action: 'update', task_id: id, status: 'review' }, context)).isError).toBeFalsy();
+    expect((await tool.execute({ action: 'complete', task_id: id }, context)).isError).toBeFalsy();
+    expect(await tasks.getTask(uid, '', id)).toMatchObject({ status: 'done' });
+    for (const request of [
+      { action: 'list_projects' },
+      { action: 'list', project: 'PRIVATE_PROJECT' },
+      { action: 'get', project: project.project.project_id, task_id: privateTask.task.id },
+      { action: 'get', task_id: privateTask.task.id },
+      { action: 'complete', task_id: privateTask.task.id },
+      { action: 'create', project: project.project.project_id, content: 'Forbidden' },
+      { action: 'create', project: 'missing-project', content: 'Forbidden' },
+    ]) expect((await tool.execute(request, context)).isError).toBe(true);
+    const program = tools.get('run_program');
+    expect(program).toBeDefined();
+    const denied = await program.execute({ code: 'const result = await tools.todo_tasks({action:"get",project:"PRIVATE_PROJECT",task_id:"' + privateTask.task.id + '"}); console.log(result);' }, context);
+    expect(denied.content).toContain('project_scope_mismatch');
+    expect(denied.content).not.toContain('PRIVATE_PROJECT_TASK');
+    expect(await tasks.listTasks(uid, project.project.project_id)).toEqual(before);
     expect(names).not.toHaveBeenCalled();
-    expect(built.runner.getActiveToolDefinitions().map((tool) => tool.name)).toContain('todo_tasks');
-    const tool = runner.tools.get('todo_tasks');
-    const discovery = JSON.parse((await tool.execute({ action: 'list_projects' }, context)).content);
-    expect(discovery.projects.map((project: any) => project.project_id).sort())
-      .toEqual(['__global__', target.project.project_id, other.project.project_id].sort());
-    const globalCreated = await tool.execute({ action: 'create', project: '__global__', content: '全局待办' }, context);
-    expect(JSON.parse(globalCreated.content)).toMatchObject({
-      ok: true,
-      outcome: 'task_created',
-      project: { project_id: '__global__', name: 'Global' },
-    });
-    expect(await tasks.listTasks(uid, '')).toEqual([
-      expect.objectContaining({ content: '全局待办', status: 'todo' }),
-    ]);
-    // A global to-do saved from a conversation links back to it, so opening or
-    // running it later returns there.
-    expect((await tasks.listTasks(uid, ''))[0]).toHaveProperty('origin_cid', 'outside-project');
-    const request = { action: 'create', project: '测试项目', content: '这是一条测试待办' };
-    const created = await tool.execute(request, context);
-    expect(JSON.parse(created.content)).toMatchObject({
-      ok: true, outcome: 'task_created', project: { project_id: target.project.project_id },
-    });
-    const repeated = await tool.execute(request, context);
-    expect(JSON.parse(repeated.content)).toMatchObject({ ok: true, outcome: 'existing_task_reused' });
-    const persisted = await tasks.listTasks(uid, target.project.project_id);
-    expect(persisted).toHaveLength(1);
-    expect(persisted[0]).toMatchObject({ content: request.content, status: 'todo' });
-    expect(persisted[0]).not.toHaveProperty('origin_cid');
-    const userCreated = await tasks.createTask(uid, target.project.project_id, { content: 'Status-only task' });
-    if (!userCreated.ok) throw new Error('user-created task fixture failed');
-    const statusUpdate = await tool.execute({
-      action: 'update',
-      project: target.project.project_id,
-      task_id: userCreated.task.id,
-      status: 'progress',
-    }, context);
-    expect(statusUpdate.isError).not.toBe(true);
-    expect(await tasks.getTask(uid, target.project.project_id, userCreated.task.id)).toMatchObject({
-      status: 'progress',
-    });
-    expect(await tasks.getTask(uid, target.project.project_id, userCreated.task.id)).not.toHaveProperty('origin_cid');
-    const completedByConversation = await tasks.createTask(uid, target.project.project_id, { content: 'Completion-only task' });
-    if (!completedByConversation.ok) throw new Error('complete-linked task fixture failed');
-    const completed = await tool.execute({
-      action: 'complete',
-      project: target.project.project_id,
-      task_id: completedByConversation.task.id,
-    }, context);
-    expect(completed.isError).not.toBe(true);
-    expect(await tasks.getTask(uid, target.project.project_id, completedByConversation.task.id)).toMatchObject({
-      status: 'done',
-    });
-    expect(await tasks.getTask(uid, target.project.project_id, completedByConversation.task.id)).not.toHaveProperty('origin_cid');
-    const titleOnly = await tasks.createTask(uid, target.project.project_id, { content: 'Title-only task' });
-    if (!titleOnly.ok) throw new Error('content-only task fixture failed');
-    await tool.execute({
-      action: 'update',
-      project: target.project.project_id,
-      task_id: titleOnly.task.id,
-      content: 'Title-only edit',
-    }, context);
-    expect((await tasks.getTask(uid, target.project.project_id, titleOnly.task.id))?.origin_cid).toBeUndefined();
-    expect(await tasks.listTasks(uid, other.project.project_id)).toEqual([]);
-    for (const project of ['missing', '../different-account', foreign.project.project_id]) {
-      const rejected = await tool.execute({ ...request, project }, context);
-      expect(rejected.isError).toBe(true);
-      expect(JSON.parse(rejected.content).error).toContain('project_not_found');
-    }
-    expect(await tasks.listTasks('different-account', foreign.project.project_id)).toEqual([]);
-    expect(built.resolvedSystemPrompt).toBe(initialPrompt);
-    expect(built.turnEphemeral).toBe(initialTail);
+    expect(built.resolvedSystemPrompt + built.turnEphemeral).not.toContain('PRIVATE_PROJECT_TASK');
     const next = await buildRunner({ sessionId: 'gconv-unbound-project-tasks', userId: uid, cid: 'outside-project' });
-    expect(next.runner.getActiveToolDefinitions().map((entry) => entry.name)).not.toContain('todo_tasks');
+    expect(next.runner.getActiveToolDefinitions().map(tool => tool.name)).not.toContain('todo_tasks');
     names.mockRestore();
   });
 
-  it('rejects ambiguous or stale unbound project targets and preserves bound Agent isolation', async () => {
+  it('keeps shared member discovery absent from each public global and private turn', async () => {
+    const uid = 'runner-todo-local-scope';
+    await configureUser(uid);
+    const projects = await import('../../../src/main/features/projects');
+    const created = await projects.createProject(uid, 'Member assignment');
+    if (!created.ok) throw new Error('project fixture failed');
+    const projectId = created.project.project_id;
+    const { buildRunner } = await loadRunner();
+    const memberSchema = async (boundProject?: string) => {
+      const built = await buildRunner({ sessionId: 'gconv-member-scope', userId: uid, projectId: boundProject });
+      return (built.runner as any).tools.get('todo_tasks').inputSchema;
+    };
+    for (const boundProject of [undefined, projectId]) {
+      const schema = await memberSchema(boundProject);
+      expect(schema.properties.action.enum).not.toContain('list_members');
+      expect(schema.properties).not.toHaveProperty('assignee_uid');
+    }
+
+  });
+
+  it('preserves bound Agent backlog access and rejects other scopes', async () => {
     process.env.ORKAS_TOOL_LOADING_MODE = 'scoped';
     const uid = 'runner-project-target-boundaries';
     await configureUser(uid);
@@ -1137,24 +1291,7 @@ describe('runner › scoped tool loading', () => {
     const second = await projects.createProject(uid, 'B');
     if (!first.ok || !second.ok) throw new Error('project fixture failed');
     const { buildRunner } = await loadRunner();
-    // Synced/legacy duplicate names are possible even though create rejects them.
-    const duplicateNames = vi.spyOn(projects, 'listProjectNameRows').mockResolvedValue([
-      { project_id: first.project.project_id, name: 'Same' },
-      { project_id: second.project.project_id, name: 'Same' },
-    ]);
-    const built = await buildRunner({ sessionId: 'gconv-project-target-boundaries', userId: uid });
-    const runner = built.runner as any;
     const context = { state: {} };
-    await runner.tools.get('tool_load').execute({ groups: ['management.projects'] }, context);
-    const rejected = await runner.tools.get('todo_tasks').execute({ action: 'create', project: 'Same', content: 'Do it' }, context);
-    expect(rejected.isError).toBe(true);
-    expect(JSON.parse(rejected.content).candidates).toHaveLength(2);
-    expect(await tasks.listTasks(uid, first.project.project_id)).toEqual([]);
-    expect(await tasks.listTasks(uid, second.project.project_id)).toEqual([]);
-    duplicateNames.mockResolvedValue([{ project_id: first.project.project_id, name: 'A' }]);
-    await projects.deleteProject(uid, second.project.project_id);
-    expect((await runner.tools.get('todo_tasks').execute({ action: 'list', project: second.project.project_id }, context)).isError).toBe(true);
-
     const agentTask = await tasks.createTask(uid, first.project.project_id, { content: 'AGENT_BACKLOG_ON_DEMAND' });
     if (!agentTask.ok) throw new Error('agent task fixture failed');
     const agent = await buildRunner({
@@ -1175,6 +1312,7 @@ describe('runner › scoped tool loading', () => {
       .toContainEqual(expect.objectContaining({ content: 'AGENT_BACKLOG_ON_DEMAND' }));
     expect(agent.runner.getActiveToolDefinitions().map((tool) => tool.name)).toContain('todo_tasks');
     expect(bound.inputSchema.properties.action.enum).toEqual(['list', 'get', 'create', 'update', 'complete', 'add_attachment', 'delete']);
+    expect(bound.inputSchema.properties).not.toHaveProperty('assignee_uid');
     expect((await bound.execute({ action: 'update', task_id: agentTask.task.id, status: 'review' }, context)).isError).toBeFalsy();
     expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).toMatchObject({ status: 'review' });
     expect(await tasks.getTask(uid, first.project.project_id, agentTask.task.id)).not.toHaveProperty('origin_cid');
@@ -1188,22 +1326,47 @@ describe('runner › scoped tool loading', () => {
     expect(added.isError).toBeFalsy();
     const addedId = JSON.parse(added.content).task.id;
     expect(await tasks.getTask(uid, first.project.project_id, addedId)).toMatchObject({ content: 'Agent-created item' });
-    expect(await tasks.getTask(uid, first.project.project_id, addedId)).not.toHaveProperty('origin_cid');
+    // The conversation's first open project to-do links back to it.
+    expect(await tasks.getTask(uid, first.project.project_id, addedId)).toMatchObject({ origin_cid: 'agent-result' });
     expect((await bound.execute({ action: 'update', task_id: addedId, content: 'Edited by Agent\nNew detail' }, context)).isError).toBeFalsy();
     expect(await tasks.getTask(uid, first.project.project_id, addedId)).toMatchObject({ content: 'Edited by Agent\nNew detail' });
     for (const project of [second.project.project_id, '__global__']) {
       expect((await bound.execute({ action: 'create', content: 'forbidden', project }, context)).isError).toBe(true);
     }
-    expect((await agentRunner.tools.get('tool_load').execute({ groups: ['management.projects'] }, context)).isError).toBeFalsy();
+    const activeBeforeRetiredLoad = agent.runner.getActiveToolDefinitions().map(tool => tool.name);
+    const retiredLoad = await agentRunner.tools.get('tool_load').execute({ groups: ['management.projects'] }, context);
+    expect(retiredLoad.isError).toBe(true);
+    expect(JSON.parse(retiredLoad.content)).toMatchObject({
+      ok: false, error: 'E_TOOL_GROUP_INVALID', unavailable: ['management.projects'],
+    });
+    expect(agent.runner.getActiveToolDefinitions().map(tool => tool.name)).toEqual(activeBeforeRetiredLoad);
+    expect((await agentRunner.tools.get('tool_load').execute({ groups: ['management.todos'] }, context)).isError).toBeFalsy();
     const unboundAgent = await buildRunner({ sessionId: 'gmember-unbound-reader', userId: uid, agentId: 'reader', toolList: [] });
     const globalTools = (unboundAgent.runner as any).tools;
-    expect((await globalTools.get('tool_load').execute({ groups: ['management.projects', 'management.automation'] }, context)).isError).toBeFalsy();
+    expect((await globalTools.get('tool_load').execute({ groups: ['management.todos', 'management.automation'] }, context)).isError).toBeFalsy();
     const globalTodo = globalTools.get('todo_tasks');
     const createdGlobal = JSON.parse((await globalTodo.execute({ action: 'create', content: 'Global work' }, context)).content);
     expect(createdGlobal.ok).toBe(true);
     expect(await tasks.getTask(uid, '', createdGlobal.task.id)).toMatchObject({ content: 'Global work' });
     expect((await globalTodo.execute({ action: 'complete', task_id: createdGlobal.task.id, project: '__global__' }, context)).isError).toBeFalsy();
     expect((await tasks.getTask(uid, '', createdGlobal.task.id))?.status).toBe('done');
+    const foreign = await tasks.createTask(uid, second.project.project_id, { content: 'OTHER_PROJECT_TASK' });
+    if (!foreign.ok) throw new Error('foreign task fixture failed');
+    const projectCommander = await buildRunner({
+      sessionId: 'gconv-project-target-boundaries', userId: uid, projectId: first.project.project_id,
+    });
+    for (const tool of [bound, (projectCommander.runner as any).tools.get('todo_tasks')]) {
+      const listed = JSON.parse((await tool.execute({ action: 'list' }, context)).content).tasks;
+      expect(listed).not.toContainEqual(expect.objectContaining({ id: createdGlobal.task.id }));
+      expect(listed).not.toContainEqual(expect.objectContaining({ id: foreign.task.id }));
+      for (const task_id of [createdGlobal.task.id, foreign.task.id]) {
+        expect((await tool.execute({ action: 'get', task_id }, context)).isError).toBe(true);
+        expect((await tool.execute({ action: 'complete', task_id }, context)).isError).toBe(true);
+      }
+      expect((await tool.execute({ action: 'list', project: '__global__' }, context)).isError).toBe(true);
+    }
+    expect(await tasks.getTask(uid, second.project.project_id, foreign.task.id)).toMatchObject({ status: 'todo' });
+    expect(await tasks.getTask(uid, '', createdGlobal.task.id)).toMatchObject({ status: 'done' });
     for (const input of [
       { action: 'get', task_id: agentTask.task.id },
       { action: 'complete', task_id: agentTask.task.id },
@@ -1215,7 +1378,6 @@ describe('runner › scoped tool loading', () => {
     const autoStore = await import('../../../src/main/features/auto_tasks');
     expect(await autoStore.getTask(uid, auto.taskId)).not.toHaveProperty('project_id');
 
-    duplicateNames.mockRestore();
   });
 
   it('keeps reflection on its fixed tools and skips ordinary Skills even under legacy rollback', async () => {
@@ -1669,6 +1831,38 @@ describe('runner › scoped tool loading', () => {
     expect(after.isError).toBeFalsy();
     expect(after.content).toContain('## Skill runtime requirements');
     expect(after.content).toContain('Use this exact Skill.');
+  });
+
+  it('gives project follow-up guidance to final deliverers, never workers or intermediate Agents', async () => {
+    const uid = 'runner-project-followup';
+    await configureUser(uid);
+    const chats = await import('../../../src/main/features/chats');
+    const projects = await import('../../../src/main/features/projects');
+    const created = await projects.createProject(uid, 'Recurring reports');
+    if (!created.ok) throw new Error('project fixture failed');
+    const conv = await chats.createConversation(uid, { title: 'Weekly report' });
+    const cid = conv.conversation_id;
+    expect((await chats.moveConversationToProject(uid, cid, created.project.project_id)).ok).toBe(true);
+    const { buildRunner } = await loadRunner();
+    for (const kind of ['gconv', 'gmember', 'gworker']) {
+      const built = await buildRunner({
+        sessionId: `${kind}-${cid}-${CONTENT_WRITER_AGENT_ID}`, userId: uid, cid,
+        projectId: created.project.project_id,
+        ...(kind === 'gmember' ? { agentId: CONTENT_WRITER_AGENT_ID, toolList: ['workspace.read'] } : {}),
+      });
+      expect(built.turnEphemeral.includes('schedule it in this reply')).toBe(kind !== 'gworker');
+      expect(built.turnEphemeral).not.toContain('sentence offering a project for it');
+      expect(built.turnEphemeral).not.toContain('this conversation belongs to no project');
+      expect(built.resolvedSystemPrompt).not.toContain('## Keeping work going');
+      expect(built.resolvedSystemPrompt).not.toContain('## Giving work a project');
+    }
+    const intermediate = await buildRunner({
+      sessionId: `gmember-${cid}-${CONTENT_WRITER_AGENT_ID}`, userId: uid, cid,
+      agentId: CONTENT_WRITER_AGENT_ID, outputDelivery: 'process',
+      toolList: ['workspace.read'], projectId: created.project.project_id,
+    });
+    expect(intermediate.turnEphemeral).not.toContain('## Keeping work going');
+    expect(intermediate.toolDefs.map(tool => tool.name)).not.toContain('create_project');
   });
 
   it('preloads Commander command, web, Skill search, and app navigation while mutation tools stay dormant', async () => {
@@ -2238,7 +2432,7 @@ describe('runner › scoped tool loading', () => {
     expect(await todos.getTask(uid, pid, receipt.todoId)).toMatchObject({
       status: 'done',
     });
-    expect(await todos.getTask(uid, pid, receipt.todoId)).not.toHaveProperty('origin_cid');
+    expect(await todos.getTask(uid, pid, receipt.todoId)).toMatchObject({ origin_cid: 'task-origin' });
     expect(await automations.getTask(uid, receipt.autoId)).toMatchObject({
       title: 'Edited automation', content: 'Full automation detail', project_id: pid, enabled: false,
     });
@@ -2896,9 +3090,11 @@ describe('runner › conversation-history scope exposure', () => {
       (tool) => tool.name === 'chat_history',
     );
     expect(agentHistory).toBeTruthy();
-    expect((agentHistory?.inputSchema as any).properties.action.enum).toEqual(['search', 'read']);
+    // The approved grouped-history contract keeps all four retrieval modes
+    // while the host still binds an Agent to its current conversation.
+    expect((agentHistory?.inputSchema as any).properties.action.enum).toEqual(['search', 'read', 'read_process', 'read_output']);
     expect((agentHistory?.inputSchema as any).properties.scope.enum).toEqual(['current']);
-    expect((agentHistory?.inputSchema as any).properties.page).toMatchObject({
+    expect((agentHistory?.inputSchema as any).properties.read.properties.page).toMatchObject({
       type: 'object',
       additionalProperties: false,
       properties: {
@@ -2908,7 +3104,8 @@ describe('runner › conversation-history scope exposure', () => {
       },
       required: ['mode'],
     });
-    expect((agentHistory?.inputSchema as any).properties.include_current).toBeUndefined();
+    expect((agentHistory?.inputSchema as any).properties.search.properties.include_current).toBeUndefined();
+    expect((agentHistory?.inputSchema as any).properties.cid).toBeUndefined();
     expect((nonProjectCommanderHistory?.inputSchema as any).properties.scope.enum)
       .toEqual(['current', 'all']);
     expect(nonProjectCommanderHistory?.description)
@@ -2929,10 +3126,16 @@ describe('runner › conversation-history scope exposure', () => {
       expect(prompt.indexOf('Use supplied context first')).toBeLessThan(prompt.indexOf('## Runtime injection'));
       expect(built.turnEphemeral).not.toContain('even without a user lookup request');
       const schema = built.toolDefs.find((tool) => tool.name === 'chat_history')!.inputSchema as any;
-      expect(schema.properties.action.description).toContain('read uses cid/record_id/turn_id/tool_call_id');
-      expect(schema.properties.action.description).toContain('or latest for vague local references');
       expect(schema.properties.action.description).toContain('Follow next_read');
-      expect(schema.properties.query.description).toContain('discriminative name, phrase, id, or fact');
+      expect(schema.properties.read.properties).toHaveProperty('record_id');
+      expect(schema.properties.process.required).toEqual(['record_id', 'process_index']);
+      expect(schema.properties.process.properties.process_index.minimum).toBe(0);
+      expect(schema.properties.output.required).toEqual(['record_id', 'tool_call_id']);
+      expect(schema.properties.search.required).toEqual(['query']);
+      expect(schema.properties.search.properties.query.type).toBe('string');
+      for (const legacy of ['page', 'query', 'record_id', 'process_index', 'tool_call_id', 'output_cursor']) {
+        expect(schema.properties).not.toHaveProperty(legacy);
+      }
     }
   });
 
@@ -3004,12 +3207,18 @@ describe('runner › conversation-history scope exposure', () => {
     expect((chatHistoryDefinition?.inputSchema as any).properties.scope.enum)
       .toEqual(['current', 'all']);
 
+    const records = await import('../../../src/main/features/chat-history-records');
+    const historyIndex = vi.spyOn(records, 'historyMessageIndex');
     const invalidProject = await chatHistory.execute(
-      { action: 'read', scope: 'project' },
+      { action: 'read', scope: 'project', read: {} },
       { state: {} } as any,
     );
     expect(invalidProject.isError).toBe(true);
-    expect(invalidProject.content).toContain('scope "project" is not allowed');
+    expect(JSON.parse(invalidProject.content)).toMatchObject({
+      tool: 'chat_history', code: 'invalid_arguments', invalid_fields: ['scope'],
+    });
+    expect(historyIndex).not.toHaveBeenCalled();
+    historyIndex.mockRestore();
 
     const pages: string[] = [];
     let beforeMsgIndex: number | undefined;
@@ -3017,9 +3226,9 @@ describe('runner › conversation-history scope exposure', () => {
       const result = await chatHistory.execute({
         action: 'read',
         scope: 'current',
-        page: beforeMsgIndex === undefined
+        read: { page: beforeMsgIndex === undefined
           ? { mode: 'latest', count: 10 }
-          : { mode: 'before', index: beforeMsgIndex, count: 10 },
+          : { mode: 'before', index: beforeMsgIndex, count: 10 } },
       }, { state: {} } as any);
       expect(result.isError).toBeFalsy();
       pages.push(result.content);
@@ -3395,5 +3604,47 @@ describe('runner › bounded Skill creation correction', () => {
     const { complete, run, input } = await setup(result);
     await expect(run(input)).rejects.toThrow();
     expect(complete).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('runner public configured model and credential recovery', () => {
+
+  it('rebuilds the same OAuth candidate with the replacement key after one upstream 401', async () => {
+    const used: string[] = [];
+    const createPiProvider = vi.fn(({ provider, apiKey }: any) => ({ id: provider, name: 'OAuth recovery',
+      complete: async () => { used.push(apiKey); if (apiKey === 'synthetic-old') throw Object.assign(new Error('Unauthorized'), { status: 401 });
+        return { role: 'assistant', model: 'gpt-5.6-sol', content: [{ type: 'text', text: 'recovered' }], stopReason: 'end_turn' }; },
+      stream: vi.fn(), validateAuth: vi.fn() }));
+    vi.doMock('#core-agent', async () => ({ ...await vi.importActual<any>('#core-agent'), createPiProvider }));
+    const auth = await import('../../../src/main/features/auth');
+    const refreshApiKey = vi.fn(async (rejected: string) => rejected === 'synthetic-old' ? 'synthetic-new' : undefined);
+    vi.spyOn(auth, 'pickChatEntryGroup').mockResolvedValue([{ entryId: 'refresh-entry', profileId: 'oauth-recovery-owner', provider: 'openai', model: 'gpt-5.6-sol', apiKey: 'synthetic-old', refreshApiKey }]);
+    const { buildRunner } = await loadRunner();
+    const built = await buildRunner({ sessionId: 'gconv-public-oauth-recovery', userId: RUNNER_TEST_UID });
+    const result = await (built.runner as any).providers.get('openai').complete({ model: 'gpt-5.6-sol', messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] });
+    expect(result.content).toContainEqual({ type: 'text', text: 'recovered' });
+    expect(used).toEqual(['synthetic-old', 'synthetic-new']);
+    expect(refreshApiKey).toHaveBeenCalledExactlyOnceWith('synthetic-old');
+    expect(createPiProvider).toHaveBeenCalledTimes(2);
+    expect((await import('../../../src/main/model/core-agent/profile-cooldown')).getCooldown('oauth-recovery-owner')).toBeUndefined();
+  });
+});
+
+describe('runner legacy capacity remediation', () => {
+  it('explains an all-small saved configuration before constructing a model provider', async () => {
+    const paths = await import('../../../src/main/paths');
+    const secrets = await import('../../../src/main/util/local-secret-store');
+    const file = paths.userAuthProfilesFile(RUNNER_TEST_UID);
+    const context = { namespace: 'auth.profiles', ownerId: RUNNER_TEST_UID, recordId: 'auth-profiles.json' };
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, secrets.encryptLocalSecret(context, JSON.stringify({ version: 6, profiles: {
+      'custom:small': { type: 'api_key', provider: 'custom', label: 'small', key: 'synthetic-small', baseUrl: 'https://capacity.example/v1', contextWindow: 31999, maxTokens: 8192, createdAt: 1, lastUsed: 0 },
+    }, entries: [{ entryId: 'small-entry', provider: 'custom', profileId: 'custom:small', model: 'small-fixture', createdAt: 1, lastUsed: 0 }] })));
+    const before = fs.readFileSync(file, 'utf8');
+    const { t } = await import('../../../src/main/i18n');
+    const { buildRunner } = await loadRunner();
+    await expect(buildRunner({ sessionId: 'gconv-small-remediation', userId: RUNNER_TEST_UID }))
+      .rejects.toThrow(t('errors.model_context_too_small', { minimum: 32000 }));
+    expect(fs.readFileSync(file, 'utf8')).toBe(before);
   });
 });

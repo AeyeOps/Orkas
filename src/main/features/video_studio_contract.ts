@@ -1,7 +1,7 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
-import { z } from 'zod/v3';
+import { z } from 'zod';
 
 export type ContractIssue = {
   code: string;
@@ -84,7 +84,7 @@ export const CompositionManifestSchema = z.object({
   source_alignment: z.object({
     merge_reason: z.string().trim().min(1).optional(),
   }).strict().optional(),
-  art_direction: z.record(z.unknown()).optional(),
+  art_direction: z.record(z.string(), z.unknown()).optional(),
 }).strict().superRefine((manifest, ctx) => {
   const hasNarration = manifest.scenes.some((scene) => !!scene.narration_text?.trim());
   if (manifest.schema_version === 2
@@ -1118,9 +1118,9 @@ ${audio}
       // scene-attributable so unchanged scenes can skip re-rendering.
 ${manifest.scenes.map((scene) => [
     `      // ORKAS-SCENE-MOTION-BEGIN:${scene.id}`,
-    `      // Tweens for scene "${scene.id}" only, positioned from S(${JSON.stringify(scene.id)}) — for example:`,
-    `      //   tl.from('[data-scene-id="${scene.id}"] [data-role="title"]', { y: 40, duration: 0.6 }, S(${JSON.stringify(scene.id)}) + 0.2);`,
-    `      //   tl.to('[data-scene-id="${scene.id}"] [data-role="visual"]', { x: 240, duration: D(${JSON.stringify(scene.id)}) }, S(${JSON.stringify(scene.id)}));`,
+    // No sample tween: a copied example became every scene's motion
+    // (2026-10-30, eight scenes drifting x:240). Point at the scene's own beats.
+    `      // Tweens for scene "${scene.id}" only, from its art_direction beats, positioned from S(${JSON.stringify(scene.id)}) with D(${JSON.stringify(scene.id)}) as its length.`,
     `      // ORKAS-SCENE-MOTION-END:${scene.id}`,
   ].join('\n')).join('\n')}
     })();

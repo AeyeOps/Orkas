@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { drainMainRuntimeForTest } from '../../helpers/drain-main-runtime';
@@ -428,7 +429,7 @@ describe('projects › deleteProject', () => {
     const conv = await chats.createConversation(TEST_UID, { projectId: pid });
     const projectFile = path.join(tmpDir, TEST_UID, 'cloud', 'projects', pid, 'project.json');
 
-    vi.spyOn(chats, 'listConversations').mockRejectedValueOnce(new Error('temporary index read failure'));
+    vi.spyOn(chats, 'listConversationDeletionRows').mockRejectedValueOnce(new Error('temporary index read failure'));
     const result = await projects.deleteProject(TEST_UID, pid);
 
     expect(result).toEqual({ ok: false, error: 'cascade_failed' });
@@ -688,8 +689,7 @@ describe('projects › instructions', () => {
     const expectedOrder = [
       '1. The current user request',
       '2. Project instructions',
-      '3. Latest project status',
-      "4. This project's memory",
+      "3. This project's memory",
     ];
     let last = -1;
     for (const line of expectedOrder) {
@@ -697,6 +697,9 @@ describe('projects › instructions', () => {
       expect(index).toBeGreaterThan(last);
       last = index;
     }
+    // No host source ever produced a "project status" tier; the open-work
+    // snapshot is turn-ephemeral host facts, not a precedence level.
+    expect(block).not.toContain('Latest project status');
     expect(block).toContain('tell the user which values conflict and where each came from');
     expect(block).toContain('standing defaults, not immutable higher-authority policy');
     expect(block).toContain('one-turn exception without changing the saved project instructions');
@@ -719,6 +722,28 @@ describe('projects › instructions', () => {
     if (!read.ok) return;
     expect(read.content).toBe('');
     expect(read.limit).toBe(projects.PROJECT_INSTRUCTIONS_CHAR_LIMIT);
+  });
+
+  it.each(['EACCES', 'EIO'])('keeps unreadable instructions unavailable and recovers without losing saved rules (%s)', async code => {
+    const projects = await loadProjects();
+    const paths = await import('../../../src/main/paths');
+    const created = await projects.createProject(TEST_UID, 'Instructions read recovery');
+    if (!created.ok) throw new Error('Project fixture failed');
+    const pid = created.project.project_id;
+    const original = 'Keep the approved venue and do not contact vendors.';
+    await projects.writeProjectInstructions(TEST_UID, pid, original);
+    const file = paths.projectInstructionsFile(TEST_UID, pid);
+    const read = fs.promises.readFile.bind(fs.promises);
+    const spy = vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
+      if (args[0] === file) return Promise.reject(Object.assign(new Error('Private instructions read failure'), { code }));
+      return (read as any)(...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      expect(await projects.readProjectInstructions(TEST_UID, pid)).toEqual({ ok: false, error: 'read_failed' });
+      expect(fs.readFileSync(file, 'utf8')).toBe(original);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect(await projects.readProjectInstructions(TEST_UID, pid)).toMatchObject({ ok: true, content: original });
   });
 
   it('write → persists ORKAS.md in the project dir; read round-trips; empty write clears', async () => {
@@ -798,11 +823,32 @@ describe('projects › instructions', () => {
     if (!r.ok) throw new Error('create failed');
     const over = await projects.writeProjectInstructions(
       TEST_UID, r.project.project_id, 'x'.repeat(projects.PROJECT_INSTRUCTIONS_CHAR_LIMIT + 1));
-    expect(over).toEqual({ ok: false, error: 'too_long' });
+    expect(over).toEqual({ ok: false, error: 'too_long', limit: 4000, actual: 4001 });
     // at-limit content is accepted (boundary)
     const atLimit = await projects.writeProjectInstructions(
       TEST_UID, r.project.project_id, 'x'.repeat(projects.PROJECT_INSTRUCTIONS_CHAR_LIMIT));
     expect(atLimit.ok).toBe(true);
+  });
+
+  it.each(['x', '中', '😀'])('preserves content on an over-limit %s write and accepts a corrected replacement', async (unit) => {
+    const projects = await loadProjects();
+    const created = await projects.createProject(TEST_UID, 'Length recovery');
+    if (!created.ok) throw new Error('fixture failed');
+    const pid = created.project.project_id;
+    const atLimit = unit.repeat(4000 / unit.length);
+    const overLimit = atLimit + 'x';
+    expect(await projects.writeProjectInstructions(TEST_UID, pid, 'Original')).toEqual({ ok: true });
+    for (const conditional of [false, true]) {
+      const result = conditional
+        ? await projects.writeProjectInstructionsIfUnchanged(TEST_UID, pid, 'Original', overLimit)
+        : await projects.writeProjectInstructions(TEST_UID, pid, overLimit);
+      expect(result).toEqual({ ok: false, error: 'too_long', limit: 4000, actual: 4001 });
+      expect(await projects.readProjectInstructions(TEST_UID, pid)).toMatchObject({ content: 'Original' });
+    }
+    expect(await projects.writeProjectInstructionsIfUnchanged(TEST_UID, pid, 'Original', atLimit)).toEqual({ ok: true });
+    expect(await projects.readProjectInstructions(TEST_UID, pid)).toMatchObject({ content: atLimit });
+    expect(await projects.writeProjectInstructionsIfUnchanged(TEST_UID, pid, 'Original', 'Stale')).toEqual({ ok: false, error: 'conflict' });
+    expect(await projects.readProjectInstructions(TEST_UID, pid)).toMatchObject({ content: atLimit });
   });
 
   it('formatProjectInstructionsForSystemPrompt: block for real content, empty for missing/blank', async () => {
@@ -831,6 +877,76 @@ describe('projects › instructions', () => {
     fs.writeFileSync(file, 'y'.repeat(projects.PROJECT_INSTRUCTIONS_CHAR_LIMIT * 3));
     const block = projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid);
     expect(block.length).toBeLessThan(projects.PROJECT_INSTRUCTIONS_CHAR_LIMIT + 300); // content capped + header
+  });
+
+  it.each(['EACCES', 'EIO', 'EPERM', 'EBUSY'])('reports %s to the model without inventing empty instructions or caching the failure', async code => {
+    const records = await capturePrivateDiagnostics();
+    const projects = await loadProjects();
+    const created = await projects.createProject(TEST_UID, 'Instructions');
+    if (!created.ok) throw new Error('create failed');
+    const pid = created.project.project_id;
+    const rule = 'Keep the release channel private.';
+    await projects.writeProjectInstructions(TEST_UID, pid, rule);
+    records.length = 0;
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'projects', pid, 'ORKAS.md');
+    const originalRead = fs.readFileSync;
+    const nativeFs = (await import('node:fs')).default;
+    const read = vi.spyOn(nativeFs, 'readFileSync').mockImplementation(((target: any, ...args: any[]) => {
+      if (String(target) === file) throw Object.assign(new Error(`Private failure: ${file} ${rule}`), { code });
+      return (originalRead as any)(target, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      const block = projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid);
+      expect(block).toContain('## Project instructions (user-authored)');
+      expect(block).toContain('unavailable');
+      expect(block).toContain('not mean that the project has no instructions');
+      expect(block).toContain('Continue the task');
+      expect(block.length).toBeLessThan(400);
+      for (const privateValue of [file, rule, TEST_UID, 'Private failure']) {
+        expect(block).not.toContain(privateValue);
+        expect(JSON.stringify(records)).not.toContain(privateValue);
+      }
+      expect(records).toHaveLength(1);
+    } finally { read.mockRestore(); syncBuiltinESMExports(); }
+    expect(fs.readFileSync(file, 'utf8')).toBe(rule);
+    const recovered = projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid);
+    expect(recovered).toContain(rule);
+    expect(recovered).not.toContain('unavailable');
+  });
+
+  it.each(['temporary-write', 'publish'])('preserves readable instructions if the %s fails', async failurePoint => {
+    const projects = await loadProjects();
+    const created = await projects.createProject(TEST_UID, 'Atomic instructions');
+    if (!created.ok) throw new Error('create failed');
+    const pid = created.project.project_id;
+    const file = path.join(tmpDir, TEST_UID, 'cloud', 'projects', pid, 'ORKAS.md');
+    await projects.writeProjectInstructions(TEST_UID, pid, 'Original complete rule.');
+    const nativeFs = (await import('node:fs')).default;
+    const originalWrite = fs.writeFileSync;
+    const originalRename = fs.renameSync;
+    const publish = vi.spyOn(nativeFs, 'renameSync').mockImplementation((from, to) => {
+      if (String(to) === file) {
+        expect(projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid)).toContain('Original complete rule.');
+        if (failurePoint === 'publish') throw Object.assign(new Error('injected publication failure'), { code: 'EIO' });
+      }
+      return originalRename(from, to);
+    });
+    const write = vi.spyOn(nativeFs, 'writeFileSync').mockImplementation(((target: any, ...args: any[]) => {
+      if (String(target).startsWith(`${file}.`)) {
+        (originalWrite as any)(target, 'Partial candidate');
+        if (failurePoint === 'temporary-write') throw Object.assign(new Error('injected write failure'), { code: 'EIO' });
+      }
+      return (originalWrite as any)(target, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      await expect(projects.writeProjectInstructions(TEST_UID, pid, 'New complete rule.')).rejects.toThrow('injected');
+      expect(projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid)).toContain('Original complete rule.');
+      expect(fs.readdirSync(path.dirname(file)).filter(name => name.endsWith('.tmp'))).toEqual([]);
+    } finally { write.mockRestore(); publish.mockRestore(); syncBuiltinESMExports(); }
+    expect(await projects.writeProjectInstructions(TEST_UID, pid, 'New complete rule.')).toEqual({ ok: true });
+    expect(projects.formatProjectInstructionsForSystemPrompt(TEST_UID, pid)).toContain('New complete rule.');
   });
 });
 

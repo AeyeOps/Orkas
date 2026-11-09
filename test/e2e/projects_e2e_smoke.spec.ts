@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmdirSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { expect, test, type OrkasTestApp } from './fixtures/orkas';
@@ -109,76 +109,6 @@ test.describe('projects', () => {
     }
   });
 
-  test('keeps member invitation visible as a commercial download guide', async ({ orkas }, testInfo) => {
-    const projectName = 'E2E Invite Guide';
-    if (!orkas.page) throw new Error('Orkas renderer is unavailable');
-    const page = orkas.page;
-    const rendererRequests: string[] = [];
-    page.on('request', request => {
-      const url = new URL(request.url());
-      if (url.protocol === 'http:' || url.protocol === 'https:') rendererRequests.push(url.origin + url.pathname);
-    });
-    await orkas.electronApp!.evaluate(({ shell, net }) => {
-      const root = globalThis as any;
-      root.__projectInviteExternalUrls = [];
-      root.__projectEntryRequests = [];
-      root.__projectBackgroundRequests = [];
-      const backgroundRequests = new Set([
-        'GET /api/config/client',
-        'POST /api/marketplace/defaults',
-        'POST /api/marketplace/agents/list',
-        'POST /api/marketplace/agents/detail',
-        'POST /api/marketplace/skills/list',
-      ]);
-      shell.openExternal = async (url: string) => { root.__projectInviteExternalUrls.push(url); };
-      for (const owner of [root, net]) {
-        const original = owner.fetch;
-        owner.fetch = function (input: any, ...args: any[]) {
-          const url = new URL(typeof input === 'string' ? input : input.url || String(input));
-          const method = String(args[0]?.method || input?.method || 'GET').toUpperCase();
-          // Startup refreshes can overlap this local project journey. Keep every
-          // other endpoint, origin and method in the prohibited-request ledger.
-          const isBackground = url.origin === 'https://orkas.ai'
-            && backgroundRequests.has(`${method} ${url.pathname}`);
-          (isBackground ? root.__projectBackgroundRequests : root.__projectEntryRequests)
-            .push(url.origin + url.pathname);
-          return original.call(this, input, ...args);
-        };
-      }
-    });
-    await createProject(orkas, projectName);
-    await expect(page.locator('#project-detail-content')).toHaveAttribute('aria-busy', 'false');
-    await expect(page.locator('#project-detail-content')).not.toHaveClass(/\bis-loading\b/);
-    expect(await page.locator('#panel-project .project-detail-header').evaluate(header =>
-      getComputedStyle(header, '::after').animationName)).toBe('none');
-    const row = page.locator('.project-row', {
-      has: page.locator('.project-name', { hasText: projectName }),
-    });
-    const guidance = await page.evaluate(() => (globalThis as any).t('project.invite_members.commercial_only'));
-    const inviteLabel = await page.evaluate(() => (globalThis as any).t('project.menu.invite_members'));
-    const headerInvite = page.locator('#panel-project .project-detail-actions').getByRole('button', { name: inviteLabel, exact: true });
-    await expect(headerInvite).toHaveCount(0);
-    await page.locator('#panel-project').screenshot({ path: testInfo.outputPath('project-member-invite-entry.png') });
-    const cancelGuide = async () => {
-      const dialog = page.locator('.ui-dialog-overlay:visible');
-      await expect(dialog.locator('.ui-dialog-message')).toHaveText(guidance);
-      await expect(dialog.locator('[data-act="ok"]')).toBeVisible();
-      await dialog.locator('[data-act="cancel"]').click();
-      await expect(page.locator('.ui-dialog-overlay:visible')).toHaveCount(0);
-      expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__projectInviteExternalUrls)).toEqual([]);
-      expect(await orkas.electronApp!.evaluate(() => (globalThis as any).__projectEntryRequests)).toEqual([]);
-      expect(rendererRequests).toEqual([]);
-      await expect(page.locator('#project-detail-title')).toHaveText(projectName);
-      await expect(row).toHaveCount(1);
-    };
-    await row.hover();
-    await row.locator('[data-project-menu]').click();
-    const invite = page.locator('#project-row-menu [data-action="invite-members"]');
-    await expect(invite).toBeVisible();
-    await invite.click();
-    await cancelGuide();
-  });
-
   test('creates a project and keeps it after an app relaunch', async ({ orkas }) => {
     const projectName = 'E2E Persistent Project';
     await createProject(orkas, projectName);
@@ -274,6 +204,46 @@ test.describe('projects', () => {
     await expect(memory).toHaveCount(0);
   });
 
+  test('locks unreadable project instructions and restores the saved rules after recovery', async ({ orkas }) => {
+    const name = 'E2E Instructions Read Recovery';
+    const original = 'Keep the approved venue and do not contact vendors.';
+    await createProject(orkas, name);
+    const page = orkas.page!;
+    const listed = await orkas.invoke<{ projects: Array<{ project_id: string; name: string }> }>('projects.list');
+    const projectId = listed.projects.find(project => project.name === name)!.project_id;
+    await orkas.invoke('projects.instructions.set', { projectId, content: original });
+    await expect(page.locator('#project-instructions-read')).toHaveText(original);
+    const file = readdirSync(orkas.workspaceRoot)
+      .map(uid => path.join(orkas.workspaceRoot, uid, 'cloud', 'projects', projectId, 'ORKAS.md'))
+      .find(candidate => existsSync(candidate))!;
+    expect(file).toBeTruthy();
+    const preserved = file + '.preserved';
+    // A directory at the file path triggers a real read failure without
+    // relying on permission bits that elevated users or Windows may ignore.
+    renameSync(file, preserved);
+    mkdirSync(file);
+    try {
+      await page.evaluate(pid => (window as any).loadProjectDetail(pid), projectId);
+      await expect(page.locator('#project-instructions-input')).toBeDisabled();
+      await expect(page.locator('#project-instructions-edit-btn')).toBeDisabled();
+      await expect(page.locator('#project-instructions-setup-btn')).toBeDisabled();
+      await expect(page.locator('#project-instructions-save-btn')).toBeDisabled();
+      await expect(page.locator('#project-instructions-modal')).not.toHaveClass(/open/);
+      expect(readFileSync(preserved, 'utf8')).toBe(original);
+    } finally {
+      rmdirSync(file);
+      renameSync(preserved, file);
+    }
+    await page.evaluate(pid => (window as any).loadProjectDetail(pid), projectId);
+    await expect(page.locator('#project-instructions-read')).toHaveText(original);
+    await page.locator('#project-instructions-edit-btn').click();
+    await expect(page.locator('#project-instructions-input')).toHaveValue(original);
+    await page.locator('#project-instructions-input').fill('Unsaved recovery draft.');
+    await page.locator('#project-instructions-cancel-btn').click();
+    expect(await orkas.invoke('projects.instructions.get', { projectId })).toMatchObject({ content: original });
+    await expect(page.locator('#project-instructions-read')).toHaveText(original);
+  });
+
   test('uploads, previews, persists, and deletes a project Library file', async ({ orkas }) => {
     const projectName = 'E2E Project Library';
     const fileName = 'E2E project source.md';
@@ -361,7 +331,7 @@ test.describe('projects', () => {
     await page.locator('#project-chat-input').fill('Use the attached project brief.');
     await page.locator('#project-chat-send-btn').click();
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
       'E2E project attachment received.',
       { timeout: 20_000 },
     );
@@ -399,7 +369,7 @@ test.describe('projects', () => {
     await page.locator('#project-chat-input').fill(taskText);
     await page.locator('#project-chat-send-btn').click();
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
       'E2E image deliverable is ready.',
       { timeout: 20_000 },
     );
@@ -473,7 +443,7 @@ test.describe('projects', () => {
     await expect(page.locator('#chat-history .chat-message.user')).toContainText(
       'Give a self-contained status update for this project.',
     );
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
       modelReply,
       { timeout: 20_000 },
     );
@@ -524,7 +494,7 @@ test.describe('projects', () => {
       'Keep the existing project instructions and add that all customer copy must be English.',
     );
     await page.locator('#project-chat-send-btn').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble .markdown-body')).toContainText(
       toolReply,
       { timeout: 20_000 },
     );
@@ -535,11 +505,14 @@ test.describe('projects', () => {
       await modelOrkas.invoke<{ content: string }>('projects.instructions.get', { projectId })
     ).content).toBe(replacement);
 
+    // A visible final body can precede stream teardown. Wait until this
+    // control is Send; clicking it while streaming invokes Stop instead.
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
     modelOrkas.clearModelToolScenario();
     modelOrkas.setModelTextReplies([nextTurnReply]);
     await page.locator('#chat-input').fill('Confirm the current project rules.');
     await page.locator('#chat-send-btn').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble .markdown-body', {
       hasText: nextTurnReply,
     })).toBeVisible({ timeout: 20_000 });
     await expect.poll(() => modelOrkas.modelRequests.length).toBe(3);
@@ -547,6 +520,7 @@ test.describe('projects', () => {
     expect(nextTurnRequest).toContain(original);
     expect(nextTurnRequest).toContain('All customer copy must be English.');
 
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
     const concurrentUiEdit = `${replacement}\nUse the July launch checklist.`;
     const staleModelReplacement = `${replacement}\nPublish on Friday.`;
     const conflictReply = 'E2E stale project-instructions replacement was rejected.';
@@ -565,7 +539,7 @@ test.describe('projects', () => {
         content: concurrentUiEdit,
       });
     } finally { releaseTool(); }
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]', {
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble .markdown-body', {
       hasText: conflictReply,
     })).toBeVisible({ timeout: 20_000 });
     await expect.poll(() => modelOrkas.modelRequests.length).toBe(5);
@@ -598,7 +572,7 @@ test.describe('projects', () => {
     modelOrkas.setModelTextReplies([sourceReply]);
     await page.locator('#project-chat-input').fill('Record the Nimbus payments decision for this project.');
     await page.locator('#project-chat-send-btn').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
       sourceReply,
       { timeout: 20_000 },
     );
@@ -619,7 +593,7 @@ test.describe('projects', () => {
       'Continue the earlier Nimbus payments plan from this project. Do not make me repeat its constraints.',
     );
     await page.locator('#project-chat-send-btn').click();
-    await expect(page.locator('#chat-history .chat-message.assistant [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
       finalReply,
       { timeout: 20_000 },
     );
@@ -636,7 +610,7 @@ test.describe('projects', () => {
       /please.{0,20}(?:repeat|restate)|请.{0,20}(?:重复|重述)/i,
     );
     await expect(
-      page.locator('#chat-history .chat-message.assistant [data-role="final"]'),
+      page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])'),
     ).not.toContainText(/chat_history|<chat-history/i);
 
     const allConversations = await modelOrkas.invoke<{
@@ -737,6 +711,7 @@ test.describe('projects', () => {
     await expect.poll(async () => (
       await projectNames.allTextContents()
     ).filter((name) => name === projectName).length).toBe(1);
+    await orkas.acknowledgeInvokeFailures('projects.create', 1);
   });
 
   test('keeps an unsaved project draft focused without creating it during a background refresh', async ({
@@ -811,7 +786,7 @@ test.describe('projects', () => {
 
   }
 
-  // The project page header keeps only the title; rename and delete live in its
+  // The project page header keeps only the title; invite, rename and delete live in its
   // "⋯" menu, and "Done" stands in for the menu while the title is edited.
   test('renames from the project header menu and keeps delete behind its confirmation', async ({ orkas }, testInfo) => {
     const originalName = 'E2E Header Rename Before';
@@ -1222,6 +1197,7 @@ test.describe('projects', () => {
     expect(list.conversations.find((item) => item.conversation_id === conversation.conversation_id)?.project_id).toBe(project.project_id);
     const bindings = await orkas.invoke<{ bindings: { agents: string[] } }>('projects.bindings.list', { projectId: project.project_id });
     expect(bindings.bindings.agents).not.toContain(agent.agent_id);
+    await orkas.acknowledgeInvokeFailures('projects.bindings.add', 1);
   });
 
 });

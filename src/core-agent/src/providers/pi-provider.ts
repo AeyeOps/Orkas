@@ -11,7 +11,6 @@ import {
   stream as piStream,
   completeSimple as piCompleteSimple,
   streamSimple as piStreamSimple,
-  Type,
   getEnvApiKey,
 } from "@earendil-works/pi-ai/compat";
 import {
@@ -54,6 +53,7 @@ import { providerCredentialFailure, providerErrorFacts } from "../shared/provide
 import type { CompletionParams, CompletionResult, LLMProvider, ToolDefinition } from "./base.js";
 
 import { createResponsesTerminalReasoning } from './responses-terminal-reasoning.js';
+import { prepareChatReasoningReplay } from './chat-reasoning-replay.js';
 import { createResponsesStatusDiagnostics } from './responses-status-diagnostics.js';
 import { createRequestDiagnostics, type ProviderFailureSource } from "./request-diagnostics.js";
 import { createProviderErrorCapture } from "./provider-error-capture.js";
@@ -73,16 +73,44 @@ type ProviderHttpResponse = { status: number; headers?: Headers | Record<string,
 // turn owns this weak lifetime; neither session ids nor credentials retain it.
 const codexTurnStates = new WeakMap<object, { owner: string; value?: string }>();
 
+/** Replace only SDK affinity headers after construction. Caller-owned headers
+ * (including managed login credentials) and per-chat request ids stay intact.
+ * Without an explicit host user scope, retain the SDK's per-chat identity. */
+function withUserCacheAffinity(
+  next: typeof globalThis.fetch, model: Model<Api>, key: string | undefined,
+  enabled: boolean, suppliedHeaders?: Record<string, string>,
+): typeof globalThis.fetch {
+  if (!enabled || !key) return next;
+  const name = model.api === 'openai-codex-responses' ? 'session-id'
+    : model.api === 'openai-responses' || model.api === 'openai-completions' ? 'session_id' : undefined;
+  if (!name || (model.api !== 'openai-codex-responses'
+    && new Headers(suppliedHeaders).has(name))) return next;
+  return (input, init) => {
+    const headers = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined));
+    if (!headers.has(name)) return next(input, init);
+    headers.set(name, key);
+    return next(input, { ...init, headers });
+  };
+}
+
+/** Do not introduce cache extensions to an unknown protocol or gateway. */
+function withUserPromptCacheKey(payload: unknown, key: string | undefined): unknown {
+  if (!key || !payload || typeof payload !== 'object' || Array.isArray(payload)
+    || typeof (payload as Record<string, unknown>).prompt_cache_key !== 'string'
+    || !(payload as Record<string, unknown>).prompt_cache_key) return payload;
+  return { ...payload, prompt_cache_key: key };
+}
+
 function codexTurnRouting(
   model: Model<Api>, params: CompletionParams, apiKey: string | undefined,
-  headers: Record<string, string> | undefined,
+  headers: Record<string, string> | undefined, userCacheKey?: string,
 ): { headers: Record<string, string>; observe: (response: ProviderHttpResponse) => void } | undefined {
   const turn = params.providerTurnContext;
   if (model.api !== "openai-codex-responses" || !turn) return undefined;
   // A credential refresh, endpoint/model switch or session switch starts fresh.
   // Never retain raw credentials or send another owner's routing state.
   const owner = crypto.createHash("sha256").update(JSON.stringify([
-    model.provider, model.baseUrl, model.id, apiKey, params.sessionId,
+    model.provider, model.baseUrl, model.id, apiKey, params.sessionId, userCacheKey,
   ])).digest("hex");
   let state = codexTurnStates.get(turn);
   if (!state || state.owner !== owner) {
@@ -173,7 +201,7 @@ type RuntimePiContext = PiContext & { hostMessageIndexes: number[]; foreignRespo
  * ordering in `transform-messages`, one image trailer per contiguous tool-result
  * batch in `openai-completions`). Bump only after re-checking those rules against
  * the new release; `providers.test.ts` pins the installed package to this value. */
-export const MIRRORED_PI_AI_SERIALIZER_VERSION = "1.2.0";
+export const MIRRORED_PI_AI_SERIALIZER_VERSION = "1.5.0";
 
 /** pi-ai's portable history has no developer role. Responses has one, so
  * restore explicitly typed host messages at the native serialization boundary.
@@ -263,8 +291,7 @@ function buildPiContext(
   const piTools: PiTool[] | undefined = tools?.map((t) => ({
     name: t.name,
     description: t.description,
-    // Preserve the full JSON Schema while adding pi-ai's TypeBox marker.
-    parameters: Type.Unsafe(t.inputSchema),
+    parameters: t.inputSchema,
     // Only explicitly capable Responses routes receive native grammar input.
     ...((model?.api === "openai-responses" || model?.api === "openai-codex-responses")
       && model.compat && "supportsOpenAIGrammarTools" in model.compat
@@ -681,6 +708,10 @@ function mapContent(
         atTextStart = false;
       }
     } else if (block.type === "toolCall") {
+      // pi-ai 1.3 marks invalid final JSON separately from its empty-object
+      // fallback. Never turn that fallback into an executable host call.
+      // The SDK error contains raw arguments, so keep it out of diagnostics.
+      if (block.argumentsError) throw new Error("Invalid tool call arguments");
       result.push({
         type: "tool_use",
         id: block.id,
@@ -772,6 +803,8 @@ function restoreOfficialReasoningDefaults(
   }
 
   const next: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+  // pi-schema's optional-map Static type becomes unknown without strictNullChecks.
+  const mappedOff = (model.thinkingLevelMap as { off?: string | null })?.off;
   const compat = model.compat as (Record<string, unknown> & {
     thinkingFormat?: string;
     chatTemplateKwargs?: Record<string, unknown>;
@@ -814,7 +847,7 @@ function restoreOfficialReasoningDefaults(
       removeSynthesizedReasoningFields("none", false);
     }
   } else if (thinkingFormat === "string-thinking") {
-    const offValue = model.thinkingLevelMap?.off;
+    const offValue = mappedOff;
     if (next.thinking === "none" || (typeof offValue === "string" && next.thinking === offValue)) {
       delete next.thinking;
     }
@@ -823,7 +856,6 @@ function restoreOfficialReasoningDefaults(
   // OpenAI Responses and generic OpenAI-compatible reasoners use these
   // shapes rather than a named thinkingFormat.
   const reasoning = next.reasoning as { effort?: unknown } | undefined;
-  const mappedOff = model.thinkingLevelMap?.off;
   if (reasoning?.effort === "none" || (typeof mappedOff === "string" && reasoning?.effort === mappedOff)) {
     removeSynthesizedReasoningFields(reasoning.effort);
   }
@@ -908,6 +940,8 @@ export function createPiProvider(config: {
   apiKey?: string;
   baseUrl?: string;
   headers?: Record<string, string>;
+  /** Opaque host user mapping for cache affinity only; never local Session identity. */
+  userCacheKey?: string;
   /** Optional per-call HTTP headers derived from Host-private metadata.
    * Values are merged after static headers and are never added to the model
    * payload. Managed Orkas requests use this for `X-Request-ID`. */
@@ -949,6 +983,7 @@ export function createPiProvider(config: {
   normalizeLiteralLeadingThinkText?: boolean;
 }): LLMProvider {
   const providerId = config.provider as KnownProvider;
+  const userCacheKey = cacheSafeSessionId(config.userCacheKey);
 
   // Resolve the model object. `customModel` shortcuts pi-ai's catalog
   // lookup for providers pi-ai doesn't know about.
@@ -1009,27 +1044,29 @@ export function createPiProvider(config: {
       const suppliedHeaders = requestHeaders(params);
       const apiKey = config.apiKey ?? getEnvApiKey(model.provider);
       const origin = replayOrigin(model, apiKey, suppliedHeaders);
-      const context = buildPiContext(params.messages, params.systemPrompt, params.tools, model, statusDiagnostics, origin);
+      const chatReplay = prepareChatReasoningReplay(buildPiContext(params.messages, params.systemPrompt, params.tools, model, statusDiagnostics, origin), model);
+      const context = chatReplay.context;
       const reasoning = effectiveReasoning(params.reasoning);
       const sessionId = cacheSafeSessionId(params.sessionId);
       const terminalReasoning = createResponsesTerminalReasoning(model.api, params.signal);
       const useOfficialReasoningDefaults = model.reasoning === true
         && ((params.reasoning === undefined && config.defaultReasoning === undefined)
-          || (params.reasoning === "off" && model.thinkingLevelMap?.off === null));
+          || (params.reasoning === "off" && (model.thinkingLevelMap as { off?: string | null })?.off === null));
       const useProviderOutputDefault = params.requestMetadata?.outputLimitSource === "provider_default";
-      const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders);
+      const cacheKey = sessionId && params.cacheRetention !== 'none' ? userCacheKey : undefined;
+      const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders, userCacheKey);
       const headers = turnRouting?.headers ?? suppliedHeaders;
-      const onPayload = (statusDiagnostics || useOfficialReasoningDefaults || useProviderOutputDefault || needsDeepSeekToolReasoning(model) || config.onPayload || context.hostMessageIndexes.length || context.foreignResponsesCalls.some(Boolean))
+      const onPayload = (cacheKey || chatReplay.active || statusDiagnostics || useOfficialReasoningDefaults || useProviderOutputDefault || needsDeepSeekToolReasoning(model) || config.onPayload || context.hostMessageIndexes.length || context.foreignResponsesCalls.some(Boolean))
         ? ((payload: unknown, hookModel: Model<Api>) => requestDiagnostics.observePayload(() => {
-            payload = restoreHostMessageRoles(projectResponsesItemIds(payload, context.foreignResponsesCalls), context, hookModel);
+            payload = restoreHostMessageRoles(projectResponsesItemIds(chatReplay.restore(payload), context.foreignResponsesCalls), context, hookModel);
             const reasoningNormalized = useOfficialReasoningDefaults
               ? restoreOfficialReasoningDefaults(payload, hookModel)
               : payload;
-            const normalized = useProviderDefaultOutputLimit(
+            const normalized = withUserPromptCacheKey(useProviderDefaultOutputLimit(
               reasoningNormalized,
               hookModel,
               params.requestMetadata?.outputLimitSource,
-            );
+            ), cacheKey);
             const transformed = config.onPayload
               ? config.onPayload(normalized, hookModel, params.requestMetadata)
               : normalized;
@@ -1037,7 +1074,7 @@ export function createPiProvider(config: {
             // Preserve Host normalization when an observer-only hook returns
             // nothing instead of accidentally restoring the generated cap.
             const observe = (result: unknown) => {
-              const value = projectDeepSeekToolReasoning(result === undefined ? normalized : result, hookModel);
+              const value = withUserPromptCacheKey(projectDeepSeekToolReasoning(result === undefined ? normalized : result, hookModel), cacheKey);
               requestDiagnostics.observeBudget(value, hookModel.contextWindow);
               statusDiagnostics?.payload(value);
               return value;
@@ -1059,7 +1096,10 @@ export function createPiProvider(config: {
         responseErrorStatus = response.status >= 400 ? response.status : undefined;
         requestDiagnostics.onResponse(response);
       };
-      const transportFetch = errorCapture.wrapFetch(config.wrapFetch?.(requestDiagnostics.requestFetch) ?? requestDiagnostics.requestFetch);
+      const transportFetch = withUserCacheAffinity(
+        errorCapture.wrapFetch(config.wrapFetch?.(requestDiagnostics.requestFetch) ?? requestDiagnostics.requestFetch),
+        model, cacheKey, Boolean(cacheKey), suppliedHeaders,
+      );
       const requestFetch: typeof globalThis.fetch = async (input, init) => {
         const response = await transportFetch(input, init);
         onResponse(response);
@@ -1155,14 +1195,16 @@ export function createPiProvider(config: {
       const suppliedHeaders = requestHeaders(params);
       const apiKey = config.apiKey ?? getEnvApiKey(model.provider);
       const origin = replayOrigin(model, apiKey, suppliedHeaders);
-      const context = buildPiContext(params.messages, params.systemPrompt, params.tools, model, statusDiagnostics, origin);
+      const chatReplay = prepareChatReasoningReplay(buildPiContext(params.messages, params.systemPrompt, params.tools, model, statusDiagnostics, origin), model);
+      const context = chatReplay.context;
       const reasoning = effectiveReasoning(params.reasoning);
       const sessionId = cacheSafeSessionId(params.sessionId);
       const terminalReasoning = createResponsesTerminalReasoning(model.api, params.signal);
       const useOfficialReasoningDefaults = model.reasoning === true
         && ((params.reasoning === undefined && config.defaultReasoning === undefined)
-          || (params.reasoning === "off" && model.thinkingLevelMap?.off === null));
-      const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders);
+          || (params.reasoning === "off" && (model.thinkingLevelMap as { off?: string | null })?.off === null));
+      const cacheKey = sessionId && params.cacheRetention !== 'none' ? userCacheKey : undefined;
+      const turnRouting = codexTurnRouting(model, params, config.apiKey, suppliedHeaders, userCacheKey);
       const headers = turnRouting?.headers ?? suppliedHeaders;
       const errorCapture = createProviderErrorCapture(
         model.api === 'openai-responses' ? 'openai-responses'
@@ -1173,7 +1215,10 @@ export function createPiProvider(config: {
         responseErrorStatus = response.status >= 400 ? response.status : undefined;
         requestDiagnostics.onResponse(response);
       };
-      const transportFetch = errorCapture.wrapFetch(config.wrapFetch?.(requestDiagnostics.requestFetch) ?? requestDiagnostics.requestFetch);
+      const transportFetch = withUserCacheAffinity(
+        errorCapture.wrapFetch(config.wrapFetch?.(requestDiagnostics.requestFetch) ?? requestDiagnostics.requestFetch),
+        model, cacheKey, Boolean(cacheKey), suppliedHeaders,
+      );
       const requestFetch: typeof globalThis.fetch = async (input, init) => {
         const response = await transportFetch(input, init);
         onResponse(response);
@@ -1185,21 +1230,21 @@ export function createPiProvider(config: {
       };
       let effectiveMaxTokens: number | undefined;
       const onPayload = (payload: unknown, hookModel: Model<Api>): Promise<unknown> => requestDiagnostics.observePayload(async () => {
-        payload = restoreHostMessageRoles(projectResponsesItemIds(payload, context.foreignResponsesCalls), context, hookModel);
+        payload = restoreHostMessageRoles(projectResponsesItemIds(chatReplay.restore(payload), context.foreignResponsesCalls), context, hookModel);
         const reasoningNormalized = useOfficialReasoningDefaults
           ? restoreOfficialReasoningDefaults(payload, hookModel)
           : payload;
-        const normalized = useProviderDefaultOutputLimit(
+        const normalized = withUserPromptCacheKey(useProviderDefaultOutputLimit(
           reasoningNormalized,
           hookModel,
           params.requestMetadata?.outputLimitSource,
-        );
+        ), cacheKey);
         const transformed = config.onPayload
           ? await config.onPayload(normalized, hookModel, params.requestMetadata)
           : normalized;
         // pi-ai treats an undefined hook result as "keep the pre-hook
         // payload". Observer-only hooks must not undo Host normalization.
-        const finalPayload = projectDeepSeekToolReasoning(transformed === undefined ? normalized : transformed, hookModel);
+        const finalPayload = withUserPromptCacheKey(projectDeepSeekToolReasoning(transformed === undefined ? normalized : transformed, hookModel), cacheKey);
         // Observe that exact final shape so this is an on-wire value, not a
         // model-catalog guess made before context and adapter adjustments.
         effectiveMaxTokens = effectiveMaxTokensFromPayload(finalPayload);
@@ -1552,7 +1597,9 @@ function wrapError(err: unknown, providerId: string): Error {
     return err;
   }
 
-  if (facts.codes.some(code => code === 'context_length_exceeded' || code === 'CONTEXT_OVERFLOW')) {
+  // llama.cpp reports oversized input in error.type, alongside numeric code 400.
+  if (facts.codes.some(code => code === 'context_length_exceeded'
+    || code === 'exceed_context_size_error' || code === 'CONTEXT_OVERFLOW')) {
     return new ContextOverflowError(`${providerId} context overflow: ${msg}`, original);
   }
   if (err instanceof ProviderError) return err;

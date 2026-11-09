@@ -3,6 +3,7 @@ import { DATA_INPUTS, dataDefinitionSchema, commonMethod, type AppType } from '.
 import { isAtomicWriteTempPath } from '../../storage';
 import { z } from 'zod';
 import { MAX_TEXT_FILE_BYTES } from '../../util/file-size-limits';
+const { schemaToJson } = require('../../../../bin/schema-to-json.cjs');
 
 export const SDK_VERSION = 1;
 export const MANIFEST_FILE = 'orkas-app.json';
@@ -69,7 +70,7 @@ export function describeMethod(method: string) {
   const def = METHODS[method as Method];
   return { name: method, capability: def.capability, description: def.description,
     appTypes:commonMethod(method)?['local','web']:['local'],environments:commonMethod(method)?['desktop','preview','online']:['desktop','preview'],status:'supported',
-    inputSchema: z.toJSONSchema(def.input, { target: 'draft-7', io: 'input', reused: 'inline' }), result: def.result, example: def.example };
+    inputSchema: schemaToJson(def.input), result: def.result, example: def.example };
 }
 export function catalogDocument(appType:AppType='local') {
   const starter = appType === 'web' ? 'web' : 'starter';
@@ -80,11 +81,11 @@ export function catalogDocument(appType:AppType='local') {
     : manifestSchema;
   return { sdkVersion: SDK_VERSION,
     manifest: { file: MANIFEST_FILE, schema: {
-        ...z.toJSONSchema(schema, { target: 'draft-7', io: 'input', reused: 'inline' }),
+        ...schemaToJson(schema),
         // Both creators and runtimes require a definition for declared data.
         allOf: [{ if: { properties: { capabilities: { contains: { const: 'data' } } }, required: ['capabilities'] }, then: { required: ['data'] } }],
       },
       starter: { entry: `@skill/web-app-sdk/assets/${starter}/index.html`,
         manifest: `@skill/web-app-sdk/assets/${starter}/${MANIFEST_FILE}` } },
-    dataDefinition:z.toJSONSchema(dataDefinitionSchema,{target:'draft-7',io:'input',reused:'inline'}), methods: Object.keys(METHODS).filter(name=>appType==='local'||commonMethod(name)).map(name => describeMethod(name)), unsupported: UNSUPPORTED };
+    dataDefinition:schemaToJson(dataDefinitionSchema), methods: Object.keys(METHODS).filter(name=>appType==='local'||commonMethod(name)).map(name => describeMethod(name)), unsupported: UNSUPPORTED };
 }

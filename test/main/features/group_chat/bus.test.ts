@@ -203,10 +203,10 @@ vi.mock('../../../../src/main/model/client', () => ({
     if (isCommanderTurn && steerDispatchIndex >= 0) {
       const data = JSON.parse(Buffer.from(message.slice(steerDispatchIndex + steerDispatchMarker.length)
         .split(/\s/, 1)[0], 'base64').toString('utf8'));
-      const tool = _opts.extraTools.find((candidate: any) => candidate.name === 'dispatch_to');
+      const tool = _opts.extraTools.find((candidate: any) => candidate.name === (data.tool || 'dispatch_to'));
       const result = await tool.execute({ to: AGENT_NAME, message: data.task }, { signal: _opts.abortSignal });
       streamProbe.dispatchResults.push(String(result?.content || ''));
-      yield { type: 'final', text: 'Commander received the CLI result.' };
+      yield { type: 'final', text: data.tool === 'hand_off_to' ? '' : 'Commander received the CLI result.' };
       yield { type: 'done' };
       return;
     }
@@ -289,6 +289,7 @@ vi.mock('../../../../src/main/model/client', () => ({
       const encoded = message.slice(publishedIdx + publishedMarker.length).split(/\s/, 1)[0];
       const data = JSON.parse(Buffer.from(encoded, 'base64').toString('utf8'));
       for (const p of data.paths || []) await _opts?.onFileWritten?.(p);
+      if (data.holdAfterWrite && streamProbe.slowGate) await streamProbe.slowGate;
       const publications = Array.isArray(data.publications)
         ? data.publications
         : [data.published || []];
@@ -347,6 +348,17 @@ vi.mock('../../../../src/main/model/client', () => ({
         },
       };
       yield { type: 'final', text: 'timing recorded' };
+      yield { type: 'done' };
+      return;
+    }
+    if (message.includes('REJECTED_WITH_DETAIL_TEST')) {
+      yield {
+        type: 'error',
+        text: 'The model service rejected this request (HTTP 400).',
+        detail: 'Provider said: image input is not supported',
+        failureKind: 'model',
+        failureCode: 'provider_http_400',
+      };
       yield { type: 'done' };
       return;
     }
@@ -793,6 +805,19 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       .toEqual(ending === 'success' ? ['Inspect sources.', 'Verify results.', 'Delivered.'] : ['Inspect sources.', 'Verify results.']);
   });
 
+  it('shows the sanitized provider explanation beside the failure', async () => {
+    const cid = 'cid-native-rejected-detail';
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const paths = await import('../../../../src/main/paths');
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'REJECTED_WITH_DETAIL_TEST' });
+    await waitForQuiescent(TEST_UID, cid);
+    const rows = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
+      .trim().split('\n').map(line => JSON.parse(line));
+    const reply = rows.find(row => row.from === 'commander');
+    expect(reply.failure_code).toBe('provider_http_400');
+    expect(reply.text).toMatch(/rejected this request \(HTTP 400\)\.<\/span> <span>Provider said: image input is not supported<\/span>$/);
+  });
+
   it.each(['codex', 'claude'])('recovers the complete active %s display without retaining another event log', async cli => {
     const paths = await import('../../../../src/main/paths');
     const bus = await import('../../../../src/main/features/group_chat/bus');
@@ -821,6 +846,9 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     recovered = await recovered;
     expect(recovered.turns).toHaveLength(1);
     const records = recovered.turns[0].records;
+    expect(recovered.turns[0].activity_after_message_id).toBe(
+      live.find(event => event.type === 'message' && event.msg.from === 'user').msg.id,
+    );
     expect(records.at(-1).text).toBe('Partial reply\n');
     expect(records.flatMap((r: any) => r.process || []).filter((p: any) => p.event?.data?.type === 'tool-event')).toHaveLength(350);
     if (cli === 'claude') expect(records[0].text).toBe('Inspect the code.\n');
@@ -2460,6 +2488,79 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     }
   });
 
+  it('finalizes only the visible terminal deliverable, leaving supporting files untouched', async () => {
+    const hooks = await import('../../../../src/main/features/produced_output_hooks');
+    const finalized: string[] = [];
+    const unregister = hooks.registerProducedOutputHooks({
+      finalizeFile: async (file) => { finalized.push(file); },
+    });
+    let sourcePath = '';
+    let previewPath = '';
+    let finalPath = '';
+    try {
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const cid = 'cid-produced-finalization';
+      sourcePath = path.join(tmpDir, 'workspace', 'report.md');
+      previewPath = path.join(tmpDir, 'workspace', 'preview-cover.png');
+      finalPath = path.join(tmpDir, 'workspace', 'report.pdf');
+      for (const [file, body] of [
+        [sourcePath, '# source'],
+        [previewPath, 'preview'],
+        [finalPath, 'pdf'],
+      ] as const) {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, body);
+      }
+
+      await bus.enqueue({
+        uid: TEST_UID,
+        cid,
+        fromActorId: 'user',
+        text: `PRODUCED_FILTER_TEST:${Buffer.from(JSON.stringify({
+          paths: [sourcePath, previewPath, finalPath],
+        })).toString('base64')}`,
+      });
+      await waitForQuiescent(TEST_UID, cid);
+
+      expect(finalized).toEqual([finalPath]);
+      expect(fs.readFileSync(sourcePath, 'utf8')).toBe('# source');
+      expect(fs.readFileSync(previewPath, 'utf8')).toBe('preview');
+
+      expect(fs.readFileSync(finalPath, 'utf8')).toBe('pdf');
+    } finally {
+      unregister();
+    }
+  });
+
+  it('keeps a generated audio file out of the composer while its producing turn is still running', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const attachments = await import('../../../../src/main/features/chat_attachments');
+    const layout = await import('../../../../src/main/util/project-layout');
+    const cid = 'cid-live-generated-audio';
+    const audio = path.join(layout.chatAttachmentDirForConversation(TEST_UID, cid), 'narration.mp3');
+    fs.mkdirSync(path.dirname(audio), { recursive: true });
+    fs.writeFileSync(audio, 'generated audio bytes');
+    let release!: () => void;
+    streamProbe.slowGate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user',
+        text: `PUBLISHED_OUTPUT_TEST:${Buffer.from(JSON.stringify({
+          paths: [audio], published: [], holdAfterWrite: true,
+        })).toString('base64')}`,
+      });
+      await vi.waitFor(() => expect(bus._cidStateForTest(TEST_UID, cid)?.producedPaths.has(audio)).toBe(true));
+      await vi.waitFor(() => expect(attachments.listPendingAttachments(TEST_UID, cid)).toEqual([]));
+      expect(attachments.listAttachments(TEST_UID, cid).map(item => item.name)).toEqual(['narration.mp3']);
+    } finally {
+      release();
+      await waitForQuiescent(TEST_UID, cid);
+      streamProbe.slowGate = null;
+    }
+    // Even an intermediate file omitted from the final deliverables remains
+    // an output, never an implicit attachment on the user's next message.
+    expect(attachments.listPendingAttachments(TEST_UID, cid)).toEqual([]);
+  });
+
   it('finalizes explicitly published exported videos on terminal delivery', async () => {
     const hooks = await import('../../../../src/main/features/produced_output_hooks');
     const finalized: string[] = [];
@@ -3128,7 +3229,10 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(rows[1].result_msg_id).toBe(rows[0].result_msg_id);
   });
 
-  it.each(['steered', 'queued_followup', 'unavailable'] as const)('Send now into a Commander-dispatched CLI preserves the task and result when ingress is %s', async (mode) => {
+  it.each([
+    ['dispatch_to', 'steered'], ['dispatch_to', 'queued_followup'], ['dispatch_to', 'unavailable'],
+    ['hand_off_to', 'steered'], ['hand_off_to', 'queued_followup'], ['hand_off_to', 'unavailable'],
+  ] as const)('Send now into a %s CLI preserves the task and result when ingress is %s', async (tool, mode) => {
     const paths = await import('../../../../src/main/paths');
     const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
     const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
@@ -3144,13 +3248,13 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     };
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const board = await import('../../../../src/main/features/group_chat/task_board');
-    const cid = `cid-dispatched-cli-steer-${mode}`;
+    const cid = `cid-${tool}-cli-steer-${mode}`;
     cidsToDrop.add(cid);
     const chats = await import('../../../../src/main/features/chats');
     await chats.createConversation(TEST_UID, { conversationId: cid });
     try {
       await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user',
-        text: `CLI_STEER_DISPATCH_TEST:${Buffer.from(JSON.stringify({ task: 'Implement the CLI feature.' })).toString('base64')}` });
+        text: `CLI_STEER_DISPATCH_TEST:${Buffer.from(JSON.stringify({ tool, task: 'Implement the CLI feature.' })).toString('base64')}` });
       await vi.waitFor(() => expect(cliRunMock.calls).toHaveLength(1));
       expect(bus.runtimeSnapshot(TEST_UID, cid).activeTurns).toEqual([
         expect.objectContaining({ actor: AGENT_ID, steerable: mode !== 'unavailable' }),
@@ -3158,6 +3262,7 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       const child = (await board.listTasks(TEST_UID, cid)).find(task => task.created_by === 'commander')!;
       await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Discuss the plan first.', forceTo: [AGENT_ID] });
       const queued = (await board.listTasks(TEST_UID, cid)).find(task => task.status === 'queued')!;
+      expect(cliRunMock.submittedSteers).toHaveLength(0);
       const promotion = await bus.sendConversationTaskNow(TEST_UID, cid, queued.task_id);
       if (mode === 'unavailable') {
         expect(promotion).toEqual({ ok: false, error: 'turn_not_steerable' });
@@ -3184,13 +3289,15 @@ describe('group_chat bus › enqueue routing + persistence', () => {
       expect(settledChild).toMatchObject({ status: 'done', instruction: 'Implement the CLI feature.' });
       expect(update.status).toBe('done');
       expect(streamProbe.dispatchResults).toHaveLength(1);
-      expect(streamProbe.dispatchResults[0]).toContain('CLI task result.');
+      expect(streamProbe.dispatchResults[0]).toContain(tool === 'hand_off_to' ? '"ok":true' : 'CLI task result.');
       expect(cliRunMock.calls).toHaveLength(mode === 'steered' ? 1 : 2);
       if (mode === 'steered') expect(update.result_msg_id).toBe(settledChild.result_msg_id);
       else expect(cliRunMock.calls[1].prompt).toContain('Discuss the plan first.');
       const messages = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
         .split('\n').filter(Boolean).map(line => JSON.parse(line));
       expect(messages.filter(message => message.from === 'user' && message.text === 'Discuss the plan first.')).toHaveLength(1);
+      expect(messages.filter(message => message.from === AGENT_ID && message.turn_id === child.turn_id
+        && message.text === 'CLI task result.')).toHaveLength(1);
       expect(loggerMocks.warn).not.toHaveBeenCalled();
     } finally {
       cliRunMock.activeIngress = null;
@@ -3785,6 +3892,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     const cliWireContext = `${cliRunMock.calls[0].systemPrompt || ''}\n${cliRunMock.calls[0].prompt || ''}`;
     expect(cliWireContext).toContain('COMMANDER_CLI_LEDGER_ROUTE_TEST');
     expect(cliWireContext).toContain('CLI_LEDGER_TASK_TEST');
+    expect(cliRunMock.calls[0].prompt).toContain('Return the result to Commander, who will continue the remaining work.');
+    expect(cliRunMock.calls[0].prompt).not.toContain('completion returns only the conversation floor');
     expect(cliRunMock.calls[0].prompt).not.toContain('<referenced-messages>');
     expect(cliWireContext.match(/COMMANDER_CLI_LEDGER_ROUTE_TEST/g)).toHaveLength(1);
     const resumeInput = streamProbe.messages.find((message) => (
@@ -3840,6 +3949,8 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 
     expect(cliRunMock.calls).toHaveLength(1);
     expect(cliRunMock.calls[0].prompt).toContain('## Return control to commander');
+    expect(cliRunMock.calls[0].prompt).toContain('Deliver the final result to the user; completion returns only the conversation floor to Commander.');
+    expect(cliRunMock.calls[0].prompt).not.toContain('who will continue the remaining work');
     expect(cliRunMock.calls[0].prompt).toContain('Use `<handback reason="completed_handoff" />` only to close this routed interaction.');
     expect(cliRunMock.calls[0].prompt).not.toContain('primary outcome exceeds');
     let floor = await state.readState(TEST_UID, cid);
@@ -4595,6 +4706,116 @@ describe('group_chat bus › enqueue routing + persistence', () => {
     expect(failure?.text).toContain('openclaw exited with code 17');
     expect(failure?.text).not.toContain('signed in');
     expect(failure?.text).not.toContain('/Users/alice');
+  });
+
+  describe('external CLI failure feedback', () => {
+    const useCli = async (cli: string) => {
+      const paths = await import('../../../../src/main/paths');
+      const agentFile = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+      const spec = JSON.parse(fs.readFileSync(agentFile, 'utf8'));
+      spec.runtime = { kind: 'cli', cli };
+      fs.writeFileSync(agentFile, JSON.stringify(spec));
+      const i18n = await import('../../../../src/main/i18n');
+      i18n.setCurrentLang('en');
+      return paths;
+    };
+    const exitedAtStart = {
+      runId: 'exited-at-start',
+      status: 'failed',
+      error: 'opencode exited with code 1',
+      stderrExcerpt: 'Error: no provider credentials. Run `opencode auth login` at /Users/test/project',
+      failureCategory: 'cli_failed_before_output',
+    };
+    const agentRows = async (cid: string) => {
+      const paths = await import('../../../../src/main/paths');
+      const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      return fs.readFileSync(mainFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+        .filter((row: any) => row.from === AGENT_ID);
+    };
+    const ask = async (cid: string, fromActorId = 'user') => {
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      // Commander delegates through an explicit recipient, as dispatch_to does.
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId, text: `@${AGENT_NAME} run the task`,
+        ...(fromActorId === 'commander' ? { forceTo: [AGENT_ID] } : {}) });
+      await waitForQuiescent(TEST_UID, cid);
+    };
+
+    it.each([
+      { language: 'en', error: 'opencode exited with code 1' },
+      { language: 'zh', error: 'account/read: workspace routing discovery timed out (code=-32603)' },
+    ])('shows only the primary CLI failure in $language and records the failure stage', async ({ language, error }) => {
+      await useCli('opencode');
+      const i18n = await import('../../../../src/main/i18n');
+      i18n.setCurrentLang(language as 'en' | 'zh');
+      // A legacy runner payload must not reintroduce stderr into the bubble.
+      cliRunMock.nextResult = { ...exitedAtStart, error };
+      const cid = 'cid-cli-stderr-shown';
+      await ask(cid);
+
+      const [failure] = await agentRows(cid);
+      expect(failure.failure_kind).toBe('runtime');
+      expect(failure.failure_code).toBe('cli_failed_before_output');
+      expect(failure.text).toContain(error);
+      expect(failure.text).toMatch(/^<span style="color:var\(--danger\)">[^<]+<\/span>$/);
+      expect(failure.text).not.toContain('no provider credentials');
+      expect(failure.text).not.toContain('data-private-diagnostic');
+      expect(failure.text).not.toContain('/Users/alice');
+      // One failure is not a pattern: no suggestion to switch yet.
+      expect(failure.text).not.toContain('Commander');
+    });
+
+    it('suggests Commander when the same agent fails again in this conversation', async () => {
+      await useCli('opencode');
+      const cid = 'cid-cli-repeated-failure';
+      cliRunMock.nextResult = exitedAtStart;
+      await ask(cid);
+      cliRunMock.nextResult = { ...exitedAtStart, runId: 'exited-again' };
+      await ask(cid);
+
+      const failures = (await agentRows(cid)).filter((row: any) => row.failure_kind);
+      expect(failures).toHaveLength(2);
+      expect(failures[0].text).not.toContain('@Commander');
+      expect(failures[1].text).toContain('@Commander');
+      expect(failures[1].failure_code).toBe('cli_failed_before_output');
+    });
+
+    it('does not count failures separated by a completed reply as consecutive', async () => {
+      await useCli('opencode');
+      const cid = 'cid-cli-failure-recovered';
+      cliRunMock.nextResult = exitedAtStart;
+      await ask(cid);
+      cliRunMock.nextResult = { runId: 'recovered', status: 'completed', output: 'Finished this one.' };
+      await ask(cid);
+      cliRunMock.nextResult = { ...exitedAtStart, runId: 'failed-after-recovery' };
+      await ask(cid);
+
+      const rows = await agentRows(cid);
+      expect(rows.filter((row: any) => row.failure_kind)).toHaveLength(2);
+      expect(rows.some((row: any) => String(row.text).includes('@Commander'))).toBe(false);
+    });
+
+    it('does not suggest Commander for work Commander delegated', async () => {
+      await useCli('opencode');
+      const cid = 'cid-cli-delegated-failure';
+      cliRunMock.nextResult = exitedAtStart;
+      await ask(cid, 'commander');
+      cliRunMock.nextResult = { ...exitedAtStart, runId: 'delegated-again' };
+      await ask(cid, 'commander');
+
+      const failures = (await agentRows(cid)).filter((row: any) => row.failure_kind);
+      expect(failures).toHaveLength(2);
+      expect(failures.some((row: any) => String(row.text).includes('@Commander'))).toBe(false);
+    });
+
+    it('keeps the generic code when the runner gives no stage or stderr', async () => {
+      await useCli('opencode');
+      cliRunMock.nextResult = { runId: 'no-stage', status: 'failed', error: 'opencode exited with code 1' };
+      const cid = 'cid-cli-no-stage';
+      await ask(cid);
+      const [failure] = await agentRows(cid);
+      expect(failure.failure_code).toBe('cli_failed');
+      expect(failure.text).not.toContain('CLI output');
+    });
   });
 
   it('states that no specific error information was provided when the CLI omits it', async () => {
@@ -5867,6 +6088,76 @@ describe('group_chat bus › enqueue routing + persistence', () => {
 });
 
 describe('group_chat bus › abort', () => {
+  it.each(['commander', 'agent', 'codex'])(
+    'retains the executing %s through terminal persistence so crash recovery keeps its identity', async runtime => {
+      const paths = await import('../../../../src/main/paths');
+      const storage = await import('../../../../src/main/storage');
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const chats = await import('../../../../src/main/features/chats');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const actorId = runtime === 'commander' ? 'commander' : AGENT_ID;
+      if (runtime === 'codex') {
+        const file = path.join(paths.agentDir(TEST_UID, AGENT_ID), 'agent.json');
+        const spec = JSON.parse(fs.readFileSync(file, 'utf8'));
+        spec.runtime = { kind: 'cli', cli: 'codex' };
+        fs.writeFileSync(file, JSON.stringify(spec));
+      }
+      const cid = `cid-persist-owner-${runtime}`;
+      cidsToDrop.add(cid);
+      const mainFile = path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`);
+      const originalAppend = storage.appendJsonlAtomic;
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      let entered = false;
+      const append = vi.spyOn(storage, 'appendJsonlAtomic').mockImplementation(async (...args) => {
+        const row = args[1] as any;
+        if (args[0] === mainFile && row.from === actorId && row.source_message_id) {
+          entered = true;
+          await gate;
+        }
+        return originalAppend(...args);
+      });
+      try {
+        await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', forceTo: [actorId],
+          text: 'NON_CLI_PHASED_TEXT_TEST' });
+        await vi.waitFor(() => expect(entered).toBe(true), { timeout: 5000 });
+        const durable = await state.readState(TEST_UID, cid);
+        expect(bus.runtimeSnapshot(TEST_UID, cid).processing).toBe(true);
+        const input = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map(line => JSON.parse(line)).find(row => row.from === 'user');
+        expect(durable.in_flight_turns?.[actorId]).toMatchObject({
+          source_message_id: input.id, turn_id: expect.any(String),
+        });
+
+        // Replay the actual pre-append disk snapshot under a separate cid:
+        // the recovery fixture supplies no actor that the real run lost.
+        const copy = await chats.createConversation(TEST_UID);
+        cidsToDrop.add(copy.conversation_id);
+        fs.copyFileSync(mainFile, path.join(paths.userChatsDir(TEST_UID), `${copy.conversation_id}.jsonl`));
+        fs.copyFileSync(paths.groupChatMembersFile(TEST_UID, cid), paths.groupChatMembersFile(TEST_UID, copy.conversation_id));
+        fs.writeFileSync(paths.groupChatStateFile(TEST_UID, copy.conversation_id), JSON.stringify({
+          ...durable, last_active_at: new Date(Date.now() - 60_000).toISOString(),
+        }));
+        const journalFile = paths.userRunningConversationsFile(TEST_UID);
+        const journal = JSON.parse(fs.readFileSync(journalFile, 'utf8'));
+        journal.items.push({ conversation_id: copy.conversation_id });
+        fs.writeFileSync(journalFile, JSON.stringify(journal));
+        expect((await chats.sweepStaleProcessing(TEST_UID)).swept).toBe(1);
+        const recovered = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${copy.conversation_id}.jsonl`), 'utf8')
+          .trim().split('\n').map(line => JSON.parse(line));
+        expect(recovered.at(-1)).toMatchObject({ from: actorId, system_kind: 'reply_interrupted', ...durable.in_flight_turns?.[actorId] });
+        expect(durable.in_flight).toEqual([actorId]);
+      } finally {
+        release();
+        await waitForQuiescent(TEST_UID, cid, 5000);
+        append.mockRestore();
+      }
+      expect((await state.readState(TEST_UID, cid)).in_flight).toEqual([]);
+      expect((await state.readState(TEST_UID, cid)).in_flight_turns).toBeUndefined();
+      const rows = fs.readFileSync(mainFile, 'utf8').trim().split('\n').map(line => JSON.parse(line));
+      expect(rows.filter(row => row.from === actorId && row.source_message_id)).toHaveLength(1);
+    },
+  );
+
   it('flips state.json to aborted + clears the queue', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const state = await import('../../../../src/main/features/group_chat/state');
@@ -6056,21 +6347,24 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
       const edited = 'Revised first line\nSecond line with <literal> markup';
       const reference = { source_cid: 'quoted-task', source_msg_id: 'quoted-message', from_actor: 'user',
         source_title: 'Reference', source_ts: '2026-09-11T00:00:00', text: 'Keep this reference context' };
-      const layout = await import('../../../../src/main/util/project-layout');
-      const attachmentDir = layout.chatAttachmentDirForConversation(TEST_UID, cid);
-      fs.mkdirSync(attachmentDir, { recursive: true });
-      fs.writeFileSync(path.join(attachmentDir, 'notes.txt'), 'Attached notes');
+      const attachments = await import('../../../../src/main/features/chat_attachments');
+      expect(await attachments.uploadAttachment(TEST_UID, cid, 'notes.txt', Buffer.from('Attached notes'))).toMatchObject({ ok: true });
+      expect(await attachments.uploadAttachment(TEST_UID, cid, 'draft.txt', Buffer.from('Independent unsent attachment'))).toMatchObject({ ok: true });
       try {
         await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'DEFERRED_SLOW_TURN_TEST active' });
         await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'obsolete queued instruction',
           model_text: 'OBSOLETE MODEL TEXT', attachments: ['notes.txt'], references: [reference] });
         const queued = (await tb.listTasks(TEST_UID, cid)).find((row) => row.status === 'queued')!;
+        expect.soft(attachments.listPendingAttachments(TEST_UID, cid).map(item => item.name)).toEqual(['draft.txt']);
+        expect(bus.beginConversationTaskEdit(TEST_UID, cid, queued.task_id))
+          .toMatchObject({ ok: true, message: { attachments: ['notes.txt'] } });
         const result = await bus.editConversationTask(TEST_UID, cid, queued.task_id, edited, queued.instruction);
         expect(result).toMatchObject({ ok: true, task: {
           task_id: queued.task_id, assignee: queued.assignee, instruction: edited,
           source_msg_id: queued.source_msg_id, attachments: ['notes.txt'], status: 'queued',
         } });
         expect(await userRows(cid)).toEqual(['DEFERRED_SLOW_TURN_TEST active']);
+        expect.soft(attachments.listPendingAttachments(TEST_UID, cid).map(item => item.name)).toEqual(['draft.txt']);
         expect(await bus.editConversationTask(TEST_UID, cid, queued.task_id, 'stale overwrite', queued.instruction))
           .toMatchObject({ ok: false, error: 'edit_conflict' });
         if (action === 'send-now') {
@@ -6085,6 +6379,9 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
       await waitForQuiescent(TEST_UID, cid, 5000);
       expect(await userRows(cid)).toEqual(action === 'cancel'
         ? ['DEFERRED_SLOW_TURN_TEST active'] : ['DEFERRED_SLOW_TURN_TEST active', edited]);
+      expect(attachments.listPendingAttachments(TEST_UID, cid).map(item => item.name))
+        .toEqual(action === 'cancel' ? ['draft.txt', 'notes.txt'] : ['draft.txt']);
+      expect(attachments.listAttachments(TEST_UID, cid).map(item => item.name)).toEqual(['draft.txt', 'notes.txt']);
       if (action === 'admission') {
         expect(streamProbe.messages.some((message) => message.includes(edited))).toBe(true);
         expect(streamProbe.messages.some((message) => message.includes('OBSOLETE MODEL TEXT'))).toBe(false);
@@ -6352,7 +6649,7 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
     expect(streamProbe.messages.join('\n')).not.toContain('message that must never send');
   });
 
-  it('board send-now persists the queued message at the fold and absorbs its row', async () => {
+  it('board send-now publishes the sent message before model acceptance and later settles its row', async () => {
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const taskBoard = await import('../../../../src/main/features/group_chat/task_board');
     const cid = 'cid-deferred-send-now';
@@ -6369,9 +6666,15 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
 
       const res = await bus.sendConversationTaskNow(TEST_UID, cid, queued!.task_id);
       expect(res).toMatchObject({ ok: true });
-      // Send-now IS the start of execution (D21): the message persists right
-      // here, while the live turn is still running. The board row survives as
-      // the durable record and settles through the absorbed/leftover path.
+      expect(res).toMatchObject({
+        message: { id: queued!.source_msg_id, from: 'user', text: 'fold me into the live turn' },
+        task: { task_id: queued!.task_id, status: 'queued', message_sent_at: expect.any(String) },
+      });
+      const sent = (await taskBoard.listTasks(TEST_UID, cid)).find(t => t.task_id === queued!.task_id)!;
+      expect(sent.message_sent_at).toBeTruthy();
+      expect(sent.absorbed_into_turn_id).toBeUndefined();
+      // Sending persists the bubble while the model is still held. It does
+      // not claim that the runtime consumed the update or started another turn.
       expect(await userRows(cid)).toEqual([
         'DEFERRED_SLOW_TURN_TEST live',
         'fold me into the live turn',
@@ -6391,6 +6694,37 @@ describe('deferred user-message bubble (queued-until-execution, 2026-08-27)', ()
     const settled = await taskBoard.listTasks(TEST_UID, cid);
     const promoted = settled.find((t) => t.instruction === 'fold me into the live turn');
     expect(['done', 'stopped', 'failed', 'cancelled']).toContain(promoted?.status);
+  });
+
+  it('keeps a send-now row unsent when message persistence fails', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const taskBoard = await import('../../../../src/main/features/group_chat/task_board');
+    const storage = await import('../../../../src/main/storage');
+    const cid = 'cid-send-now-persist-failure';
+    cidsToDrop.add(cid);
+    let release: () => void = () => {};
+    streamProbe.slowGate = new Promise<void>((resolve) => { release = resolve; });
+    let append: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'DEFERRED_SLOW_TURN_TEST live' });
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Unsent correction' });
+      const queued = (await taskBoard.listTasks(TEST_UID, cid)).find(t => t.status === 'queued')!;
+      append = vi.spyOn(storage, 'appendJsonlAtomic').mockRejectedValueOnce(new Error('injected history failure'));
+      expect(await bus.sendConversationTaskNow(TEST_UID, cid, queued.task_id))
+        .toMatchObject({ ok: false, error: 'persist_failed' });
+      const retained = (await taskBoard.listTasks(TEST_UID, cid)).find(t => t.task_id === queued.task_id)!;
+      expect(retained.status).toBe('queued');
+      expect(retained.message_sent_at).toBeUndefined();
+      expect(retained.absorbed_into_turn_id).toBeUndefined();
+      expect(await userRows(cid)).toEqual(['DEFERRED_SLOW_TURN_TEST live']);
+      expect(loggerMocks.warn).toHaveBeenCalledWith('task send-now persist failed', expect.any(Object));
+      await bus.cancelConversationTask(TEST_UID, cid, queued.task_id);
+    } finally {
+      append?.mockRestore();
+      release();
+      streamProbe.slowGate = null;
+    }
+    await waitForQuiescent(TEST_UID, cid, 5000);
   });
 
   it('creates no task when a planned send cannot persist its message', async () => {

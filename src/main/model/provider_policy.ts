@@ -26,7 +26,8 @@ export function isModelProviderAllowed(providerId: string, modelId?: string): bo
 }
 
 export function assertModelProviderAllowed(providerId: string, modelId?: string): void {
+  if (providerId === 'orkas-api') throw new Error('Orkas vendor services are unavailable in this build');
   if (!isModelProviderAllowed(providerId, modelId)) {
-    throw new Error(`${providerId} is disabled in this build`);
+    throw new Error('DeepSeek is disabled in this build');
   }
 }

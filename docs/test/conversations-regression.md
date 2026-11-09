@@ -233,6 +233,7 @@ An Agent that stops to ask the user takes a free floor (the composer chip) and k
 22. 打开约 100 KB 、正文很长且包含多个同步外链 CSS/JS 标签的 HTML：布局推断只应扫描
     `<style>` 内容，不得在无大括号的正文上发生二次回溯，预览应在 5 秒内结束 loading。HTML 仍保持
     无尺寸上限的流式加载、离线 CSP 和 iframe sandbox。
+23. 分别在 macOS 和 Windows 上传 GBK 编码的中文 CSV 与纯文本纪要（例如 Excel 另存的 CSV）：都应上传成功，不再提示编码错误；让 Commander 统计或总结后，回答中的中文和数字应与原文一致，不得出现乱码或编造内容。上传改了扩展名的二进制文件时也应上传成功，但模型应说明读不了，不得给出数字。预览里这类文件仍显示乱码，属已知限制；保存到资料库仍应拒绝。
 
 ## 文件产物操作
 
@@ -353,12 +354,40 @@ Orkas 不在 Commander、内置 in-process Agent 或 CLI Agent 的 prompt 中追
 3. 自动恢复验证成功后返回 `cascade_failed` 并清理内部快照；验证不完整时返回
    `cascade_recovery_incomplete` 并保留快照供重试。
 
+### Local history cleanup, repair and restoration
+
+- Cleanup operates on the confirmed preview only. After a successful run, show
+  the refreshed remaining count and clear selection. Tasks added afterwards
+  require a new selection; changing the age filter does not install a retention policy.
+- A repair paused during discovery must not overwrite a subsequent delete,
+  pin, create or explicit restore, or remove the restored metadata.
+- An explicitly deleted task must remain hidden if its old payload reappears
+  with a newer modification time. Missing or unreadable transcripts alone must
+  not be treated as permission to delete a task.
+- Repeat local repair after restarting. Deleted metadata must not reappear;
+  an explicit recycle-bin restoration must remain visible, including a task
+  whose archive contains metadata and drafts without a transcript.
+
+Automated owners: `test/main/features/chats.test.ts`,
+`test/main/features/recycle_bin.test.ts`, `test/renderer/task-cleanup.test.ts`
+and `test/e2e/task_cleanup_e2e_history.spec.ts`.
+
 ## 任务失败只来自明确执行错误（2026-08-20）
 
 1. 模型正文不再携带成功/失败结果标记，宿主不得从模型自述推导任务状态。
 2. 本地媒体链接指向不存在的文件时，协议层仍可在实际加载时记录 `not_found`，但不得给消息写入结构化失败字段，也不得把任务或会话改判为失败。
 3. `failed` 只用于 Runner、模型流、CLI、工具或宿主操作明确返回且未恢复的执行错误；取消和等待输入分别保持 `cancelled`、`waiting_input`。
 4. `Produced files: [...]` 页脚仍归宿主独占并从结构化 `produced` 生成；模型手写的仿冒页脚继续剥离，但不作为任务失败判据。
+
+## Read-only saved task references
+
+`chat_task_references.ts` resolves bounded, validated todo/automation references
+under the active account. Project fallback requires an explicit flag; missing
+or pending-delete tasks are omitted, and lookup never starts a task. The
+renderer serializes hydration, checks account/DOM freshness, escapes current
+titles and preserves literal IDs on failure. Owners are
+`chat_task_references.test.ts` and `chat_e2e_saved_tasks.spec.ts`; the latter
+checks saved-task navigation and hydrated chips in the native app.
 
 ## Tool Surface 会话兼容
 

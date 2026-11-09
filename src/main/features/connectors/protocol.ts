@@ -88,7 +88,7 @@ export function registerConnectorProtocol(): void {
   app.on('second-instance', (_event, argv) => {
     const rawUrl = _extractConnectorCallback(argv);
     if (rawUrl) void _dispatch(rawUrl);
-    else focusMainWindow();
+    else if (!argv.includes('--orkas-startup')) focusMainWindow();
   });
 
   const cold = _extractConnectorCallback(process.argv);

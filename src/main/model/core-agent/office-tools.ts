@@ -122,6 +122,11 @@ function officeIssueEntries(value: unknown): Array<Record<string, unknown>> {
 }
 
 function officeIssueSeverity(issue: Record<string, unknown>): OfficeIssueSeverity {
+  // Bundled OfficeCLI's IssueSeverity enum serializes as numbers:
+  // Error=0, Warning=1, Info=2. Preserve string/subtype compatibility below.
+  if (issue.severity === 0) return 'blocker';
+  if (issue.severity === 1) return 'warning';
+  if (issue.severity === 2) return 'info';
   const upstream = typeof issue.severity === 'string' ? issue.severity.trim().toLowerCase() : '';
   if (['blocker', 'error', 'fatal', 'critical'].includes(upstream)) return 'blocker';
   if (['warning', 'warn', 'advisory'].includes(upstream)) return 'warning';
@@ -856,22 +861,12 @@ function createXlsxTool(opts: OfficeToolsOpts): AgentTool {
     async execute(input, ctx) {
       const prep = prepareOutput(opts, ctx, input, '.xlsx');
       if ('error' in prep) return prep.error;
-      const hasCanonicalSheets = Array.isArray(input.sheets) && input.sheets.length > 0;
-      const hasLegacyFields = ['sheet', 'rows', 'columns', 'charts']
+      const hasRetiredFields = ['sheet', 'rows', 'columns', 'charts']
         .some((key) => Object.prototype.hasOwnProperty.call(input, key));
-      if (hasCanonicalSheets && hasLegacyFields) {
-        return errResult('E_BAD_INPUT', 'use `sheets` alone; do not mix it with legacy sheet/rows/columns/charts fields');
+      if (hasRetiredFields || !Array.isArray(input.sheets) || input.sheets.length === 0) {
+        return errResult('E_BAD_INPUT', 'provide sheets; flat sheet/rows/columns/charts fields are unsupported');
       }
-      // Direct execution of persisted historical calls remains supported even
-      // though the public schema now exposes only the canonical sheets form.
-      const sheets: XlsxSheetSpec[] = hasCanonicalSheets
-        ? (input.sheets as XlsxSheetSpec[])
-        : [{
-            name: typeof input.sheet === 'string' && input.sheet ? input.sheet : 'Sheet1',
-            rows: Array.isArray(input.rows) ? (input.rows as XlsxCell[][]) : [],
-            ...(Array.isArray(input.columns) ? { columns: input.columns as XlsxSheetSpec['columns'] } : {}),
-            ...(Array.isArray(input.charts) ? { charts: input.charts as XlsxSheetSpec['charts'] } : {}),
-          }];
+      const sheets = input.sheets as XlsxSheetSpec[];
       return runCreate(opts, ctx, {
         inputAbs: prep.abs,
         createFlags: ['--force'],

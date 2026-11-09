@@ -19,6 +19,15 @@ function stubHandler(): { handler: ProjectTasksToolHandler; calls: any[] } {
 }
 
 describe('todo_tasks tool', () => {
+  it.each([{}, { globalScope: true }, { readOnly: true }, { globalScope: true, readOnly: true }])('hides member-only operations outside a writable shared project: %j', (options) => {
+    const { handler } = stubHandler();
+    const schema = createProjectTasksTool(handler, options).inputSchema as any;
+    expect(schema.properties.action.enum).not.toContain('list_members');
+    expect(schema.properties).not.toHaveProperty('assignee_uid');
+    expect(schema.properties.action.enum).toContain('list');
+    expect(schema.properties.action.enum).toContain('get');
+  });
+
   it('deletes only an explicitly identified task in the writable scope', async () => {
     const { handler } = stubHandler();
     const deleted: string[] = [];
@@ -148,23 +157,37 @@ describe('todo_tasks tool', () => {
     expect(statusValues).toEqual(['todo', 'progress', 'review', 'done']);
   });
 
-  it('explains unconfirmed shared sync states in every project variant within the description budget', () => {
-    // Shared task views carry sync_state; without its meaning a model may retry a
-    // status change on a conflicted task or report an unsynced edit as shared.
+  it('distinguishes localized status prose from fixed tool values in every scope', () => {
     const { handler } = stubHandler();
-    const variants = {
-      bound: createProjectTasksTool(handler),
-      readOnly: createProjectTasksTool(handler, { readOnly: true }),
-      selector: createProjectTasksTool({ listProjects: async () => [], resolveProject: async () => ({ ok: false, error: 'project_not_found' }) } as any),
-    };
-    for (const [name, tool] of Object.entries(variants)) {
-      for (const term of ['sync_state', 'pending/retry', 'conflict', 'status_conflict']) {
-        expect(tool.description, name).toContain(term);
-      }
-      expect(estimateTextTokens(tool.description.replace(/\s+/g, ' ').trim()), name)
-        .toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
+    for (const options of [{}, { globalScope: true }, { readOnly: true }, { globalScope: true, readOnly: true }]) {
+      const status = (createProjectTasksTool(handler, options).inputSchema as any).properties.status;
+      expect(status.description).toContain('Describe statuses in the response language');
+      expect(status.description).toContain('keep enum values unchanged in tool arguments');
+      expect(status.enum).toEqual(['todo', 'progress', 'review', 'done']);
     }
   });
+
+  it('names the global to-do list on the selector parameter and only there', () => {
+    // Outside a project the open-work block is absent when there are no open
+    // to-dos, so the schema is the only place a Commander can learn that the
+    // account's global list is addressed as "__global__".
+    const selector = createProjectTasksTool({
+      listProjects: async () => [],
+      resolveProject: async () => ({ ok: false, error: 'project_not_found' }),
+    } as any);
+    const projectField = (selector.inputSchema as any).properties.project;
+    expect(projectField.description).toContain('"__global__"');
+    expect(projectField.description).toMatch(/global to-do list/);
+    expect(projectField.description).toContain('list_projects');
+    // A bound project session cannot retarget scope, so it advertises no
+    // selector; the fixed global executor keeps only the legacy enum.
+    const { handler } = stubHandler();
+    expect((createProjectTasksTool(handler).inputSchema as any).properties).not.toHaveProperty('project');
+    const fixedGlobal = (createProjectTasksTool(handler, { globalScope: true }).inputSchema as any).properties.project;
+    expect(fixedGlobal).toEqual({ type: 'string', enum: ['__global__'] });
+  });
+
+
 
   it('completes once with redundant done status but rejects a conflicting status', async () => {
     const { handler, calls } = stubHandler();
@@ -477,4 +500,19 @@ it('validates only effective task parameters, preserving the bound target', asyn
   expect(calls).toEqual([['get', 't_a']]);
   expect((await tool.execute({ action: 'complete', task_id: 't_a', project: 'foreign' }, ctx)).isError).toBe(true);
   expect(calls).toHaveLength(1);
+});
+
+ it('rejects retired title/detail before any scope lookup or mutation', async () => {
+  const { handler, calls } = stubHandler();
+  for (const options of [{}, { globalScope: true }, { readOnly: true }]) {
+    const tool = createProjectTasksTool(handler, options);
+    for (const input of [{ action: 'create', title: 'retired' },
+      { action: 'update', task_id: 't_a', detail: 'retired' },
+      { action: 'get', task_id: 't_a', title: 'unused' }]) {
+      const result = await tool.execute(input, ctx);
+      expect(result.isError).toBe(true);
+      expect(result.content).toContain('title/detail are unsupported; use content');
+    }
+  }
+  expect(calls).toEqual([]);
 });

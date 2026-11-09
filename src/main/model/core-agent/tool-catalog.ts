@@ -37,6 +37,7 @@ export type ToolGroupId =
   | 'management'
   | 'management.app'
   | 'management.projects'
+  | 'management.todos'
   | 'management.skills'
   | 'management.automation'
   | 'runtime';
@@ -111,11 +112,12 @@ export const TOOL_GROUPS: readonly ToolGroupEntry[] = [
   { id: 'connectors', title: 'Connectors', summary: 'Find, configure, and call third-party connectors.', activation: 'loadable', agentDependency: true },
   { id: 'context', title: 'Context', summary: 'Conversation, plan, memory, and project context managed by the host.', activation: 'host-managed', agentDependency: false },
   { id: 'orchestration', title: 'Orchestration', summary: 'Commander delegation, handoff, and anonymous worker controls.', activation: 'host-managed', agentDependency: false },
-  { id: 'management', title: 'Management', summary: 'App support, Skill, marketplace, and automation management controls.', activation: 'loadable', agentDependency: false },
+  { id: 'management', title: 'Management', summary: 'Project, to-do, automation, app support, Skill, and marketplace management controls.', activation: 'loadable', agentDependency: false },
   { id: 'management.app', title: 'App support', summary: 'Navigate supported Orkas screens and inspect sanitized app health.', parent: 'management', activation: 'loadable', agentDependency: false },
-  { id: 'management.projects', title: 'Project tasks', summary: 'Find an existing project and read or update its task backlog.', parent: 'management', activation: 'loadable', agentDependency: true },
+  { id: 'management.projects', title: 'Projects', summary: 'Create or rename a project; move this conversation into or out of one.', parent: 'management', activation: 'loadable', agentDependency: false },
+  { id: 'management.todos', title: 'To-dos', summary: "Read or update global to-dos outside a project, or the current project's backlog.", parent: 'management', activation: 'loadable', agentDependency: true },
   { id: 'management.skills', title: 'Skill management', summary: 'Search available shared Skills or import a user-requested Skill package.', parent: 'management', activation: 'loadable', agentDependency: false },
-  { id: 'management.automation', title: 'Automation management', summary: 'Manage scheduled automations.', parent: 'management', activation: 'loadable', agentDependency: true },
+  { id: 'management.automation', title: 'Automations', summary: 'Manage scheduled automations.', parent: 'management', activation: 'loadable', agentDependency: true },
   { id: 'runtime', title: 'Runtime', summary: 'Tool-surface, learned-skill, and oversized-result runtime controls.', activation: 'host-managed', agentDependency: false },
 ] as const;
 
@@ -169,7 +171,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'process_session', loadGroups: ['workspace.execute.command', 'workspace.execute.session'], permission: 'localExec', summary: 'Manage a persistent process session.' },
   { name: 'interactive_cli', loadGroups: ['workspace.execute.session'], permission: 'localExec', summary: 'Manage a live user-input CLI session.' },
   { name: 'create_artifact', loadGroups: ['workspace.artifact'], permission: 'localExec', summary: 'Build an interactive HTML/CSS/JS artifact.' },
-  { name: 'html_preview', loadGroups: ['workspace.artifact'], permission: 'localExec', summary: 'Audit local HTML at desktop or mobile targets.' },
+  { name: 'html_preview', loadGroups: ['workspace.artifact'], permission: 'localExec', summary: 'Audit local HTML or a current-conversation app at desktop or mobile targets.' },
 
   { name: 'create_pdf', loadGroups: ['office.pdf'], permission: 'localExec', summary: 'Create a PDF from Markdown or HTML.' },
   { name: 'edit_pdf', loadGroups: ['office.pdf'], permission: 'localExec', summary: 'Edit PDF pages, overlays, watermarks, and forms.' },
@@ -195,7 +197,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
 
   { name: 'list_connector_tools', loadGroups: ['connectors'], programmatic: { mode: 'allow' }, summary: 'List actions exposed by one connector.' },
   { name: 'call_connector_tool', loadGroups: ['connectors'], programmatic: { mode: 'conditional', policy: 'connector-read' }, summary: 'Call an action on an enabled connector.' },
-  { name: 'add_custom_connector', loadGroups: ['connectors'], agentAssignable: false, summary: 'Commander-only custom MCP installation request.' },
+  { name: 'add_custom_connector', loadGroups: ['connectors'], agentAssignable: false, summary: 'Submit complete user-provided non-secret MCP configuration for installation confirmation.' },
   { name: 'connector_setup', loadGroups: ['connectors'], agentAssignable: false, summary: 'Setup/reconnect any built-in.' },
 
   { name: 'chat_history', loadGroups: ['context'], programmatic: { mode: 'allow' }, summary: 'Search or read prior conversation messages.' },
@@ -203,10 +205,10 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'cross_session_memory', loadGroups: ['context'], summary: 'Read or update cross-session memory.' },
   { name: 'metacognition', loadGroups: ['context'], summary: 'Read or update agent competence and strategies.' },
   { name: 'project_instructions', loadGroups: ['context'], summary: 'Update project standing instructions.' },
-  { name: 'todo_tasks', loadGroups: ['management.projects'], programmatic: { mode: 'allow' }, summary: 'Manage a selected project backlog.' },
+  { name: 'todo_tasks', loadGroups: ['management.todos'], programmatic: { mode: 'allow' }, summary: "Manage the global to-do list outside a project; project to-dos require a conversation in that project." },
   // Commander-only: it relocates this conversation, which is an orchestration
   // decision, and `run_program` gets no access to that side effect.
-  { name: 'project_setup', loadGroups: ['management.projects'], agentAssignable: false, summary: "Create a project for this conversation's work, or undo that." },
+  { name: 'project_setup', loadGroups: ['management.projects'], agentAssignable: false, summary: "Create or rename a project; move this conversation into or out of one." },
 
   { name: 'dispatch_to', loadGroups: ['orchestration'], summary: 'Delegate visible work and continue the commander turn.' },
   { name: 'hand_off_to', loadGroups: ['orchestration'], summary: 'Transfer terminal ownership to another Agent.' },
@@ -217,7 +219,7 @@ export const TOOL_CATALOG: readonly ToolCatalogEntry[] = [
   { name: 'skill_manage', loadGroups: ['runtime'], summary: 'Manage an Agent-owned learned skill.' },
   { name: 'auto_tasks', loadGroups: ['management.automation'], programmatic: { mode: 'allow' }, summary: 'Manage scheduled automations.' },
   { name: 'open_app_view', loadGroups: ['management.app'], summary: 'Stage a click-to-open navigation card to an app surface.' },
-  { name: 'app_health', loadGroups: ['management.app'], programmatic: { mode: 'allow' }, summary: 'Read-only sanitized app diagnosis snapshot.' },
+  { name: 'app_health', loadGroups: ['management.app'], programmatic: { mode: 'allow' }, summary: 'Read-only Orkas diagnosis: model, connectors, knowledge base, and running conversation status.' },
 
   { name: 'tool_load', loadGroups: ['runtime'], summary: 'Activate one or more loadable tool groups.' },
   { name: 'tool_result', loadGroups: ['runtime'], programmatic: { mode: 'allow' }, summary: 'Search, aggregate, page, or materialize a persisted oversized tool result.' },
@@ -268,6 +270,14 @@ export function canonicalToolGroupId(value: unknown): ToolGroupId | undefined {
   return TOOL_GROUP_ALIASES[id];
 }
 
+/** Before the split, this Agent dependency granted only the backlog executor.
+ * Preserve that meaning on reads/explicit writes without rewriting stored specs
+ * or turning a legacy dependency into Commander project-mutation authority. */
+export function canonicalAgentToolGroupId(value: unknown): ToolGroupId | undefined {
+  const id = canonicalToolGroupId(value);
+  return id === 'management.projects' ? 'management.todos' : id;
+}
+
 export function isLoadableToolGroup(id: ToolGroupId): boolean {
   return GROUP_BY_ID.get(id)?.activation === 'loadable';
 }
@@ -306,16 +316,17 @@ export function canonicalizeToolGroups(values: readonly string[]): ToolGroupId[]
 
 /** Stable representation accepted by agent.json.tool_list and Agent Creator. */
 export function canonicalizeAgentToolGroups(values: readonly string[]): ToolGroupId[] {
-  return canonicalizeGroups(values, isAgentDependencyToolGroup);
+  return canonicalizeGroups(values, isAgentDependencyToolGroup, canonicalAgentToolGroupId);
 }
 
 function canonicalizeGroups(
   values: readonly string[],
   accepts: (id: ToolGroupId) => boolean,
+  resolve: (value: unknown) => ToolGroupId | undefined = canonicalToolGroupId,
 ): ToolGroupId[] {
   const ids = new Set<ToolGroupId>();
   for (const value of values) {
-    const id = canonicalToolGroupId(value);
+    const id = resolve(value);
     if (id && accepts(id)) ids.add(id);
   }
   for (const id of [...ids]) {
@@ -336,17 +347,21 @@ export function invalidToolGroupRefs(values: readonly unknown[]): string[] {
 }
 
 export function invalidAgentToolGroupRefs(values: readonly unknown[]): string[] {
-  return invalidGroupRefs(values, isAgentDependencyToolGroup);
+  return invalidGroupRefs(values, isAgentDependencyToolGroup, canonicalAgentToolGroupId);
 }
 
 function invalidGroupRefs(
   values: readonly unknown[],
   accepts: (id: ToolGroupId) => boolean,
+  resolve: (value: unknown) => ToolGroupId | undefined = canonicalToolGroupId,
 ): string[] {
   return values
     .filter((value): value is string => typeof value === 'string')
     .map((value) => value.trim())
-    .filter((value) => !canonicalToolGroupId(value) || !accepts(canonicalToolGroupId(value)!));
+    .filter((value) => {
+      const id = resolve(value);
+      return !id || !accepts(id);
+    });
 }
 
 export function toolNamesForGroups(groups: readonly string[]): string[] {
@@ -357,7 +372,8 @@ export function toolNamesForGroups(groups: readonly string[]): string[] {
 }
 
 export function toolNamesForAgentGroups(groups: readonly string[]): string[] {
-  return toolNamesForGroups(groups).filter((name) => CATALOG_BY_NAME.get(name)?.agentAssignable !== false);
+  return toolNamesForGroups(canonicalizeAgentToolGroups(groups))
+    .filter((name) => CATALOG_BY_NAME.get(name)?.agentAssignable !== false);
 }
 
 export function hostManagedToolNames(): string[] {

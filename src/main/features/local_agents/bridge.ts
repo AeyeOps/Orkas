@@ -44,7 +44,7 @@
  */
 
 import { librarySaveFieldError } from '../../util/library-save-input';
-import { addMemoryEntry, replaceMemoryEntry, removeMemoryEntry } from '../memory-writes';
+import { addMemoryEntry, replaceMemoryEntry, removeMemoryEntry, batchMemoryEntries } from '../memory-writes';
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as net from 'node:net';
@@ -153,11 +153,20 @@ export interface CommanderHandoffRequest {
   context?: string;
 }
 
+/** Host-only observation; never a model receipt, permission grant or public event. */
+export interface BridgeCallObservation {
+  method: string;
+  params: Readonly<Record<string, unknown>>;
+  ok: boolean;
+}
+
 export interface StartBridgeOpts {
   uid: string;
   cid: string;
   agentId: string;
   agentName: string;
+  /** Optional in-process audit sink. No raw results or failure messages. */
+  onCallObserved?: (observation: BridgeCallObservation) => void;
   conversationTitle?: string;
   cli: LocalCliType;
   permissionPolicy: LocalCliPermissionPolicy;
@@ -215,13 +224,14 @@ const BASE_CAPABILITIES: readonly BridgeCapability[] = [
   'commander.handoff',
 ];
 
-type AgentMemoryAction = 'add' | 'replace' | 'remove' | 'list';
+type AgentMemoryAction = 'add' | 'replace' | 'remove' | 'list' | 'batch';
 
 const AGENT_MEMORY_ACTION_FIELDS: Readonly<Record<AgentMemoryAction, ReadonlySet<string>>> = {
   add: new Set(['action', 'target', 'content']),
   replace: new Set(['action', 'target', 'content', 'old_text']),
   remove: new Set(['action', 'target', 'old_text']),
   list: new Set(['action', 'target']),
+  batch: new Set(['action', 'target', 'expected_revision', 'operations']),
 };
 
 async function _capabilitiesForRun(
@@ -345,7 +355,7 @@ function _buildMethods(
     if (bridgeResourceRealpath(row.dir) !== root) throw new Error('Skill directory changed; start a new run');
     return { row, root };
   };
-  const connectorResults = new Map<string, { file: string; connectorId: string; accountKey: string; toolName: string }>();
+  const connectorResults = new Map<string, { file: string; connectorId: string; accountKey: string; toolName: string; isError?: true }>();
 
   if (capabilities.has('browser')) {
     // CLI runtimes may issue parallel calls; never race a page mutation with
@@ -429,7 +439,8 @@ function _buildMethods(
         if (!current || connectorAccountKey(current.instance) !== stored.accountKey || isConnectorActionBlocked(stored.connectorId, stored.toolName)
             || !current.tools.some((tool) => tool.name === stored.toolName)) throw new Error('connector result is no longer available for this account');
         const page = readBridgeFilePage(stored.file, params);
-        return { text: page.content, ...page, output_ref: params.output_ref };
+        return { text: page.content, ...page, output_ref: params.output_ref,
+          ...(stored.isError ? { isError: true } : {}), };
       }
       const reject = (message: string, _errorCode: string, _errorType = 'validation'): never => {
         throw new Error(message);
@@ -513,20 +524,22 @@ function _buildMethods(
         }
 
         const raw = await connectors.callTool(opts.uid, connectorId, toolName, args, {
-          signal: call.signal,
+          signal: call.signal, conversationId: opts.cid,
         });
         if (!call.signal.aborted) observeTaskDraftResult(draftScope, toolName, args, raw);
+        const isError = !!raw && typeof raw === 'object' && (raw as { isError?: unknown }).isError === true;
         const text = connectors.stringifyMcpResult(raw);
         assertActive();
-        if (Buffer.byteLength(text, 'utf8') <= CONNECTOR_RESULT_CAP) return { text };
+        const failureStatus = isError ? { isError: true as const } : {};
+        if (Buffer.byteLength(text, 'utf8') <= CONNECTOR_RESULT_CAP) return { text, ...failureStatus };
         try {
           const file = persistToolResult(path.join(opts.configDir, '.orkas-bridge-results'), 'connector', text);
           const ref = crypto.randomBytes(16).toString('hex');
-          connectorResults.set(ref, { file, connectorId, accountKey: connectorAccountKey(target.instance), toolName });
+          connectorResults.set(ref, { file, connectorId, accountKey: connectorAccountKey(target.instance), toolName, ...failureStatus });
           const page = readBridgeFilePage(file, {});
-          return { text: page.content, ...page, output_ref: ref };
+          return { text: page.content, ...page, output_ref: ref, ...failureStatus };
         } catch {
-          return { text: '', execution_completed: true, result_unavailable: true,
+          return { text: '', execution_completed: true, result_unavailable: true, ...failureStatus,
             error: 'The connector returned, but its result could not be retained. Do not repeat a modifying action to recover its output.' };
         }
       } catch (error) {
@@ -569,7 +582,7 @@ function _buildMethods(
   });
 
   if (capabilities.has('tasks.read')) Object.assign(methods, {
-    todo_tasks: async (params) => {
+    todo_tasks: async (params, call) => {
       if (opts.projectId && !(await projectExists(opts.uid, opts.projectId))) throw new Error('project_not_found');
       const readOnly = !capabilities.has('tasks.write');
       const { createProjectTasksTool } = await import('../../../core-agent/src/tools/project-tasks-tool');
@@ -586,7 +599,7 @@ function _buildMethods(
       // Reads and writes share native validation, paging, scope and execution facts.
       const tool = createProjectTasksTool(createProjectTasksHandler(opts.uid, opts.projectId || '', opts.cid, names, {
         actorId: opts.agentId,
-      }, { workingDir: opts.workingDir }, opts.onTodoTaskSaved, opts.onTodoTaskDeleted), { readOnly, globalScope: !opts.projectId });
+      }, { workingDir: opts.workingDir }, opts.onTodoTaskSaved, opts.onTodoTaskDeleted, call.signal), { readOnly, globalScope: !opts.projectId });
       const result = await tool.execute(params, { state: {} });
       const receipt = JSON.parse(result.content);
       if (result.isError) throw new Error(receipt.error || 'task operation failed');
@@ -599,7 +612,7 @@ function _buildMethods(
       assertActive();
       const action = String(params.action || '') as AgentMemoryAction;
       const allowedFields = AGENT_MEMORY_ACTION_FIELDS[action];
-      if (!allowedFields) throw new Error('action must be one of: add, replace, remove, list');
+      if (!allowedFields) throw new Error('action must be one of: add, replace, remove, list, batch');
       const unrelated = Object.keys(params).filter((key) => !allowedFields.has(key));
       if (unrelated.length) {
         throw new Error(`fields not allowed for ${action}: ${unrelated.sort().join(', ')}`);
@@ -614,6 +627,7 @@ function _buildMethods(
         assertActive();
         const scope = { project: opts.projectId };
         switch (action) {
+          case 'batch': return batchMemoryEntries(opts.uid, scope, params.expected_revision, params.operations, { signal: call.signal });
           case 'add': return addMemoryEntry(opts.uid, scope, String(params.content || ''), { signal: call.signal });
           case 'replace': return replaceMemoryEntry(opts.uid, scope, String(params.old_text || ''), String(params.content || ''), { signal: call.signal });
           case 'remove': return removeMemoryEntry(opts.uid, scope, String(params.old_text || ''));
@@ -623,6 +637,8 @@ function _buildMethods(
       if (target !== 'agent') throw new Error('target must be "agent" for an external CLI Agent');
 
       switch (action) {
+        case 'batch':
+          return batchMemoryEntries(opts.uid, { agent: opts.agentId }, params.expected_revision, params.operations, { signal: call.signal });
         case 'add':
           return addMemoryEntry(opts.uid, { agent: opts.agentId }, String(params.content || ''), { signal: call.signal });
         case 'replace':
@@ -789,6 +805,12 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
     socket.on('error', () => { /* client died mid-run; harmless */ });
   });
 
+  const observeCall = (method: string, params: Record<string, unknown>, ok: boolean) => {
+    if (!opts.onCallObserved) return;
+    try { opts.onCallObserved({ method, params, ok }); }
+    catch { log.warn('Bridge call observer failed'); }
+  };
+
   async function handleLine(line: string, socket: net.Socket): Promise<void> {
     let req: { id?: unknown; token?: unknown; method?: unknown; params?: unknown };
     try { req = JSON.parse(line); }
@@ -829,8 +851,10 @@ export async function startBridge(opts: StartBridgeOpts): Promise<BridgeHandle> 
       try {
         const result = await handler(params, { signal: controller.signal });
         payload = JSON.stringify({ id, ok: true, result });
+        observeCall(method, params, true);
       } catch (err) {
         payload = JSON.stringify({ id, ok: false, error: (err as Error).message || String(err) });
+        observeCall(method, params, false);
       } finally {
         if (id !== null && calls.get(id) === controller) calls.delete(id);
       }

@@ -1,4 +1,4 @@
-import { taskForPath, type TaskOwnership } from './conversation_deletions';
+import { taskForPath, conversationFileInventory, invalidateTaskDeletions, type TaskOwnership } from './conversation_deletions';
 /**
  * Conversations (per-user) — CRUD + message reads.
  *
@@ -25,7 +25,7 @@ import { turnIndexRequest } from './conversation-history-client';
 
 import {
   userChatsDir, userLocalConfigDir, projectChatsDir, projectChatIndexFile, userProjectsDir,
-  WS_ROOT,
+  WS_ROOT, userCloudRoot, projectMetaFile,
   localCliDirectoryFile,
 } from '../paths';
 import {
@@ -50,10 +50,11 @@ import {
 import { evictSession, deleteSessionFileForUser } from '../model/core-agent/session-store';
 import {
   nowIso, genConversationId, genId12, safeId,
-  readJson, writeJson, invalidateLineCount, readJsonl, readJsonlPage, readJsonlWindow, appendJsonlAtomic,
+  readJson, writeJson, invalidateLineCount, readJsonl, readJsonlPage, readJsonlPageWithOffsets, readJsonlWindow, appendJsonlAtomic,
 } from '../storage';
 import { removeCodingDirectory } from './local_agents/project-directory';
 import { createLogger } from '../logger';
+import { resolveCloudRelPath } from '../util/cloud-path';
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 import { t } from '../i18n';
 import {
@@ -96,10 +97,11 @@ import {
   readMembers,
   readRunningConversationRegistry,
   readState,
-  setStatus,
+  parseInFlightTurns,
+  recoverOrphanRunningState,
   untrackRunningConversation,
 } from './group_chat/state';
-import type { ActorKind } from './group_chat/state';
+import type { ActorKind, StateFile } from './group_chat/state';
 import type { GroupMessage } from './group_chat/visibility';
 
 function conversationIndexName(): string {
@@ -190,6 +192,7 @@ export interface Conversation {
    *  long enough to propagate across offline devices; user-facing readers
    *  filter them out. */
   deleted_at?: string;
+  restored_at?: string;
   /** Record-level conflict clock for aggregate `_index.json` merges. */
   _sync_rev?: number;
   _sync_device_id?: string;
@@ -478,6 +481,7 @@ function _normaliseConversation(raw: any, fallbackCid = ''): Conversation | null
   if (typeof raw.pinned_at === 'string' && raw.pinned_at) out.pinned_at = raw.pinned_at;
   if (typeof raw.pin_state_updated_at === 'string' && raw.pin_state_updated_at) out.pin_state_updated_at = raw.pin_state_updated_at;
   if (raw.title_manually_set === true) out.title_manually_set = true;
+  if (typeof raw.restored_at === 'string' && raw.restored_at) out.restored_at = raw.restored_at;
   if (typeof raw.deleted_at === 'string' && raw.deleted_at) out.deleted_at = raw.deleted_at;
   if (Array.isArray(raw.agent_ids)) out.agent_ids = _normaliseAgentIds(raw.agent_ids);
   if (typeof raw.commander_in_chat === 'boolean') out.commander_in_chat = raw.commander_in_chat;
@@ -724,6 +728,7 @@ export async function retainedConversationIdsForEditCleanup(uid: string): Promis
 }
 
 export interface ConversationDisplayRow {
+  deleted: boolean;
   conversation_id: string;
   title: string;
   project_id: string;
@@ -735,13 +740,22 @@ export async function listCleanupConversationRows(userId: string): Promise<Conve
   return items.filter(row => !isDeletedConversation(row));
 }
 
+/** Deletion discovers durable metadata, including legacy and already deleted
+ * children, without history/runtime enrichment or silently losing recoverable rows. */
+export async function listConversationDeletionRows(userId: string, projectId: string): Promise<Conversation[]> {
+  return (await _readRawConversations(userId)).filter(row => row.project_id === projectId);
+}
+
 /** Compact search/display catalog. Reuses the central parsed index snapshot
  * and deliberately excludes runtime, participants, history, and metadata. */
-export async function listConversationDisplayRows(userId: string): Promise<ConversationDisplayRow[]> {
+export async function listConversationDisplayRows(
+  userId: string, options: { includeDeleted?: boolean } = {},
+): Promise<ConversationDisplayRow[]> {
   const { items } = _mergeNormalizedConversationRows(await _readIndexConversations(userId));
   return items
-    .filter((row) => !isDeletedConversation(row))
+    .filter((row) => options.includeDeleted || !isDeletedConversation(row))
     .map((row) => ({
+      deleted: isDeletedConversation(row),
       conversation_id: row.conversation_id,
       title: row.title || '',
       project_id: typeof row.project_id === 'string' ? row.project_id : '',
@@ -953,19 +967,11 @@ async function _saveConversationMetas(
   });
 }
 
-async function _removeConversationMeta(userId: string, cid: string): Promise<void> {
+async function _removeConversationMeta(cid: string, roots: ReadonlyArray<{ dir: string }>): Promise<void> {
   if (!safeId(cid)) return;
-  for (const root of conversationRoots(userId)) {
+  for (const root of roots) {
     try { await fsp.unlink(path.join(root.dir, cid, conversationMetaName())); } catch { /* ignore */ }
   }
-}
-
-function _notifyChatIndexDirty(projectId?: string | null): void {
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('chats', `cloud/chats/${conversationIndexName()}`);
-  } catch { /* features/sync stripped */ }
 }
 
 function _messageText(raw: any): string {
@@ -1068,60 +1074,107 @@ async function _withConversationWrite<T>(userId: string, fn: () => Promise<T>): 
   }
 }
 
+/** Tombstones cleaned per lifecycle-lock hold. */
+const TOMBSTONE_CLEANUP_BATCH = 32;
+
+/**
+ * Remove the files a published repair left behind, in short lifecycle-lock holds
+ * so that a new task never queues behind the whole list. Each hold rechecks the
+ * index, because a restore between holds must keep the metadata it just wrote.
+ *
+ * `pruned` rows just left the index: nothing would clean them later and discovery
+ * would revive whatever stays on disk. They go first and ignore cancellation, while
+ * the others wait for the next repair. Returns false when cancelled.
+ */
+async function _removeTombstoneFiles(
+  userId: string,
+  tombstones: readonly Conversation[],
+  pruned: ReadonlySet<string>,
+  signal?: AbortSignal,
+): Promise<boolean> {
+  if (!tombstones.length) return true;
+  const isPruned = (c: Conversation) => pruned.has(c.conversation_id);
+  const ordered = [...tombstones.filter(isPruned), ...tombstones.filter(c => !isPruned(c))];
+  const roots = conversationRoots(userId);
+  let checkedGeneration = -1;
+  let live = new Set<string>();
+  for (let start = 0; start < ordered.length; start += TOMBSTONE_CLEANUP_BATCH) {
+    const batch = ordered.slice(start, start + TOMBSTONE_CLEANUP_BATCH);
+    if (signal?.aborted && !isPruned(batch[0])) return false;
+    await _withConversationWrite(userId, async () => {
+      const generation = _conversationListGeneration.get(userId) || 0;
+      if (generation !== checkedGeneration) {
+        checkedGeneration = generation;
+        // The index cache is per module instance; the generation spans them.
+        _invalidateConversationIndexCache(userId);
+        live = new Set((await _readIndexConversations(userId))
+          .filter(row => !isDeletedConversation(row)).map(row => row.conversation_id));
+      }
+      for (const c of batch) {
+        if (live.has(c.conversation_id)) continue;
+        await _removeConversationMeta(c.conversation_id, roots);
+        if (isExpiredIsoTombstone(c.deleted_at)) {
+          const file = conversationMessageReadFile(userId, c.conversation_id, c.project_id ?? null);
+          try { await fsp.unlink(file); } catch { /* missing is fine */ }
+          invalidateLineCount(file);
+        }
+      }
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
+  return true;
+}
+
 async function _repairConversationIndexFromDiskUnlocked(
   userId: string,
   items: Conversation[],
-  discoveredMetaRows = 0,
+  discoveredMetaRows: number,
+  generation: number,
   signal?: AbortSignal,
 ): Promise<ConversationRepairRun> {
   if (signal?.aborted) return { items, cancelled: true };
   const existing = new Set(items.map((c) => c.conversation_id).filter(Boolean));
   const recovered: Conversation[] = [];
-  let resurrected = 0;
-  for (let index = 0; index < items.length; index++) {
-    if (index > 0 && index % 100 === 0) {
-      await new Promise<void>((resolve) => setImmediate(resolve));
-    }
-    const c = items[index];
-    if (!isDeletedConversation(c) || !safeId(c.conversation_id)) continue;
-    const file = conversationMessageReadFile(userId, c.conversation_id, c.project_id ?? null);
-    let st: fs.Stats | null = null;
-    try { st = await fsp.stat(file); } catch {
-      await _removeConversationMeta(userId, c.conversation_id);
-      continue;
-    }
-    if (!st.isFile()) {
-      await _removeConversationMeta(userId, c.conversation_id);
-      continue;
-    }
-    // A sync download has a fresh filesystem mtime too. Only an explicit
-    // restore/recreation may clear the record tombstone.
-    await _removeConversationMeta(userId, c.conversation_id);
-    if (isExpiredIsoTombstone(c.deleted_at)) {
-      try { await fsp.unlink(file); } catch { /* ignore */ }
-      invalidateLineCount(file);
-    }
-  }
+  const tombstones = items.filter(c => isDeletedConversation(c) && safeId(c.conversation_id));
   const compacted = pruneExpiredDeletedRecords(items) as Conversation[];
   const expiredTombstoneCount = items.length - compacted.length;
+  const keptCids = new Set(compacted.map(c => c.conversation_id));
+  const prunedCids = new Set(tombstones.map(c => c.conversation_id).filter(cid => !keptCids.has(cid)));
   items = compacted;
 
   const finish = async (cancelled: boolean, includeRecovered: boolean): Promise<ConversationRepairRun> => {
     const acceptedRecovered = includeRecovered ? recovered : [];
-    if (!acceptedRecovered.length && !resurrected && !expiredTombstoneCount && !discoveredMetaRows) {
-      return { items, cancelled };
-    }
-    const repaired = [...items, ...acceptedRecovered];
-    // Once a repair commit begins it runs to completion. Stopping between
-    // physical root writes could leave project/global indexes inconsistent.
-    await saveConversations(userId, repaired);
-    _notifyChatIndexDirty();
-    try {
-      createLogger('chats').info(
-        `repaired conversation index user=${userId} recovered=${acceptedRecovered.length} recovered_meta=${discoveredMetaRows} resurrected=${resurrected} pruned_tombstones=${expiredTombstoneCount} cancelled=${cancelled}`,
-      );
-    } catch { /* early circular init */ }
-    return { items: repaired, cancelled };
+    const snapshot = [...items, ...acceptedRecovered];
+    let published = false;
+    // Do not hold the lifecycle lock during discovery. Validate the snapshot
+    // inside that lock before any index, metadata, or transcript mutation.
+    const run = await _withConversationWrite<ConversationRepairRun>(userId, async () => {
+      if ((_conversationListGeneration.get(userId) || 0) !== generation) {
+        _invalidateConversationIndexCache(userId);
+        return { items: await _readIndexConversations(userId), cancelled: true };
+      }
+      const repaired = snapshot;
+      const changed = acceptedRecovered.length || expiredTombstoneCount || discoveredMetaRows;
+      try {
+        // Persist deletion intent before removing any remaining metadata.
+        if (changed) await _saveConversationsUnlocked(userId, repaired);
+        published = true;
+        if (changed) {
+          try {
+            createLogger('chats').info(
+              `repaired conversation index recovered=${acceptedRecovered.length} recovered_meta=${discoveredMetaRows} pruned_tombstones=${expiredTombstoneCount} cancelled=${cancelled}`,
+            );
+          } catch { /* early circular init */ }
+        }
+        return { items: repaired, cancelled };
+      } finally {
+        if (changed) _invalidateConversationListCache(userId);
+      }
+    });
+    // A rejected snapshot lost to a newer write and removes nothing.
+    if (!published) return run;
+    const cleaned = await _removeTombstoneFiles(userId, tombstones, prunedCids, signal);
+    return cleaned ? run : { ...run, cancelled: true };
   };
 
   if (signal?.aborted) return finish(true, false);
@@ -1175,6 +1228,7 @@ async function _repairConversationIndexFromDisk(
   const tails = _repairIndexTails();
   const prev = tails.get(userId) || Promise.resolve({ items: [], cancelled: false });
   const next = prev.catch(() => ({ items: [], cancelled: false })).then(async () => {
+    const generation = _conversationListGeneration.get(userId) || 0;
     const indexed = await _readIndexConversations(userId);
     if (signal?.aborted) return { items: indexed, cancelled: true };
     const indexedCids = new Set(indexed.map((row) => row.conversation_id));
@@ -1184,7 +1238,7 @@ async function _repairConversationIndexFromDisk(
       (count, row) => count + (indexedCids.has(row.conversation_id) ? 0 : 1),
       0,
     );
-    return _repairConversationIndexFromDiskUnlocked(userId, latest, discoveredMetaRows, signal);
+    return _repairConversationIndexFromDiskUnlocked(userId, latest, discoveredMetaRows, generation, signal);
   });
   tails.set(userId, next);
   try {
@@ -1227,7 +1281,12 @@ function _invalidateConversationIndexCache(userId: string): void {
 const CONVERSATION_LIST_CACHE_TTL_MS = 2_000;
 const _conversationListCache = new Map<string, { expiresAt: number; items: Conversation[] }>();
 const _conversationListInFlight = new Map<string, Promise<Conversation[]>>();
-const _conversationListGeneration = new Map<string, number>();
+// Match the shared write queue across CJS/ESM instances. A module-local
+// generation would miss lifecycle mutations made through the other loader.
+const _conversationGenerationRegistry = globalThis as typeof globalThis & {
+  __orkasConversationListGeneration?: Map<string, number>;
+};
+const _conversationListGeneration = _conversationGenerationRegistry.__orkasConversationListGeneration ||= new Map<string, number>();
 
 function _cloneConversationList(items: Conversation[]): Conversation[] {
   return items.map((c) => ({
@@ -1238,6 +1297,7 @@ function _cloneConversationList(items: Conversation[]): Conversation[] {
 }
 
 function _invalidateConversationListCache(userId: string): void {
+  invalidateTaskDeletions(userId);
   _invalidateConversationIndexCache(userId);
   _conversationListCache.delete(userId);
   _conversationListInFlight.delete(userId);
@@ -1401,8 +1461,8 @@ async function _listConversationsUncached(
       const deviceId = _recordDeviceId(userId);
       for (const c of summariesToBackfill) bumpRecordSyncVersion(c, deviceId);
       const cleaned = pruneExpiredDeletedRecords(items.map(_cleanConversation)) as Conversation[];
-      const writtenRoots = await _writeConversationIndexes(userId, cleaned);
-      for (const root of writtenRoots) _notifyChatIndexDirty(root || undefined);
+      await _writeConversationIndexes(userId, cleaned);
+
       log.info(`backfilled participant summaries user=${userId} conversations=${summariesToBackfill.length}`);
     });
   }
@@ -1463,9 +1523,8 @@ export interface ConversationPage extends ConversationPageInfo {
 }
 
 export const CONVERSATION_LIST_PAGE_SIZE = 10;
-// The renderer includes today and yesterday, so the previous local midnight
-// can be 49 hours behind across a DST fallback. Keep one extra hour of
-// tolerance while bounding the startup slice to the recent calendar window.
+// Retain compatibility with older renderers' two-calendar-day windows (up to
+// 49h across a DST fallback). Current renderers request a rolling 24h window.
 const STARTUP_ACTIVE_SINCE_MAX_LOOKBACK_MS = 50 * 60 * 60 * 1000;
 
 function _conversationActivityMs(c: Conversation): number {
@@ -1519,8 +1578,8 @@ async function _enrichConversationPage(
  * per-conversation state/member/history enrichment is limited to rows that can
  * actually appear on first paint. Project and unprojected task lists each use
  * one chronological 10-row page; time buckets are only a renderer grouping.
- * Rows active at or after `activeSinceMs` (the renderer's previous local day start) are
- * always included, whatever their project, so the sidebar's recent-task aggregate can
+ * Pinned rows and rows active at or after `activeSinceMs` (the recent-task cutoff)
+ * are always included, whatever their project, so the sidebar's recent-task aggregate can
  * show tasks under collapsed projects; page totals and cursors are unchanged. */
 export async function listStartupConversations(
   userId: string,
@@ -1577,6 +1636,7 @@ export async function listStartupConversations(
     if (active?.project_id) selectedProjectCids.add(active.conversation_id);
     else if (active) selectedUnprojectedCids.add(active.conversation_id);
     return all.filter((c) => {
+      if (c.pinned_at) return true;
       if (activeSinceMs !== null && _conversationActivityMs(c) >= activeSinceMs) return true;
       if (c.project_id) return selectedProjectCids.has(c.conversation_id);
       return selectedUnprojectedCids.has(c.conversation_id);
@@ -1736,6 +1796,10 @@ class ConversationIndexStore {
     if (projectIdHint === null || (typeof projectIdHint === 'string' && safeId(projectIdHint))) {
       const hinted = await this.targetInRoot(_conversationRootKey(projectIdHint), cid);
       if (hinted) return hinted;
+      if (projectIdHint) {
+        const legacy = await this.targetInRoot('', cid);
+        if (legacy?.conversation.project_id === projectIdHint) return legacy;
+      }
       if (!fallbackAcrossRoots) return null;
     }
 
@@ -1752,12 +1816,21 @@ class ConversationIndexStore {
     const winner = _mergeNormalizedConversationRows(candidates).items[0];
     if (!winner) return null;
     const winnerRoot = _conversationRootKey(winner.project_id);
-    return this.targetInRoot(winnerRoot, cid);
+    const canonical = await this.targetInRoot(winnerRoot, cid);
+    if (canonical) return canonical;
+    // Pre-v4 project rows can still be physically in the global index. Their
+    // declared membership, not an assumed index location, owns the mutation.
+    const legacy = winnerRoot ? await this.targetInRoot('', cid) : null;
+    return legacy?.conversation.project_id === winner.project_id ? legacy : null;
   }
 
   async persistTarget(target: ConversationIndexTarget, next: Conversation): Promise<void> {
     const oldRoot = target.rootKey;
-    const newRoot = _conversationRootKey(next.project_id);
+    // Project deletion retains its child tombstones in the existing global
+    // catalog. Acknowledging them must not recreate a removed project tree.
+    const newRoot = isDeletedConversation(next) && !oldRoot
+      && next.project_id && !fs.existsSync(projectMetaFile(this.userId, next.project_id))
+      ? '' : _conversationRootKey(next.project_id);
     const changedRoots = new Set<string>([oldRoot, newRoot]);
     const oldRows = await this.readRoot(oldRoot);
     // A project move spans two atomic files. Keep their rows until both writes
@@ -1769,6 +1842,11 @@ class ConversationIndexStore {
     if (oldRoot === newRoot) {
       if (oldIndex >= 0) oldRows[oldIndex] = next;
       else oldRows.unshift(next);
+      if (newRoot && isDeletedConversation(next)) {
+        const legacy = await this.readRoot('');
+        const at = legacy.findIndex(row => row.conversation_id === next.conversation_id && row.project_id === next.project_id);
+        if (at >= 0) { legacy.splice(at, 1); changedRoots.add(''); }
+      }
     } else {
       for (let i = oldRows.length - 1; i >= 0; i -= 1) {
         if (oldRows[i].conversation_id === next.conversation_id) oldRows.splice(i, 1);
@@ -1817,12 +1895,24 @@ class ConversationIndexStore {
     );
   }
 
+  async retainProjectDeletes(projectId: string): Promise<void> {
+    const rows = await this.readRoot(projectId);
+    const global = await this.readRoot('');
+    for (const row of rows) {
+      if (!isDeletedConversation(row)) throw new Error('project deletion incomplete');
+      const at = global.findIndex(item => item.conversation_id === row.conversation_id);
+      if (at >= 0 && global[at].project_id !== projectId) throw new Error('conversation ownership conflict');
+      if (at >= 0) global[at] = row;
+      else global.push(row);
+    }
+    if (rows.length) await this.commitRoots(new Set(['']));
+  }
+
   private async commitRoots(rootKeys: ReadonlySet<string>): Promise<void> {
     const results = await Promise.allSettled(Array.from(rootKeys, async (rootKey) => {
       const rows = await this.readRoot(rootKey);
       const cleaned = pruneExpiredDeletedRecords(rows.map(_cleanConversation)) as Conversation[];
       await writeJson(conversationIndexFile(this.userId, rootKey || null), cleaned);
-      _notifyChatIndexDirty(rootKey || undefined);
     }));
     // A rejected sibling must not keep writing after rollback has begun.
     const failed = results.find((result) => result.status === 'rejected');
@@ -1879,6 +1969,14 @@ async function _writeConversationIndexes(
   return roots;
 }
 
+async function _saveConversationsUnlocked(userId: string, items: Conversation[]): Promise<void> {
+  const rawCleaned = items.map(_cleanConversation);
+  const cleaned = pruneExpiredDeletedRecords(rawCleaned) as Conversation[];
+  await _writeConversationIndexes(userId, cleaned);
+  await _saveConversationMetas(userId, rawCleaned);
+
+}
+
 async function _saveConversations(
   userId: string,
   items: Conversation[],
@@ -1886,11 +1984,7 @@ async function _saveConversations(
   _invalidateConversationListCache(userId);
   try {
     await _withConversationWrite(userId, async () => {
-      const rawCleaned = items.map(_cleanConversation);
-      const cleaned = pruneExpiredDeletedRecords(rawCleaned) as Conversation[];
-      const writtenRoots = await _writeConversationIndexes(userId, cleaned);
-      await _saveConversationMetas(userId, rawCleaned);
-      for (const root of writtenRoots) _notifyChatIndexDirty(root || undefined);
+      await _saveConversationsUnlocked(userId, items);
     });
   } finally {
     // A list can start while the index/meta writes above are in flight. Bump
@@ -2355,7 +2449,7 @@ function purgeSession(userId: string, sessionId: string): void {
   deleteSessionFileForUser(userId, sessionId);
 }
 
-async function _purgeDeletedConversationFiles(userId: string, cid: string, ownership: TaskOwnership, removed?: Conversation): Promise<void> {
+async function _purgeDeletedConversationFiles(userId: string, cid: string, ownership: TaskOwnership, physicalRoots: string[], removed?: Conversation): Promise<void> {
   // A completed turn may still be materializing remote image/video output in
   // the background. Abort it before removing the message file; attachment
   // purge also holds the writer lock so a response already past abort cannot
@@ -2437,6 +2531,15 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, owner
     }
   } catch (err) { log.warn(`purge cli sessions user=${userId} cid=${cid}: ${(err as Error).message}`); }
 
+  // Feature purgers clear caches/locks but older implementations were best
+  // effort and resolved only the current write location. Verify the physical
+  // inventory strictly before claiming durable deletion, including old copies.
+  try {
+    for (const rel of physicalRoots) await fsp.rm(resolveCloudRelPath(userCloudRoot(userId), rel), { recursive: true, force: true });
+  } catch (error) {
+    log.warn('conversation physical deletion incomplete', { ...logErrorSummary(error) });
+    throw new Error('delete_failed');
+  }
   removeCodingDirectory(userId, cid);
   log.info(`deleted user=${userId} cid=${cid}`);
 }
@@ -2449,6 +2552,7 @@ export async function deleteConversation(
 ): Promise<boolean> {
   let removed: Conversation | null = null;
   let ownership: TaskOwnership = new Map();
+  let physicalRoots: string[] = [];
   const found = await _withConversationIndexStore(userId, async (store) => {
     const target = await store.findTarget(cid, projectIdHint);
     if (!target) return false;
@@ -2458,8 +2562,10 @@ export async function deleteConversation(
     // index twice per task just to disambiguate member-session prefixes.
     ownership = new Map((await store.readRoot(target.rootKey)).map(row => [
       `${target.rootKey}/${row.conversation_id}`,
-      { cid: row.conversation_id, projectId: target.rootKey || null },
+      { cid: row.conversation_id, projectId: target.rootKey || null, deletedAt: row.deleted_at || '' },
     ]));
+    const inventory = await conversationFileInventory(userId, cid, target.conversation.project_id || null, ownership);
+    physicalRoots = inventory.roots;
     if (!isDeletedConversation(target.conversation)) {
       const deletedAt = nowIso();
       const tombstone = _stampConversationSync(userId, {
@@ -2478,7 +2584,7 @@ export async function deleteConversation(
     return true;
   });
   if (!found || !removed) return false;
-  await _purgeDeletedConversationFiles(userId, cid, ownership, removed);
+  await _purgeDeletedConversationFiles(userId, cid, ownership, physicalRoots, removed);
   await (await import('./saved_apps')).cleanupEditSnapshots(userId, false, cid);
   return true;
 }
@@ -2759,6 +2865,21 @@ interface ConversationStateCandidate {
   journalTracked?: boolean;
 }
 
+// The active-user startup pass and deferred maintenance may overlap. Serialize
+// the same conversation's reconciliation, including partial-write recovery.
+type StaleRecovery = Promise<void> & { recovery: { pendingFor?: string } };
+const _staleRecoveryTails = new Map<string, StaleRecovery>();
+
+function staleRecoveryIdentity(state: Pick<StateFile, 'in_flight' | 'in_flight_turns'>): string {
+  return JSON.stringify([state.in_flight, state.in_flight_turns]);
+}
+
+/** Status polling must not discard a startup receipt whose write is pending
+ * or failed. A newer state generation no longer belongs to that recovery. */
+export function isInterruptionRecoveryPending(uid: string, cid: string, state: StateFile): boolean {
+  return _staleRecoveryTails.get(`${uid}:${cid}`)?.recovery.pendingFor === staleRecoveryIdentity(state);
+}
+
 /** A conversation blocked by pending move recovery has no resolvable layout.
  * Skip it so one blocked cid cannot abort the sweep for every other run. */
 function _stateCandidateFile(uid: string, cid: string, projectId: string | null | undefined): string | null {
@@ -2799,6 +2920,18 @@ async function _indexedConversationStateCandidates(uid: string): Promise<Convers
   return out;
 }
 
+function _isStaleTurnTerminal(record: GroupMessage): boolean {
+  if (record.deleted_at || record.from === 'user' || record.dispatch || record.cli_question) return false;
+  if (record.system_kind === 'reply_interrupted') return true;
+  if (!record.source_message_id?.trim()) return false;
+  // Public native segments retain the source too, but only the terminal
+  // segment settles the execution. Never mistake a saved commentary segment
+  // for a completed actor merely because it carries its causal input.
+  const phases = (record.process || []).filter(item => item.event?.stream === 'runtime')
+    .map(item => (item.event?.data as { phase?: string })?.phase);
+  return !phases.includes('segment_end') || phases.includes('end');
+}
+
 function _latestHistorySettlesStaleRun(records: GroupMessage[]): boolean {
   let latest: GroupMessage | undefined;
   for (let index = records.length - 1; index >= 0; index -= 1) {
@@ -2809,24 +2942,50 @@ function _latestHistorySettlesStaleRun(records: GroupMessage[]): boolean {
     }
   }
   if (!latest) return false;
-  // A prior recovery notice already settles this stale state. This keeps a
-  // damaged/recreated journal from appending the same notice on every boot.
-  if (latest.system_kind === 'reply_interrupted') return true;
-  // `source_message_id` is persisted on the actor's official terminal reply.
-  // If that reply is the canonical tail, no newer user/dispatch record
-  // started more work, so a lagging `state.json: running` is completion
-  // residue rather than proof that the app exited mid-reply.
-  const hasTerminalSource = typeof latest.source_message_id === 'string'
-    && latest.source_message_id.trim().length > 0;
-  return hasTerminalSource
-    && latest.dispatch !== true
-    && latest.from !== 'user';
+  return _isStaleTurnTerminal(latest);
 }
 
-async function _historySettlesStaleRun(uid: string, cid: string): Promise<boolean> {
+async function _unsettledStaleActors(uid: string, cid: string, state: StateFile): Promise<string[]> {
   const file = conversationMessageReadFile(uid, cid);
-  const tail = await readJsonl<GroupMessage>(file, 8);
-  return _latestHistorySettlesStaleRun(tail);
+  const actors = [...new Set(state.in_flight.filter(actor => safeId(actor) && actor !== 'user'))];
+  const readPage = async (cursor: number | null) => {
+    // A partial row is the residue this recovery exists for, so it is skipped
+    // and never settles an actor. Only an unreadable source stays retryable.
+    try { return await readJsonlPageWithOffsets<GroupMessage>(file, 8, cursor, { strict: true, skipInvalidRecords: true }); }
+    catch (error) {
+      // A locally journaled run can outlive its missing canonical file. Its
+      // interruption notice recreates that file; other I/O failures retry.
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { entries: [], nextCursor: null };
+      throw error;
+    }
+  };
+  if (!actors.length) {
+    const tail = await readPage(null);
+    return _latestHistorySettlesStaleRun(tail.entries.map(entry => entry.record)) ? [] : ['commander'];
+  }
+  const searching = new Set(actors), settled = new Set<string>();
+  let cursor: number | null = null;
+  do {
+    const page = await readPage(cursor);
+    for (let index = page.entries.length - 1; index >= 0 && searching.size; index--) {
+      const record = page.entries[index].record;
+      if (record.deleted_at) continue;
+      for (const actor of searching) {
+        const identity = state.in_flight_turns?.[actor];
+        if (record.from === actor && (!identity || record.turn_id === identity.turn_id) && _isStaleTurnTerminal(record)) {
+          settled.add(actor); searching.delete(actor);
+        } else if (identity ? record.id === identity.source_message_id : record.from === 'user') {
+          // This execution's input is a hard lower boundary. Legacy rosters
+          // have only the latest user turn as evidence; older replies cannot
+          // certify completion of newer work.
+          searching.delete(actor);
+        }
+      }
+    }
+    if (page.nextCursor === cursor) break;
+    cursor = page.nextCursor;
+  } while (cursor !== null && searching.size);
+  return actors.filter(actor => !settled.has(actor));
 }
 
 /**
@@ -2834,7 +2993,7 @@ async function _historySettlesStaleRun(uid: string, cid: string): Promise<boolea
  * durable terminal history tail proves the status write merely lagged and is
  * cleared silently. Otherwise the app stopped mid-run: flip to `idle` (not
  * aborted — abort is a deliberate user action) and persist one actor-owned
- * interruption bubble so a reload cannot silently erase the live assistant
+ * interruption bubble per unfinished actor so a reload cannot erase a live
  * placeholder. The next user message starts a fresh worker from durable state.
  */
 export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swept: number }> {
@@ -2892,12 +3051,28 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
   await _runBounded(candidates, 32, async ({
     uid, cid, file, journalTracked,
   }) => {
+    const key = `${uid}:${cid}`;
+    const previous = _staleRecoveryTails.get(key);
+    let release!: () => void;
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    // Queue replacement must retain an earlier pending or failed receipt while
+    // the next sweep waits or reloads state and UI status polling continues.
+    const tail: StaleRecovery = Object.assign((previous || Promise.resolve()).then(() => pending), {
+      recovery: previous?.recovery || {},
+    });
+    _staleRecoveryTails.set(key, tail);
+    await previous;
+    let stateLoaded = false;
+    let recoveryFailed = false;
     try {
-      const raw = JSON.parse(await fsp.readFile(file, 'utf8'));
+      const raw = JSON.parse(await fsp.readFile(file, 'utf8')) as StateFile;
+      stateLoaded = true;
       if (raw?.status !== 'running') {
         if (journalTracked) await untrackRunningConversation(uid, cid);
         return;
       }
+      raw.in_flight = Array.isArray(raw.in_flight) ? raw.in_flight.filter(actor => typeof actor === 'string') : [];
+      raw.in_flight_turns = parseInFlightTurns(raw.in_flight, raw.in_flight_turns);
       const lastActiveMs = Date.parse(String(raw.last_active_at || ''));
       if (Number.isFinite(lastActiveMs) && lastActiveMs >= PROCESS_BOOT_CUTOFF_MS) {
         // This state was created or refreshed by the current process. It is
@@ -2910,57 +3085,77 @@ export async function sweepStaleProcessing(activeUserId?: string): Promise<{ swe
         // live in-memory work always wins over disk maintenance.
         return;
       }
-      const alreadySettled = await _historySettlesStaleRun(uid, cid);
-      if (!journalTracked && !alreadySettled) {
+      if (journalTracked) tail.recovery.pendingFor = staleRecoveryIdentity(raw);
+      const interruptedActors = await _unsettledStaleActors(uid, cid, raw);
+      if (!journalTracked && interruptedActors.length) {
         // A missing/corrupt local journal provides no ownership proof. This
         // may be a live run synced from another device, so the migration scan
         // may reconcile a durable terminal tail but must never manufacture an
         // interruption from `state.json: running` alone.
         return;
       }
-      await setStatus(uid, cid, 'idle');
-      if (alreadySettled) {
+      if (!interruptedActors.length) {
         // The terminal reply (or a prior recovery notice) is already durable.
         // Reconcile only the stale status/journal; adding an interruption row
         // here would turn a successfully completed task into a false failure.
+        await recoverOrphanRunningState(uid, cid, () => bus.isQuiescent(uid, cid));
         return;
       }
-      const interruptedActors = Array.isArray(raw.in_flight)
-        ? raw.in_flight.filter((actorId: unknown): actorId is string => safeId(actorId))
-        : [];
       const members = await readMembers(uid, cid);
-      const memberIds = members.actors.map((actor) => actor.id).filter(safeId);
-      const senderId = interruptedActors.find((actorId) => memberIds.includes(actorId))
-        || interruptedActors[0]
-        || 'commander';
+      const publicActors = new Set(raw.in_flight.filter(actor => raw.in_flight_turns?.[actor]
+        || members.actors.some(member => member.id === actor && member.kind !== 'worker')));
+      // Anonymous helpers have no public roster/turn receipt. Legacy retries
+      // could leave their ids in the roster; retain their public owner instead.
+      // A wholly legacy/missing roster still keeps the original actor fallback.
+      const senders = publicActors.size ? interruptedActors.filter(actor => publicActors.has(actor)) : interruptedActors;
       const ts = new Date().toISOString();
-      const interruptedMessage: GroupMessage = {
-        id: genId12(),
-        ts,
-        from: senderId,
-        to: ['user'],
-        system_kind: 'reply_interrupted',
-        text: t('chat.reply_interrupted'),
-        model_text: 'The previous assistant run was interrupted by an application exit or crash before it produced a complete reply. Do not assume the interrupted operation completed; recover durable state before continuing.',
-      };
       const layout = conversationLayout(uid, cid);
-      const { msgIndex, source } = await appendJsonlAtomic<GroupMessage>(layout.messageFile, interruptedMessage, true);
-      await search.indexChatMessage(uid, cid, msgIndex, source ?? interruptedMessage);
-      const senderKind = members.actors.find((actor) => actor.id === senderId)?.kind
-        || (senderId === 'commander' ? 'commander' : 'agent');
-      await bumpConversationActivity(uid, cid, ts, {
-        senderKind,
-        senderId,
-        ...(senderKind === 'agent' ? { agentIds: [senderId] } : {}),
-      }, layout.projectId);
+      for (const senderId of senders) {
+        const interruptedMessage: GroupMessage = {
+          id: genId12(),
+          ts,
+          from: senderId,
+          to: ['user'],
+          system_kind: 'reply_interrupted',
+          text: t('chat.reply_interrupted'),
+          model_text: 'The previous assistant run was interrupted by an application exit or crash before it produced a complete reply. Do not assume the interrupted operation completed; recover durable state before continuing.',
+          ...raw.in_flight_turns?.[senderId],
+        };
+        const { msgIndex, source } = await appendJsonlAtomic<GroupMessage>(layout.messageFile, interruptedMessage, true);
+        await search.indexChatMessage(uid, cid, msgIndex, source ?? interruptedMessage);
+        const senderKind = members.actors.find((actor) => actor.id === senderId)?.kind
+          || (senderId === 'commander' ? 'commander' : 'agent');
+        await bumpConversationActivity(uid, cid, ts, {
+          senderKind,
+          senderId,
+          ...(senderKind === 'agent' ? { agentIds: [senderId] } : {}),
+        }, layout.projectId);
+      }
+      // Clear ownership only after every receipt is durable. A failed append
+      // keeps the journal retryable; already-written actor notices dedupe by
+      // their retained turn identity on the next sweep.
+      await recoverOrphanRunningState(uid, cid, () => bus.isQuiescent(uid, cid));
       swept += 1;
-    } catch {
-      // Missing/malformed state is idle; prune any stale journal row.
-      if (journalTracked) await untrackRunningConversation(uid, cid);
+    } catch (error) {
+      recoveryFailed = true;
+      if (!stateLoaded && ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError)) {
+        if (journalTracked) await untrackRunningConversation(uid, cid);
+      } else {
+        log.warn('stale sweep recovery remains pending', { user: maskId(uid), cid: maskId(cid), ...logErrorSummary(error) });
+      }
+    } finally {
+      if (!recoveryFailed) delete tail.recovery.pendingFor;
+      release();
+      if (_staleRecoveryTails.get(key) === tail && !tail.recovery.pendingFor) _staleRecoveryTails.delete(key);
     }
   });
   if (swept) log.info(`cleared ${swept} stale running conversations`);
   return { swept };
+}
+
+/** Preserve deletion generations before their parent directory is removed. */
+export async function retainProjectConversationDeletes(userId: string, projectId: string): Promise<void> {
+  await _withConversationIndexStore(userId, store => store.retainProjectDeletes(projectId));
 }
 
 /** Serialize explicit recycle restoration with ordinary task lifecycle writes. */

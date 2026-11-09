@@ -48,6 +48,9 @@ import type { ZodIssue } from 'zod';
 import { createLogger } from '../logger';
 import { logErrorSummary, maskId } from '../util/log-redact';
 import { isPathAllowed } from '../util/path-sandbox';
+import { writeTextAtomicSync } from '../storage';
+import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
+import { fileEditLock } from '../util/locks';
 
 const log = createLogger('chat_artifacts');
 
@@ -112,6 +115,8 @@ export interface ArtifactFileInput {
 }
 
 export interface ArtifactMeta {
+  revision?: number;
+  savedAppId?: string;
   browserStorage?: 'isolated-v1';
   appType?: AppType;
   title: string;
@@ -314,25 +319,25 @@ function declarationError(detail: string): string {
   return text.length <= DECLARATION_ERROR_MAX ? text : text.slice(0, DECLARATION_ERROR_MAX - 3) + '...';
 }
 
-function declarationPath(issuePath: readonly PropertyKey[]): string {
+function declarationPath(issuePath: ReadonlyArray<PropertyKey>): string {
   let out = '';
   for (const part of issuePath) {
     if (typeof part === 'number') out += `[${part}]`;
-    else out += (out ? '.' : '') + (IDENTIFIER_KEY.test(String(part)) ? String(part) : '<key>');
+    else out += (out ? '.' : '') + (typeof part === 'string' && IDENTIFIER_KEY.test(part) ? part : '<key>');
   }
   return out || 'root';
 }
 
 /** The schema-side reason for one issue, without its location. */
-function declarationReason(issue: ZodIssue, value: unknown): string {
+function declarationReason(issue: ZodIssue): string {
   switch (issue.code) {
     case 'invalid_type': {
-      const received = value === null ? 'null' : Array.isArray(value) ? 'array' : typeof value;
+      const received = issue.input === null ? 'null' : Array.isArray(issue.input) ? 'array' : typeof issue.input;
       return received === 'undefined' ? 'is required' : `must be ${issue.expected}, received ${received}`;
     }
     case 'invalid_value':
       return issue.values.length === 1
-        ? value === undefined ? 'is required' : `must be ${JSON.stringify(issue.values[0])}`
+        ? issue.input === undefined ? 'is required' : `must be ${JSON.stringify(issue.values[0])}`
         : `must be one of ${issue.values.join(', ')}`;
     case 'unrecognized_keys': {
       const named = issue.keys.filter(key => IDENTIFIER_KEY.test(key));
@@ -351,13 +356,11 @@ function declarationReason(issue: ZodIssue, value: unknown): string {
 
 /** Group identical reasons; unsupported fields first because an invented
  *  member (e.g. `interfaces`) usually explains the missing required ones. */
-function describeDeclarationIssues(issues: readonly ZodIssue[], input: unknown): string {
+function describeDeclarationIssues(issues: readonly ZodIssue[]): string {
   const groups = new Map<string, string[]>();
   const ordered = [...issues].sort((a, b) => Number(b.code === 'unrecognized_keys') - Number(a.code === 'unrecognized_keys'));
   for (const issue of ordered) {
-    const value = issue.path.reduce<unknown>((current, key) => current !== null && typeof current === 'object'
-      ? (current as Record<PropertyKey, unknown>)[key] : undefined, input);
-    const reason = declarationReason(issue, value);
+    const reason = declarationReason(issue);
     const paths = groups.get(reason) ?? [];
     paths.push(declarationPath(issue.path));
     groups.set(reason, paths);
@@ -373,7 +376,7 @@ function describeDeclarationIssues(issues: readonly ZodIssue[], input: unknown):
 // ── Public API ───────────────────────────────────────────────────────────
 
 /**
- * Write a new artifact bundle for (uid, cid, agentId). Validates the file set
+ * Create or explicitly revise an artifact bundle for (uid, cid, agentId). Validates the file set
  * (must include exactly one top-level `index.html`; extension allowlist; UTF-8 for utf8-encoded text files; relpath
  * safety; no `__orkas/` or `__orkas-meta.json` clobber), writes atomically
  * (temp dir → rename), and stamps `__orkas-meta.json`.
@@ -382,11 +385,32 @@ export async function createArtifact(
   userId: string,
   cid: string,
   agentId: string,
-  input: { title?: unknown; files?: unknown; appType?: unknown },
-): Promise<Result<{ artifactId: string; title: string }>> {
+  input: { title?: unknown; files?: unknown; appType?: unknown; artifactId?: unknown },
+  finalize?: (stagedDir: string, artifactId: string) => Promise<void>,
+): Promise<Result<{ artifactId: string; title: string; revision: number }>> {
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
+
+  let targetId: string | undefined;
+  let previousMeta: ArtifactMeta | undefined;
+  let previousRaw: string | undefined;
+  let previousFiles: string[] = [];
+  if (input.artifactId !== undefined) {
+    try {
+      targetId = safeArtifactId(input.artifactId);
+      const resolved = resolveArtifactDir(userId, safeConvId, targetId);
+      if (!resolved.ok) return { ok: false, error: 'application to revise was not found in this conversation' };
+      previousMeta = readArtifactMeta(userId, safeConvId, targetId, { strictSaveBinding: true });
+      if (!previousMeta || previousMeta.agentId !== agentId || !previousMeta.appType) {
+        return { ok: false, error: 'application revision requires an existing app from this creator' };
+      }
+      previousRaw = fs.readFileSync(path.join(resolved.dirPath, META_FILENAME), 'utf8');
+      previousFiles = listArtifactFilesRel(resolved.dirPath);
+    } catch {
+      return { ok: false, error: 'application revision target is invalid or unavailable' };
+    }
+  }
 
   let boundType:AppType|undefined;
   try{boundType=await (await import('./saved_apps')).boundAppType(userId,cid);}
@@ -394,15 +418,12 @@ export async function createArtifact(
     log.warn('createArtifact app binding unavailable',{user_id:maskId(userId),conversation_id:maskId(safeConvId),error:logErrorSummary(err)});
     return {ok:false,error:'app editing source unavailable; reopen editing from the app or save as a new app'};
   }
-  const selectedType=appTypeSchema.safeParse((input.appType === 'cloud' ? 'web' : input.appType) ?? boundType ?? 'local');
-  if (boundType === 'web' || input?.appType === 'web' || input?.appType === 'cloud') {
-    return (await import('./web_apps/commercial-entry')).commercialWebAppFailure();
-  }
-  if(!selectedType.success || (boundType && selectedType.data!==boundType))return {ok:false,error:'app type must match the task or editing source'};
+  const selectedType=appTypeSchema.safeParse((input.appType === 'cloud' ? 'web' : input.appType) ?? previousMeta?.appType ?? boundType ?? 'local');
+  if(!selectedType.success || (boundType && selectedType.data!==boundType) || (previousMeta && selectedType.data!==previousMeta.appType))return {ok:false,error:'app type must match the task or editing source'};
   const appType=selectedType.data;
   const title = (typeof input?.title === 'string' && input.title.trim())
     ? input.title.trim().slice(0, 120)
-    : 'Interactive app';
+    : previousMeta?.title ?? 'Interactive app';
 
   if (!Array.isArray(input?.files) || input.files.length === 0) {
     return { ok: false, error: 'files: required, must be a non-empty array of { path, content }' };
@@ -448,8 +469,10 @@ export async function createArtifact(
     if(!Buffer.from(declaredText,'utf8').equals(bytes))return {ok:false,error:declarationError('content must be UTF-8 text')};
     let parsedJson:unknown;
     try{parsedJson=JSON.parse(declaredText);}catch{return {ok:false,error:declarationError('content must be valid JSON')};}
-    const parsed=manifestSchema.safeParse(parsedJson);
-    if(!parsed.success)return {ok:false,error:declarationError(describeDeclarationIssues(parsed.error.issues,parsedJson))};
+    // Input is retained only for the type/required distinction below; rejected
+    // values never enter the bounded declaration error or logs.
+    const parsed=manifestSchema.safeParse(parsedJson,{reportInput:true});
+    if(!parsed.success)return {ok:false,error:declarationError(describeDeclarationIssues(parsed.error.issues))};
     const manifest=parsed.data;
     const hostOnly=manifest.capabilities.filter(c=>c!=='data');
     if(appType==='web'&&hostOnly.length)return {ok:false,error:`web applications cannot use host interfaces: declared local-only capabilities ${hostOnly.join(', ')}; web apps may declare only data`};
@@ -464,50 +487,65 @@ export async function createArtifact(
   if (!hasIndex) return { ok: false, error: 'files must include a top-level "index.html"' };
 
   const meta: ArtifactMeta = {
-    browserStorage: 'isolated-v1',
+    ...(previousRaw ? JSON.parse(previousRaw) : { browserStorage: 'isolated-v1' }),
     appType,
     title,
     agentId: typeof agentId === 'string' ? agentId : '',
-    createdAt: new Date().toISOString(),
+    createdAt: previousMeta?.createdAt ?? new Date().toISOString(),
+    revision: (previousMeta?.revision ?? (previousMeta ? 1 : 0)) + 1,
   };
   const metaBuf = Buffer.from(JSON.stringify(meta, null, 2), 'utf8');
 
   // Mint an id that isn't already taken (collisions are astronomically
   // unlikely with 9 random bytes, but a few retries cost nothing).
-  let artifactId = '';
-  let finalDir = '';
-  for (let attempt = 0; attempt < 5; attempt++) {
+  let artifactId = targetId ?? '';
+  let finalDir = targetId ? artifactDirForConversation(userId, safeConvId, targetId) : '';
+  for (let attempt = 0; !artifactId && attempt < 5; attempt++) {
     const candidate = crypto.randomBytes(9).toString('base64url'); // 12 url-safe chars
     const dir = artifactDirForConversation(userId, safeConvId, candidate);
     if (!fs.existsSync(dir)) { artifactId = candidate; finalDir = dir; break; }
   }
   if (!artifactId) return { ok: false, error: 'could not allocate an artifact id' };
 
-  const tmpDir = `${finalDir}.tmp-${crypto.randomBytes(4).toString('hex')}`;
   try {
-    for (const { rel, content, encoding } of prepared) {
-      let buf = Buffer.from(content, encoding);
-      if (encoding === 'utf8') {
-        if (buf.toString('utf8') !== content) throw new Error(`file "${rel}": content is not valid UTF-8`);
-        if (rel === 'index.html' && appType === 'local') buf = Buffer.from(ensureBridgeScript(content), 'utf8');
+    await replaceDirectoryAtomically(finalDir, async tmpDir => {
+      for (const { rel, content, encoding } of prepared) {
+        let buf = Buffer.from(content, encoding);
+        if (encoding === 'utf8') {
+          if (buf.toString('utf8') !== content) throw new Error(`file "${rel}": content is not valid UTF-8`);
+          if (rel === 'index.html' && appType === 'local') buf = Buffer.from(ensureBridgeScript(content), 'utf8');
+        }
+        const dst = path.join(tmpDir, rel);
+        await fsp.mkdir(path.dirname(dst), { recursive: true });
+        await fsp.writeFile(dst, buf);
+        totalBytes += buf.length;
       }
-      const dst = path.join(tmpDir, rel);
-      await fsp.mkdir(path.dirname(dst), { recursive: true });
-      await fsp.writeFile(dst, buf);
-      totalBytes += buf.length;
-    }
-    await fsp.writeFile(path.join(tmpDir, META_FILENAME), metaBuf);
-    await fsp.mkdir(path.dirname(finalDir), { recursive: true });
-    await fsp.rename(tmpDir, finalDir);
+      await fsp.writeFile(path.join(tmpDir, META_FILENAME), metaBuf);
+      await finalize?.(tmpDir, artifactId);
+    }, undefined, {
+      activationGuard: activate => fileEditLock(finalDir).runExclusive(async () => {
+        if (targetId) {
+          const current = resolveArtifactDir(userId, safeConvId, targetId);
+          if (!current.ok || await fsp.readFile(path.join(finalDir, META_FILENAME), 'utf8') !== previousRaw) {
+            throw new Error('application changed while preparing the revision');
+          }
+        } else if (fs.existsSync(finalDir)) throw new Error('application identity already exists');
+        return activate();
+      }),
+      onCleanupError: err => log.warn('artifact replacement cleanup deferred', { error: logErrorSummary(err) }),
+    });
   } catch (err) {
-    try { await fsp.rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    try { await fsp.rm(finalDir, { recursive: true, force: true }); } catch { /* best-effort */ }
-    log.warn(`createArtifact failed user=${userId} cid=${safeConvId}: ${(err as Error).message}`);
-    return { ok: false, error: `failed to write artifact: ${(err as Error).message}` };
+    log.warn('artifact preparation failed', { error: logErrorSummary(err) });
+    return { ok: false, error: targetId ? 'could not update the application; the previous version is retained' : 'could not prepare the application' };
   }
-  log.info(`createArtifact user=${userId} cid=${safeConvId} id=${artifactId} files=${prepared.length} bytes=${totalBytes} agent=${meta.agentId}`);
+  log.info('artifact committed', { user_id: maskId(userId), conversation_id: maskId(safeConvId),
+    artifact_id: maskId(artifactId), file_count: prepared.length, bytes: totalBytes, revision: meta.revision });
   notifyArtifactDirty(userId, safeConvId, artifactId);
-  return { ok: true, artifactId, title };
+  if (previousFiles.length) {
+    const retained = new Set(listArtifactFilesRel(finalDir));
+    for (const rel of previousFiles) if (!retained.has(rel)) notifyArtifactDeleted(userId, safeConvId, artifactId, rel);
+  }
+  return { ok: true, artifactId, title, revision: meta.revision! };
 }
 
 export async function inspectArtifactIndex(userId: string, cid: string, artifactId: string): Promise<ArtifactInspection> {
@@ -602,8 +640,9 @@ export function discardArtifact(
 }
 
 /** Read an artifact's metadata, if present. Best-effort (returns undefined on
- *  any failure — callers fall back to a generic title). */
-export function readArtifactMeta(userId: string, cid: string, artifactId: string): ArtifactMeta | undefined {
+ *  any failure — callers fall back to a generic title). Save-target resolution
+ *  opts into strict association reads so damaged state never redirects a write. */
+export function readArtifactMeta(userId: string, cid: string, artifactId: string, opts: { strictSaveBinding?: boolean } = {}): ArtifactMeta | undefined {
   let safeConvId: string;
   let safeId: string;
   try { safeConvId = safeCid(cid); safeId = safeArtifactId(artifactId); }
@@ -611,8 +650,13 @@ export function readArtifactMeta(userId: string, cid: string, artifactId: string
   try {
     const raw = fs.readFileSync(path.join(artifactDirForConversation(userId, safeConvId, safeId), META_FILENAME), 'utf8');
     const obj = JSON.parse(raw) as Partial<ArtifactMeta>;
+    const validSavedAppId = typeof obj?.savedAppId === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(obj.savedAppId);
+    if (opts.strictSaveBinding && (!obj || typeof obj !== 'object' || Array.isArray(obj)
+        || (Object.hasOwn(obj, 'savedAppId') && !validSavedAppId))) throw new Error('invalid save binding');
     if (obj && typeof obj === 'object') {
       return {
+        ...(Number.isSafeInteger(obj.revision) && obj.revision! > 0 ? { revision: obj.revision } : {}),
+        ...(validSavedAppId ? { savedAppId: obj.savedAppId } : {}),
         appType: metadataAppType(obj.appType),
         ...(obj.browserStorage === 'isolated-v1' ? { browserStorage: obj.browserStorage } : {}),
         title: typeof obj.title === 'string' ? obj.title : 'Interactive app',
@@ -620,8 +664,30 @@ export function readArtifactMeta(userId: string, cid: string, artifactId: string
         createdAt: typeof obj.createdAt === 'string' ? obj.createdAt : '',
       };
     }
-  } catch { /* missing / malformed */ }
+  } catch (error) {
+    if (opts.strictSaveBinding && (error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw new Error('app_save_binding_unavailable');
+    }
+  }
   return undefined;
+}
+
+/** Host-owned save association; never accepted from application source files. */
+export function bindSavedApp(userId: string, cid: string, artifactId: string, appId: string): void {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(appId)) throw new Error('invalid app id');
+  const source = resolveArtifactDir(userId, cid, artifactId);
+  if (!source.ok) throw new Error('artifact unavailable');
+  const file = path.join(source.dirPath, META_FILENAME);
+  if (!isPathAllowed(file, [source.dirPath])) throw new Error('artifact unavailable');
+  let meta = {};
+  try {
+    if (!fs.lstatSync(file).isFile()) throw new Error('artifact unavailable');
+    meta = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+  writeTextAtomicSync(file, JSON.stringify({ ...meta, savedAppId: appId }, null, 2));
+  notifyArtifactDirty(userId, cid, artifactId);
 }
 
 export interface ArtifactSummary {
@@ -646,14 +712,14 @@ export interface ArtifactSummary {
  * Best-effort: an unreadable or malformed entry is skipped rather than failing
  * the whole listing.
  */
-export function listArtifacts(userId: string, cid: string): ArtifactSummary[] {
+export async function listArtifacts(userId: string, cid: string): Promise<ArtifactSummary[]> {
   let safeConvId: string;
   try { safeConvId = safeCid(cid); }
   catch { return []; }
 
   const root = chatArtifactCidDirForConversation(userId, safeConvId);
   let entries: fs.Dirent[];
-  try { entries = fs.readdirSync(root, { withFileTypes: true }); }
+  try { entries = await fsp.readdir(root, { withFileTypes: true }); }
   catch { return []; }
 
   const out: ArtifactSummary[] = [];
@@ -666,18 +732,32 @@ export function listArtifacts(userId: string, cid: string): ArtifactSummary[] {
     let bytes = 0;
     let mtime = 0;
     let files: fs.Dirent[];
-    try { files = fs.readdirSync(dir, { withFileTypes: true }); }
+    try { files = await fsp.readdir(dir, { withFileTypes: true }); }
     catch { continue; }
     // An artifact with no entry point is a half-written or discarded bundle;
     // the `chat-app://` handler could not serve it either.
     if (!files.some((file) => file.isFile() && file.name === 'index.html')) continue;
-    for (const file of files) {
-      if (!file.isFile()) continue;
-      try {
-        const st = fs.statSync(path.join(dir, file.name));
-        bytes += st.size;
-        mtime = Math.max(mtime, Math.floor(st.mtimeMs));
-      } catch { /* skip an unreadable sibling, keep the bundle */ }
+    // Summarize the full bundle, including nested resources. Keep traversal
+    // iterative and I/O serial/async so large apps do not block the host or
+    // create one pending operation per file. Links are not bundle resources.
+    const directories = [dir];
+    while (directories.length) {
+      const current = directories.pop()!;
+      let children: fs.Dirent[];
+      try { children = current === dir ? files : await fsp.readdir(current, { withFileTypes: true }); }
+      catch { continue; }
+      for (const file of children) {
+        if (!file.isFile() && !file.isDirectory()) continue;
+        const target = path.join(current, file.name);
+        try {
+          const st = await fsp.lstat(target);
+          if (st.isDirectory()) directories.push(target);
+          else if (st.isFile()) {
+            bytes += st.size;
+            mtime = Math.max(mtime, Math.floor(st.mtimeMs));
+          }
+        } catch { /* skip an unreadable sibling, keep the bundle */ }
+      }
     }
     const meta = readArtifactMeta(userId, safeConvId, artifactId);
     out.push({
