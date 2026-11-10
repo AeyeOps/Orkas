@@ -65,9 +65,14 @@ function isModelConfigured() {
  *
  * `opts.silent === true` skips the alert — useful for background/auto paths
  * (queued sends, polling) where we just want to quietly no-op.
+ *
+ * `opts.composerTarget` names the composer whose send is being gated. A send
+ * that reaches only external CLI agents never runs a built-in model, so it
+ * passes without one.
  */
 function ensureModelConfigured(opts = {}) {
   if (_hasConfiguredModel) return true;
+  if (opts.composerTarget && _composerRecipientUsesExternalAgent(opts.composerTarget)) return true;
   if (!opts.silent) {
     const msg = opts.message || t('model_guard.modal');
     try {
