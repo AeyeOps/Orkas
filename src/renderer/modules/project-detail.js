@@ -4472,7 +4472,7 @@ async function _submitProjectChat() {
     ? _chatAttachList(draftCid)
     : [];
   let intendedAttachmentCount = draftItems.filter((item) => item && item.status !== 'error').length;
-  if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured()) {
+  if (typeof ensureModelConfigured === 'function' && !ensureModelConfigured({ composerTarget: 'project' })) {
     return;
   }
   const releaseAttachmentSend = typeof _chatAttachTryBeginSend === 'function'
@@ -4660,6 +4660,7 @@ async function _submitProjectChat() {
         restoreComposerOnFailure: true,
         source_view: 'project',
         content_length: requestText.length,
+        modelGateChecked: true,
       });
     }
   } finally {
