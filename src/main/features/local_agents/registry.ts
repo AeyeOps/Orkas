@@ -150,6 +150,28 @@ export const LOCAL_CLI_CAPABILITIES = {
     progressEvents: true,
     permissionPolicies: ['inherit', 'ask', 'full_access'],
   },
+  cursor: {
+    resume: 'none',
+    instructionChannel: 'user-message',
+    durableInstructionScope: 'invocation',
+    codingProjectDirectory: true,
+    orkasBridge: true,
+    agentMemory: false,
+    activeRunIngress: 'none',
+    progressEvents: true,
+    permissionPolicies: ['full_access', 'ask'],
+  },
+  grok: {
+    resume: 'none',
+    instructionChannel: 'user-message',
+    durableInstructionScope: 'invocation',
+    codingProjectDirectory: true,
+    orkasBridge: true,
+    agentMemory: false,
+    activeRunIngress: 'none',
+    progressEvents: true,
+    permissionPolicies: ['full_access'],
+  },
 } as const satisfies Record<string, LocalCliCapabilities>;
 
 export type LocalCliType = keyof typeof LOCAL_CLI_CAPABILITIES;
@@ -219,6 +241,8 @@ const BIN_NAMES: Record<LocalCliType, string> = {
   openclaw: 'openclaw',
   opencode: 'opencode',
   hermes: 'hermes',
+  cursor: 'cursor-agent',
+  grok: 'grok',
 };
 
 /** Env var to override default binary path per CLI. */
@@ -228,6 +252,8 @@ const ENV_KEYS: Record<LocalCliType, string> = {
   openclaw: 'ORKAS_OPENCLAW_PATH',
   opencode: 'ORKAS_OPENCODE_PATH',
   hermes: 'ORKAS_HERMES_PATH',
+  cursor: 'ORKAS_CURSOR_PATH',
+  grok: 'ORKAS_GROK_PATH',
 };
 
 /** Documented version probes for each CLI, in compatibility order. */
@@ -239,6 +265,8 @@ const VERSION_PROBES: Record<LocalCliType, readonly (readonly string[])[]> = {
   // Hermes documents both forms across releases. Prefer the stable
   // subcommand, then tolerate installations that expose only the flag.
   hermes: [['version'], ['--version']],
+  cursor: [['--version']],
+  grok: [['--version']],
 };
 
 // Version commands are normally quick, but bundled CLIs can take several

@@ -89,7 +89,7 @@ function isActivePermissionOwner(uid: string): boolean {
 // CLI has a backend — left as a guard for future additions where the
 // dispatch path lags detection.
 const DISPATCHABLE: ReadonlySet<LocalCliType> = new Set<LocalCliType>(
-  ['claude', 'codex', 'openclaw', 'opencode', 'hermes'],
+  ['claude', 'codex', 'openclaw', 'opencode', 'hermes', 'cursor', 'grok'],
 );
 
 function maskUnsupported(entries: LocalCliEntry[]): LocalCliEntry[] {
