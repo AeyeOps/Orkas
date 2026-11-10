@@ -224,10 +224,10 @@ describe('external-agent unavailable status copy', () => {
       pt: 'Não instalado',
     };
     const prerequisiteCopy = {
-      en: 'Supports Claude Code, Codex, OpenClaw, OpenCode, and Hermes. Install and configure one to connect.',
-      zh: '快速接入已安装的智能体，支持 Claude Code、Codex、OpenClaw、OpenCode 和 Hermes。',
-      ja: 'Claude Code、Codex、OpenClaw、OpenCode、Hermes に対応しています。インストールして設定すると接続できます。',
-      pt: 'Compatível com Claude Code, Codex, OpenClaw, OpenCode e Hermes. Instale e configure um deles para conectar.',
+      en: 'Supports Claude Code, Codex, OpenClaw, OpenCode, Hermes, Cursor, Grok, and Antigravity. Install and configure one to connect.',
+      zh: '快速接入已安装的智能体，支持 Claude Code、Codex、OpenClaw、OpenCode、Hermes、Cursor、Grok 和 Antigravity。',
+      ja: 'Claude Code、Codex、OpenClaw、OpenCode、Hermes、Cursor、Grok、Antigravity に対応しています。インストールして設定すると接続できます。',
+      pt: 'Compatível com Claude Code, Codex, OpenClaw, OpenCode, Hermes, Cursor, Grok e Antigravity. Instale e configure um deles para conectar.',
     };
     for (const locale of ['en', 'zh', 'ja', 'pt']) {
       const table = JSON.parse(fs.readFileSync(path.join(rendererRoot, `locales/${locale}.json`), 'utf8'));

@@ -1857,7 +1857,7 @@
   "agent_modal.ext_cli_status_version_too_old": "الإصدار {version} قديم جدًا",
   "agent_modal.ext_cli_detecting": "جارٍ الاكتشاف…",
   "agent_modal.ext_cli_updating": "جارٍ التحديث…",
-  "agent_modal.ext_cli_prerequisite_body": "يدعم Claude Code وCodex وOpenClaw وOpenCode وHermes. ثبّت أحدها واضبطه للاتصال.",
+  "agent_modal.ext_cli_prerequisite_body": "يدعم Claude Code وCodex وOpenClaw وOpenCode وHermes وCursor وGrok وAntigravity. ثبّت أحدها واضبطه للاتصال.",
   "agent_modal.ext_name": "الاسم",
   "agent_modal.ext_name_placeholder": "مثلًا: ClaudeCode",
   "agent_modal.ext_desc": "الملخص",

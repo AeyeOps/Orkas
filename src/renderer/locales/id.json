@@ -1857,7 +1857,7 @@
   "agent_modal.ext_cli_status_version_too_old": "Versi {version} terlalu tua",
   "agent_modal.ext_cli_detecting": "Mendeteksi...",
   "agent_modal.ext_cli_updating": "Memperbarui...",
-  "agent_modal.ext_cli_prerequisite_body": "Mendukung Claude Code, Codex, OpenClaw, OpenCode, dan Hermes. Instal dan konfigurasikan satu untuk terhubung.",
+  "agent_modal.ext_cli_prerequisite_body": "Mendukung Claude Code, Codex, OpenClaw, OpenCode, Hermes, Cursor, Grok, dan Antigravity. Instal dan konfigurasikan satu untuk terhubung.",
   "agent_modal.ext_name": "Nama",
   "agent_modal.ext_name_placeholder": "Mis. Kode Claude",
   "agent_modal.ext_desc": "Ringkasan",

@@ -1857,7 +1857,7 @@
   "agent_modal.ext_cli_status_version_too_old": "A versão {version} é muito antiga",
   "agent_modal.ext_cli_detecting": "A detetar…",
   "agent_modal.ext_cli_updating": "A atualizar…",
-  "agent_modal.ext_cli_prerequisite_body": "Compatível com Claude Code, Codex, OpenClaw, OpenCode e Hermes. Instale e configure um deles para ligar.",
+  "agent_modal.ext_cli_prerequisite_body": "Compatível com Claude Code, Codex, OpenClaw, OpenCode, Hermes, Cursor, Grok e Antigravity. Instale e configure um deles para ligar.",
   "agent_modal.ext_name": "Nome",
   "agent_modal.ext_name_placeholder": "por exemplo ClaudeCode",
   "agent_modal.ext_desc": "Resumo",

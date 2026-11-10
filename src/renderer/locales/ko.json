@@ -1857,7 +1857,7 @@
   "agent_modal.ext_cli_status_version_too_old": "{version} 버전이 너무 오래되었습니다",
   "agent_modal.ext_cli_detecting": "감지 중…",
   "agent_modal.ext_cli_updating": "업데이트 중…",
-  "agent_modal.ext_cli_prerequisite_body": "Claude Code, Codex, OpenClaw, OpenCode, Hermes를 지원합니다. 하나를 설치하고 설정하여 연결하세요.",
+  "agent_modal.ext_cli_prerequisite_body": "Claude Code, Codex, OpenClaw, OpenCode, Hermes, Cursor, Grok, Antigravity를 지원합니다. 하나를 설치하고 설정하여 연결하세요.",
   "agent_modal.ext_name": "이름",
   "agent_modal.ext_name_placeholder": "예: ClaudeCode",
   "agent_modal.ext_desc": "요약",

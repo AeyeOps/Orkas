@@ -1857,7 +1857,7 @@
   "agent_modal.ext_cli_status_version_too_old": "版本过低（{version}）",
   "agent_modal.ext_cli_detecting": "识别中…",
   "agent_modal.ext_cli_updating": "更新中…",
-  "agent_modal.ext_cli_prerequisite_body": "快速接入已安装的智能体，支持 Claude Code、Codex、OpenClaw、OpenCode 和 Hermes。",
+  "agent_modal.ext_cli_prerequisite_body": "快速接入已安装的智能体，支持 Claude Code、Codex、OpenClaw、OpenCode、Hermes、Cursor、Grok 和 Antigravity。",
   "agent_modal.ext_name": "名称",
   "agent_modal.ext_name_placeholder": "例如：ClaudeCode",
   "agent_modal.ext_desc": "简介",
