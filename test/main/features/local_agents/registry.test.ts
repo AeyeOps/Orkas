@@ -91,6 +91,39 @@ describe('local CLI context capabilities', () => {
         progressEvents: true,
         permissionPolicies: ['inherit', 'ask', 'full_access'],
       },
+      cursor: {
+        resume: 'none',
+        instructionChannel: 'user-message',
+        durableInstructionScope: 'invocation',
+        codingProjectDirectory: true,
+        orkasBridge: true,
+        agentMemory: false,
+        activeRunIngress: 'none',
+        progressEvents: true,
+        permissionPolicies: ['full_access', 'ask'],
+      },
+      grok: {
+        resume: 'none',
+        instructionChannel: 'user-message',
+        durableInstructionScope: 'invocation',
+        codingProjectDirectory: true,
+        orkasBridge: true,
+        agentMemory: false,
+        activeRunIngress: 'none',
+        progressEvents: true,
+        permissionPolicies: ['full_access'],
+      },
+      agy: {
+        resume: 'none',
+        instructionChannel: 'user-message',
+        durableInstructionScope: 'invocation',
+        codingProjectDirectory: true,
+        orkasBridge: true,
+        agentMemory: false,
+        activeRunIngress: 'none',
+        progressEvents: true,
+        permissionPolicies: ['full_access', 'ask'],
+      },
     });
   });
 
@@ -329,6 +362,9 @@ describe('local_agents/registry', () => {
     'ORKAS_OPENCLAW_PATH',
     'ORKAS_OPENCODE_PATH',
     'ORKAS_HERMES_PATH',
+    'ORKAS_CURSOR_PATH',
+    'ORKAS_GROK_PATH',
+    'ORKAS_AGY_PATH',
     'APPDATA',
     'LOCALAPPDATA',
     'VOLTA_HOME',
@@ -419,7 +455,7 @@ describe('local_agents/registry', () => {
     const dirs = Array.from({ length: 30 }, (_, index) => path.join(tmpDir, 'path-' + index));
     dirs.forEach(dir => fs.mkdirSync(dir));
     const probeLog = path.join(tmpDir, 'unexpected-presence-process.log');
-    const installed = LOCAL_CLI_TYPES.map(type => writeCountingMockCli(path.join(dirs[29], type), probeLog, '999.0.0'));
+    const installed = LOCAL_CLI_TYPES.map(type => writeCountingMockCli(path.join(dirs[29], type === 'cursor' ? 'cursor-agent' : type), probeLog, '999.0.0'));
     process.env.PATH = dirs.join(path.delimiter);
     const samples: number[] = [];
     for (let round = 0; round < 10; round += 1) {
@@ -689,15 +725,18 @@ describe('local_agents/registry', () => {
 
   it('coalesces concurrent forced discovery into one set of version processes', async () => {
     const probeLog = path.join(tmpDir, 'probe-calls.log');
-    // The scheduling fixture represents all five CLIs, including OpenClaw's
-    // calendar-version floor; the availability oracle must use a valid version.
-    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-cli'), probeLog, '2026.4.11');
+    // The scheduling fixture represents every CLI, including the calendar-version
+    // floors of OpenClaw and Cursor; the availability oracle must use a valid version.
+    const fake = writeCountingMockCli(path.join(tmpDir, 'counting-cli'), probeLog, '2026.11.5');
     process.env.PATH = '';
     process.env.ORKAS_CLAUDE_PATH = fake;
     process.env.ORKAS_CODEX_PATH = fake;
     process.env.ORKAS_OPENCLAW_PATH = fake;
     process.env.ORKAS_OPENCODE_PATH = fake;
     process.env.ORKAS_HERMES_PATH = fake;
+    process.env.ORKAS_CURSOR_PATH = fake;
+    process.env.ORKAS_GROK_PATH = fake;
+    process.env.ORKAS_AGY_PATH = fake;
 
     const [first, second] = await Promise.all([
       detectAll({ force: true }),
@@ -707,8 +746,11 @@ describe('local_agents/registry', () => {
     expect(second).toBe(first);
     expect(first.filter(e => !e.available).map(e => ({ type: e.type, error: e.error, path: e.path }))).toEqual([]);
     const probes = fs.readFileSync(probeLog, 'utf8').trim().split(/\r?\n/).sort();
-    // Four single-probe CLIs plus Hermes `version` and `--version`.
+    // Seven single-probe CLIs plus Hermes `version` and `--version`.
     expect(probes).toEqual([
+      '--version',
+      '--version',
+      '--version',
       '--version',
       '--version',
       '--version',

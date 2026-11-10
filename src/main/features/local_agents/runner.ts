@@ -46,6 +46,9 @@ import { codexBackend } from './backends/codex.js';
 import { openclawBackend } from './backends/openclaw.js';
 import { opencodeBackend } from './backends/opencode.js';
 import { hermesBackend } from './backends/hermes.js';
+import { cursorBackend } from './backends/cursor.js';
+import { grokBackend } from './backends/grok.js';
+import { agyBackend } from './backends/agy.js';
 import { getLocalCliSupportedFlags } from './runtime_options.js';
 import {
   type LocalActiveRunIngress,
@@ -219,6 +222,9 @@ const BACKENDS: Partial<Record<LocalCliType, LocalBackend>> = {
   openclaw: openclawBackend,
   opencode: opencodeBackend,
   hermes: hermesBackend,
+  cursor: cursorBackend,
+  grok: grokBackend,
+  agy: agyBackend,
 };
 
 const MAX_PUBLIC_DIAGNOSTIC_CHARS = 4_096;
