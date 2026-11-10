@@ -1858,7 +1858,7 @@
   "agent_modal.ext_cli_status_version_too_old": "版本過低（{version}）",
   "agent_modal.ext_cli_detecting": "辨識中…",
   "agent_modal.ext_cli_updating": "更新中…",
-  "agent_modal.ext_cli_prerequisite_body": "支援 Claude Code、Codex、OpenClaw、OpenCode 與 Hermes。請先安裝並設定其中一項，再進行連線。",
+  "agent_modal.ext_cli_prerequisite_body": "支援 Claude Code、Codex、OpenClaw、OpenCode、Hermes、Cursor、Grok 與 Antigravity。請先安裝並設定其中一項，再進行連線。",
   "agent_modal.ext_name": "名稱",
   "agent_modal.ext_name_placeholder": "例如：ClaudeCode",
   "agent_modal.ext_desc": "簡介",

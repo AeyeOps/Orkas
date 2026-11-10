@@ -1858,7 +1858,7 @@
   "agent_modal.ext_cli_status_version_too_old": "Phiên bản {version} quá cũ",
   "agent_modal.ext_cli_detecting": "Đang phát hiện…",
   "agent_modal.ext_cli_updating": "Đang cập nhật…",
-  "agent_modal.ext_cli_prerequisite_body": "Hỗ trợ Claude Code, Codex, OpenClaw, OpenCode và Hermes. Cài và cấu hình một công cụ để kết nối.",
+  "agent_modal.ext_cli_prerequisite_body": "Hỗ trợ Claude Code, Codex, OpenClaw, OpenCode, Hermes, Cursor, Grok và Antigravity. Cài và cấu hình một công cụ để kết nối.",
   "agent_modal.ext_name": "Tên",
   "agent_modal.ext_name_placeholder": "ví dụ: ClaudeCode",
   "agent_modal.ext_desc": "Tóm tắt",
