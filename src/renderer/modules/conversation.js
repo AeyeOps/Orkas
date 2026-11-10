@@ -11225,7 +11225,7 @@ async function _retryFailedAssistantMessage(msgDiv) {
   // turn finishes made a queued retry look like already-running work and
   // prevented the user from deliberately queuing another attempt.
   await sendInConversation(currentCid, payload.content, payload.extra, {
-
+    modelGateChecked: !!failedMessageId && _agentIsExternal(String(msgDiv.dataset.fromActor || '')),
   });
 }
 
