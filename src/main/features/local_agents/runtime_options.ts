@@ -703,7 +703,7 @@ async function discover(entry: LocalCliEntry, cwd: string, force: boolean, custo
     out.allow_custom_thinking = out.can_select_thinking;
     return out;
   }
-  if (entry.type === 'cursor' || entry.type === 'grok') {
+  if (entry.type === 'cursor' || entry.type === 'grok' || entry.type === 'agy') {
     out.status = 'ready';
     return out;
   }

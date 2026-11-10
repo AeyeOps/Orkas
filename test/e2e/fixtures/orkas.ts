@@ -75,7 +75,7 @@ type OrkasOptions = {
 };
 
 export type CliStubInvocation = {
-  cli: 'opencode' | 'hermes' | 'codex' | 'claude' | 'cursor' | 'grok';
+  cli: 'opencode' | 'hermes' | 'codex' | 'claude' | 'cursor' | 'grok' | 'agy';
   args: string[];
   prompt: string;
   resumeSessionId: string | null;
@@ -506,8 +506,8 @@ input.on('line', line => {
 `;
 }
 
-function fakeAcpCliSource(cli: 'cursor' | 'grok'): string {
-  const version = cli === 'cursor' ? '2026.11.05-e2e' : 'grok 1.0.77 (e2e) [alpha]';
+function fakeAcpCliSource(cli: 'cursor' | 'grok' | 'agy'): string {
+  const version = { cursor: '2026.11.05-e2e', grok: 'grok 1.0.77 (e2e) [alpha]', agy: '1.5.5' }[cli];
   return String.raw`
 const fs = require('node:fs');
 const readline = require('node:readline');
@@ -998,6 +998,7 @@ export class OrkasTestApp {
   readonly fakeHermesPath: string | null;
   readonly fakeCursorPath: string | null;
   readonly fakeGrokPath: string | null;
+  readonly fakeAgyPath: string | null;
   readonly fakeCodexPath: string | null;
   readonly fakeClaudePath: string | null;
   readonly modelRequests: Array<Record<string, unknown>> = [];
@@ -1126,6 +1127,9 @@ export class OrkasTestApp {
     this.fakeGrokPath = this.cliStub
       ? writeNodeExecutable(cliBinRoot, 'grok-e2e', fakeAcpCliSource('grok'), true)
       : null;
+    this.fakeAgyPath = this.cliStub
+      ? writeNodeExecutable(cliBinRoot, 'agy-e2e', fakeAcpCliSource('agy'), true)
+      : null;
     this.fakeCodexPath = this.cliStub
       ? writeNodeExecutable(cliBinRoot, 'codex-e2e', fakeCodexSource())
       : null;
@@ -1189,6 +1193,7 @@ export class OrkasTestApp {
       environment.ORKAS_HERMES_PATH = this.fakeHermesPath || '';
       environment.ORKAS_CURSOR_PATH = this.fakeCursorPath || '';
       environment.ORKAS_GROK_PATH = this.fakeGrokPath || '';
+      environment.ORKAS_AGY_PATH = this.fakeAgyPath || '';
       environment.ORKAS_CODEX_PATH = this.fakeCodexPath || '';
       environment.ORKAS_CLAUDE_PATH = this.fakeClaudePath || '';
       environment.ORKAS_TEST_NODE = TEST_NODE;

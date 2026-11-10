@@ -5,9 +5,10 @@ import { expect, test, type OrkasTestApp } from './fixtures/orkas';
 const CASES = [
   { cli: 'cursor', agent: 'CursorAcpE2E', tag: 'CURSOR', args: 'acp' },
   { cli: 'grok', agent: 'GrokAcpE2E', tag: 'GROK', args: 'agent --always-approve stdio' },
+  { cli: 'agy', agent: 'AgyAcpE2E', tag: 'AGY', args: 'acp --dangerously-skip-permissions' },
 ] as const;
 
-async function createAgent(app: OrkasTestApp, name: string, cli: 'cursor' | 'grok'): Promise<Page> {
+async function createAgent(app: OrkasTestApp, name: string, cli: 'cursor' | 'grok' | 'agy'): Promise<Page> {
   await app.invoke('agents.create', {
     name,
     description: `Deterministic ${cli} ACP E2E agent`,

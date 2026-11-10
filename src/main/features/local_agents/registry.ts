@@ -172,6 +172,17 @@ export const LOCAL_CLI_CAPABILITIES = {
     progressEvents: true,
     permissionPolicies: ['full_access'],
   },
+  agy: {
+    resume: 'none',
+    instructionChannel: 'user-message',
+    durableInstructionScope: 'invocation',
+    codingProjectDirectory: true,
+    orkasBridge: true,
+    agentMemory: false,
+    activeRunIngress: 'none',
+    progressEvents: true,
+    permissionPolicies: ['full_access', 'ask'],
+  },
 } as const satisfies Record<string, LocalCliCapabilities>;
 
 export type LocalCliType = keyof typeof LOCAL_CLI_CAPABILITIES;
@@ -243,6 +254,7 @@ const BIN_NAMES: Record<LocalCliType, string> = {
   hermes: 'hermes',
   cursor: 'cursor-agent',
   grok: 'grok',
+  agy: 'agy',
 };
 
 /** Env var to override default binary path per CLI. */
@@ -254,6 +266,7 @@ const ENV_KEYS: Record<LocalCliType, string> = {
   hermes: 'ORKAS_HERMES_PATH',
   cursor: 'ORKAS_CURSOR_PATH',
   grok: 'ORKAS_GROK_PATH',
+  agy: 'ORKAS_AGY_PATH',
 };
 
 /** Documented version probes for each CLI, in compatibility order. */
@@ -267,6 +280,7 @@ const VERSION_PROBES: Record<LocalCliType, readonly (readonly string[])[]> = {
   hermes: [['version'], ['--version']],
   cursor: [['--version']],
   grok: [['--version']],
+  agy: [['--version']],
 };
 
 // Version commands are normally quick, but bundled CLIs can take several
