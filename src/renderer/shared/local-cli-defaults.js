@@ -31,6 +31,18 @@
       description_en: 'Carries out research, code development, and tasks that require multiple steps, providing research findings, code changes, or generated files.',
       isCoding: false,
     },
+    cursor: {
+      name: 'Cursor',
+      description_zh: '理解和维护项目代码，解答代码问题、开发功能、修复缺陷和审查改动，提供代码修改或分析建议。',
+      description_en: 'Understands and maintains project code, answers code questions, develops features, fixes bugs, and reviews changes, providing code changes or analysis and recommendations.',
+      isCoding: true,
+    },
+    grok: {
+      name: 'Grok',
+      description_zh: '理解和维护项目代码，解答代码问题、开发功能、修复缺陷和审查改动，提供代码修改或分析建议。',
+      description_en: 'Understands and maintains project code, answers code questions, develops features, fixes bugs, and reviews changes, providing code changes or analysis and recommendations.',
+      isCoding: true,
+    },
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = defaults;
   if (typeof window !== 'undefined') window.LOCAL_CLI_DEFAULTS = defaults;

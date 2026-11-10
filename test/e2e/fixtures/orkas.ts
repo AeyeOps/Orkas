@@ -75,7 +75,7 @@ type OrkasOptions = {
 };
 
 export type CliStubInvocation = {
-  cli: 'opencode' | 'hermes' | 'codex' | 'claude';
+  cli: 'opencode' | 'hermes' | 'codex' | 'claude' | 'cursor' | 'grok';
   args: string[];
   prompt: string;
   resumeSessionId: string | null;
@@ -87,6 +87,7 @@ export type CliStubInvocation = {
   toolExecuted?: boolean;
   questionAnswers?: Record<string, unknown>;
   steers?: Array<{ id: string | null; text: string; localImages: string[] }>;
+  permissionOutcome?: string;
 };
 
 export type CliStubState = {
@@ -495,6 +496,80 @@ input.on('line', line => {
     } else if (prompt.includes('E2E_HERMES_LIMITS_CURRENT_TASK')) {
       text = 'E2E_HERMES_LIMITS_OK';
     }
+    send({ jsonrpc: '2.0', method: 'session/update', params: {
+      sessionId,
+      update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
+    } });
+    send({ jsonrpc: '2.0', id: 100, result: { stopReason: 'end_turn' } });
+  }
+});
+`;
+}
+
+function fakeAcpCliSource(cli: 'cursor' | 'grok'): string {
+  const version = cli === 'cursor' ? '2026.11.05-e2e' : 'grok 1.0.77 (e2e) [alpha]';
+  return String.raw`
+const fs = require('node:fs');
+const readline = require('node:readline');
+const cli = ${JSON.stringify(cli)};
+const args = process.argv.slice(2);
+if (args.includes('--version')) {
+  process.stdout.write(${JSON.stringify(version)} + '\n');
+  process.exit(0);
+}
+const statePath = process.env.ORKAS_E2E_CLI_STATE;
+const blank = () => ({ nextSession: 0, attempts: {}, toolExecutions: 0, invocations: [] });
+const readState = () => {
+  try { return { ...blank(), ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
+  catch { return blank(); }
+};
+const writeState = state => {
+  const tmp = statePath + '.' + String(process.pid) + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+  fs.renameSync(tmp, statePath);
+};
+const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+let sessionId = '';
+let prompt = '';
+const input = readline.createInterface({ input: process.stdin });
+input.on('line', line => {
+  let message;
+  try { message = JSON.parse(line); } catch { return; }
+  if (message.id === 1) {
+    send({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } });
+    return;
+  }
+  if (message.id === 2) {
+    const state = readState();
+    sessionId = cli + '-e2e-' + String(++state.nextSession);
+    writeState(state);
+    send({ jsonrpc: '2.0', id: 2, result: { sessionId } });
+    return;
+  }
+  if (message.id === 100) {
+    prompt = String(message.params?.prompt?.[0]?.text || '');
+    send({ jsonrpc: '2.0', id: 900, method: 'session/request_permission', params: {
+      sessionId,
+      toolCall: { toolCallId: 'e2e-tool', kind: 'execute', title: 'Run e2e command', rawInput: { command: 'true' } },
+      options: [
+        { optionId: 'allow-once', name: 'Allow', kind: 'allow_once' },
+        { optionId: 'reject-once', name: 'Reject', kind: 'reject_once' },
+      ],
+    } });
+    return;
+  }
+  if (message.id === 900) {
+    const outcome = message.result?.outcome;
+    const state = readState();
+    state.invocations.push({
+      cli, args, prompt, resumeSessionId: null, sessionId,
+      permissionOutcome: outcome?.outcome === 'selected' ? String(outcome.optionId) : String(outcome?.outcome || 'missing'),
+    });
+    writeState(state);
+    const tag = cli.toUpperCase();
+    const text = prompt.includes('E2E_ACP_CONTINUE') && prompt.includes('E2E_ACP_PRIOR_FACT')
+      ? 'E2E_' + tag + '_HISTORY_BRIDGED'
+      : prompt.includes('E2E_ACP_CONTINUE') ? 'E2E_' + tag + '_HISTORY_MISSING' : 'E2E_' + tag + '_FIRST_OK';
     send({ jsonrpc: '2.0', method: 'session/update', params: {
       sessionId,
       update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } },
@@ -921,6 +996,8 @@ export class OrkasTestApp {
   readonly cliStatePath: string;
   readonly fakeOpenCodePath: string | null;
   readonly fakeHermesPath: string | null;
+  readonly fakeCursorPath: string | null;
+  readonly fakeGrokPath: string | null;
   readonly fakeCodexPath: string | null;
   readonly fakeClaudePath: string | null;
   readonly modelRequests: Array<Record<string, unknown>> = [];
@@ -1043,6 +1120,12 @@ export class OrkasTestApp {
     this.fakeHermesPath = this.cliStub
       ? writeNodeExecutable(cliBinRoot, 'hermes-e2e', fakeHermesSource(), true)
       : null;
+    this.fakeCursorPath = this.cliStub
+      ? writeNodeExecutable(cliBinRoot, 'cursor-agent-e2e', fakeAcpCliSource('cursor'), true)
+      : null;
+    this.fakeGrokPath = this.cliStub
+      ? writeNodeExecutable(cliBinRoot, 'grok-e2e', fakeAcpCliSource('grok'), true)
+      : null;
     this.fakeCodexPath = this.cliStub
       ? writeNodeExecutable(cliBinRoot, 'codex-e2e', fakeCodexSource())
       : null;
@@ -1104,6 +1187,8 @@ export class OrkasTestApp {
       environment.ORKAS_E2E_CLI_STATE = this.cliStatePath;
       environment.ORKAS_OPENCODE_PATH = this.fakeOpenCodePath || '';
       environment.ORKAS_HERMES_PATH = this.fakeHermesPath || '';
+      environment.ORKAS_CURSOR_PATH = this.fakeCursorPath || '';
+      environment.ORKAS_GROK_PATH = this.fakeGrokPath || '';
       environment.ORKAS_CODEX_PATH = this.fakeCodexPath || '';
       environment.ORKAS_CLAUDE_PATH = this.fakeClaudePath || '';
       environment.ORKAS_TEST_NODE = TEST_NODE;
