@@ -36,6 +36,7 @@ export const MIN_VERSIONS: Readonly<Record<LocalCliType, string>> = {
   hermes: '0.9.0',
   cursor: '2026.11.5',
   grok: '1.0.77',
+  agy: '1.5.5',
 };
 
 /** Anthropic's upstream CHANGELOG.md, 2.1.81: --bare was introduced for

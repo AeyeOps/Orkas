@@ -113,6 +113,17 @@ describe('local CLI context capabilities', () => {
         progressEvents: true,
         permissionPolicies: ['full_access'],
       },
+      agy: {
+        resume: 'none',
+        instructionChannel: 'user-message',
+        durableInstructionScope: 'invocation',
+        codingProjectDirectory: true,
+        orkasBridge: true,
+        agentMemory: false,
+        activeRunIngress: 'none',
+        progressEvents: true,
+        permissionPolicies: ['full_access', 'ask'],
+      },
     });
   });
 
@@ -353,6 +364,7 @@ describe('local_agents/registry', () => {
     'ORKAS_HERMES_PATH',
     'ORKAS_CURSOR_PATH',
     'ORKAS_GROK_PATH',
+    'ORKAS_AGY_PATH',
     'APPDATA',
     'LOCALAPPDATA',
     'VOLTA_HOME',
@@ -724,6 +736,7 @@ describe('local_agents/registry', () => {
     process.env.ORKAS_HERMES_PATH = fake;
     process.env.ORKAS_CURSOR_PATH = fake;
     process.env.ORKAS_GROK_PATH = fake;
+    process.env.ORKAS_AGY_PATH = fake;
 
     const [first, second] = await Promise.all([
       detectAll({ force: true }),
@@ -733,8 +746,9 @@ describe('local_agents/registry', () => {
     expect(second).toBe(first);
     expect(first.filter(e => !e.available).map(e => ({ type: e.type, error: e.error, path: e.path }))).toEqual([]);
     const probes = fs.readFileSync(probeLog, 'utf8').trim().split(/\r?\n/).sort();
-    // Six single-probe CLIs plus Hermes `version` and `--version`.
+    // Seven single-probe CLIs plus Hermes `version` and `--version`.
     expect(probes).toEqual([
+      '--version',
       '--version',
       '--version',
       '--version',
