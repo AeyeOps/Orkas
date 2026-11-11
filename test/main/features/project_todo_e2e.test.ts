@@ -110,6 +110,22 @@ async function seedProject(projects: any, name = 'Iterate'): Promise<string> {
 }
 
 describe('project to-do › end-to-end', () => {
+  it('saves the due day a model gives a to-do, clears it on an empty string, and refuses a malformed one', async () => {
+    await load();
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const handler = createProjectTasksHandler(UID, '', 'c_due', new Map());
+    const created = await handler.create({ content: 'Send the launch email', due_at: '2026-10-25' });
+    expect(created).toMatchObject({ ok: true, task: { due_at: '2026-10-25' } });
+    const tid = (created as { task: { id: string } }).task.id;
+    expect(await handler.update(tid, { due_at: '2026-11-01' })).toMatchObject({ ok: true, task: { due_at: '2026-11-01' } });
+    expect(await handler.update(tid, { due_at: 'Friday' })).toMatchObject({ ok: false, error: 'due_invalid' });
+    expect((await handler.get(tid) as { task: { due_at?: string } }).task.due_at).toBe('2026-11-01');
+    expect(await handler.update(tid, { due_at: '' })).toMatchObject({ ok: true });
+    expect((await handler.get(tid) as { task: object }).task).not.toHaveProperty('due_at');
+    expect(await handler.create({ content: 'Bad day', due_at: '2026-02-30' })).toMatchObject({ ok: false, error: 'due_invalid' });
+  });
+
+
   it.each(['project', 'global'])('executes a synced %s backlog only on its bound installation, then hands it over after disable/re-enable', async scope => {
     const a = await load();
     const pid = scope === 'project' ? await seedProject(a.projects) : '';
@@ -196,14 +212,19 @@ describe('project to-do › end-to-end', () => {
     const created = await creator.create({ content: 'Execute only when requested' });
     expect(created.ok).toBe(true);
     const tid = created.task.id;
-    // A global to-do saved from a conversation points back there; a project
-    // backlog item links on its first run instead.
-    if (scope === 'global') expect(created.task).toMatchObject({ origin_cid: 'c_creator' });
-    else expect(created.task).not.toHaveProperty('origin_cid');
+    // A to-do saved from a conversation points back there. In a project only
+    // the conversation's first open to-do does, so a backlog split into several
+    // items is not funnelled back into one conversation: the rest link on
+    // their first run.
+    expect(created.task).toMatchObject({ origin_cid: 'c_creator' });
+    const sibling = await creator.create({ content: 'Split-out follow-up' });
+    expect(sibling.ok).toBe(true);
+    if (scope === 'global') expect(sibling.task).toMatchObject({ origin_cid: 'c_creator' });
+    else expect(sibling.task).not.toHaveProperty('origin_cid');
+    expect((await creator.delete(sibling.task.id)).ok).toBe(true);
     expect((await creator.update(tid, { status: 'progress' })).ok).toBe(true);
     expect((await creator.complete(tid)).ok).toBe(true);
-    if (scope === 'global') expect(await pt.getTask(UID, pid, tid)).toMatchObject({ origin_cid: 'c_creator' });
-    else expect(await pt.getTask(UID, pid, tid)).not.toHaveProperty('origin_cid');
+    expect(await pt.getTask(UID, pid, tid)).toMatchObject({ origin_cid: 'c_creator' });
     await creator.update(tid, { status: 'todo' });
 
     // The saved-from conversation does not exist in this fixture, so the run
@@ -227,6 +248,31 @@ describe('project to-do › end-to-end', () => {
     expect(await reloaded.listTasks(UID, pid)).toEqual([expect.objectContaining({
       id: tid, content: 'Final requirements', status: 'done', origin_cid: second.cid,
     })]);
+  });
+
+  it('links the next project to-do saved from a conversation once its earlier one is finished, without touching other conversations', async () => {
+    const { projects } = await load();
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const pid = await seedProject(projects);
+    const creator = createProjectTasksHandler(UID, pid, 'c_creator', new Map());
+    const first = await creator.create({ content: 'Draft the outline' });
+    expect(first).toMatchObject({ ok: true, task: { origin_cid: 'c_creator' } });
+    // Another conversation's next step is its own, whatever this one holds.
+    const elsewhere = await createProjectTasksHandler(UID, pid, 'c_other', new Map()).create({ content: 'Price the print run' });
+    expect(elsewhere).toMatchObject({ ok: true, task: { origin_cid: 'c_other' } });
+    expect((await creator.complete(first.task.id)).ok).toBe(true);
+    const next = await creator.create({ content: 'Write chapter one' });
+    expect(next).toMatchObject({ ok: true, task: { origin_cid: 'c_creator' } });
+  });
+
+  it('still saves a project to-do, unlinked, when its backlog cannot be read to decide the link', async () => {
+    const { pt, projects } = await load();
+    const { createProjectTasksHandler } = await import('../../../src/main/features/project_tasks_tool_handler');
+    const pid = await seedProject(projects);
+    vi.spyOn(pt, 'listTasks').mockRejectedValueOnce(new Error('backlog unreadable'));
+    const created = await createProjectTasksHandler(UID, pid, 'c_creator', new Map()).create({ content: 'Draft the outline' });
+    expect(created).toMatchObject({ ok: true, task: { content: 'Draft the outline' } });
+    expect(await pt.getTask(UID, pid, created.task.id)).not.toHaveProperty('origin_cid');
   });
 
   it.each([
@@ -474,10 +520,12 @@ describe('project to-do › end-to-end', () => {
     const t1 = await pt.createTask(UID, pid, { content: 'Brief', owner_agent: 'Owner', owner_agent_id: AGENT });
     if (!t1.ok) throw new Error('seed');
     await pt.uploadTaskAttachment(UID, pid, t1.task.id, 'brief.txt', Buffer.from('do X'));
+    await pt.uploadTaskAttachment(UID, pid, t1.task.id, 'z-first.txt', Buffer.from('first'));
+    await pt.updateTask(UID, pid, t1.task.id, { attachment_order: ['z-first.txt', 'brief.txt'] });
     const res = await runner.runTaskNow(UID, pid, t1.task.id);
     expect(res.ok).toBe(true);
     const runSend = vi.mocked(groupChat.send).mock.calls.at(-1)?.[0] as { attachments?: string[] };
-    expect(runSend.attachments).toEqual(['brief.txt']);
+    expect(runSend.attachments).toEqual(['z-first.txt', 'brief.txt']);
     // Resolve from the fresh module (paths pin the workspace root at load, so a
     // top-level import would use a stale root from before beforeEach ran).
     const { chatAttachmentDirForConversation } = await import('../../../src/main/util/project-layout');
@@ -488,10 +536,12 @@ describe('project to-do › end-to-end', () => {
     const t2 = await pt.createTask(UID, pid, { content: 'Spec', owner_agent_id: AGENT });
     if (!t2.ok) throw new Error('seed');
     await pt.uploadTaskAttachment(UID, pid, t2.task.id, 'spec.md', Buffer.from('# spec'));
+    await pt.uploadTaskAttachment(UID, pid, t2.task.id, 'z-first.txt', Buffer.from('first'));
+    await pt.updateTask(UID, pid, t2.task.id, { attachment_order: ['z-first.txt', 'spec.md'] });
     const fresh = await pt.getTask(UID, pid, t2.task.id);
     const adv = await startAutomaticTask(runner, pid, fresh!);
     expect(adv.ok).toBe(true);
     const advSend = vi.mocked(groupChat.send).mock.calls.at(-1)?.[0] as { attachments?: string[] };
-    expect(advSend.attachments).toEqual(['spec.md']);
+    expect(advSend.attachments).toEqual(['z-first.txt', 'spec.md']);
   });
 });

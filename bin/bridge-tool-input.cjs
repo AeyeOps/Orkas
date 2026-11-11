@@ -1,26 +1,22 @@
 'use strict';
 
+const { schemaToJson } = require('./schema-to-json.cjs');
+
 const { projectToolInput } = require('./tool-input-compat.cjs');
 
 /** Unknown envelope fields are ignored; declared fields retain Zod validation. */
 exports.bridgeToolInput = (z, description, shape, handler, compatibilityFields = []) => {
   const fields = [...Object.keys(shape), ...compatibilityFields];
   const inputSchema = z.object(shape).passthrough();
-  const jsonSchemaOptions = {
-    target: 'draft-7',
-    reused: 'inline',
-    unrepresentable: ({ zodSchema }) => zodSchema instanceof z.ZodCatch ? 'any' : 'throw',
-    override: ({ zodSchema, jsonSchema }) => {
-      if (zodSchema === inputSchema) jsonSchema.additionalProperties = true;
-    },
-  };
   let inputJson;
   let outputJson;
+  // SDK v2 consumes Standard Schema. Keep discovery's optional defaults and
+  // preferred numeric bounds aligned with the existing execution contract.
   inputSchema['~standard'] = {
     ...inputSchema['~standard'],
     jsonSchema: {
-      input: () => inputJson ||= z.toJSONSchema(inputSchema, { ...jsonSchemaOptions, io: 'input' }),
-      output: () => outputJson ||= z.toJSONSchema(inputSchema, { ...jsonSchemaOptions, io: 'output' }),
+      input: () => inputJson ||= schemaToJson(inputSchema),
+      output: () => outputJson ||= schemaToJson(inputSchema),
     },
   };
   return [{

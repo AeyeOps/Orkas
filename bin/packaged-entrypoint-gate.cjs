@@ -115,14 +115,16 @@ const PACKAGED_BIN_HELPERS = Object.freeze([
   // Shared automation schema loaded by both the packaged Orkas bridge and
   // the in-process auto_tasks tool.
   'auto-tasks-contract.cjs',
+  'chat-history-contract.cjs',
+  'project-instructions-contract.cjs',
   'browser-tool-contract.cjs',
   'bridge-skill-runner.cjs',
   // Loaded by the retained Google Workspace bundle, never a standalone catalog transport.
   'gmail-mcp-server.cjs',
   'bridge-tool-input.cjs',
   'skill-esm-loader.cjs',
+  'schema-to-json.cjs',
   'tool-input-compat.cjs',
-  'browser-tool-contract.cjs',
   'connector-discovery-contract.cjs',
   // Lark CLI shortcut contract required by local-cli-mcp-server.cjs.
   'local-cli-lark.cjs',
@@ -216,6 +218,7 @@ const PACKAGED_BIN_HELPERS = Object.freeze([
 const DORMANT_BIN_FILES = Object.freeze([]);
 
 const BUILD_ONLY_BIN_FILES = Object.freeze([
+  'project-instructions-contract.d.cts',
   'tool-input-compat.d.cts',
   'builtin-resource-gate.cjs',
   'ensure-runtime.cjs',
@@ -284,7 +287,7 @@ const PACKAGED_MCP_RUNTIME_FILES = Object.freeze([
     packageName: 'ajv-formats',
     entries: ['dist/index.js'],
   },
-  { lockPath: 'node_modules/zod', packageName: 'zod', entries: ['index.cjs', 'v3/index.cjs', 'v4/index.cjs'] },
+  { lockPath: 'node_modules/zod', packageName: 'zod', entries: ['index.cjs', 'v4/index.cjs'] },
   {
     lockPath: 'node_modules/zod-to-json-schema',
     packageName: 'zod-to-json-schema',
@@ -532,7 +535,8 @@ function verifyBridgeSdkRuntime(projectRoot) {
   const bridgePackages = PACKAGED_MCP_RUNTIME_FILES.filter(spec =>
     spec.lockPath.startsWith('node_modules/@modelcontextprotocol/server')
     || spec.lockPath.startsWith('node_modules/@modelcontextprotocol/core')
-    || spec.packageName === 'zod');
+    || spec.packageName === 'zod'
+    || spec.packageName === 'zod-to-json-schema');
   for (const spec of bridgePackages) {
     const installed = readJson(`${spec.lockPath} package.json`, path.join(projectRoot, spec.lockPath, 'package.json'));
     if (installed.version !== packageLockPathVersion(packageLock, spec.lockPath)) {
@@ -542,7 +546,8 @@ function verifyBridgeSdkRuntime(projectRoot) {
   const fromProject = Module.createRequire(path.join(projectRoot, 'package.json'));
   if (typeof fromProject('@modelcontextprotocol/server').McpServer !== 'function'
     || typeof fromProject('@modelcontextprotocol/server/stdio').serveStdio !== 'function'
-    || typeof fromProject('zod').z.toJSONSchema !== 'function') {
+    || typeof fromProject('zod').toJSONSchema !== 'function'
+    || typeof fromProject('zod-to-json-schema').zodToJsonSchema !== 'function') {
     throw new Error('[packaged-entrypoint-gate] bridge dependency exports are unavailable');
   }
 }

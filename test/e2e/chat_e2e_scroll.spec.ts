@@ -1,5 +1,9 @@
 import { expect, test } from './fixtures/orkas';
 
+declare const currentCid: string;
+
+
+
 async function createProject(
   app: import('./fixtures/orkas').OrkasTestApp,
   name: string,
@@ -36,6 +40,61 @@ async function historyScrollState(page: import('@playwright/test').Page): Promis
 }
 
 test.describe('conversation message-list scrolling', () => {
+  test('keeps the sent attachment bubble in place when an active reply is recovered', async ({ modelOrkas }, testInfo) => {
+    const page = modelOrkas.page!;
+    await page.setViewportSize({ width: 1050, height: 760 });
+    await page.evaluate(() => (window as any).setLang('zh'));
+    await page.locator('#new-chat-btn').click();
+    const files = Array.from({ length: 5 }, (_, index) =>
+      modelOrkas.createFixtureFile(`attachment-for-recovery-${index + 1}.txt`, `Fixture attachment ${index + 1}`));
+    await modelOrkas.selectFilesOnNextDialog(files);
+    await page.locator('#new-chat-attach-btn').click();
+    await expect(page.locator('#new-chat-attachments .chat-attach-label')).toHaveCount(5);
+
+    modelOrkas.setModelMode('controlled-slow');
+    await page.locator('#new-chat-input').fill('请查看这五个附件。');
+    await page.locator('#new-chat-send-btn').click();
+    await expect.poll(() => modelOrkas.modelRequests.length).toBe(1);
+    modelOrkas.releaseControlledModelChunk();
+    const history = page.locator('#chat-history');
+    const bubble = history.locator('.chat-message.user > .chat-bubble');
+    await expect(bubble.locator('.chat-msg-attach')).toHaveCount(5);
+    await expect.poll(() => historyScrollState(page)).toMatchObject({ pinActive: true, spacerCount: 1 });
+    await expect(history.locator('[data-role="final"]')).toContainText('Hello');
+    await page.evaluate(() => document.fonts.ready.then(() => undefined));
+    const before = await bubble.boundingBox();
+    expect(before).toBeTruthy();
+
+    await page.evaluate(async () => {
+      const runtime = window as any;
+      const apiFetch = runtime.apiFetch;
+      // Model text that accumulated while the renderer was unavailable. Keep
+      // the active-turn identity and the history response from the real IPC.
+      runtime.apiFetch = async (url: string, ...args: unknown[]) => {
+        const response = await apiFetch(url, ...args);
+        if (!url.includes('/history?') || !url.endsWith('&live=1')) return response;
+        const data = await response.json();
+        const record = data.live_display?.turns[0]?.records.at(-1);
+        if (!record) throw new Error('Expected an active display snapshot');
+        record.text = Array.from({ length: 35 }, (_, index) => `Recovered paragraph ${index + 1}.`).join('\n\n');
+        return { ...response, json: async () => data };
+      };
+      try {
+        await runtime.loadConversationHistory(currentCid, { preserveScroll: true, refreshDisplay: true });
+      } finally {
+        runtime.apiFetch = apiFetch;
+      }
+    });
+    await expect(history.locator('[data-role="final"]')).toContainText('Recovered paragraph 35.');
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    const after = await bubble.boundingBox();
+    await page.screenshot({ path: testInfo.outputPath('attachment-bubble-after-recovery.png') });
+    expect(Math.abs(after!.y - before!.y)).toBeLessThanOrEqual(1);
+
+    modelOrkas.finishControlledModelStream();
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+  });
+
   for (const [position, update] of [
     ['bottom', 'activity'], ['bottom', 'receipt'],
     ['reading', 'activity'], ['reading', 'receipt'],
@@ -50,7 +109,7 @@ test.describe('conversation message-list scrolling', () => {
       await page.locator('#new-chat-btn').click();
       await page.locator('#new-chat-input').fill('E2E establish the reorder scroll fixture.');
       await page.locator('#new-chat-send-btn').click();
-      await expect(page.locator('#chat-history [data-role="final"]')).toContainText(
+      await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
         'Hello from the local E2E model.',
         { timeout: 20_000 },
       );
@@ -180,15 +239,18 @@ test.describe('conversation message-list scrolling', () => {
     await page.locator('#new-chat-btn').click();
     await page.locator('#new-chat-input').fill('E2E establish a fresh task without history hydration.');
     await page.locator('#new-chat-send-btn').click();
-    await expect(page.locator('#chat-history [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
       'Hello from the local E2E model.',
       { timeout: 20_000 },
     );
 
-    modelOrkas.setModelMode('slow');
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    modelOrkas.setModelMode('controlled-slow');
     await page.locator('#chat-input').fill('E2E keep the second response streaming while I scroll the message list.');
     await page.locator('#chat-input').press('Enter');
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+    await expect.poll(() => modelOrkas.modelRequests.length).toBe(2);
+    modelOrkas.releaseControlledModelChunk();
     await expect.poll(async () => historyScrollState(page)).toMatchObject({
       pinActive: true,
       spacerCount: 1,
@@ -198,15 +260,16 @@ test.describe('conversation message-list scrolling', () => {
     await history.hover({ position: { x: 40, y: 80 } });
     await page.mouse.wheel(0, 420);
 
-    // Check before the deterministic slow stream reaches its 2.4s terminal
-    // marker; terminal cleanup also removes the spacer and would mask a wheel
-    // gesture that the message list never handled.
-    await page.waitForTimeout(150);
-    expect(await historyScrollState(page)).toEqual({
+    // Keep the terminal marker withheld so completion cannot remove the
+    // spacer and masquerade as a successful user-scroll release.
+    await expect.poll(() => historyScrollState(page)).toEqual({
       pinActive: false,
       stickyBound: true,
       spacerCount: 0,
     });
+    await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+    modelOrkas.finishControlledModelStream();
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
   });
 
   test('keeps a project-created task message list scrollable during streaming', async ({ modelOrkas }) => {
@@ -217,15 +280,18 @@ test.describe('conversation message-list scrolling', () => {
     await page.locator('#project-chat-input').fill('E2E establish the project-created task.');
     await page.locator('#project-chat-send-btn').click();
     await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
-    await expect(page.locator('#chat-history [data-role="final"]')).toContainText(
+    await expect(page.locator('#chat-history .chat-message.assistant .chat-bubble > :is(.markdown-body, [data-role="final"])')).toContainText(
       'Hello from the local E2E model.',
       { timeout: 20_000 },
     );
 
-    modelOrkas.setModelMode('slow');
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    modelOrkas.setModelMode('controlled-slow');
     await page.locator('#chat-input').fill('E2E stream the project follow-up while I scroll downward.');
     await page.locator('#chat-input').press('Enter');
     await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+    await expect.poll(() => modelOrkas.modelRequests.length).toBe(2);
+    modelOrkas.releaseControlledModelChunk();
     await expect.poll(async () => historyScrollState(page)).toMatchObject({
       pinActive: true,
       stickyBound: true,
@@ -235,12 +301,13 @@ test.describe('conversation message-list scrolling', () => {
     const history = page.locator('#chat-history');
     await history.hover({ position: { x: 40, y: 80 } });
     await page.mouse.wheel(0, 420);
-    await page.waitForTimeout(150);
-
-    expect(await historyScrollState(page)).toEqual({
+    await expect.poll(() => historyScrollState(page)).toEqual({
       pinActive: false,
       stickyBound: true,
       spacerCount: 0,
     });
+    await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+    modelOrkas.finishControlledModelStream();
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
   });
 });

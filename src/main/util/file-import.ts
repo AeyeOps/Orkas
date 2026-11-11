@@ -120,6 +120,114 @@ export async function copyLocalFileAtomic(
   }
 }
 
+
+/** Copy a validated entry into a create-only destination. Namespace and source
+ * validation belong to the feature caller. Only a directory root claimed by
+ * this operation may be rolled back; native exclusive file copies own theirs. */
+export function copyLocalEntryExclusiveSync(source: string, target: string, directory: boolean): void {
+  if (!directory) {
+    fs.copyFileSync(source, target, fs.constants.COPYFILE_EXCL);
+    return;
+  }
+  const sourceMode = fs.statSync(source).mode;
+  fs.mkdirSync(target);
+  let owned: fs.BigIntStats | undefined;
+  try {
+    owned = fs.lstatSync(target, { bigint: true });
+    fs.cpSync(source, target, {
+      recursive: true, errorOnExist: true, force: false,
+      dereference: false, mode: fs.constants.COPYFILE_EXCL,
+    });
+    fs.chmodSync(target, sourceMode);
+  } catch (error) {
+    try {
+      const current = fs.lstatSync(target, { bigint: true });
+      if (owned && current.dev === owned.dev && current.ino === owned.ino && !current.isSymbolicLink()) {
+        fs.rmSync(target, { recursive: true, force: true });
+      }
+    } catch { /* best-effort rollback of an owned partial copy */ }
+    throw error;
+  }
+}
+
+export interface LocalEntryRevision {
+  root: string;
+  entries: Array<{ relative: string; stamp: string }>;
+}
+
+const MAX_REVISION_ENTRIES = 10_000;
+const MAX_REVISION_PATH_BYTES = 1024 * 1024;
+
+function revisionStamp(stat: fs.BigIntStats): string | undefined {
+  if (!stat.isFile() && !stat.isDirectory()) return undefined;
+  return [stat.isDirectory() ? 'dir' : 'file', stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
+}
+
+/** Metadata only: native saves replace the inode or change its timestamps.
+ * Include every directory so additions/removals are detected too. Refuse an
+ * unavailable or oversized snapshot before a move can remove any source. */
+export async function captureLocalEntryRevision(root: string): Promise<LocalEntryRevision | undefined> {
+  const entries: LocalEntryRevision['entries'] = [];
+  const deadline = performance.now() + 5000;
+  let pathBytes = 0;
+  async function visit(absolute: string, relative: string, depth: number): Promise<void> {
+    pathBytes += Buffer.byteLength(relative);
+    if (depth > 64 || entries.length >= MAX_REVISION_ENTRIES
+      || pathBytes > MAX_REVISION_PATH_BYTES || performance.now() > deadline) throw new Error('revision budget exceeded');
+    const stat = await fsp.lstat(absolute, { bigint: true });
+    const stamp = revisionStamp(stat);
+    if (!stamp) throw new Error('unsupported revision source');
+    entries.push({ relative, stamp });
+    if (stat.isDirectory()) {
+      const directory = await fsp.opendir(absolute);
+      for await (const child of directory) {
+        await visit(path.join(absolute, child.name), relative ? path.join(relative, child.name) : child.name, depth + 1);
+      }
+    }
+  }
+  try { await visit(root, '', 0); return { root, entries }; }
+  catch { return undefined; }
+}
+
+/** Capture the owned copy before indexing can yield to another edit. */
+export function captureLocalEntryRevisionSync(root: string): LocalEntryRevision | undefined {
+  const entries: LocalEntryRevision['entries'] = [];
+  const deadline = performance.now() + 100;
+  let pathBytes = 0;
+  function visit(absolute: string, relative: string, depth: number): void {
+    pathBytes += Buffer.byteLength(relative);
+    if (depth > 64 || entries.length >= MAX_REVISION_ENTRIES
+      || pathBytes > MAX_REVISION_PATH_BYTES || performance.now() > deadline) throw new Error('revision budget exceeded');
+    const stat = fs.lstatSync(absolute, { bigint: true });
+    const stamp = revisionStamp(stat);
+    if (!stamp) throw new Error('unsupported revision source');
+    entries.push({ relative, stamp });
+    if (stat.isDirectory()) {
+      const directory = fs.opendirSync(absolute);
+      try {
+        let child: fs.Dirent | null;
+        while ((child = directory.readSync())) {
+          visit(path.join(absolute, child.name), relative ? path.join(relative, child.name) : child.name, depth + 1);
+        }
+      } finally { directory.closeSync(); }
+    }
+  }
+  try { visit(root, '', 0); return { root, entries }; }
+  catch { return undefined; }
+}
+
+/** Called at the actual synchronous removal boundary, after async validation.
+ * Bound main-thread work; uncertain state must retain both recoverable copies. */
+export function localEntryRevisionMatches(
+  revision: LocalEntryRevision | undefined, deadline = performance.now() + 100,
+): boolean {
+  if (!revision?.entries.length || revision.entries.length > MAX_REVISION_ENTRIES) return false;
+  try {
+    return revision.entries.every(({ relative, stamp }) => performance.now() <= deadline
+      && revisionStamp(fs.lstatSync(path.join(revision.root, relative), { bigint: true })) === stamp);
+  } catch { return false; }
+}
+
 export async function isUtf8File(absPath: string): Promise<boolean> {
   const decoder = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
   const stream = fs.createReadStream(absPath);

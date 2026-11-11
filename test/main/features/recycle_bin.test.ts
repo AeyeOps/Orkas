@@ -112,6 +112,13 @@ describe('global recycle bin', () => {
     const [restoredRow] = JSON.parse(await fsp.readFile(index, 'utf8'));
     expect(restoredRow).toMatchObject({ conversation_id: cid, title: row.title, created_at: row.created_at });
     expect(restoredRow.project_id || null).toBe(project ? pid : null);
+    expect(Number.isFinite(Date.parse(restoredRow.restored_at))).toBe(true);
+    const chats = await import('../../../src/main/features/chats');
+    await chats.repairConversationIndex(UID);
+    expect((await chats.listCleanupConversationRows(UID)).map(row => row.conversation_id)).toContain(cid);
+    const [repairedRow] = JSON.parse(await fsp.readFile(index, 'utf8'));
+    expect(repairedRow.restored_at).toBe(restoredRow.restored_at);
+    expect(repairedRow.deleted_at).toBeUndefined();
     expect(fs.existsSync(path.join(root, 'chats', `${cid}.jsonl`))).toBe(false);
   });
 
@@ -800,6 +807,21 @@ describe('global recycle bin', () => {
       title: 'Daily Sales Digest',
       id: taskId,
     }));
+  });
+
+  it.each(['\n', '\r\n'])('keeps Skill titles with inline dashes in recycle previews (%j)', async (eol) => {
+    const paths = await import('../../../src/main/paths');
+    const { createRecycleBatch, listRecycleBatches } = await import('../../../src/main/features/recycle_bin');
+    const rel = 'cloud/skills/skill-dashes/SKILL.md';
+    const file = path.join(paths.userCloudRoot(UID), 'skills', 'skill-dashes', 'SKILL.md');
+    await fsp.mkdir(path.dirname(file), { recursive: true });
+    const content = ['---', 'description: Convert Markdown --- to PDF', 'name: Release --- Writer', '---', 'Body'].join(eol);
+    await fsp.writeFile(file, content);
+    const batch = await createRecycleBatch(UID, [rel]);
+    expect(batch?.display_items).toContainEqual(expect.objectContaining({ category: 'skill', id: 'skill-dashes', title: 'Release --- Writer' }));
+    await fsp.rm(file);
+    const listed = await listRecycleBatches(UID);
+    expect(listed.find((item) => item.id === batch?.id)?.display_items).toContainEqual(expect.objectContaining({ title: 'Release --- Writer' }));
   });
 
   it('labels project library, skill, and saved app entries with readable titles', async () => {

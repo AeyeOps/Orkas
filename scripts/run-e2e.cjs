@@ -10,6 +10,14 @@ process.env.ORKAS_E2E_HIDE_WINDOW = debug ? '0' : '1';
 if (debug) process.env.PWDEBUG = '1';
 else delete process.env.PWDEBUG;
 
+// Source E2E launches esbuild through tsx in Electron and its workers. Bound
+// Go's parallelism and soft heap target on Windows hosts without a pagefile;
+// otherwise compilation can exhaust commit space and lose the renderer.
+if (process.platform === 'win32') {
+  process.env.GOMAXPROCS ||= '1';
+  process.env.GOMEMLIMIT ||= '128MiB';
+}
+
 // Playwright forces color in workers and strips it in the parent reporter.
 // Translate NO_COLOR before loading Playwright so worker environments never
 // contain conflicting controls, while the reporter retains plain output.
@@ -20,4 +28,11 @@ if (process.env.NO_COLOR !== undefined) {
   delete process.env.NO_COLOR;
 }
 
-require('playwright/lib/program').program.parse(process.argv);
+if (args.some(arg => arg === '--resume' || arg.startsWith('--checkpoint-dir') || arg.startsWith('--batch-count'))) {
+  import('./runner-checkpoint.mjs').then(({ runRunnerCheckpoint }) =>
+    runRunnerCheckpoint('e2e', args, { cwd: process.cwd(), env: process.env }))
+    .then(code => { process.exitCode = code; })
+    .catch(error => { console.error(`[run-e2e] ${error.message}`); process.exitCode = 1; });
+} else {
+  require('playwright/lib/program').program.parse(process.argv);
+}

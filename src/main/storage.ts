@@ -1,4 +1,4 @@
-import { prepareIndexedJsonlAppend } from './util/indexed-jsonl';
+import { indexedJsonlStampFromStat, prepareIndexedJsonlAppend } from './util/indexed-jsonl';
 /**
  * Timestamps, ID generation, and JSON/JSONL IO helpers.
  *
@@ -54,12 +54,18 @@ export function safeId(value: unknown): boolean {
 
 // ── JSON / JSONL IO ──────────────────────────────────────────────────────
 
-/** Read a JSON file. Returns {} on any error (missing, invalid, etc.). */
-export async function readJson<T = Record<string, any>>(filePath: string): Promise<T> {
+/** Tolerant by default. Authoritative lookups opt into strict reads so an
+ * unavailable source cannot be mistaken for an empty collection. */
+export async function readJson<T = Record<string, any>>(
+  filePath: string,
+  opts?: { strict?: boolean },
+): Promise<T> {
   try {
     const text = await fsp.readFile(filePath, 'utf8');
-    return JSON.parse(text) as T;
-  } catch {
+    // A single leading UTF-8 BOM is an encoding marker, not JSON content.
+    return JSON.parse(text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text) as T;
+  } catch (error) {
+    if (opts?.strict) throw error;
     return {} as T;
   }
 }
@@ -67,7 +73,8 @@ export async function readJson<T = Record<string, any>>(filePath: string): Promi
 /** Synchronous variant — used in startup paths before the event loop is hot. */
 export function readJsonSync<T = Record<string, any>>(filePath: string): T {
   try {
-    return JSON.parse(fs.readFileSync(filePath, 'utf8')) as T;
+    const text = fs.readFileSync(filePath, 'utf8');
+    return JSON.parse(text.charCodeAt(0) === 0xFEFF ? text.slice(1) : text) as T;
   } catch {
     return {} as T;
   }
@@ -82,7 +89,7 @@ export function isAtomicWriteTempPath(filePath: string): boolean {
   return ATOMIC_TMP_PATH_RE.test(path.basename(filePath));
 }
 
-function atomicTmpPath(filePath: string): string {
+export function atomicTmpPath(filePath: string): string {
   return `${filePath}.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}.tmp`;
 }
 
@@ -124,6 +131,12 @@ export function renameWithRetry(tmp: string, filePath: string, shouldCommit?: ()
   // A guarded publication must not yield between the ownership check and
   // rename. Retry delays stay asynchronous so file locks do not block main.
   return renameWithRetryUsing(tmp, filePath, shouldCommit ? fs.renameSync : fsp.rename, shouldCommit);
+}
+
+/** Publish a completed same-filesystem inode without replacing an existing
+ * destination, retaining the bounded asynchronous Windows lock retries. */
+export async function linkWithRetry(source: string, target: string): Promise<void> {
+  await renameWithRetryUsing(source, target, fsp.link);
 }
 
 function renameWithRetrySyncUsing(
@@ -202,8 +215,8 @@ export async function writeBytesAtomic(filePath: string, data: Uint8Array, opts?
 export function writeJsonSync(filePath: string, data: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = atomicTmpPath(filePath);
-  fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
   try {
+    fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf8');
     renameWithRetrySync(tmp, filePath);
   } catch (err) {
     try { fs.rmSync(tmp, { force: true }); } catch {}
@@ -223,13 +236,27 @@ export function writeTextAtomicSync(
   encoding: BufferEncoding = 'utf8',
   opts?: { mode?: number },
 ): void {
+  writeFileAtomicSync(filePath, text, encoding, opts);
+}
+
+/** Publish binary bytes with the same bounded rename and cleanup as text. */
+export function writeBytesAtomicSync(filePath: string, bytes: Uint8Array, opts?: { mode?: number }): void {
+  writeFileAtomicSync(filePath, bytes, 'utf8', opts);
+}
+
+function writeFileAtomicSync(
+  filePath: string,
+  data: string | Uint8Array,
+  encoding: BufferEncoding,
+  opts?: { mode?: number },
+): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   const tmp = atomicTmpPath(filePath);
   // Mode is applied to the tmp file; rename carries it onto the target — used
   // by secret-bearing writers (connectors.json, auth profiles) that need 0600.
   try {
     // A failed (e.g. disk-full) write must not leave a partial sibling behind.
-    fs.writeFileSync(tmp, text, { encoding, ...(opts && opts.mode !== undefined ? { mode: opts.mode } : {}) });
+    fs.writeFileSync(tmp, data, { encoding, ...(opts && opts.mode !== undefined ? { mode: opts.mode } : {}) });
     renameWithRetrySync(tmp, filePath);
   } catch (err) {
     try { fs.rmSync(tmp, { force: true }); } catch {}
@@ -257,13 +284,18 @@ function _getLineLock(filePath: string): MutexInterface {
   return m;
 }
 
+/** Count existing rows and leave the file ready for the next append. A crash,
+ * power loss or ENOSPC can leave a partial last line, and writing straight after
+ * it would fuse the new record into one unreadable row. The partial row is not a
+ * record, so it takes no slot in the valid-record numbering readers use. */
 async function _loadLineCount(filePath: string): Promise<number> {
-  try {
-    const text = await fsp.readFile(filePath, 'utf8');
-    let n = 0;
-    for (const line of text.split('\n')) if (line.trim()) n++;
-    return n;
-  } catch { return 0; }
+  let text: string;
+  try { text = await fsp.readFile(filePath, 'utf8'); } catch { return 0; }
+  let n = 0;
+  for (const line of text.split('\n')) if (_parseJsonlRecord(line) !== undefined) n++;
+  if (text.endsWith('\n') || !text.trim()) return n;
+  await fsp.appendFile(filePath, '\n', 'utf8');
+  return n;
 }
 
 export interface AtomicAppendResult<T = unknown> {
@@ -281,6 +313,8 @@ export interface JsonlAppendSource {
   dev: number;
   ino: number;
   beforeMtime: number;
+  beforeStamp?: string;
+  stamp?: string;
   mtime: number;
   size: number;
 }
@@ -304,17 +338,25 @@ export async function appendJsonlAtomic<T>(filePath: string, record: T, withSour
     const finishIndex = await prepareIndexedJsonlAppend(filePath);
     const line = JSON.stringify(record) + '\n';
     let source: JsonlAppendSource | undefined;
-    if (withSource) {
-      const handle = await fsp.open(filePath, 'a');
-      try {
-        const before = await handle.stat();
-        await handle.writeFile(line, 'utf8');
-        const after = await handle.stat();
-        source = { kind: 'jsonl-append', file: filePath, offset: before.size,
-          bytes: Buffer.byteLength(line), dev: after.dev, ino: after.ino,
-          beforeMtime: before.mtimeMs, mtime: after.mtimeMs, size: after.size };
-      } finally { await handle.close(); }
-    } else await fsp.appendFile(filePath, line, 'utf8');
+    try {
+      if (withSource) {
+        const handle = await fsp.open(filePath, 'a');
+        try {
+          const before = await handle.stat();
+          await handle.writeFile(line, 'utf8');
+          const after = await handle.stat();
+          source = { kind: 'jsonl-append', file: filePath, offset: before.size,
+            bytes: Buffer.byteLength(line), dev: after.dev, ino: after.ino,
+            beforeMtime: before.mtimeMs, mtime: after.mtimeMs, size: after.size,
+            beforeStamp: indexedJsonlStampFromStat(before), stamp: indexedJsonlStampFromStat(after) };
+        } finally { await handle.close(); }
+      } else await fsp.appendFile(filePath, line, 'utf8');
+    } catch (error) {
+      // A failed write may have left part of this line. Recount on the next
+      // append so that it starts on a clean line.
+      _lineCounts.delete(filePath);
+      throw error;
+    }
     await finishIndex(record, Buffer.byteLength(line));
     _lineCounts.set(filePath, count + 1);
     return { record, msgIndex: count, ...(source ? { source } : {}) };
@@ -362,18 +404,28 @@ export async function rewriteJsonlLine<T extends object>(
     const hasTrailing = lines.length > 0 && lines[lines.length - 1] === '';
     const body = hasTrailing ? lines.slice(0, -1) : lines;
 
-    if (msgIndex < 0 || msgIndex >= body.length) {
-      return { ok: false, error: `index out of range (${msgIndex}/${body.length})` };
+    // Callers obtain msgIndex from the tolerant readers or atomic append.
+    // Keep their valid-record positions even when crash residue is preserved.
+    let validIndex = 0;
+    let lineIndex = -1;
+    let current!: T;
+    for (let i = 0; i < body.length; i++) {
+      const record = _parseJsonlRecord<T>(body[i]);
+      if (record === undefined) continue;
+      if (validIndex++ === msgIndex) {
+        lineIndex = i;
+        current = record;
+        break;
+      }
     }
-
-    let current: T;
-    try { current = JSON.parse(body[msgIndex]) as T; }
-    catch (err) { return { ok: false, error: `line ${msgIndex} not JSON: ${(err as Error).message}` }; }
+    if (lineIndex < 0) {
+      return { ok: false, error: `index out of range (${msgIndex}/${validIndex})` };
+    }
 
     const next = mutate(current);
     if (next === null) return { ok: false, error: 'mutate aborted' };
 
-    body[msgIndex] = JSON.stringify(next);
+    body[lineIndex] = JSON.stringify(next);
     const out = body.join('\n') + '\n';
     // Write to tmp + rename — rewrite is a "full file" op; we can't use
     // append here. Line count stays the same.
@@ -397,14 +449,17 @@ function _concatJsonlSegments(segments: Buffer[]): Buffer {
   return Buffer.concat(segments);
 }
 
-function _parseJsonlRecord<T>(line: string): T | undefined {
+function _parseJsonlRecord<T>(line: string, strict = false): T | undefined {
   const trimmed = line.trim();
   if (!trimmed) return undefined;
-  try { return JSON.parse(trimmed) as T; } catch { return undefined; }
+  try { return JSON.parse(trimmed) as T; } catch {
+    if (strict) throw new Error('JSONL record is invalid');
+    return undefined;
+  }
 }
 
-function _appendJsonlRecord<T>(out: T[], line: string): void {
-  const record = _parseJsonlRecord<T>(line);
+function _appendJsonlRecord<T>(out: T[], line: string, strict = false): void {
+  const record = _parseJsonlRecord<T>(line, strict);
   if (record !== undefined) out.push(record);
 }
 
@@ -445,25 +500,31 @@ export async function readJsonlPage<T = Record<string, any>>(
   filePath: string,
   limit = 200,
   before?: number | null,
+  opts?: { strict?: boolean },
 ): Promise<JsonlPage<T>> {
-  const page = await readJsonlPageWithOffsets<T>(filePath, limit, before);
+  const page = await readJsonlPageWithOffsets<T>(filePath, limit, before, opts);
   return {
     records: page.entries.map(({ record }) => record),
     nextCursor: page.nextCursor,
   };
 }
 
-/** Offset-preserving variant used by sparse derived page caches. */
+/** Offset-preserving variant used by sparse derived page caches.
+ * `skipInvalidRecords` keeps `strict` for I/O only, for readers that must tell an
+ * unavailable source from an empty one yet still get past a partial crash-time row. */
 export async function readJsonlPageWithOffsets<T = Record<string, any>>(
   filePath: string,
   limit = 200,
   before?: number | null,
+  opts?: { strict?: boolean; skipInvalidRecords?: boolean },
 ): Promise<JsonlPageWithOffsets<T>> {
   const wanted = Math.max(1, Math.floor(Number(limit) || 1));
+  const strictRecords = !!opts?.strict && !opts?.skipInvalidRecords;
   let handle: fs.promises.FileHandle;
   try {
     handle = await fsp.open(filePath, 'r');
-  } catch {
+  } catch (error) {
+    if (opts?.strict) throw error;
     return { entries: [], nextCursor: null };
   }
 
@@ -485,6 +546,7 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
       position -= bytes;
       const block = Buffer.allocUnsafe(bytes);
       const { bytesRead } = await handle.read(block, 0, bytes, position);
+      if (opts?.strict && bytesRead !== bytes) throw new Error('JSONL read is incomplete');
       if (bytesRead <= 0) break;
 
       let end = bytesRead;
@@ -494,7 +556,7 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
         const line = suffixSegments.length
           ? _concatJsonlSegments([current, ...suffixSegments.reverse()])
           : current;
-        const record = _parseJsonlRecord<T>(line.toString('utf8'));
+        const record = _parseJsonlRecord<T>(line.toString('utf8'), strictRecords);
         if (record !== undefined) {
           const start = position + i + 1;
           newestFirst.push({ record, start });
@@ -513,6 +575,7 @@ export async function readJsonlPageWithOffsets<T = Record<string, any>>(
     if (newestFirst.length < wanted && suffixSegments.length) {
       const record = _parseJsonlRecord<T>(
         _concatJsonlSegments(suffixSegments.reverse()).toString('utf8'),
+        strictRecords,
       );
       if (record !== undefined) {
         newestFirst.push({ record, start: 0 });
@@ -685,22 +748,24 @@ export async function readJsonlWindowAtMatch<T = Record<string, any>>(
  * characters that straddle a disk-read boundary remain intact.
  *
  * Non-positive limits retain the historical full-file behavior. Malformed
- * lines are silently skipped, matching the previous Python-compatible read.
+ * lines are silently skipped by default, matching the previous Python-compatible read.
+ * Durable projections can opt into strict reads to distinguish missing, corrupt or incomplete IO.
  */
-export async function readJsonl<T = Record<string, any>>(filePath: string, limit = 200): Promise<T[]> {
+export async function readJsonl<T = Record<string, any>>(filePath: string, limit = 200, opts?: { strict?: boolean }): Promise<T[]> {
   if (!Number.isFinite(limit) || limit < 1) {
     let text: string;
     try {
       text = await fsp.readFile(filePath, 'utf8');
-    } catch {
+    } catch (error) {
+      if (opts?.strict) throw error;
       return [];
     }
     const out: T[] = [];
-    for (const line of text.split('\n')) _appendJsonlRecord(out, line);
+    for (const line of text.split('\n')) _appendJsonlRecord(out, line, opts?.strict);
     return out.slice(-limit);
   }
 
-  return (await readJsonlPage<T>(filePath, limit)).records;
+  return (await readJsonlPage<T>(filePath, limit, undefined, opts)).records;
 }
 
 /** Read one immutable append receipt without scanning the conversation. */

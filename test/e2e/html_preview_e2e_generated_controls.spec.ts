@@ -4,6 +4,129 @@ import { test } from './fixtures/web-app-eval';
 import { expect } from './fixtures/orkas';
 import type { HtmlPreviewDesignEvidence } from '../../src/main/features/html_preview';
 
+test('submits bounded native temporal fields without reporting a false form failure', async ({ sdkOrkas: orkas }, info) => {
+  const entry = orkas.createWorkspaceFile('temporal-form/index.html', `<!doctype html>
+    <style>input:focus-visible,button:focus-visible{outline:2px solid blue}</style>
+    <form><label>Date<input id="date" type="date" min="2026-11-20" max="2026-11-22" required></label>
+    <label>Time<input id="time" type="time" min="10:30" max="11:30" required></label>
+    <label>Month<input id="month" type="month" min="2026-11" max="2026-12" required></label>
+    <label>Week<input id="week" type="week" min="2026-W47" max="2026-W48" required></label>
+    <label>Appointment<input id="appointment" type="datetime-local" min="2026-11-20T10:30" max="2026-11-22T11:30" required></label>
+    <button>Confirm appointment</button></form><output></output><script>
+    document.querySelector('form').onsubmit=e=>{e.preventDefault();
+      const values=['date','time','month','week','appointment'].map(id=>document.getElementById(id).value);
+      document.querySelector('output').textContent=values.join('|');
+      const a=document.createElement('a');a.download=values.join('_')+'.txt';a.href='data:text/plain,Confirmed';a.click();};</script>`);
+  for (const artifact of [false, true]) {
+    const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+      const preview = (process as any).mainModule.require(args.modulePath);
+      return (await (args.artifact ? preview.renderInteractiveHtmlSmoke(args.entry)
+        : preview.renderResponsiveHtmlPreview(args.entry, [{name:'desktop',width:1280,height:800}]))).evidence;
+    }, {entry,artifact,modulePath:path.resolve(__dirname,'../../src/main/features/html_preview.ts')});
+    writeFileSync(info.outputPath(`temporal-${artifact}.json`), JSON.stringify({...evidence,entryPath:undefined},null,2));
+    expect(evidence.ok).toBe(true);
+    expect(evidence.interactions.formsSubmitted).toBe(1);
+    expect(evidence.interactions.failures).toEqual([]);
+    expect(evidence.interactions.downloads).toEqual([{filename:'2026-11-20_10_30_2026-11_2026-W47_2026-11-20T10_30.txt',mimeType:'text/plain',totalBytes:9,urlKind:'data'}]);
+    expect(evidence.warnings.some(w=>w.includes('does not conform'))).toBe(false);
+  }
+});
+
+test('changes a standalone date within its constraints and keeps impossible date forms blocked', async ({ sdkOrkas: orkas }, info) => {
+  for (const impossible of [false,true]) {
+    const entry = orkas.createWorkspaceFile('date-check/index.html', impossible
+      ? '<!doctype html><form><label>Appointment<input type="date" min="2026-11-22" max="2026-11-20" required></label><button>Confirm</button></form>'
+      : '<!doctype html><style>input:focus-visible{outline:2px solid blue}</style><label>Appointment<input id="date" type="date" min="2026-11-20" max="2026-11-22"></label><output></output><script>document.getElementById("date").onchange=e=>{document.querySelector("output").textContent=e.target.validity.valid&&e.target.value?"Selected "+e.target.value:"Invalid selection";};</script>');
+    const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+      return (await (process as any).mainModule.require(args.modulePath).renderResponsiveHtmlPreview(args.entry,[{name:'desktop',width:1280,height:800}])).evidence;
+    }, {entry,modulePath:path.resolve(__dirname,'../../src/main/features/html_preview.ts')});
+    writeFileSync(info.outputPath(`date-${impossible}.json`),JSON.stringify({...evidence,entryPath:undefined},null,2));
+    expect(evidence.ok).toBe(!impossible);
+    expect(evidence.interactions.formsSubmitted).toBe(0);
+    if (impossible) expect(evidence.interactions.failures).toHaveLength(1);
+    else {
+      expect(evidence.interactions.stateChangesObserved).toBeGreaterThan(0);
+      expect(evidence.warnings.some(w=>w.includes('does not conform'))).toBe(false);
+    }
+  }
+});
+
+test('submits a native text field constrained to digits without treating its valid form as broken', async ({ sdkOrkas: orkas }, info) => {
+  const entry = orkas.createWorkspaceFile('numeric-pattern/index.html', `<!doctype html>
+    <style>input:focus-visible,button:focus-visible{outline:2px solid blue}</style>
+    <form><label>Count<input id="count" inputmode="numeric" pattern="[0-9]+" required></label><button>Save</button></form>
+    <output></output><script>document.querySelector('form').onsubmit=e=>{e.preventDefault();
+    const n=document.getElementById('count').value;document.querySelector('output').textContent='Saved '+n;
+    const a=document.createElement('a');a.download='count-'+n+'.txt';a.href='data:text/plain,Saved';a.click();};</script>`);
+  const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+    return (await (process as any).mainModule.require(args.modulePath).renderResponsiveHtmlPreview(args.entry,[{name:'desktop',width:1280,height:800}])).evidence;
+  }, {entry,modulePath:path.resolve(__dirname,'../../src/main/features/html_preview.ts')});
+  writeFileSync(info.outputPath('numeric-pattern.json'),JSON.stringify({...evidence,entryPath:undefined},null,2));
+  expect(evidence.ok).toBe(true);
+  expect(evidence.interactions.formsSubmitted).toBe(1);
+  expect(evidence.interactions.downloads).toEqual([{filename:'count-1.txt',mimeType:'text/plain',totalBytes:5,urlKind:'data'}]);
+});
+
+test('exercises SVG diagram controls and downloads without losing native controls or disabled exclusions', async ({ sdkOrkas: orkas }, info) => {
+  const entry = orkas.createWorkspaceFile('svg-controls/index.html', `<!doctype html>
+    <style>button:focus-visible,[tabindex]:focus-visible{outline:2px solid blue}</style>
+    <button onclick="document.getElementById('detail').textContent='Native selected'">Native control</button>
+    <svg viewBox="0 0 420 180" width="420" style="max-width:100%;height:auto" aria-label="Architecture">
+      <g role="button" tabindex="0" aria-label="Diagram detail" onclick="document.getElementById('detail').textContent='Diagram selected'">
+        <rect width="120" height="40" fill="blue"/><text y="20" fill="white">Diagram</text>
+      </g>
+      <g role="tab" tabindex="0" aria-label="Unwired detail" transform="translate(140 0)">
+        <rect width="120" height="40" fill="gray"/>
+      </g>
+      <g role="button" tabindex="0" aria-label="Download diagram" transform="translate(0 60)"
+        onclick="const a=document.createElement('a');a.download='diagram.txt';a.href='data:text/plain,Diagram';a.click()">
+        <rect width="120" height="40" fill="green"/>
+      </g>
+      <g role="button" aria-disabled="true" aria-label="Disabled detail" transform="translate(140 60)"
+        onclick="console.error('Disabled control was activated')"><rect width="120" height="40"/></g>
+      <g role="button" aria-label="Hidden detail" style="display:none"
+        onclick="console.error('Hidden control was activated')"><rect width="120" height="40"/></g>
+    </svg><p id="detail">Choose a component</p>`);
+  for (const artifact of [false, true]) {
+    const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+      const preview = (process as any).mainModule.require(args.modulePath);
+      return (await (args.artifact ? preview.renderInteractiveHtmlSmoke(args.entry)
+        : preview.renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }]))).evidence;
+    }, { entry, artifact, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+    writeFileSync(info.outputPath(`svg-controls-${artifact}.json`), JSON.stringify({ ...evidence, entryPath: undefined }, null, 2));
+    expect(evidence.ok).toBe(true);
+    expect(evidence.blockers).toEqual([]);
+    expect(evidence.viewports.every(view => view.consoleErrors.length === 0)).toBe(true);
+    expect(evidence.interactions).toMatchObject({ controlsExercised: 4, stateControlsExercised: 3,
+      stateTransitionsObserved: 2, failures: [], warnings: ['enabled control produced no observable outcome: Unwired detail'] });
+    expect(evidence.interactions.downloads).toEqual([{
+      filename: 'diagram.txt', mimeType: 'text/plain', totalBytes: 7, urlKind: 'data',
+    }]);
+  }
+});
+
+for (const empty of [false, true]) {
+  test(`measures an inline resume download (${empty ? 'empty' : 'nonempty'})`, async ({ sdkOrkas: orkas }, info) => {
+    const content = empty ? '' : '简历\nProduct designer\nExperience and contact details.';
+    const entry = orkas.createWorkspaceFile('inline-resume/index.html', `<!doctype html>
+      <style>a:focus-visible{outline:2px solid blue}</style>
+      <a download="resume.txt" href="data:text/plain;charset=utf-8,${encodeURIComponent(content)}">Download resume</a>`);
+    for (const artifact of [false, true]) {
+      const evidence = await orkas.electronApp!.evaluate(async (_, args) => {
+        const preview = (process as any).mainModule.require(args.modulePath);
+        return (await (args.artifact ? preview.renderInteractiveHtmlSmoke(args.entry)
+          : preview.renderResponsiveHtmlPreview(args.entry, [{ name: 'desktop', width: 1280, height: 800 }], {},
+            { fileViewer: true }))).evidence;
+      }, { entry, artifact, modulePath: path.resolve(__dirname, '../../src/main/features/html_preview.ts') });
+      writeFileSync(info.outputPath(`inline-resume-${artifact}.json`), JSON.stringify({ ...evidence, entryPath: undefined }, null, 2));
+      expect(evidence.interactions.downloads).toEqual([{
+        filename: 'resume.txt', mimeType: 'text/plain', totalBytes: Buffer.byteLength(content), urlKind: 'data',
+      }]);
+      expect(evidence.ok).toBe(!empty);
+    }
+  });
+}
+
 for (const broken of [false, true]) {
   test(`fills an editor before download and retains empty-payload rejection (${broken ? 'broken' : 'working'})`, async ({ sdkOrkas: orkas }, info) => {
     const entry = orkas.createWorkspaceFile('editor/index.html', `<!doctype html>

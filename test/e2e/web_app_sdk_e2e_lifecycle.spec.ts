@@ -1,17 +1,147 @@
 import path from 'node:path';
+import { lstatSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
 import { openSidebarEntry, expect, test } from './fixtures/orkas';
 
 
-test('web and legacy cloud SDK authoring returns commercial-required without allocating apps', async ({ orkas }) => {
-  for (const appType of ['web', 'cloud']) {
-    const receipt = await orkas.electronApp!.evaluate(async (_electron, input) =>
-      (process as any).mainModule.require(input.module).createArtifact('account-e2e', 'refused-sdk', 'helper', {
-        appType: input.appType, files: [{ path: 'index.html', content: '<h1>Do not execute</h1>' }],
-      }), { module: path.resolve('src/main/features/chat_artifacts.ts'), appType });
-    expect(receipt).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
+test('native saved-app consumer retains the submitted check-in count after app-list reopening', async ({ orkas }, info) => {
+  const definition = { version: 1, tables: [{ id: 'counts', name: 'counts', fields: [
+    { id: 'value', name: 'value', type: 'number' },
+  ], access: { read: ['value'], insert: ['value'] } }] };
+  const reference = '<!doctype html><html><meta charset="utf-8"><script src="/__orkas/sdk.js"></script><h1>Check-in</h1><label for="count">Count</label><input id="count" type="number"><button id="save">Save</button><output id="value"></output><script>const refresh=async()=>{const r=await orkasApp.data.query({table:"counts"});document.getElementById("value").textContent=String(r.records.reduce((n,r)=>n+r.value,0));};document.getElementById("save").onclick=async()=>{await orkasApp.data.insert({table:"counts",values:{value:Number(document.getElementById("count").value)}});await refresh();};refresh();</script></html>';
+  const source = process.env.ORKAS_EVAL_NATIVE_APP_BUNDLE;
+  const files = new Map<string, Buffer>();
+  if (source) {
+    if (!path.isAbsolute(source)) throw new Error('Native app consumer needs an absolute bundle directory');
+    let bytes = 0, directories = 0;
+    const visit = (relative: string) => {
+      if (++directories > 100 || relative.split(path.sep).length > 10) throw new Error('Native app consumer directory limit');
+      const dir = path.join(source, relative), stat = lstatSync(dir);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Native app consumer rejects linked bundles');
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const rel = path.join(relative, entry.name), file = path.join(source, rel), st = lstatSync(file);
+        if (st.isSymbolicLink() || entry.name.startsWith('.')) throw new Error('Native app consumer rejects hidden or linked files');
+        if (st.isDirectory()) visit(rel);
+        else {
+          if (!st.isFile() || !/\.(?:html?|js|mjs|css|json|svg|png|jpe?g|webp|woff2?)$/i.test(rel)
+            || files.size >= 100 || (bytes += st.size) > 4 * 1024 * 1024) throw new Error('Native app consumer bundle limit');
+          files.set(rel, readFileSync(file));
+        }
+      }
+    };
+    visit('');
+  } else {
+    files.set('index.html', Buffer.from(reference));
+    files.set('orkas-app.json', Buffer.from(JSON.stringify({ sdkVersion: 1, capabilities: ['data'], data: definition })));
   }
-  expect((await orkas.invoke<any>('savedApps.list')).apps).toEqual([]);
-  expect(orkas.electronApp!.windows()).toHaveLength(1);
+  expect(files.has('index.html')).toBe(true);
+  const hashes = [...files].map(([name, bytes]) => ({ name, sha256: createHash('sha256').update(bytes).digest('hex') }));
+  for (const [name, bytes] of files) orkas.createWorkspaceFile(path.join('checkin', name), bytes);
+  const entry = path.join(orkas.userWorkspaceRoot, 'checkin/index.html');
+  const page = orkas.page!;
+  const saved = await orkas.invoke<any>('savedApps.saveFromPath', { path: entry, title: 'Check-in', mode: 'auto' });
+  expect(saved.ok).toBe(true);
+  const apps = (await orkas.invoke<any>('savedApps.list')).apps;
+  expect(apps).toHaveLength(1);
+  const id = apps[0].id;
+  const savedRoot = path.join(orkas.workspaceRoot, 'account-e2e/cloud/saved_apps', id);
+  for (const [name, bytes] of files) if (name !== 'orkas-app.json') expect(readFileSync(path.join(savedRoot, name))).toEqual(bytes);
+  await openSidebarEntry(page, '#apps-btn');
+  const card = page.locator(`.app-card[data-app-id="${id}"]`);
+  await expect(card).toBeVisible();
+  let preview = await orkas.openPreview(() => card.click());
+  let frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+  await expect(frame.locator('#value')).toHaveText('0');
+  await frame.locator('#count').fill('7');
+  await frame.locator('#save').click();
+  await expect(frame.locator('#value')).toHaveText('7');
+  await orkas.closePreview(preview);
+  expect((await orkas.invoke<any>('savedApps.list')).apps.map((a: any) => a.id)).toEqual([id]);
+  preview = await orkas.openPreview(() => card.click());
+  frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+  await expect(frame.locator('#value')).toHaveText('7');
+  await preview.screenshot({ path: info.outputPath('native-count-reopened.png') });
+  await orkas.closePreview(preview);
+  expect(orkas.modelRequests).toHaveLength(0);
+  writeFileSync(info.outputPath('native-app-consumer.json'), JSON.stringify({ owner: 'production-evaluation-runner',
+    sourceFiles: hashes, savedAppCount: 1, savedAppId: id, enteredCount: 7, reopenedCount: 7,
+    saveEntry: 'savedApps.saveFromPath IPC', reopenEntry: 'native-app-list-card', modelRequests: 0 }));
+});
+
+test('web app common data survives closing and reopening while host inference remains unavailable',async({orkas},testInfo)=>{
+  const definition={version:1,tables:[{id:'notes',name:'notes',fields:[{id:'body',name:'body',type:'string'}],access:{read:['body'],insert:['body'],count:true}}]};
+  const app=await orkas.electronApp!.evaluate(async(_electron,input)=>{
+    const main=(process as any).mainModule,artifacts=main.require(input.artifacts),saved=main.require(input.saved),chats=main.require(input.chats);const task=await chats.createConversation('account-e2e',{title:'Cloud data'});
+    const result=await artifacts.createArtifact('account-e2e',task.conversation_id,'helper',{appType:'web',files:[{path:'index.html',content:'<!doctype html><html><head><script src="/__orkas/sdk.js"></script></head><body><h1>Cloud notes</h1><input aria-label="Note"><button id="save">Save note</button><output></output><script>const refresh=async()=>{const value=await orkasApp.data.query({table:"notes"});document.querySelector("output").textContent=value.records.map(record=>record.body).join(";")||"Empty";};document.getElementById("save").onclick=async()=>{await orkasApp.data.insert({table:"notes",values:{body:document.querySelector("input").value}});await refresh();};refresh();</script></body></html>'},{path:'orkas-app.json',content:JSON.stringify({sdkVersion:1,capabilities:['data'],data:input.definition})}]});if(!result.ok)throw new Error(result.error);return saved.saveFromArtifact('account-e2e',task.conversation_id,result.artifactId);
+  },{artifacts:path.resolve('src/main/features/chat_artifacts.ts'),saved:path.resolve('src/main/features/saved_apps.ts'),chats:path.resolve('src/main/features/chats.ts'),definition});
+  if(!app.ok)throw new Error(app.error);await openSidebarEntry(orkas.page,'#apps-btn');let preview=await orkas.openPreview(()=>orkas.page.locator(`.app-card[data-app-id="${app.id}"]`).click());let frame=preview.locator('.saved-app-viewer-frame').contentFrame();await expect(frame.locator('output')).toHaveText('Empty');await frame.getByLabel('Note').fill('Retained locally');await frame.getByRole('button',{name:'Save note'}).click();await expect(frame.locator('output')).toHaveText('Retained locally');
+  expect(await frame.locator('body').evaluate(()=>(window as any).orkasApp.ai)).toBeUndefined();await orkas.closePreview(preview);preview=await orkas.openPreview(()=>orkas.page.locator(`.app-card[data-app-id="${app.id}"]`).click());frame=preview.locator('.saved-app-viewer-frame').contentFrame();await expect(frame.locator('output')).toHaveText('Retained locally');await preview.screenshot({path:testInfo.outputPath('cloud-local-data.png')});expect(orkas.modelRequests).toHaveLength(0);
+});
+
+test('a closed saved app retains its records after a compatible update and process restart', async ({ orkas }, testInfo) => {
+  const definition = { version: 1, tables: [{ id: 'loans', name: 'loans', fields: [
+    { id: 'borrower', name: 'borrower', type: 'string' },
+    { id: 'item', name: 'item', type: 'string' },
+  ], access: { read: ['borrower', 'item'], insert: ['borrower', 'item'] } }] };
+  const html = (revision: number) => `<!doctype html><html><head><script src="/__orkas/sdk.js"></script></head><body>
+    <h1>Loan register ${revision}</h1><label>Borrower <input id="borrower"></label><label>Item <input id="item"></label>
+    <button id="save">Record loan</button><output></output><script>
+    const refresh=async()=>{const result=await orkasApp.data.query({table:'loans'});
+      document.querySelector('output').textContent=JSON.stringify(result.records);};
+    document.getElementById('save').onclick=async()=>{await orkasApp.data.insert({table:'loans',values:{
+      borrower:document.getElementById('borrower').value,item:document.getElementById('item').value}});await refresh();};
+    refresh();</script></body></html>`;
+  const entry = orkas.createWorkspaceFile('loans/index.html', html(1));
+  orkas.createWorkspaceFile('loans/orkas-app.json', JSON.stringify({ sdkVersion: 1, capabilities: ['data'], data: definition }));
+  const app: any = await orkas.invoke('savedApps.saveFromPath', { path: entry, title: 'Loan register', mode: 'auto' });
+  expect(app.ok).toBe(true);
+  const row = { borrower: `Borrower ${randomUUID()}`, item: 'Radio 7' };
+  await openSidebarEntry(orkas.page, '#apps-btn');
+  let preview = await orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${app.id}"]`).click());
+  let frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+  await frame.getByLabel('Borrower').fill(row.borrower);
+  await frame.getByLabel('Item', { exact: true }).fill(row.item);
+  await frame.getByRole('button', { name: 'Record loan' }).click();
+  await expect(frame.locator('output')).toHaveText(JSON.stringify([row]));
+  await orkas.closePreview(preview);
+  writeFileSync(entry, html(2));
+  const updated: any = await orkas.invoke('savedApps.saveFromPath', { path: entry, mode: 'auto' });
+  expect(updated).toMatchObject({ ok: true, id: app.id });
+  await orkas.relaunch();
+  await openSidebarEntry(orkas.page, '#apps-btn');
+  const listed: any = await orkas.invoke('savedApps.list');
+  expect(listed.apps.map((value: any) => value.id)).toEqual([app.id]);
+  preview = await orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${app.id}"]`).click());
+  frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+  await expect(frame.getByRole('heading')).toHaveText('Loan register 2');
+  await expect(frame.locator('output')).toHaveText(JSON.stringify([row]));
+  const heading = await frame.getByRole('heading').innerText();
+  const visible = JSON.parse((await frame.locator('output').textContent())!);
+  await orkas.closePreview(preview);
+  const persisted = await orkas.electronApp!.evaluate(async (_electron, input) => {
+    const main = (process as any).mainModule, { LocalAppData } = main.require(input.module);
+    const paths = main.require(input.paths), crypto = main.require('node:crypto');
+    const key = crypto.createHash('sha256').update(JSON.stringify(['saved', input.id])).digest('hex');
+    const database = new LocalAppData(paths.webAppSandboxRoot('account-e2e', key, 'local') + '/data.sqlite',
+      paths.userLocalRoot('account-e2e'), input.definition);
+    try { return await database.call('data.query', { table: 'loans' }); }
+    finally { await database.close(); }
+  }, { id: app.id, definition, module: path.resolve('src/main/features/web_apps/data.ts'), paths: path.resolve('src/main/paths.ts') });
+  expect(persisted).toEqual({ records: [row] });
+  // A success-looking rendered row alone must not hide skipped writes,
+  // duplicate side effects, or stale code at this same consumer boundary.
+  const correct = { ids: listed.apps.map((value: any) => value.id), heading, records: persisted.records, visible };
+  const accepts = (value: typeof correct) => value.ids.length === 1 && value.ids[0] === app.id && value.heading === 'Loan register 2'
+    && JSON.stringify(value.records) === JSON.stringify([row]) && JSON.stringify(value.visible) === JSON.stringify([row]);
+  expect(accepts(correct)).toBe(true);
+  const controls = [
+    { name: 'correct', expected: true, value: correct },
+    { name: 'false-success-without-persisted-record', expected: false, value: { ...correct, records: [] } },
+    { name: 'duplicate-effect', expected: false, value: { ...correct, records: [row, row] } },
+    { name: 'stale-consumer', expected: false, value: { ...correct, heading: 'Loan register 1' } },
+  ].map(({ name, expected, value }) => ({ name, expected, accepted: accepts(value) }));
+  expect(controls.every(control => control.expected === control.accepted)).toBe(true);
+  await testInfo.attach('native-record-controls', { body: JSON.stringify(controls), contentType: 'application/json' });
   expect(orkas.modelRequests).toHaveLength(0);
 });
 
@@ -187,6 +317,45 @@ test('local pages, reload and rejected navigation preserve the app SDK', async (
   await frame.getByRole('link',{name:'Forbidden'}).click();
   expect(await frame.locator('body').evaluate(()=>(window as any).orkasApp.storage.get({key:'count'}))).toEqual({value:3});
   expect(orkas.modelRequests).toHaveLength(0);
+});
+
+test('a same-length source edit revokes the live SDK and protocol while reopening preserves saved data', async ({ orkas }) => {
+  const entry = orkas.createWorkspaceFile('revision/index.html', '<!doctype html><h1>Revision before</h1><script src="/__orkas/sdk.js"></script>');
+  orkas.createWorkspaceFile('revision/orkas-app.json', JSON.stringify({ sdkVersion: 1, capabilities: ['storage'] }));
+  const app: any = await orkas.invoke('savedApps.saveFromPath', { path: entry, title: 'Source revision' });
+  await openSidebarEntry(orkas.page, '#apps-btn');
+  const open = () => orkas.openPreview(() => orkas.page.locator(`.app-card[data-app-id="${app.id}"]`).click());
+  const preview = await open();
+  const frame = preview.locator('.saved-app-viewer-frame').contentFrame();
+  await expect(frame.getByRole('heading')).toHaveText('Revision before');
+  expect(await frame.locator('body').evaluate(() => (window as any).orkasApp.storage.set({ key: 'value', value: 'KEEP' }))).toEqual({ saved: true });
+  const mutation = await orkas.electronApp!.evaluate((_electron, input) => {
+    const req = (process as any).mainModule.require.bind((process as any).mainModule);
+    const fs = req('node:fs'), saved = req(input.module);
+    const file = saved.resolveSavedAppFilePath('account-e2e', input.id, 'index.html');
+    if (!file.ok) throw new Error('Source fixture is unavailable');
+    const before = fs.readFileSync(file.absPath, 'utf8'), after = before.replace('Revision before', 'Revision after!');
+    fs.writeFileSync(file.absPath, after);
+    return { changed: before !== after, sameLength: Buffer.byteLength(before) === Buffer.byteLength(after) };
+  }, { module: path.resolve('src/main/features/saved_apps.ts'), id: app.id });
+  expect(mutation).toEqual({ changed: true, sameLength: true });
+  expect(await frame.locator('body').evaluate(async () => {
+    try { await (window as any).orkasApp.storage.set({ key: 'value', value: 'WRONG' }); return 'unexpected-success'; }
+    catch (error: any) { return error.code; }
+  })).toBe('E_CLOSED');
+  const denialStart = orkas.rendererDiagnosticCheckpoint();
+  const deniedUrl = await frame.locator('body').evaluate((_body, nonce) => {
+    const url = new URL(location.href); url.searchParams.set('denial-probe', nonce); return url.href;
+  }, randomUUID());
+  const deniedStatus = await frame.locator('body').evaluate(async (_body, url) => (await fetch(url)).status, deniedUrl);
+  expect(deniedStatus).toBe(403);
+  await preview.close();
+  const reopened = await open();
+  const fresh = reopened.locator('.saved-app-viewer-frame').contentFrame();
+  await expect(fresh.getByRole('heading')).toHaveText('Revision after!');
+  expect(await fresh.locator('body').evaluate(() => (window as any).orkasApp.storage.get({ key: 'value' }))).toEqual({ value: 'KEEP' });
+  expect(orkas.modelRequests).toHaveLength(0);
+  orkas.acknowledgeResourceDenial(preview, { url: deniedUrl, after: denialStart, status: deniedStatus });
 });
 
 test('unavailable conversation apps show independent inline retries without modal stacks', async ({ orkas }, testInfo) => {

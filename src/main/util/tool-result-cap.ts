@@ -18,7 +18,7 @@
 import { appendInputReceipt } from '../../../bin/tool-input-compat.cjs';
 import * as fs from 'fs';
 import * as path from 'path';
-import { createHash } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type { AgentTool, ToolResult, ToolContext } from '#core-agent';
 import { createLogger } from '../logger';
@@ -316,7 +316,9 @@ export function capToolResult(
     });
     return {
       ...result,
-      content: buildPersistedOutputMarker(absPath, toolName, content, result.isError),
+      content: buildPersistedOutputMarkerFromPreview(absPath, toolName, content, {
+        sizeChars: len, estimatedTokens, isError: !!result.isError, sourceTruncated: false,
+      }),
       persistedOutput: {
         path: absPath,
         size: content.length,
@@ -433,7 +435,7 @@ export function persistToolResult(
     .slice(0, TOOL_RESULT_REF_HASH_HEX);
   const abs = path.join(toolResultsDir, `${safeTool}.${id}.txt`);
   if (fs.existsSync(abs)) return abs;
-  const tmp = `${abs}.${process.pid}.tmp`;
+  const tmp = `${abs}.${process.pid}.${randomUUID()}.tmp`;
   try {
     fs.writeFileSync(tmp, content, { encoding: 'utf8', mode: 0o600 });
     fs.renameSync(tmp, abs);
@@ -566,7 +568,8 @@ export function maybeSpillToolResult(opts: {
   if (typeof serialized !== 'string') {
     return { output: '[Unsupported tool result omitted.]' };
   }
-  if (!serialized || estimateToolResultTokens(serialized) <= maxInlineTokens) {
+  const estimatedTokens = estimateToolResultTokens(serialized);
+  if (!serialized || estimatedTokens <= maxInlineTokens) {
     return { output };
   }
   try {
@@ -580,7 +583,9 @@ export function maybeSpillToolResult(opts: {
     // Same preview shape as the in-process path so the renderer's
     // click-to-expand logic works identically.
     return {
-      output: buildPersistedOutputMarker(abs, toolName, serialized),
+      output: buildPersistedOutputMarkerFromPreview(abs, toolName, serialized, {
+        sizeChars: serialized.length, estimatedTokens, isError: false, sourceTruncated: false,
+      }),
       outputPath: abs,
     };
   } catch (err) {
@@ -757,7 +762,8 @@ function buildBoundedPreview(content: string, maxTokens: number): string {
 
 function prefixWithinTokenBudget(text: string, maxTokens: number): string {
   let lo = 0;
-  let hi = text.length;
+  // The fixed estimator charges at least one token per four UTF-16 units.
+  let hi = Math.min(text.length, maxTokens * 4);
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2);
     if (estimateToolResultTokens(text.slice(0, mid)) <= maxTokens) lo = mid;
@@ -768,7 +774,8 @@ function prefixWithinTokenBudget(text: string, maxTokens: number): string {
 
 function suffixWithinTokenBudget(text: string, maxTokens: number): string {
   let lo = 0;
-  let hi = text.length;
+  // The fixed estimator charges at least one token per four UTF-16 units.
+  let hi = Math.min(text.length, maxTokens * 4);
   while (lo < hi) {
     const mid = Math.ceil((lo + hi) / 2);
     if (estimateToolResultTokens(text.slice(text.length - mid)) <= maxTokens) lo = mid;
