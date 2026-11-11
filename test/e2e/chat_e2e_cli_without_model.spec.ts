@@ -49,7 +49,34 @@ test.describe('CLI agents without a built-in model', () => {
       await page.locator('#new-chat-input').fill('Plan my week');
       await page.locator('#new-chat-send-btn').click();
       await expect(guardAlert).toContainText('No model has been added');
+      await expect(page.locator('#conversation-list .conv-item')).toHaveCount(1);
       expect(app.readCliState().invocations).toHaveLength(2);
+    } finally {
+      await app.dispose();
+    }
+  });
+
+  test('a project chat send to a CLI agent needs no model', async ({}, info) => {
+    const app = new OrkasTestApp(info, { cliStub: true, configuredModel: false });
+    try {
+      await app.launch();
+      const page = app.page!;
+      const guardAlert = page.locator('.ui-dialog-overlay.open .ui-dialog-message');
+      await expect.poll(() => page.evaluate(() => (window as any).isModelConfigured())).toBe(false);
+      await connectCliAgent(page, 'cursor', 'CliProjectE2E');
+
+      const listed = await app.invoke<{ agents: { agent_id: string; name: string }[] }>('agents.list', { summary: true });
+      const agentId = listed.agents.find(agent => agent.name === 'CliProjectE2E')!.agent_id;
+      const created = await app.invoke<any>('projects.create', { name: 'CLI project' });
+      await app.invoke('projects.bindings.add', { projectId: created.project.project_id, kind: 'agent', id: agentId });
+      await page.evaluate(id => (window as any).setView('project', id), created.project.project_id);
+      await expect(page.locator('#project-detail-title')).toHaveText('CLI project');
+      await page.locator('#project-chat-input').fill('@CliProjectE2E Remember E2E_ACP_PRIOR_FACT=blue-orbit');
+      await page.locator('#project-chat-send-btn').click();
+      await expect(assistantReply(page, 'E2E_CURSOR_FIRST_OK')).toBeVisible({ timeout: 30_000 });
+      await expect(guardAlert).toHaveCount(0);
+      await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+      expect(app.readCliState().invocations).toHaveLength(1);
     } finally {
       await app.dispose();
     }
