@@ -1858,7 +1858,7 @@
   "agent_modal.ext_cli_status_version_too_old": "{version} sürümü çok eski",
   "agent_modal.ext_cli_detecting": "Algılanıyor…",
   "agent_modal.ext_cli_updating": "Güncelleniyor…",
-  "agent_modal.ext_cli_prerequisite_body": "Claude Code, Codex, OpenClaw, OpenCode ve Hermes desteklenir. Bağlanmak için birini yükleyip yapılandırın.",
+  "agent_modal.ext_cli_prerequisite_body": "Claude Code, Codex, OpenClaw, OpenCode, Hermes, Cursor, Grok ve Antigravity desteklenir. Bağlanmak için birini yükleyip yapılandırın.",
   "agent_modal.ext_name": "Ad",
   "agent_modal.ext_name_placeholder": "ör. ClaudeCode",
   "agent_modal.ext_desc": "Özet",
