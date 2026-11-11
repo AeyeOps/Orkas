@@ -59,6 +59,7 @@ function loadFailedRetrySender() {
     t: (key: string) => key === 'chat.retry_user_message' ? 'Continue' : key,
     window: { Monitor: monitor },
     Monitor: monitor,
+    _agentIsExternal: () => false,
     sendInConversation: (cid: string, content: string, extra?: Record<string, unknown>) => {
       calls.push({ cid, content, extra });
       return new Promise<void>((resolve) => releases.push(resolve));

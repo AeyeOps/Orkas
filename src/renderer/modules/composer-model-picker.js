@@ -60,8 +60,13 @@ function _composerRecipientForTarget(target) {
   }
 }
 
-function _composerRecipientUsesExternalAgent(target) {
+function _agentIsExternal(agentId) {
   if (typeof _agentsCache === 'undefined' || !Array.isArray(_agentsCache)) return false;
+  const agent = _agentsCache.find((item) => item && item.agent_id === agentId);
+  return !!(agent && agent.runtime && agent.runtime.kind === 'cli');
+}
+
+function _composerRecipientUsesExternalAgent(target) {
   // A planned send (D29) is split by a model call even when every mentioned
   // actor is a CLI agent, so the model choice still applies.
   if (target !== 'auto' && typeof _composerSendIsPlanned === 'function'
@@ -75,11 +80,8 @@ function _composerRecipientUsesExternalAgent(target) {
     : [];
   const selected = _composerRecipientForTarget(target);
   const recipients = preview.length ? preview : selected?.kind === 'group' ? selected.recipients : [selected];
-  return recipients.every((recipient) => {
-    if (!recipient || recipient.kind !== 'agent' || !recipient.id) return false;
-    const agent = _agentsCache.find((item) => item && item.agent_id === recipient.id);
-    return !!(agent && agent.runtime && agent.runtime.kind === 'cli');
-  });
+  return recipients.every((recipient) => !!recipient && recipient.kind === 'agent'
+    && !!recipient.id && _agentIsExternal(recipient.id));
 }
 
 function _syncComposerModelChipAvailability(target) {
