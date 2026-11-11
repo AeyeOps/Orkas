@@ -11225,7 +11225,7 @@ async function _retryFailedAssistantMessage(msgDiv) {
   // turn finishes made a queued retry look like already-running work and
   // prevented the user from deliberately queuing another attempt.
   await sendInConversation(currentCid, payload.content, payload.extra, {
-
+    modelGateChecked: !!failedMessageId && _agentIsExternal(String(msgDiv.dataset.fromActor || '')),
   });
 }
 
@@ -11261,7 +11261,7 @@ async function handleNewChatSubmit() {
     await uiAlert(t(unresolvedQuickStart ? 'new_chat.quick.task_required' : 'oss.task_required'));
     return;
   }
-  if (!ensureModelConfigured()) {
+  if (!ensureModelConfigured({ composerTarget: 'new-chat' })) {
     return;
   }
   const releaseAttachmentSend = _chatAttachTryBeginSend(DRAFT_CID);
@@ -11447,6 +11447,7 @@ async function handleNewChatSubmit() {
       restoreComposerOnFailure: true,
       source_view: 'new_chat',
       content_length: requestText.length,
+      modelGateChecked: true,
     });
   } finally {
     releaseAttachmentSend();
@@ -11484,7 +11485,7 @@ async function handleChatSubmit() {
     await uiAlert(t('new_chat.quick.task_required'));
     return;
   }
-  if (!ensureModelConfigured()) {
+  if (!ensureModelConfigured({ composerTarget: 'conversation' })) {
     return;
   }
   const releaseAttachmentSend = _chatAttachTryBeginSend(cid);
@@ -11633,6 +11634,7 @@ async function handleChatSubmit() {
       background: cid !== currentCid,
       ...agentRunOptions,
       content_length: requestText.length,
+      modelGateChecked: true,
     });
   } finally {
     releaseAttachmentSend();
@@ -11696,6 +11698,7 @@ function _makeConvChatController(cid, options = {}) {
     inputEl: backgroundHistory ? null : 'chat-input',
     sendBtnEl: backgroundHistory ? null : 'chat-send-btn',
     getCurrentId: () => cid,
+    modelGateChecked: options.modelGateChecked === true,
     // `getCurrentId` is intentionally fixed to the controller's request
     // target so its abort/queue lifecycle survives navigation. Rendering has
     // a different owner: only the task currently mounted in the conversation
@@ -11885,6 +11888,7 @@ async function sendInConversation(cid, content, extra, options = {}) {
 
   const ctrl = _makeConvChatController(cid, {
     background: sendOptions.background === true,
+    modelGateChecked: sendOptions.modelGateChecked === true,
     onAccepted: notifyAccepted,
     restoreComposerOnFailure: sendOptions.restoreComposerOnFailure,
     onStarted() {
@@ -14289,10 +14293,11 @@ function createChatController(config) {
     if (!id) return { started: false, aborted: false, errored: false, reason: 'missing_id' };
     let content = (rawContent || '').trim();
     if (!content) return { started: false, aborted: false, errored: false, reason: 'empty' };
-    // Gate every chat-controller send on model config — covers the normal
-    // conversation flow plus skill/agent edit chats, and also catches queue
-    // drains and auto-seed sends (e.g. skills.js 'autoSeed').
-    if (!ensureModelConfigured()) {
+    // Gate every chat-controller send on model config — covers skill/agent
+    // edit chats, queue drains and auto-seed sends (e.g. skills.js
+    // 'autoSeed'). A composer submit already ran the gate against its own
+    // recipients, which this controller cannot see.
+    if (!config.modelGateChecked && !ensureModelConfigured()) {
       return { started: false, aborted: false, errored: false, reason: 'model_not_configured' };
     }
     if (hooks.beforeSend) {
