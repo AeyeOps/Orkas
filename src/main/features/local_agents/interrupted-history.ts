@@ -74,7 +74,7 @@ async function archiveRuns(userId: string, cid: string, actors: Set<string>): Pr
       if ((await handle.stat()).size > 4 * 1024 * 1024) continue;
       const meta = JSON.parse(await handle.readFile('utf8'));
       if (meta.cid !== cid || !actors.has(meta.agentId)
-          || !['codex', 'claude', 'opencode', 'openclaw', 'hermes'].includes(meta.cli)) continue;
+          || !['codex', 'claude', 'opencode', 'openclaw', 'hermes', 'cursor', 'grok', 'agy'].includes(meta.cli)) continue;
       runs.push({ directory, cid: meta.cid, agentId: meta.agentId, cli: meta.cli,
         startedAt: meta.startedAt, endedAt: meta.endedAt, durationMs: meta.durationMs,
         currentMessageId: meta.currentMessageId });
