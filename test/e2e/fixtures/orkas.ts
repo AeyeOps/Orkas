@@ -64,6 +64,8 @@ type OrkasOptions = {
   modelStub?: boolean;
   marketplaceStub?: boolean;
   cliStub?: boolean;
+  /** Pin the CLI stubs through `local-cli-paths.json` instead of `ORKAS_<TYPE>_PATH`. */
+  savedCliPaths?: boolean;
   voiceStub?: boolean;
   metacognitionEnabled?: boolean;
   enableSystemProxy?: boolean;
@@ -989,6 +991,7 @@ export class OrkasTestApp {
   readonly modelStub: boolean;
   readonly marketplaceStub: boolean;
   readonly cliStub: boolean;
+  readonly savedCliPaths: boolean;
   readonly voiceStub: boolean;
   readonly metacognitionEnabled: boolean;
   readonly enableSystemProxy: boolean;
@@ -1100,6 +1103,7 @@ export class OrkasTestApp {
     this.modelStub = options.modelStub === true;
     this.marketplaceStub = options.marketplaceStub === true;
     this.cliStub = options.cliStub === true;
+    this.savedCliPaths = options.savedCliPaths === true;
     this.voiceStub = options.voiceStub === true;
     this.metacognitionEnabled = options.metacognitionEnabled === true;
     this.enableSystemProxy = options.enableSystemProxy === true;
@@ -1147,6 +1151,17 @@ export class OrkasTestApp {
       } satisfies CliStubState);
     }
     seedWorkspace(this.workspaceRoot, options.seedLanguage);
+    if (this.cliStub && this.savedCliPaths) {
+      writeJson(path.join(this.workspaceRoot, 'local-cli-paths.json'), {
+        opencode: this.fakeOpenCodePath,
+        hermes: this.fakeHermesPath,
+        cursor: this.fakeCursorPath,
+        grok: this.fakeGrokPath,
+        agy: this.fakeAgyPath,
+        codex: this.fakeCodexPath,
+        claude: this.fakeClaudePath,
+      });
+    }
     mkdirSync(this.userDataRoot, { recursive: true });
     mkdirSync(this.authRoot, { recursive: true });
     mkdirSync(this.userWorkspaceRoot, { recursive: true });
@@ -1196,6 +1211,11 @@ export class OrkasTestApp {
       environment.ORKAS_AGY_PATH = this.fakeAgyPath || '';
       environment.ORKAS_CODEX_PATH = this.fakeCodexPath || '';
       environment.ORKAS_CLAUDE_PATH = this.fakeClaudePath || '';
+      if (this.savedCliPaths) {
+        for (const cli of ['OPENCODE', 'HERMES', 'CURSOR', 'GROK', 'AGY', 'CODEX', 'CLAUDE']) {
+          delete environment[`ORKAS_${cli}_PATH`];
+        }
+      }
       environment.ORKAS_TEST_NODE = TEST_NODE;
     }
     for (const proxyName of [

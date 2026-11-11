@@ -17,6 +17,7 @@
  *       users.json                ← Local uid registry + current_user_id / dev_current_user_id
  *       open-users.json           ← Open-source registry + open_current_user_id
  *       window-state.json         ← Last desktop window bounds (machine-local)
+ *       local-cli-paths.json      ← Saved executable path per local CLI (machine-local)
  *       logs/                     ← Local logs (rolled daily, global)
  *       venv/                     ← Machine-global dependency envs/caches
  *       local/marketplace/        ← Per-user platform installs reconciled from cloud manifests
@@ -87,6 +88,7 @@ export const USERS_FILE        = path.join(WS_ROOT, 'users.json');
 export const OPEN_USERS_FILE   = path.join(WS_ROOT, 'open-users.json');
 export const DEVICE_FILE       = path.join(WS_ROOT, 'device.json');
 export const WINDOW_STATE_FILE = path.join(WS_ROOT, 'window-state.json');
+export const LOCAL_CLI_PATHS_FILE = path.join(WS_ROOT, 'local-cli-paths.json');
 // Machine-local logs (daily rolling, single global file shared across uids).
 export const LOGS_DIR          = path.join(WS_ROOT, 'logs');
 // Machine-local dependency environments shared across Orkas accounts on this

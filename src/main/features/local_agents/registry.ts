@@ -3,9 +3,11 @@
  *
  * Discovery rules per CLI:
  *   1. ORKAS_<TYPE>_PATH env var, if set → use as-is (still validated).
- *   2. Else `whichBin(defaultBin)` scans PATH plus standard GUI-app
+ *   2. Else the CLI's path saved in `<data>/local-cli-paths.json`, if any →
+ *      use as-is (still validated).
+ *   3. Else `whichBin(defaultBin)` scans PATH plus standard GUI-app
  *      fallback dirs (`~/.local/bin`, Homebrew locations, etc.).
- *   3. If found, run the CLI's documented version probe and `checkMinVersion`.
+ *   4. If found, run the CLI's documented version probe and `checkMinVersion`.
  *
  * The External-agent create panel uses `findAllInstalled` before this full
  * validation pass. That path-only pass never spawns a CLI process, so the
@@ -24,6 +26,7 @@
  */
 
 import { createLogger } from '../../logger.js';
+import { LOCAL_CLI_PATHS_FILE } from '../../paths.js';
 import { isBootAdmissionIdle } from '../../util/boot_init.js';
 import { whichBin, whichBins } from './which.js';
 import {
@@ -269,6 +272,57 @@ const ENV_KEYS: Record<LocalCliType, string> = {
   agy: 'ORKAS_AGY_PATH',
 };
 
+type ExplicitCliPath = {
+  /** Null when the saved entry cannot be read as a path. */
+  path: string | null;
+  /** Shown in the UI when the CLI cannot be resolved from this setting. */
+  unresolvedDetail: string;
+};
+
+/**
+ * The path a user pinned for this CLI: `ORKAS_<TYPE>_PATH` when set, else the
+ * entry saved in `<data>/local-cli-paths.json`, a JSON object of CLI type to
+ * path. Either one is authoritative: a pin that does not resolve, or a file
+ * that cannot be read as that object, leaves the CLI unavailable and
+ * automatic discovery is never used in its place.
+ */
+function explicitCliPath(type: LocalCliType): ExplicitCliPath | null {
+  const envPath = process.env[ENV_KEYS[type]]?.trim();
+  if (envPath) {
+    return {
+      path: envPath,
+      unresolvedDetail: `${ENV_KEYS[type]}=${envPath} not found on PATH or filesystem`,
+    };
+  }
+
+  let text: string;
+  try {
+    text = fs.readFileSync(LOCAL_CLI_PATHS_FILE, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  const fileName = path.basename(LOCAL_CLI_PATHS_FILE);
+  let saved: unknown;
+  try {
+    saved = JSON.parse(text);
+  } catch {
+    return { path: null, unresolvedDetail: `${fileName} is not valid JSON` };
+  }
+  if (!saved || typeof saved !== 'object' || Array.isArray(saved)) {
+    return { path: null, unresolvedDetail: `${fileName} must hold a JSON object of CLI type to path` };
+  }
+  const savedPath = (saved as Record<string, unknown>)[type];
+  if (savedPath === undefined) return null;
+  if (typeof savedPath !== 'string' || !savedPath.trim()) {
+    return { path: null, unresolvedDetail: `${fileName} ${type} must be a path` };
+  }
+  return {
+    path: savedPath.trim(),
+    unresolvedDetail: `${fileName} ${type}=${savedPath.trim()} not found on PATH or filesystem`,
+  };
+}
+
 /** Documented version probes for each CLI, in compatibility order. */
 const VERSION_PROBES: Record<LocalCliType, readonly (readonly string[])[]> = {
   claude: [['--version']],
@@ -489,12 +543,10 @@ export async function findAllInstalled(): Promise<LocalCliEntry[]> {
 }
 
 async function findInstalled(type: LocalCliType): Promise<LocalCliEntry> {
-  const envPath = process.env[ENV_KEYS[type]]?.trim();
-  const candidate = envPath && envPath.length > 0 ? envPath : BIN_NAMES[type];
-  const extraDirs = envPath ? [] : localCliSearchDirs(type);
-  const resolved = envPath
-    ? await whichBin(candidate, { extraDirs })
-    : (await whichBins(candidate, { extraDirs }))[0] ?? null;
+  const explicit = explicitCliPath(type);
+  const resolved = explicit
+    ? (explicit.path ? await whichBin(explicit.path, { extraDirs: [] }) : null)
+    : (await whichBins(BIN_NAMES[type], { extraDirs: localCliSearchDirs(type) }))[0] ?? null;
 
   if (!resolved) {
     return {
@@ -504,8 +556,8 @@ async function findInstalled(type: LocalCliType): Promise<LocalCliEntry> {
       available: false,
       validation: 'pending',
       error: 'not_found',
-      errorDetail: envPath
-        ? `${ENV_KEYS[type]}=${envPath} not found on PATH or filesystem`
+      errorDetail: explicit
+        ? explicit.unresolvedDetail
         : `${BIN_NAMES[type]} not found on PATH or standard CLI install locations`,
     };
   }
@@ -650,34 +702,31 @@ export async function detectOne(
   type: LocalCliType,
   opts: DetectLocalCliOptions = {},
 ): Promise<LocalCliEntry> {
-  const envPath = process.env[ENV_KEYS[type]]?.trim();
-  const candidate = envPath && envPath.length > 0 ? envPath : BIN_NAMES[type];
-  const extraDirs = envPath
-    ? []
-    : (opts.searchDirs ? [...opts.searchDirs] : localCliSearchDirs(type));
+  const explicit = explicitCliPath(type);
   const versionProbeTimeoutMs = Number.isFinite(opts.versionProbeTimeoutMs)
     && Number(opts.versionProbeTimeoutMs) > 0
     ? Number(opts.versionProbeTimeoutMs)
     : VERSION_PROBE_TIMEOUT_MS;
   // Automatic discovery probes every installation for every CLI. This keeps
   // source-neutral fallback available to all adapters, while an explicit
-  // ORKAS_<TYPE>_PATH remains authoritative and never silently switches.
-  if (!envPath) {
+  // path (ORKAS_<TYPE>_PATH or local-cli-paths.json) remains authoritative
+  // and never silently switches.
+  if (!explicit) {
     return detectPreferredCandidates(
       type,
-      await whichBins(candidate, { extraDirs }),
+      await whichBins(BIN_NAMES[type], {
+        extraDirs: opts.searchDirs ? [...opts.searchDirs] : localCliSearchDirs(type),
+      }),
       versionProbeTimeoutMs,
     );
   }
   candidatePools.set(type, []);
-  const resolved = await whichBin(candidate, { extraDirs });
+  const resolved = explicit.path ? await whichBin(explicit.path, { extraDirs: [] }) : null;
   if (!resolved) {
     return {
       type, path: null, version: null, available: false,
       error: 'not_found',
-      errorDetail: envPath
-        ? `${ENV_KEYS[type]}=${envPath} not found on PATH or filesystem`
-        : `${BIN_NAMES[type]} not found on PATH or standard CLI install locations`,
+      errorDetail: explicit.unresolvedDetail,
     };
   }
   // The npm @openai/codex wrapper can hang on `--version` in GUI-launched
