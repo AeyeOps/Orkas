@@ -1,6 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import type { z } from "zod/v3";
+import type { z } from "zod";
 import { CoreAgentConfigSchema, type CoreAgentConfig } from "./schema.js";
 
 /** Input type for config — allows partial values with defaults. */

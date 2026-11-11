@@ -1,21 +1,23 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import AdmZip from 'adm-zip';
 import { drainMainRuntimeForTest } from '../../../helpers/drain-main-runtime';
 import { currentTurnSnapshots, quotedSnapshots } from '../../../helpers/reference-context';
 import { estimateTextTokens } from '../../../../src/core-agent/src/shared/token-estimate';
-import { SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS } from '../../../../src/core-agent/src/tools/base';
+import { SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS, TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS } from '../../../../src/core-agent/src/tools/base';
 
 const retryInfoLog = vi.hoisted(() => vi.fn());
 const warningLog = vi.hoisted(() => vi.fn());
+const hostErrorLog = vi.hoisted(() => vi.fn());
 const correctionModel = vi.hoisted(() => vi.fn(async (_input: any): Promise<string> => ''));
 vi.mock('../../../../src/main/model/core-agent/runner', async (importOriginal) => ({
   ...(await importOriginal<any>()), completeSkillCreationCorrection: correctionModel,
 }));
 vi.mock('../../../../src/main/logger', () => ({
-  createLogger: () => ({ debug: vi.fn(), info: retryInfoLog, warn: warningLog, error: vi.fn() }),
+  createLogger: () => ({ debug: vi.fn(), info: retryInfoLog, warn: warningLog, error: hostErrorLog }),
 }));
 
 /**
@@ -67,12 +69,14 @@ function _resetStreamGates(): void {
 const _recordedCalls = vi.hoisted(() => [] as Array<{
   sid: string;
   message: string;
+  systemPrompt: string;
   model: string;
   // True when the bus asked this call to resume the still-open active turn
   // instead of opening a new one — the in-turn channel retry contract.
   resumeActiveTurn: boolean;
   executionDeadlineAt: number;
   nested: boolean;
+  outputDelivery?: 'final' | 'process';
   // Tool names offered to this turn. Lets tests assert the Commander/named
   // Agent/anonymous-worker capability split.
   extraToolNames: string[];
@@ -114,19 +118,25 @@ const _recordedToolResults = vi.hoisted(() => [] as Array<{
   executionTimeoutOwner?: string;
 }>);
 const _receivedSteers: string[] = [];
+// Observe the real turn-context resolver at the deterministic provider seam.
+// No automation run facts are manufactured by this probe.
+let _modelTurnProbe: ((opts: any) => Promise<void>) | undefined;
 
 vi.mock('../../../../src/main/model/client', () => ({
   async *streamChatWithModel(opts: any) {
+    if (_modelTurnProbe) await _modelTurnProbe(opts);
     const sid = opts.sessionId || '';
     const model = _selectedModel.value;
     _recordedCalls.push({
       sid,
       message: String(opts.message || ''),
+      systemPrompt: String(opts.systemPrompt || ''),
       model,
       terminalCorrectionAttached: typeof opts.terminalTextGuard === 'function',
       resumeActiveTurn: !!opts.resumeActiveTurn,
       executionDeadlineAt: opts.executionDeadlineAt,
       nested: !!opts.nested,
+      outputDelivery: opts.outputDelivery,
       extraToolNames: (Array.isArray(opts.extraTools) ? opts.extraTools : []).map((t: any) => String(t?.name || '')),
       browserTool: opts.extraTools?.find((tool: any) => tool.name === 'inner_browser'),
       extraToolContracts: (Array.isArray(opts.extraTools) ? opts.extraTools : []).map((tool: any) => ({
@@ -208,6 +218,10 @@ vi.mock('../../../../src/main/model/client', () => ({
         continue;
       }
       // Host task callbacks as the real todo_tasks tool reports them.
+      if (ev?.type === '__artifact_saved__') {
+        opts.onArtifactCreated?.(ev.artifact);
+        continue;
+      }
       if (ev?.type === '__todo_saved__') {
         opts.onTodoTaskSaved?.(ev.taskId, ev.projectId || '', ev.content || '');
         continue;
@@ -271,6 +285,7 @@ beforeEach(async () => {
   correctionModel.mockReset().mockResolvedValue('');
   retryInfoLog.mockClear();
   warningLog.mockClear();
+  hostErrorLog.mockClear();
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'orkas-int-'));
   prevWs = process.env.ORKAS_WORKSPACE_ROOT;
   prevTestGlobalSkillsRoot = process.env.ORKAS_TEST_GLOBAL_SKILLS_ROOT;
@@ -282,9 +297,12 @@ beforeEach(async () => {
   _recordedCalls.length = 0;
   _recordedToolResults.length = 0;
   _receivedSteers.length = 0;
+  _modelTurnProbe = undefined;
   modelAbortMock.mockClear();
   modelAbortMock.mockReturnValue(0);
   cidsToDrop.clear();
+  const shutdown = (globalThis as any)[Symbol.for('orkas.group_chat.bus.shutdown')];
+  if (shutdown) { shutdown.started = false; shutdown.pending = undefined; }
   vi.resetModules();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
@@ -382,6 +400,199 @@ async function seedDisabledSkill() {
   enabled.setSkillEnabled(TEST_UID, 'arxiv-reader', false);
 }
 
+describe('group_chat bus integration › automation first-turn facts', () => {
+  let restoreBrowserBinding: () => void;
+  beforeEach(async () => {
+    await import('../../../../src/main/features/group_chat');
+    const webAssist = await import('../../../../src/main/features/web_assist');
+    // This host fixture has no Electron window. Use the supported unbound
+    // path; browser attachment has its own owning feature coverage.
+    const binding = vi.spyOn(webAssist, 'bindHostStartedWebAssistConversation').mockReturnValue(false);
+    restoreBrowserBinding = () => binding.mockRestore();
+  }, 60_000);
+  afterEach(() => { restoreBrowserBinding?.(); });
+
+  it.each(['commander', 'named-agent'])('prepares first and subsequent run context before %s execution, even before send returns', async recipient => {
+    const autoTasks = await import('../../../../src/main/features/auto_tasks');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const { resolveConversationAssistanceForTurn } = await import('../../../../src/main/features/conversation_assistance_context');
+    const created = await autoTasks.createTask(TEST_UID, {
+      content: 'Compare the current total with the previous run.',
+      schedule: { type: 'daily', hour: 9, minute: 0 },
+      ...(recipient === 'named-agent' ? { recipient: { kind: 'agent' as const, id: AGENT_ID, name: AGENT_NAME } } : {}),
+    });
+    if (!created.ok) throw new Error(created.error);
+    const notePath = autoTasks.handoffNotePath(TEST_UID, created.task);
+    const actualSend = groupChat.send;
+    let observed!: Promise<void>;
+    const send = vi.spyOn(groupChat, 'send').mockImplementation(async input => {
+      const result = await actualSend(input);
+      // A valid send may still be doing post-dispatch work while the actor
+      // assembles its first turn. Force that ordering without a clock race.
+      if (result.ok) await observed;
+      return result;
+    });
+    try {
+      let firstCid = '';
+      for (const runNumber of [1, 2]) {
+        let notify!: () => void;
+        observed = new Promise<void>(resolve => { notify = resolve; });
+        let built: Awaited<ReturnType<typeof resolveConversationAssistanceForTurn>> | undefined;
+        let buildError: unknown;
+        _modelTurnProbe = async opts => {
+          _setScript(opts.sessionId, [{ type: 'final', text: 'Current total checked.' }]);
+          try { built = await resolveConversationAssistanceForTurn(opts.userId, opts.cid, {
+            agentId: opts.agentId, outputDelivery: opts.outputDelivery,
+          }); }
+          catch (error) { buildError = error; }
+          finally { notify(); }
+        };
+        const fired = await autoTasks.runTaskNow(TEST_UID, created.task.id);
+        expect(fired.ok).toBe(true);
+        if (!fired.ok) throw new Error(fired.error);
+        await waitForQuiescent(TEST_UID, fired.cid, 4000);
+        await vi.waitFor(async () => {
+          expect((await autoTasks.getTask(TEST_UID, created.task.id))?.last_run?.status).toBe('completed');
+        });
+        expect(buildError).toBeUndefined();
+        expect(built?.guidance).toContain(`Host facts: run ${runNumber}`);
+        if (runNumber === 1) {
+          expect(built?.guidance).toContain('This is its first run.');
+          expect(built?.readSeeds?.some(seed => seed.path === notePath)).not.toBe(true);
+          firstCid = fired.cid;
+          fs.writeFileSync(notePath, 'Previous total: 42. Next: compare the new total.');
+        } else {
+          expect(built?.guidance).toContain(`its conversation id is ${firstCid}`);
+          expect(built?.guidance).toContain('ended with status completed');
+          expect(built?.guidance).toContain('Previous total: 42.');
+          expect(built?.readSeeds?.some(seed => seed.path === notePath)).toBe(true);
+        }
+        const task = await autoTasks.getTask(TEST_UID, created.task.id);
+        expect(task?.run_count).toBe(runNumber);
+      }
+      expect(_recordedCalls).toHaveLength(2);
+      expect(_recordedCalls.every(call => call.sid.startsWith(recipient === 'named-agent' ? 'gmember-' : 'gconv-'))).toBe(true);
+      expect(hostErrorLog).not.toHaveBeenCalled();
+      expect(warningLog).not.toHaveBeenCalled();
+    } finally {
+      _modelTurnProbe = undefined;
+      send.mockRestore();
+    }
+  }, 20_000);
+
+  it('does not count an automation rejected by the real send boundary', async () => {
+    const autoTasks = await import('../../../../src/main/features/auto_tasks');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const created = await autoTasks.createTask(TEST_UID, {
+      content: 'Run after admission.', schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!created.ok) throw new Error(created.error);
+    await bus.prepareForShutdown();
+    expect(await autoTasks.runTaskNow(TEST_UID, created.task.id)).toMatchObject({ ok: false, error: 'send_not_ok' });
+    const task = await autoTasks.getTask(TEST_UID, created.task.id);
+    expect(task?.run_count).toBeUndefined();
+    expect(task?.last_run).toBeUndefined();
+    expect(_recordedCalls).toHaveLength(0);
+    expect(hostErrorLog.mock.calls.map(call => String(call[0]))).toEqual([
+      expect.stringContaining('send failed'),
+    ]);
+    expect(warningLog.mock.calls.map(call => String(call[0]))).toEqual([
+      expect.stringContaining('fire send failed'),
+    ]);
+  });
+
+  it('waits for the run-fact write before starting a model turn', async () => {
+    const autoTasks = await import('../../../../src/main/features/auto_tasks');
+    const storage = await import('../../../../src/main/storage');
+    const created = await autoTasks.createTask(TEST_UID, {
+      content: 'Wait for host facts.', schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!created.ok) throw new Error(created.error);
+    let entered!: () => void;
+    const writingStarted = new Promise<void>(resolve => { entered = resolve; });
+    let release!: () => void;
+    const writingAllowed = new Promise<void>(resolve => { release = resolve; });
+    const writeJson = storage.writeJson;
+    const writing = vi.spyOn(storage, 'writeJson').mockImplementation(async (file, value) => {
+      if ((value as any)?.id === created.task.id && (value as any)?.last_run?.status === 'running') {
+        entered();
+        await writingAllowed;
+      }
+      return writeJson(file, value);
+    });
+    _modelTurnProbe = async opts => {
+      _setScript(opts.sessionId, [{ type: 'final', text: 'Started after facts were saved.' }]);
+    };
+    const firing = autoTasks.runTaskNow(TEST_UID, created.task.id);
+    try {
+      await writingStarted;
+      expect(_recordedCalls).toHaveLength(0);
+      release();
+      const fired = await firing;
+      expect(fired.ok).toBe(true);
+      if (!fired.ok) throw new Error(fired.error);
+      await waitForQuiescent(TEST_UID, fired.cid, 4000);
+      expect(_recordedCalls).toHaveLength(1);
+      expect(hostErrorLog).not.toHaveBeenCalled();
+      expect(warningLog).not.toHaveBeenCalled();
+    } finally {
+      release();
+      await firing;
+      writing.mockRestore();
+    }
+  });
+
+  it('keeps execution available when run-fact storage fails, without retrying or inventing facts', async () => {
+    const autoTasks = await import('../../../../src/main/features/auto_tasks');
+    const storage = await import('../../../../src/main/storage');
+    const { resolveConversationAssistanceForTurn } = await import('../../../../src/main/features/conversation_assistance_context');
+    const created = await autoTasks.createTask(TEST_UID, {
+      content: 'Execute even without optional continuity facts.', schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!created.ok) throw new Error(created.error);
+    const writeJson = storage.writeJson;
+    let failedWrites = 0;
+    const writing = vi.spyOn(storage, 'writeJson').mockImplementation(async (file, value) => {
+      if ((value as any)?.id === created.task.id && (value as any)?.last_run?.status === 'running') {
+        failedWrites += 1;
+        throw Object.assign(new Error('fixture run-fact write denied'), { code: 'EACCES' });
+      }
+      return writeJson(file, value);
+    });
+    let guidance: string | undefined;
+    _modelTurnProbe = async opts => {
+      guidance = (await resolveConversationAssistanceForTurn(opts.userId, opts.cid)).guidance;
+      _setScript(opts.sessionId, [{ type: 'final', text: 'Execution remains available.' }]);
+    };
+    try {
+      const fired = await autoTasks.runTaskNow(TEST_UID, created.task.id);
+      expect(fired.ok).toBe(true);
+      if (!fired.ok) throw new Error(fired.error);
+      await waitForQuiescent(TEST_UID, fired.cid, 4000);
+      expect(_recordedCalls).toHaveLength(1);
+      expect(guidance).toBeDefined();
+      expect(guidance).not.toContain('## This automation run');
+      expect(failedWrites).toBe(1);
+      expect((await autoTasks.getTask(TEST_UID, created.task.id))?.run_count).toBeUndefined();
+      expect(hostErrorLog).not.toHaveBeenCalled();
+      expect(warningLog.mock.calls.map(call => String(call[0]))).toEqual([
+        expect.stringContaining('run start record failed'),
+      ]);
+      writing.mockRestore();
+      const recovered = await autoTasks.runTaskNow(TEST_UID, created.task.id);
+      expect(recovered.ok).toBe(true);
+      if (!recovered.ok) throw new Error(recovered.error);
+      await waitForQuiescent(TEST_UID, recovered.cid, 4000);
+      expect(_recordedCalls).toHaveLength(2);
+      expect(guidance).toContain('Host facts: run 1');
+      expect((await autoTasks.getTask(TEST_UID, created.task.id))?.run_count).toBe(1);
+    } finally {
+      _modelTurnProbe = undefined;
+      writing.mockRestore();
+    }
+  });
+});
+
 describe('group_chat bus integration › unexpected host-turn failure recovery', () => {
   // Cold module transformation is fixture setup, not failure/retry latency.
   // On a loaded host it exceeded this case's 10s business-flow budget before
@@ -389,6 +600,144 @@ describe('group_chat bus integration › unexpected host-turn failure recovery',
   beforeEach(async () => {
     await import('../../../../src/main/features/group_chat');
   }, 60_000);
+
+  it.each(['bindings'])('stops before inference on %s read failure and retries with the original project scope', async (fault) => {
+    const paths = await import('../../../../src/main/paths');
+    const projects = await import('../../../../src/main/features/projects');
+    const chats = await import('../../../../src/main/features/chats');
+    const agents = await import('../../../../src/main/features/agents');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const publishing = await import('../../../../src/main/features/runtime_content_publish');
+    const project = await projects.createProject(TEST_UID, 'Scoped recovery');
+    if (!project.ok) throw new Error('Project fixture failed');
+    const pid = project.project.project_id;
+    await projects.addAgentBinding(TEST_UID, pid, AGENT_ID);
+    const outsiderDir = paths.agentDir(TEST_UID, 'unbound-fixture');
+    fs.mkdirSync(outsiderDir, { recursive: true });
+    fs.writeFileSync(path.join(outsiderDir, 'agent.json'), JSON.stringify({ agent_id: 'unbound-fixture', name: 'UnboundFixture' }));
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, { kind: 'normal', projectId: pid });
+    cidsToDrop.add(cid);
+    const bindingFile = paths.projectBindingsFile(TEST_UID, pid);
+    const before = fs.readFileSync(bindingFile, 'utf8');
+    const target = bindingFile;
+    let active = false;
+    const read = fs.promises.readFile.bind(fs.promises);
+    const readSpy = vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
+      if (active && args[0] === target) return Promise.reject(Object.assign(new Error('private fixture read failure'), { code: 'EACCES' }));
+      return (read as any)(...args);
+    });
+    syncBuiltinESMExports();
+    const enter = publishing.enterRuntimeContentTurn;
+    const gateSpy = vi.spyOn(publishing, 'enterRuntimeContentTurn').mockImplementationOnce(async (userId) => {
+      const release = await enter(userId);
+      agents.clearAgentListCache();
+      active = true;
+      return release;
+    });
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Complete the scoped task' });
+      await waitForQuiescent(TEST_UID, cid, 4000);
+    } finally {
+      active = false;
+      readSpy.mockRestore();
+      syncBuiltinESMExports();
+      gateSpy.mockRestore();
+    }
+    expect(_recordedCalls).toHaveLength(0);
+    expect(_recordedToolResults).toHaveLength(0);
+    const rows = await groupChat.readMessages(TEST_UID, cid);
+    const source = rows.find((row: any) => row.from === 'user')!;
+    const failed = rows.filter((row: any) => row.failure_code === 'worker_turn_exception');
+    expect(failed).toHaveLength(1);
+    expect(failed[0]).toMatchObject({ from: 'commander', source_message_id: source.id, failure_kind: 'runtime' });
+    expect(failed[0].text).toContain('Please try again.');
+    const failures = hostErrorLog.mock.calls.filter(call => call[0] === 'worker turn failed');
+    expect(failures).toHaveLength(1);
+    expect(JSON.stringify(failures)).not.toContain(target);
+    expect(JSON.stringify(failures)).not.toContain('private fixture');
+    _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: 'Recovered within project' }]);
+    expect(await groupChat.retryFailedTurn({ userId: TEST_UID, cid, failedMessageId: failed[0].id, visibleText: source.text }))
+      .toMatchObject({ ok: true, mode: 'restart' });
+    await waitForQuiescent(TEST_UID, cid, 4000);
+    expect(_recordedCalls).toHaveLength(1);
+    expect(_recordedCalls[0].systemPrompt).toContain(`id: ${AGENT_ID}`);
+    expect(_recordedCalls[0].systemPrompt).not.toContain('UnboundFixture');
+    expect(_recordedCalls[0].systemPrompt).not.toContain('(no agents)');
+    expect(_recordedToolResults).toHaveLength(0);
+    expect(fs.readFileSync(bindingFile, 'utf8')).toBe(before);
+    expect(fs.readdirSync(paths.userAgentsDir(TEST_UID)).sort()).toEqual([AGENT_ID, 'unbound-fixture'].sort());
+    expect((await groupChat.readMessages(TEST_UID, cid)).some((row: any) => row.text === 'Recovered within project')).toBe(true);
+    expect((await state.readMembers(TEST_UID, cid)).actors.find(actor => actor.id === 'commander')?.in_flight).not.toBe(true);
+  }, 10_000);
+
+  // Scenario: one bound Agent's definition becomes unreadable mid-session.
+  // Only that Agent drops out; Commander still runs with the other project
+  // member, and no binding or Agent file is rewritten to "repair" the gap.
+  it('keeps the Commander turn running with the remaining project Agents when one bound definition is unreadable', async () => {
+    const paths = await import('../../../../src/main/paths');
+    const projects = await import('../../../../src/main/features/projects');
+    const chats = await import('../../../../src/main/features/chats');
+    const agents = await import('../../../../src/main/features/agents');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const publishing = await import('../../../../src/main/features/runtime_content_publish');
+    const project = await projects.createProject(TEST_UID, 'Partial roster');
+    if (!project.ok) throw new Error('Project fixture failed');
+    const pid = project.project.project_id;
+    const secondDir = paths.agentDir(TEST_UID, SECOND_AGENT_ID);
+    fs.mkdirSync(secondDir, { recursive: true });
+    fs.writeFileSync(path.join(secondDir, 'agent.json'), JSON.stringify({
+      agent_id: SECOND_AGENT_ID, name: SECOND_AGENT_NAME, description: 'Finds sources', created_at: 't', updated_at: 't',
+    }));
+    await projects.addAgentBinding(TEST_UID, pid, AGENT_ID);
+    await projects.addAgentBinding(TEST_UID, pid, SECOND_AGENT_ID);
+    const outsiderDir = paths.agentDir(TEST_UID, 'unbound-fixture');
+    fs.mkdirSync(outsiderDir, { recursive: true });
+    fs.writeFileSync(path.join(outsiderDir, 'agent.json'), JSON.stringify({ agent_id: 'unbound-fixture', name: 'UnboundFixture' }));
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, { kind: 'normal', projectId: pid });
+    cidsToDrop.add(cid);
+    const bindingFile = paths.projectBindingsFile(TEST_UID, pid);
+    const before = fs.readFileSync(bindingFile, 'utf8');
+    const target = paths.agentDefinitionFile(TEST_UID, AGENT_ID);
+    let active = false;
+    const read = fs.promises.readFile.bind(fs.promises);
+    const readSpy = vi.spyOn(fs.promises, 'readFile').mockImplementation((...args: any[]) => {
+      if (active && args[0] === target) return Promise.reject(Object.assign(new Error('private fixture read failure'), { code: 'EACCES' }));
+      return (read as any)(...args);
+    });
+    syncBuiltinESMExports();
+    const enter = publishing.enterRuntimeContentTurn;
+    const gateSpy = vi.spyOn(publishing, 'enterRuntimeContentTurn').mockImplementationOnce(async (userId) => {
+      const release = await enter(userId);
+      agents.clearAgentListCache();
+      active = true;
+      return release;
+    });
+    _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: 'Handled with the remaining Agent' }]);
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Complete the scoped task' });
+      await waitForQuiescent(TEST_UID, cid, 4000);
+    } finally {
+      active = false;
+      readSpy.mockRestore();
+      syncBuiltinESMExports();
+      gateSpy.mockRestore();
+    }
+    expect(_recordedCalls).toHaveLength(1);
+    expect(_recordedCalls[0].systemPrompt).toContain(`id: ${SECOND_AGENT_ID}`);
+    expect(_recordedCalls[0].systemPrompt).not.toContain(`id: ${AGENT_ID}`);
+    expect(_recordedCalls[0].systemPrompt).not.toContain('UnboundFixture');
+    const rows = await groupChat.readMessages(TEST_UID, cid);
+    expect(rows.filter((row: any) => row.failure_code === 'worker_turn_exception')).toHaveLength(0);
+    expect(rows.some((row: any) => row.text === 'Handled with the remaining Agent')).toBe(true);
+    expect(hostErrorLog.mock.calls.filter(call => call[0] === 'worker turn failed')).toHaveLength(0);
+    expect(fs.readFileSync(bindingFile, 'utf8')).toBe(before);
+    expect(fs.readdirSync(paths.userAgentsDir(TEST_UID)).sort()).toEqual([AGENT_ID, SECOND_AGENT_ID, 'unbound-fixture'].sort());
+    expect((await state.readMembers(TEST_UID, cid)).actors.find(actor => actor.id === 'commander')?.in_flight).not.toBe(true);
+  }, 10_000);
 
   // Scenario: the user submits an ordinary Commander task, but the host
   // boundary fails before the model turn starts. The transcript must retain
@@ -454,6 +803,31 @@ describe('group_chat bus integration › unexpected host-turn failure recovery',
   }, 10_000);
 });
 
+it('persists one latest application per identity after correction callbacks and retains separate creations', async () => {
+  const cid = newCid();
+  const state = await import('../../../../src/main/features/group_chat/state');
+  const bus = await import('../../../../src/main/features/group_chat/bus');
+  const paths = await import('../../../../src/main/paths');
+  const events: any[] = [];
+  const unsubscribe = bus.subscribe(TEST_UID, cid, event => { if (event.type === 'artifact_created') events.push(event.artifact); });
+  _setScript(state.buildGconvSessionId(cid), [
+    { type: '__artifact_saved__', artifact: { id: 'one', title: 'Draft', revision: 1 } },
+    { type: '__artifact_saved__', artifact: { id: 'one', title: 'Corrected', revision: 2 } },
+    { type: '__artifact_saved__', artifact: { id: 'one', title: 'Late draft', revision: 1 } },
+    { type: '__artifact_saved__', artifact: { id: 'two', title: 'Second', revision: 1 } },
+    { type: 'final', text: 'Ready' },
+  ]);
+  await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Build the requested apps' });
+  await waitForQuiescent(TEST_UID, cid, 5000);
+  unsubscribe();
+  const messages = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8').trim().split('\n').map(line => JSON.parse(line));
+  expect(messages.flatMap(message => message.artifacts || [])).toEqual([
+    { id: 'one', title: 'Corrected', revision: 2, agent_id: 'commander' },
+    { id: 'two', title: 'Second', revision: 1, agent_id: 'commander' },
+  ]);
+  expect(events.map(a => a.revision)).toEqual([1, 2, 1]);
+}, 10000);
+
 describe('group_chat bus integration › conversation search freshness', () => {
   it('makes committed user and assistant messages searchable without a repair scan', async () => {
     const cid = newCid();
@@ -482,6 +856,272 @@ describe('group_chat bus integration › conversation search freshness', () => {
     expect(assistantResults.some((result) => result.cid === cid && result.role === 'commander')).toBe(true);
     expect(search.__searchTestHooks.hasPendingChatRepair(TEST_UID)).toBe(false);
   });
+});
+
+describe('group_chat bus integration › failed application exit', () => {
+  async function failExit(code: 'E_SHUTDOWN_PROCESSES_FAILED' | 'E_SHUTDOWN_ARCHIVE_FAILED') {
+    const { createShutdownCoordinator } = await import('../../../../src/main/util/shutdown');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const shutdown = createShutdownCoordinator({
+      captureProcesses: async () => ({
+        // Same shape as the Windows helper failing after producers were quiesced.
+        terminate: async () => { throw new Error('controlled process cleanup timeout'); },
+        dispose() {},
+      }),
+      quiesce: async () => {
+        await bus.prepareForShutdown();
+        if (code === 'E_SHUTDOWN_ARCHIVE_FAILED') throw new Error('controlled archive failure');
+      },
+      localTasks: [],
+      onFailure: vi.fn(),
+      onIncomplete: () => bus.resumeAfterFailedShutdown(),
+    });
+    await expect(shutdown.prepare()).rejects.toMatchObject({ code });
+    return shutdown;
+  }
+
+  it.each(['E_SHUTDOWN_PROCESSES_FAILED', 'E_SHUTDOWN_ARCHIVE_FAILED'] as const)(
+    'lets the user keep sending in existing and new tasks after %s', async code => {
+      const chats = await import('../../../../src/main/features/chats');
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const groupChat = await import('../../../../src/main/features/group_chat');
+      const { conversation_id: existing } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+      _setScript(state.buildGconvSessionId(existing), [{ type: 'final', text: 'Before quitting.' }]);
+      await bus.enqueue({ uid: TEST_UID, cid: existing, fromActorId: 'user', text: 'First request.' });
+      await waitForQuiescent(TEST_UID, existing);
+
+      await failExit(code);
+
+      const { conversation_id: fresh } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+      for (const cid of [existing, fresh]) {
+        _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: `After the failed quit ${cid}.` }]);
+        await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Still here.' });
+        await waitForQuiescent(TEST_UID, cid, 4000);
+        expect((await groupChat.readMessages(TEST_UID, cid)).at(-1)).toMatchObject({
+          from: 'commander', text: `After the failed quit ${cid}.`,
+        });
+      }
+    },
+  );
+
+  it('lets a scheduler restarted after the failed exit run an automation', async () => {
+    const autoTasks = await import('../../../../src/main/features/auto_tasks');
+    const created = await autoTasks.createTask(TEST_UID, {
+      content: 'Run after the failed quit.', schedule: { type: 'daily', hour: 9, minute: 0 },
+    });
+    if (!created.ok) throw new Error(created.error);
+    await failExit('E_SHUTDOWN_PROCESSES_FAILED');
+    const fired = await autoTasks.runTaskNow(TEST_UID, created.task.id);
+    expect(fired).toMatchObject({ ok: true });
+    if (!fired.ok) throw new Error(fired.error);
+    await waitForQuiescent(TEST_UID, fired.cid, 4000);
+    await vi.waitFor(async () => {
+      expect((await autoTasks.getTask(TEST_UID, created.task.id))?.run_count).toBe(1);
+    });
+  });
+
+  it('closes admission again and completes when the user retries the exit', async () => {
+    const chats = await import('../../../../src/main/features/chats');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    await failExit('E_SHUTDOWN_PROCESSES_FAILED');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+    cidsToDrop.add(cid);
+    _setScript(state.buildGconvSessionId(cid), [{ type: 'delta', text: 'Work in progress.' }, { type: '__wait_for_abort__' }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Long request.' });
+    await expect.poll(() => JSON.stringify(bus.liveDisplaySnapshot(TEST_UID, cid)).includes('Work in progress')).toBe(true);
+    const retry = bus.prepareForShutdown();
+    await expect(bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Too late.' })).rejects.toMatchObject({ code: 'E_APP_SHUTTING_DOWN' });
+    await retry;
+    expect(bus.isQuiescent(TEST_UID, cid)).toBe(true);
+    const rows = await groupChat.readMessages(TEST_UID, cid);
+    expect(rows.filter(row => row.system_kind === 'reply_interrupted')).toHaveLength(1);
+    expect(rows.map(row => row.text)).not.toContain('Too late.');
+  });
+
+  it('keeps one interruption record when a turn settles only after the failed exit', async () => {
+    const chats = await import('../../../../src/main/features/chats');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+    cidsToDrop.add(cid);
+    _holdStream('late-settlement');
+    _setScript(state.buildGconvSessionId(cid), [
+      { type: 'delta', text: 'Public partial answer.' },
+      { type: '__wait_for_gate__', name: 'late-settlement' },
+    ]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Unresponsive provider.' });
+    await expect.poll(() => JSON.stringify(bus.liveDisplaySnapshot(TEST_UID, cid)).includes('Public partial answer')).toBe(true);
+
+    await failExit('E_SHUTDOWN_PROCESSES_FAILED');
+    expect((await groupChat.readMessages(TEST_UID, cid)).filter(row => row.system_kind === 'reply_interrupted')).toHaveLength(1);
+
+    _releaseStream('late-settlement');
+    await waitForQuiescent(TEST_UID, cid, 4000);
+    const assistantRows = (await groupChat.readMessages(TEST_UID, cid)).filter(row => row.from !== 'user');
+    expect(assistantRows.map(row => row.system_kind)).toEqual(['reply_interrupted']);
+    expect(hostErrorLog).not.toHaveBeenCalled();
+  }, 12_000);
+});
+
+describe('group_chat bus integration › failed-turn write receipt continuity', () => {
+  it.each([false, true])('archives concurrent turns on application shutdown without replay (unresponsive=%s)', async (unresponsive) => {
+    const chats = await import('../../../../src/main/features/chats');
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const cids = [];
+    for (let index = 0; index < 2; index++) {
+      const { conversation_id: cid } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+      cidsToDrop.add(cid);
+      cids.push(cid);
+      if (unresponsive) _holdStream(`shutdown-${index}`);
+      _setScript(state.buildGconvSessionId(cid), [
+        { type: 'delta', text: `Public partial answer ${index}.` },
+        { type: 'event', event: { stream: 'tool', data: { phase: 'end', id: `saved-${index}`, name: 'call_connector_tool', isError: false, output: `confirmed-${index}` } } },
+        { type: 'event', event: { stream: 'tool', data: { phase: 'start', id: `pending-${index}`, name: 'call_connector_tool', arguments: { action: 'write' } } } },
+        ...(unresponsive ? [{ type: '__wait_for_gate__', name: `shutdown-${index}` }] : [{ type: '__wait_for_abort__' }]),
+      ]);
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `Import schedule ${index}.` });
+    }
+    await expect.poll(() => cids.every(cid => JSON.stringify(bus.liveDisplaySnapshot(TEST_UID, cid)).includes('pending-'))).toBe(true);
+    await bus.enqueue({ uid: TEST_UID, cid: cids[0], fromActorId: 'user', text: 'Queued work must not run during exit.' });
+    const pending = bus.prepareForShutdown();
+    expect(bus.prepareForShutdown()).toBe(pending);
+    await expect(bus.enqueue({ uid: TEST_UID, cid: cids[0], fromActorId: 'user', text: 'Do not admit new work.' })).rejects.toMatchObject({ code: 'E_APP_SHUTTING_DOWN' });
+    await pending;
+    for (const [index, cid] of cids.entries()) {
+      const rows = await groupChat.readMessages(TEST_UID, cid);
+      const archived = rows.filter(row => row.system_kind === 'reply_interrupted');
+      expect(archived).toHaveLength(1);
+      const toolData = archived.flatMap(row => row.process || []).map(item => item.event?.data).filter(Boolean) as any[];
+      expect(toolData.filter(data => data.id === `saved-${index}` && data.phase === 'end')).toHaveLength(1);
+      expect(toolData.find(data => data.id === `saved-${index}`)?.output).toBe(`confirmed-${index}`);
+      expect(toolData.filter(data => data.id === `pending-${index}` && data.phase === 'start')).toHaveLength(1);
+      expect(toolData.some(data => data.id === `pending-${index}` && data.phase === 'end')).toBe(false);
+      expect(archived[0].source_message_id).toBe(rows.find(row => row.from === 'user')?.id);
+      expect(archived[0].text).not.toContain('Public partial answer');
+      expect(JSON.stringify(archived[0].process)).toContain(`Public partial answer ${index}.`);
+    }
+    _resetStreamGates();
+    for (const cid of cids) {
+      await waitForQuiescent(TEST_UID, cid, 4000);
+      expect((await groupChat.readMessages(TEST_UID, cid)).filter(row => row.system_kind === 'reply_interrupted')).toHaveLength(1);
+    }
+    expect(_recordedCalls).toHaveLength(2);
+    expect(hostErrorLog).not.toHaveBeenCalled();
+    expect(warningLog.mock.calls.map(call => call[0])).toEqual(unresponsive ? [] : ['stream error', 'stream error']);
+  }, 12_000);
+
+  // Provider output is controlled; mapping, segment settlement, JSONL storage,
+  // reload and the next turn's history tool are real. No external calendar runs.
+  it.each([
+    { actor: 'commander', split: 'none', ending: 'error' },
+    { actor: 'agent', split: 'none', ending: 'error' },
+    { actor: 'commander', split: 'before-writes', ending: 'error' },
+    { actor: 'commander', split: 'after-writes', ending: 'error' },
+    { actor: 'commander', split: 'before-writes', ending: 'empty' },
+    { actor: 'commander', split: 'before-writes', ending: 'abort' },
+  ])('retains completed writes for next-turn retrieval: $actor / $split / $ending', async ({ actor, split, ending }) => {
+    const chats = await import('../../../../src/main/features/chats');
+    const { conversation_id: cid } = await chats.createConversation(TEST_UID, { kind: 'normal' });
+    cidsToDrop.add(cid);
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const groupChat = await import('../../../../src/main/features/group_chat');
+    const { mapCoreAgentEvents } = await import('../../../../src/main/model/core-agent/event-mapper');
+    const expectedIds = Array.from({ length: 20 }, (_, index) => `calendar-insert-${index}`);
+    const outputs = expectedIds.map((id, index) => JSON.stringify({ id: `event-${index}`, status: 'confirmed', request_id: id,
+      ...(index === 19 ? { confirmation: 'lessonregistrationreceipt' } : {}),
+    }));
+    async function* completedWrites(): AsyncGenerator<any> {
+      for (const [index, id] of expectedIds.entries()) {
+        yield { type: 'tool_start', id, name: 'call_connector_tool', input: {
+          connector_id: 'fixture-calendar', tool_name: 'create_event', arguments: { title: `Lesson ${index}` },
+        } };
+        yield { type: 'tool_end', id, name: 'call_connector_tool', result: outputs[index], isError: false };
+      }
+    }
+    const writeEvents = [];
+    // Consume a live tool prefix; settlement is supplied by the script below.
+    // Reaching EOF without a terminal event is itself a protocol error.
+    for await (const event of mapCoreAgentEvents(completedWrites(), { nowMs: () => 0, failureTrackingScope: {} })) {
+      expect(event.type).not.toBe('error');
+      writeEvents.push(event);
+      if (event.type === 'event' && event.event.stream === 'tool'
+        && event.event.data?.phase === 'end' && event.event.data?.id === expectedIds[19]) break;
+    }
+    const dispatch = [
+      { type: 'delta', text: 'Ask Writer to check the schedule.' },
+      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'Check the schedule.' } },
+    ];
+    if (split !== 'none') _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [{ type: 'final', text: 'Schedule checked.' }]);
+    const failure = { type: 'error', text: 'fixture provider rejected the continuation',
+      failureKind: 'model', failureCode: 'context_overflow', failurePhase: 'compaction', retryExhausted: true,
+      ...(ending === 'abort' ? { aborted: true } : {}),
+    };
+    const sid = actor === 'agent' ? state.buildGmemberSessionId(cid, AGENT_ID) : state.buildGconvSessionId(cid);
+    _setScript(sid, [
+      ...(split === 'before-writes' ? dispatch : []),
+      ...writeEvents,
+      ...(split === 'after-writes' ? dispatch : []),
+      ending === 'empty' ? { type: 'final', text: '' } : failure,
+    ]);
+    const events: any[] = [];
+    const unsubscribe = bus.subscribe(TEST_UID, cid, event => events.push(event));
+    try {
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Import the twenty lessons.',
+        ...(actor === 'agent' ? { forceTo: [AGENT_ID] } : {}),
+      });
+      await waitForQuiescent(TEST_UID, cid, 4000);
+      const owner = actor === 'agent' ? AGENT_ID : 'commander';
+      const receiptData = (items: any[]) => items.map(item => item.event)
+        .filter(event => event?.stream === 'tool' && event.data?.phase === 'end' && expectedIds.includes(event.data?.id))
+        .map(event => event.data);
+      const live = receiptData(events.filter(event => event.type === 'process' && event.actor === owner)
+        .map(event => event.data));
+      expect(live.map(data => data.id)).toEqual(expectedIds);
+      const stored = (await groupChat.readMessages(TEST_UID, cid)).filter(row => row.from === owner && !row.dispatch);
+      const receipts = receiptData(stored.flatMap(row => row.process || []));
+      expect.soft(receipts.map(data => data.id), 'every completed write must survive settlement exactly once').toEqual(expectedIds);
+      expect.soft(receipts.map(data => data.output)).toEqual(outputs);
+      if (split === 'before-writes' && ending === 'error') {
+        expect.soft(stored.find(row => receiptData(row.process || []).length)?.failure_code, 'saved receipts must not turn a failed run into success').toBe('context_overflow');
+      }
+      expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(1);
+
+      // Start another user turn to exercise the authoritative current boundary.
+      // The fixture does not prescribe whether a real model chooses retrieval.
+      _setScript(sid, [{ type: 'final', text: 'Inspecting the retained execution records.' }]);
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Check prior writes before creating any more.', forceTo: [owner] });
+      await waitForQuiescent(TEST_UID, cid, 4000);
+      const rows = await groupChat.readMessages(TEST_UID, cid);
+      const boundary = rows.find(row => row.from === 'user' && row.text === 'Check prior writes before creating any more.')!;
+      const { createChatHistoryTool } = await import('../../../../src/main/model/core-agent/chat-history-tools');
+      const history = createChatHistoryTool({ userId: TEST_UID, currentCid: cid, currentMessageId: boundary.id, allowedScopes: ['current'] });
+      const read = await history.execute({ action: 'read', scope: 'current', read: { page: { mode: 'latest', count: 30 }, include_process: true }, max_tokens: 10000 }, { state: {} } as any);
+      expect(read.isError, read.content).toBeFalsy();
+      expect.soft(expectedIds.filter(id => !read.content.includes(id)), 'next-turn retrieval must retain each successful write').toEqual([]);
+      if (split === 'before-writes' && ending === 'error') {
+        const found = await history.execute({ action: 'search', scope: 'current', search: { query: 'lessonregistrationreceipt' } }, { state: {} } as any);
+        expect(found.isError, found.content).toBeFalsy();
+        const locator = JSON.parse(/^    process_read: (.+)$/m.exec(found.content)?.[1] || 'null');
+        expect(locator, 'search must offer a usable process locator for the saved write').toBeTruthy();
+        const exact = await history.execute(locator, { state: {} } as any);
+        expect(exact.isError, exact.content).toBeFalsy();
+        expect(exact.content).toContain(expectedIds[19]);
+      }
+      expect(_recordedCalls.filter(call => call.sid === sid)).toHaveLength(2);
+      expect(_recordedToolResults.filter(result => result.name !== 'dispatch_to')).toHaveLength(0);
+      expect(hostErrorLog).not.toHaveBeenCalled();
+      expect(warningLog.mock.calls.map(call => call[0])).toEqual(ending === 'empty' ? [] : ['stream error']);
+    } finally {
+      unsubscribe();
+    }
+  }, 12_000);
 });
 
 describe('group_chat bus integration › memory prose does not control execution', () => {
@@ -1551,6 +2191,10 @@ describe('group_chat bus integration › direct agent handback', () => {
     expect(commanderCalls[0].message).toContain('Treat the concrete capability report as authoritative');
     expect(commanderCalls[0].message).toContain('do not search for or run shell/process conversion');
     expect(commanderCalls[0].message).toContain('publish an empty or placeholder output');
+    // The no-conversion stop is for proprietary formats only; a missing helper
+    // that a bundled runtime can do must not end with "use another app".
+    expect(commanderCalls[0].message).toContain('If it says a proprietary file format is unsupported');
+    expect(commanderCalls[0].message).toContain('do not send the user to another application');
     expect(commanderCalls[0].message).toContain('brief.txt');
     expect(commanderCalls[0].message).toContain('Use the quoted school launch requirements.');
 
@@ -1928,7 +2572,7 @@ describe('group_chat bus integration › Commander utility tools', () => {
         surface_id: 'agents', action: 'configure', target_id: 'agent-123',
       } },
       { type: '__call_tool__', name: 'connector_setup', input: {
-        operation: 'start', connector_id: 'xiaohongshu-seller',
+        operation: 'show', connector_id: 'xiaohongshu-seller',
       } },
       { type: '__call_tool__', name: 'open_app_view', input: {
         surface_id: 'agents', action: 'configure', target_id: 'agent-123',
@@ -1940,6 +2584,7 @@ describe('group_chat bus integration › Commander utility tools', () => {
         surface_id: 'agents', action: 'configure',
       } },
       { type: '__call_tool__', name: 'open_app_view', input: { surface_id: 'not-a-surface' } },
+      { type: '__call_tool__', name: 'open_app_view', input: { surface_id: 'settings.data' } },
       { type: '__call_tool__', name: 'app_health', input: { domain: 'credentials' } },
       { type: '__call_tool__', name: 'app_health', input: { domain: 'kb' } },
       { type: '__call_tool__', name: 'app_health', input: {} },
@@ -1960,6 +2605,12 @@ describe('group_chat bus integration › Commander utility tools', () => {
     const contracts = _recordedCalls.find((call) => call.sid === sid)?.extraToolContracts ?? [];
     const navContract = contracts.find((tool) => tool.name === 'open_app_view');
     expect(navContract?.description).toContain('Use connector_setup');
+    // Recovery has one shared destination regardless of the deleted resource.
+    // It must be discoverable from the offered tool, before any guide read.
+    expect(navContract?.description).toMatch(/Recycle Bin[^.]*settings\.data[^.]*Settings > Data/i);
+    expect(navContract?.description).toMatch(/users restore deleted items/i);
+    expect(navContract?.description).toMatch(/Delete\/Empty permanently removes recycle-bin batches/i);
+    expect(estimateTextTokens(navContract?.description ?? '')).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
     expect(navContract?.inputSchema).toMatchObject({
       type: 'object',
       required: ['surface_id'],
@@ -1973,7 +2624,18 @@ describe('group_chat bus integration › Commander utility tools', () => {
         target_id: { type: 'string', maxLength: 160 },
       },
     });
-    expect(contracts.find((tool) => tool.name === 'app_health')?.inputSchema).toMatchObject({
+    const destinationDescription = (navContract?.inputSchema as any).properties.surface_id.description;
+    const actionDescription = (navContract?.inputSchema as any).properties.action.description;
+    expect(actionDescription).toMatch(/add_custom[^;]*manual[^;]*form/i);
+    expect(estimateTextTokens(actionDescription)).toBeLessThanOrEqual(SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS);
+    expect(estimateTextTokens(destinationDescription)).toBeLessThanOrEqual(SCHEMA_DESCRIPTION_SOFT_BUDGET_TOKENS);
+    const healthContract = contracts.find((tool) => tool.name === 'app_health');
+    expect((healthContract?.inputSchema as any).properties.domain.description).toContain('tasks checks running conversations');
+    expect(healthContract?.description).toContain('diagnostic_status');
+    expect(healthContract?.description).toMatch(/failed.*unknown/i);
+    expect(healthContract?.description).toMatch(/succeeded.*healthy/i);
+    expect(estimateTextTokens(healthContract?.description ?? '')).toBeLessThanOrEqual(TOOL_DESCRIPTION_SOFT_BUDGET_TOKENS);
+    expect(healthContract?.inputSchema).toMatchObject({
       type: 'object',
       additionalProperties: false,
       properties: {
@@ -1986,7 +2648,7 @@ describe('group_chat bus integration › Commander utility tools', () => {
       additionalProperties: false,
       properties: {
         operation: { enum: [
-          'search', 'inspect', 'start', 'status', 'page_observe', 'page_act', 'page_wait',
+          'search', 'inspect', 'show', 'status', 'page_observe', 'page_act', 'page_wait',
         ] },
         query: { type: 'string', maxLength: 160 },
         connector_id: { type: 'string', maxLength: 160 },
@@ -2014,13 +2676,14 @@ describe('group_chat bus integration › Commander utility tools', () => {
     expect(navResults[4]).toMatchObject({ ok: false, error: expect.stringContaining('not supported') });
     expect(navResults[5]).toMatchObject({ ok: false, error: expect.stringContaining('target_id is required') });
     expect(navResults[6]).toMatchObject({ ok: false, error: expect.stringContaining('unknown surface_id') });
+    expect(navResults[7]).toMatchObject({ ok: true, surface_id: 'settings.data', action: 'open' });
 
     const connectorSetupResults = _recordedToolResults
       .filter((result) => result.name === 'connector_setup')
       .map((result) => JSON.parse(result.content));
     expect(connectorSetupResults).toEqual([expect.objectContaining({
       ok: true,
-      operation: 'start',
+      operation: 'show',
       connector_id: 'xiaohongshu-seller',
       status: 'setup_card_staged',
     })]);
@@ -2048,12 +2711,13 @@ describe('group_chat bus integration › Commander utility tools', () => {
     });
     // Domain filter returns exactly that probe.
     expect(Object.keys(healthResults[1]).sort()).toEqual(['kb', 'ok']);
-    expect(healthResults[1].kb).toMatchObject({ total: expect.any(Number), ready: expect.any(Number) });
+    expect(healthResults[1].kb).toMatchObject({ diagnostic_status: 'succeeded', total: expect.any(Number), ready: expect.any(Number) });
     // Full snapshot covers every domain and stays sanitized: no credential or
     // secret-shaped keys may appear anywhere in the payload.
     const full = healthResults[2];
     expect(Object.keys(full).sort()).toEqual(['connectors', 'kb', 'model', 'ok', 'tasks']);
     expect(full.tasks).toMatchObject({
+      diagnostic_status: 'succeeded',
       active_work: expect.any(Boolean),
       active_conversation_count: expect.any(Number),
       other_active_conversation_count: expect.any(Number),
@@ -2082,8 +2746,48 @@ describe('group_chat bus integration › Commander utility tools', () => {
         target_id: 'xiaohongshu-seller',
         requested_at: expect.any(String),
       },
+      { surface_id: 'settings.data', action: 'open', requested_at: expect.any(String) },
     ]);
   }, 12_000);
+
+  it('returns an app_health probe failure as unknown and preserves independent results and later recovery', async () => {
+    const cid = newCid();
+    const chats = await import('../../../../src/main/features/chats');
+    await chats.createConversation(TEST_UID, { conversationId: cid });
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const kbVector = await import('../../../../src/main/features/kb_vector');
+    const probe = vi.spyOn(kbVector, 'statusSummary').mockImplementationOnce(() => {
+      throw new Error('private Library path and user content must not escape');
+    });
+    const sid = state.buildGconvSessionId(cid);
+    _setScript(sid, [
+      { type: '__call_tool__', name: 'app_health', input: {} },
+      { type: '__call_tool__', name: 'app_health', input: { domain: 'kb' } },
+      { type: 'final', text: 'The first Library check failed; the later check returned its current status.' },
+    ]);
+    try {
+      bus.subscribe(TEST_UID, cid, () => {});
+      await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '@commander check app status' });
+      await waitForQuiescent(TEST_UID, cid, 6000);
+      const results = _recordedToolResults.filter(result => result.name === 'app_health');
+      expect(results).toHaveLength(2);
+      expect(results.every(result => !result.isError)).toBe(true);
+      const [partial, recovered] = results.map(result => JSON.parse(result.content));
+      expect(partial).toMatchObject({
+        ok: true,
+        kb: { diagnostic_status: 'failed', state: 'unknown', error_code: 'diagnostic_probe_failed' },
+        tasks: { diagnostic_status: 'succeeded', active_conversation_count: expect.any(Number) },
+      });
+      expect(partial.kb).not.toHaveProperty('total');
+      expect(JSON.stringify(partial)).not.toContain('private Library');
+      expect(recovered).toMatchObject({ ok: true, kb: { diagnostic_status: 'succeeded', total: expect.any(Number) } });
+      expect(recovered.kb).not.toHaveProperty('state', 'unknown');
+    } finally {
+      probe.mockRestore();
+    }
+  }, 12_000);
+
 
 });
 
@@ -2757,6 +3461,7 @@ describe('group_chat bus integration › conversation delete cascade', () => {
 });
 
 describe('group_chat bus integration › G8d in-process dispatch (run_worker / dispatch_to)', () => {
+
   it('settles an anonymous worker cancelled while waiting for capacity without starting it or disturbing holders', async () => {
     const { workerSlots } = await import('../../../../src/main/util/locks');
     const state = await import('../../../../src/main/features/group_chat/state');
@@ -2971,19 +3676,20 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
   // The commander reads the result and synthesises within the SAME turn. The
   // mock's `__call_tool__` drives the real tool execute() so the nested run
   // actually streams (routed by its gworker/gmember session id).
-  it('run_worker (anonymous) runs the worker IN-PROCESS and hands its full result back as the tool result — no roster member, no worker bubble, no lingering worker', async () => {
+  it.each([false, true])('run_worker (anonymous) returns its full private result without roster or session residue (rejected named dispatch first: %s)', async (rejectNamedFirst) => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
     const bus = await import('../../../../src/main/features/group_chat/bus');
     const paths = await import('../../../../src/main/paths');
 
-    const WORKER_RESULT = 'WORKER-INTERNAL-OUTPUT-7c1d: scanned 42 files, here is the full structured summary the commander needs.';
+    const WORKER_RESULT = JSON.stringify({ status: 'complete', order_count: 3, total_amount: 93, missing: [] });
 
     // Commander's SINGLE turn: call run_worker with NO `to` (anonymous worker),
     // then synthesise for the user in the SAME turn. G8d removed the re-wake —
     // the worker's result returns as the tool result, in-process, so the
     // commander reads it and continues without a second scheduled turn.
     _setScript(state.buildGconvSessionId(cid), [
+      ...(rejectNamedFirst ? [{ type: '__call_tool__', name: 'dispatch_to', input: { to: 'Worker', message: 'scan the workspace and summarise' } }] : []),
       { type: '__call_tool__', name: 'run_worker', input: { task: 'scan the workspace and summarise' } },
       { type: 'final', text: 'Done — summarised the workspace for you.' },
     ]);
@@ -2999,6 +3705,18 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     // 1) The worker actually ran in-process: a gworker session turn fired.
     const workerCall = _recordedCalls.find((c) => c.sid.startsWith('gworker-'));
     expect(workerCall, 'an in-process worker sub-run should have streamed').toBeTruthy();
+    // Anonymous helpers have a private result recipient, not the named
+    // Agent's user-facing form, memory and handback protocols.
+    expect(workerCall!.systemPrompt).toMatch(/assigned sub-task/i);
+    expect(workerCall!.systemPrompt).toMatch(/blocker/i);
+    expect(workerCall!.systemPrompt).toMatch(/return.*Commander/i);
+    expect(workerCall!.systemPrompt).not.toMatch(/agent-input-form|<handback>|inputs_schema|cross.session memory/i);
+    expect(workerCall!.systemPrompt).toContain('## Runtime injection');
+    expect(workerCall!.systemPrompt).toContain('## User language');
+    expect(workerCall!.systemPrompt).not.toContain('$working_dir');
+    expect(workerCall!.systemPrompt.indexOf('## User language')).toBeGreaterThan(workerCall!.systemPrompt.indexOf('## Runtime injection'));
+    expect(workerCall!.systemPrompt.indexOf('## Current date')).toBeGreaterThan(workerCall!.systemPrompt.indexOf('## User language'));
+    expect(workerCall!.systemPrompt.length).toBeLessThan(1800);
     expect(workerCall!.skillListPresent).toBe(true);
     expect(workerCall!.skillList).toEqual([]);
     expect(workerCall!.extraToolNames).not.toContain('skill_search');
@@ -3266,7 +3984,7 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(commanderTurns, 'commander should run exactly one turn (no re-wake)').toBe(1);
   }, 12_000);
 
-  it.each([undefined, 'async'] as const)('Send now guides a dispatched Agent without replacing its task or losing the Commander result (mode: %s)', async (mode) => {
+  it.each([undefined, 'async', 'handoff', 'handoff-resume'] as const)('Send now guides a delegated Agent without replacing its task or losing its result delivery (mode: %s)', async (mode) => {
     const cid = newCid();
     const chats = await import('../../../../src/main/features/chats');
     await chats.createConversation(TEST_UID, { conversationId: cid });
@@ -3276,14 +3994,19 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     const paths = await import('../../../../src/main/paths');
     const commanderSid = state.buildGconvSessionId(cid);
     const agentSid = state.buildGmemberSessionId(cid, AGENT_ID);
+    const handoff = mode === 'handoff' || mode === 'handoff-resume';
     _holdStream('dispatch-steer');
     _setScript(commanderSid, [
-      { type: '__call_tool__', name: 'dispatch_to', input: {
-        to: AGENT_NAME, message: 'Implement the feature.', ...(mode ? { mode } : {}),
+      { type: '__call_tool__', name: handoff ? 'hand_off_to' : 'dispatch_to', input: {
+        to: AGENT_NAME, message: 'Implement the feature.',
+        ...(mode === 'async' ? { mode } : {}),
+        ...(mode === 'handoff-resume' ? { resume: 'Review the completed result.' } : {}),
       } },
-      { type: 'final', text: 'Commander received the updated result.' },
+      ...(!handoff ? [{ type: 'final', text: 'Commander received the updated result.' }] : []),
     ]);
-    if (mode) _setScript(commanderSid, [{ type: 'final', text: 'Commander received the updated result.' }]);
+    if (mode === 'async' || mode === 'handoff-resume') {
+      _setScript(commanderSid, [{ type: 'final', text: 'Commander received the updated result.' }]);
+    }
     _setScript(agentSid, [
       { type: '__wait_for_gate__', name: 'dispatch-steer' },
       { type: '__accept_steer__' },
@@ -3299,6 +4022,7 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
       expect(child).toMatchObject({ status: 'running', instruction: 'Implement the feature.' });
       await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Discuss the plan first.', forceTo: [AGENT_ID] });
       const queued = (await board.listTasks(TEST_UID, cid)).find(task => task.status === 'queued')!;
+      expect(_receivedSteers).toHaveLength(0);
       expect(await bus.sendConversationTaskNow(TEST_UID, cid, queued.task_id)).toMatchObject({ ok: true, turn_id: child.turn_id });
       _releaseStream('dispatch-steer');
       await waitForQuiescent(TEST_UID, cid, 5000);
@@ -3318,7 +4042,17 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
       const messages = fs.readFileSync(path.join(paths.userChatsDir(TEST_UID), `${cid}.jsonl`), 'utf8')
         .split('\n').filter(Boolean).map(line => JSON.parse(line));
       expect(messages.filter(message => message.from === 'user' && message.text === 'Discuss the plan first.')).toHaveLength(1);
-      if (mode) {
+      if (handoff) {
+        expect(messages.filter(message => message.from === AGENT_ID && message.turn_id === child.turn_id
+          && message.text.includes('The proposed implementation is ready for discussion.'))).toHaveLength(1);
+        expect(_recordedCalls.filter(call => call.sid === commanderSid))
+          .toHaveLength(mode === 'handoff-resume' ? 2 : 1);
+        if (mode === 'handoff-resume') {
+          expect(messages.some(message => message.from === 'commander'
+            && message.text === 'Commander received the updated result.')).toBe(true);
+        }
+        expect((await state.readState(TEST_UID, cid)).active_recipient).toBeUndefined();
+      } else if (mode) {
         expect(messages.filter(message => message.dispatch && message.to.includes('commander')
           && message.model_text?.includes('The proposed implementation is ready for discussion.'))).toHaveLength(1);
       } else {
@@ -3329,7 +4063,7 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     } finally { _releaseStream('dispatch-steer'); }
   }, 12000);
 
-  it('cancelling the parent after Send now settles both its dispatched child and absorbed update without replay', async () => {
+  it.each(['dispatch_to', 'hand_off_to'] as const)('cancelling %s after Send now settles the delegated task and absorbed update without replay', async (tool) => {
     const cid = newCid();
     const chats = await import('../../../../src/main/features/chats');
     await chats.createConversation(TEST_UID, { conversationId: cid });
@@ -3340,8 +4074,8 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     const agentSid = state.buildGmemberSessionId(cid, AGENT_ID);
     _holdStream('dispatch-steer-cancel');
     _setScript(commanderSid, [
-      { type: '__call_tool__', name: 'dispatch_to', input: { to: AGENT_NAME, message: 'Work on the feature.' } },
-      { type: '__wait_for_abort__' },
+      { type: '__call_tool__', name: tool, input: { to: AGENT_NAME, message: 'Work on the feature.' } },
+      ...(tool === 'dispatch_to' ? [{ type: '__wait_for_abort__' }] : []),
     ]);
     _setScript(agentSid, [
       { type: '__wait_for_gate__', name: 'dispatch-steer-cancel' },
@@ -3360,19 +4094,20 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
       _releaseStream('dispatch-steer-cancel');
       await vi.waitFor(async () => expect((await board.listTasks(TEST_UID, cid)).find(task => task.task_id === queued.task_id))
         .toMatchObject({ status: 'running', absorbed_into_task_id: child.task_id }));
-      expect(await bus.cancelConversationTask(TEST_UID, cid, parent.task_id)).toMatchObject({ ok: true });
+      expect(await bus.cancelConversationTask(TEST_UID, cid, tool === 'hand_off_to' ? child.task_id : parent.task_id))
+        .toMatchObject({ ok: true });
       await waitForQuiescent(TEST_UID, cid, 5000);
       const settled = await board.listTasks(TEST_UID, cid);
-      for (const id of [parent.task_id, child.task_id, queued.task_id]) {
+      for (const id of [...(tool === 'dispatch_to' ? [parent.task_id] : []), child.task_id, queued.task_id]) {
         expect(settled.find(task => task.task_id === id)?.status).toBe('cancelled');
       }
       expect(_receivedSteers).toHaveLength(1);
       expect(_recordedCalls.filter(call => call.sid === agentSid)).toHaveLength(1);
       expect(bus.runtimeSnapshot(TEST_UID, cid).activeTurns).toEqual([]);
-      // These are the two expected cancellation diagnostics, not a failed
+      // These are the expected cancellation diagnostics, not a failed
       // delivery/retry. Any other warning is an unexpected recovery path.
       expect(warningLog.mock.calls.map(call => [call[0], call[1]?.aborted]))
-        .toEqual([['stream error', true], ['stream error', true]]);
+        .toEqual(Array.from({ length: tool === 'dispatch_to' ? 2 : 1 }, () => ['stream error', true]));
     } finally { _releaseStream('dispatch-steer-cancel'); }
   }, 12000);
 
@@ -3462,6 +4197,7 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
       await vi.waitFor(() => expect(bus._cidStateForTest(TEST_UID, cid)).toBeNull());
     } else await bus.abort(TEST_UID, cid);
     await waitForQuiescent(TEST_UID, cid, 5000);
+    expect(_recordedCalls.find(call => call.sid === state.buildGmemberSessionId(cid, AGENT_ID))?.outputDelivery).toBe('process');
     const turns = _recordedCalls.filter(c => c.sid === commander);
     expect(turns).toHaveLength(scope === 'child' ? 2 : 1);
     if (scope === 'child') expect(turns[1].message).toContain('aborted="true"');
@@ -4540,10 +5276,9 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
         && Array.isArray(event.active_turns)
         && event.active_turns.some((turn: any) => turn.actor === AGENT_ID));
       expect(agentActive.length).toBeGreaterThan(0);
-      expect(agentActive.every((event: any) => event.active_turns
-        .filter((turn: any) => turn.actor === AGENT_ID)
-        .every((turn: any) => turn.steerable === false)),
-      'follow-up user input stays FIFO instead of mutating the admitted hand-off run').toBe(true);
+      expect(bus.runtimeSnapshot(TEST_UID, cid).activeTurns).toContainEqual(
+        expect.objectContaining({ actor: AGENT_ID, steerable: true }),
+      );
 
       _releaseStream('terminal-handoff-agent');
       await waitForQuiescent(TEST_UID, cid, 4000);
@@ -4657,10 +5392,10 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
       'the delegated turn must expose a stable execution start for elapsed-time recovery',
     ).toBe(true);
     expect(
-      tutorActive.every((e: any) => e.active_turns
+      tutorActive.some((e: any) => e.active_turns
         .filter((t: any) => t.actor === tutorId)
-        .every((t: any) => t.steerable === false)),
-      'terminal hand-offs must never advertise active-turn user ingress',
+        .some((t: any) => t.steerable === true)),
+      'interactive hand-offs expose live input once the runtime is ready',
     ).toBe(true);
     expect(
       tutorActive.every((e: any) => !e.active_turns.some((t: any) => t.actor === 'commander')),
@@ -5769,6 +6504,79 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     expect(st.orchestration_ledger).toBeUndefined();
   }, 20_000);
 
+  it.each([false, true])('assigns final delivery from the pending Commander continuation (resume: %s)', async (resume) => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const agentId = 'c6a2b3c4d5e6';
+    await writeInteractiveAgent(agentId, 'DeliveryStudio');
+    const commanderSid = state.buildGconvSessionId(cid);
+    const agentSid = state.buildGmemberSessionId(cid, agentId);
+    _setScript(commanderSid, [
+      { type: '__call_tool__', name: 'hand_off_to', input: {
+        to: 'DeliveryStudio', message: 'Prepare the requested result.',
+        ...(resume ? { resume: 'Finish the remaining comparison.' } : {}),
+      } },
+      { type: 'final', text: 'Over to DeliveryStudio.' },
+    ]);
+    _setScript(agentSid, [{ type: 'final', text: 'Which audience?\n<plan-interaction status="open" />' }]);
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Prepare the result for me.' });
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    const expected = resume
+      ? 'Return the result to Commander, who will continue the remaining work.'
+      : 'Deliver the final result to the user; completion returns only the conversation floor to Commander.';
+    const opposite = resume
+      ? 'Deliver the final result to the user; completion returns only the conversation floor to Commander.'
+      : 'Return the result to Commander, who will continue the remaining work.';
+    const first = _recordedCalls.find(call => call.sid === agentSid)!;
+    expect(first.message).toContain(expected);
+    expect(first.message).not.toContain(opposite);
+    let current = await state.readState(TEST_UID, cid);
+    expect(current.active_recipient).toBe(agentId);
+    expect(!!current.orchestration_ledger).toBe(resume);
+    expect(_recordedCalls.filter(call => call.sid === commanderSid)).toHaveLength(1);
+    _setScript(agentSid, [{ type: 'final', text: 'RESULT-DELIVERED\n<handback reason="completed_handoff" />' }]);
+    if (resume) _setScript(commanderSid, [{ type: 'final', text: 'COMPARISON-DELIVERED' }]);
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'For new users.' });
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    const agentCalls = _recordedCalls.filter(call => call.sid === agentSid);
+    expect(agentCalls).toHaveLength(2);
+    expect(agentCalls[1].message).toContain(expected);
+    expect(_recordedCalls.filter(call => call.sid === commanderSid)).toHaveLength(resume ? 2 : 1);
+    current = await state.readState(TEST_UID, cid);
+    expect(current.active_recipient).toBeUndefined();
+    expect(current.orchestration_ledger).toBeUndefined();
+    const group = await import('../../../../src/main/features/group_chat');
+    const rows = await group.readMessages(TEST_UID, cid);
+    expect(rows.filter(row => row.from === agentId && row.text === 'RESULT-DELIVERED')).toHaveLength(1);
+    expect(rows.filter(row => row.from === 'commander' && row.text === 'COMPARISON-DELIVERED')).toHaveLength(resume ? 1 : 0);
+  }, 15_000);
+
+  it.each(['interrupted', 'another-agent'] as const)('does not assign Commander continuation from a %s ledger', async (mode) => {
+    const cid = newCid();
+    const state = await import('../../../../src/main/features/group_chat/state');
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const agentId = 'c7a2b3c4d5e6';
+    await writeInteractiveAgent(agentId, 'FloorStudio');
+    await state.setActiveRecipient(TEST_UID, cid, agentId, 'commander_handoff');
+    await state.setOrchestrationLedger(TEST_UID, cid, {
+      status: mode === 'interrupted' ? 'interrupted' : 'waiting_for_agent', blocked_on: 'agent_handoff',
+      owner_agent_id: mode === 'another-agent' ? 'c8a2b3c4d5e6' : agentId,
+      user_goal: 'Another pending workflow.', handoff_message: 'Finish the step.', resume_instruction: 'Continue the workflow.',
+    });
+    const sid = state.buildGmemberSessionId(cid, agentId);
+    _setScript(sid, [{ type: 'final', text: 'Which audience?\n<plan-interaction status="open" />' }]);
+    bus.subscribe(TEST_UID, cid, () => {});
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'Prepare the result.' });
+    await waitForQuiescent(TEST_UID, cid, 5000);
+    const call = _recordedCalls.find(call => call.sid === sid)!;
+    expect(call.message).toContain('Deliver the final result to the user; completion returns only the conversation floor to Commander.');
+    expect(call.message).not.toContain('who will continue the remaining work');
+    expect(_recordedCalls.some(call => call.sid === state.buildGconvSessionId(cid))).toBe(false);
+    expect((await state.readState(TEST_UID, cid)).active_recipient).toBe(agentId);
+  }, 15_000);
+
   it('keeps an interactive hand-off open until the agent hands back explicitly', async () => {
     const cid = newCid();
     const state = await import('../../../../src/main/features/group_chat/state');
@@ -5989,6 +6797,7 @@ describe('group_chat bus integration › G8d in-process dispatch (run_worker / d
     bus.subscribe(TEST_UID, cid, () => {});
     await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '做个视频' });
     await waitForQuiescent(TEST_UID, cid, 5000);
+    expect(_recordedCalls.find(call => call.sid === coachSid)?.outputDelivery).toBe('final');
     _setScript(coachSid, [{ type: 'final', text: 'Here is the finished video.' }]);
     await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: '可以' });
     await waitForQuiescent(TEST_UID, cid, 5000);
@@ -7024,6 +7833,11 @@ describe('group_chat bus integration › task terminal boundary', () => {
     expect(await waitUntil(() => bus._cidStateForTest(TEST_UID, cid) === null)).toBe(true);
     await new Promise((resolve) => setTimeout(resolve, 25));
     expect(terminals).toHaveLength(1);
+    const taskBoard = await import('../../../../src/main/features/group_chat/task_board');
+    const tasks = await taskBoard.listTasks(TEST_UID, cid);
+    expect(tasks).toHaveLength(1);
+    expect(tasks[0].status).toBe('cancelled');
+    expect(hostErrorLog.mock.calls).toEqual([]);
     unsubscribe();
   }, 10_000);
 });
@@ -9566,34 +10380,117 @@ describe('group_chat bus integration › D29 planned dispatch', () => {
     const sidA = state.buildGmemberSessionId(cid, AGENT_ID);
     _setScript(sidA, [{ type: 'final', text: 'draft written' }]);
     _setScript(sidA, [{ type: 'final', text: 'ending added' }]);
-    let planning = false;
+    let notifyPlanning!: () => void;
+    const planningReady = new Promise<void>((resolve) => { notifyPlanning = resolve; });
     let release!: () => void;
     const held = new Promise<void>((resolve) => { release = resolve; });
     await installPlanner(async () => {
-      planning = true;
+      notifyPlanning();
       await held;
       return planFor([{ assignee: 'a1', part: 'WRITE_THE_DRAFT' }], { references: ['a2'] })();
     });
     const first = bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user',
       text: `先 @${AGENT_NAME} 写初稿，参考 @${SECOND_AGENT_NAME} 的意见` });
-    expect(await waitUntil(() => planning)).toBe(true);
-    const second = bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'KEEP_GOING_WITH_THE_ENDING' });
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(await tb.listTasks(TEST_UID, cid)).toEqual([]);
-    release();
-    await Promise.all([first, second]);
-    await waitForQuiescent(TEST_UID, cid, 6000);
+    try {
+      // This is an ordering gate, not a first-request latency measurement. Cold
+      // Windows admission can exceed the helper's 2s polling window. Wait for the
+      // controlled planner, retaining this case's existing overall watchdog.
+      await Promise.race([planningReady, first.then(() => {
+        throw new Error('Send completed without entering the controlled planner');
+      })]);
+      const second = bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: 'KEEP_GOING_WITH_THE_ENDING' });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(await tb.listTasks(TEST_UID, cid)).toEqual([]);
+      release();
+      await Promise.all([first, second]);
+      await waitForQuiescent(TEST_UID, cid, 6000);
 
-    const rows = await tb.listTasks(TEST_UID, cid);
-    expect(rows).toHaveLength(2);
-    expect(rows[0]).toMatchObject({ assignee: AGENT_ID, instruction: 'WRITE_THE_DRAFT' });
-    expect(rows[1].assignee).toBe(AGENT_ID);
-    expect(rows[1].instruction).toContain('KEEP_GOING_WITH_THE_ENDING');
-    const calls = _recordedCalls.filter((c) => c.sid === sidA).map((c) => c.message);
-    expect(calls).toHaveLength(2);
-    expect(calls[0]).toContain('WRITE_THE_DRAFT');
-    expect(calls[1]).toContain('KEEP_GOING_WITH_THE_ENDING');
-    expect(_recordedCalls.some((c) => c.sid === state.buildGconvSessionId(cid))).toBe(false);
+      const rows = await tb.listTasks(TEST_UID, cid);
+      expect(rows).toHaveLength(2);
+      expect(rows[0]).toMatchObject({ assignee: AGENT_ID, instruction: 'WRITE_THE_DRAFT' });
+      expect(rows[1].assignee).toBe(AGENT_ID);
+      expect(rows[1].instruction).toContain('KEEP_GOING_WITH_THE_ENDING');
+      const calls = _recordedCalls.filter((c) => c.sid === sidA).map((c) => c.message);
+      expect(calls).toHaveLength(2);
+      expect(calls[0]).toContain('WRITE_THE_DRAFT');
+      expect(calls[1]).toContain('KEEP_GOING_WITH_THE_ENDING');
+      expect(_recordedCalls.some((c) => c.sid === state.buildGconvSessionId(cid))).toBe(false);
+    } finally { release(); await first; }
+  }, 15_000);
+
+  // Planning takes seconds before any board row exists. The send must read as
+  // being arranged for that whole window, and every way planning ends must
+  // clear that state: a leftover would keep "arranging" on the board forever.
+  it.each(['planned', 'fallback', 'stopped'] as const)(
+    'reports the send as being arranged until planning ends (%s)', async (outcome) => {
+      await seedSecondAgent();
+      const state = await import('../../../../src/main/features/group_chat/state');
+      const bus = await import('../../../../src/main/features/group_chat/bus');
+      const groupChat = await import('../../../../src/main/features/group_chat');
+      const cid = newCid();
+      _setScript(state.buildGmemberSessionId(cid, AGENT_ID), [{ type: 'final', text: 'draft written' }]);
+      _setScript(state.buildGmemberSessionId(cid, SECOND_AGENT_ID), [{ type: 'final', text: 'draft reviewed' }]);
+      _setScript(state.buildGconvSessionId(cid), [{ type: 'final', text: 'work arranged' }]);
+      const events: any[] = [];
+      bus.subscribe(TEST_UID, cid, (ev) => events.push(ev));
+      let planning = false;
+      let finish!: (raw: string) => void;
+      // The planner does not observe Stop here, like a model call still
+      // resolving its provider: Stop alone must settle the arranging state.
+      await installPlanner(() => new Promise<string>((resolve) => {
+        planning = true;
+        finish = resolve;
+      }));
+      const text = `@${AGENT_NAME} write a draft, then @${SECOND_AGENT_NAME} review it`;
+      const send = bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text });
+      expect(await waitUntil(() => planning)).toBe(true);
+      const arranging = (await groupChat.listTasks(TEST_UID, cid)).planning;
+      expect(arranging).toHaveLength(1);
+      expect(arranging[0].preview).toBe(text);
+      expect(events.filter((ev) => ev.type === 'task_created')).toEqual([]);
+
+      if (outcome === 'stopped') {
+        const stopping = bus.abort(TEST_UID, cid);
+        // Stop tears the renderer's streams down first and its board re-reads
+        // at once: the send must not still read as arranging, even before
+        // planning unwinds.
+        expect((await groupChat.listTasks(TEST_UID, cid)).planning).toEqual([]);
+        finish(await planFor([{ assignee: 'a1', part: 'Write the draft' }])());
+        await stopping;
+      } else if (outcome === 'fallback') {
+        finish('not a plan');
+      } else {
+        finish(await planFor([
+          { assignee: 'a1', part: 'Write the draft' },
+          { assignee: 'a2', part: 'Review the draft', after: ['t1'] },
+        ])());
+      }
+      const msg = await send;
+      await waitForQuiescent(TEST_UID, cid, 6000);
+
+      expect(arranging[0].message_id).toBe(msg.id);
+      const lifecycle = events
+        .filter((ev) => ev.type === 'dispatch_planning' || ev.type === 'task_created')
+        .map((ev) => (ev.type === 'task_created'
+          ? `created:${ev.task.assignee}`
+          : `${ev.active ? 'arranging' : 'arranged'}:${ev.message_id === msg.id}`));
+      expect(lifecycle).toEqual({
+        planned: ['arranging:true', `created:${AGENT_ID}`, `created:${SECOND_AGENT_ID}`, 'arranged:true'],
+        fallback: ['arranging:true', 'created:commander', 'arranged:true'],
+        stopped: ['arranging:true', 'arranged:true'],
+      }[outcome]);
+      expect((await groupChat.listTasks(TEST_UID, cid)).planning).toEqual([]);
+    }, 15_000);
+
+  it('never reports a send that needs no planning as being arranged', async () => {
+    const bus = await import('../../../../src/main/features/group_chat/bus');
+    const cid = newCid();
+    const events: any[] = [];
+    bus.subscribe(TEST_UID, cid, (ev) => events.push(ev));
+    await bus.enqueue({ uid: TEST_UID, cid, fromActorId: 'user', text: `@${AGENT_NAME} write a draft` });
+    await waitForQuiescent(TEST_UID, cid, 6000);
+    expect(events.some((ev) => ev.type === 'task_created')).toBe(true);
+    expect(events.some((ev) => ev.type === 'dispatch_planning')).toBe(false);
   }, 15_000);
 });
 
@@ -10442,8 +11339,11 @@ describe('group_chat bus integration › deferred conversation filing', () => {
   // conversation: the relocation refuses while the turn holds the session files
   // open. The host finishes it at the quiescent boundary, and a cancelled run
   // drops it — the reply that announced the project never reached the user.
-  it.each(['completed', 'cancelled'] as const)(
-    'a %s turn settles the pending filing at the quiescent boundary', async (outcome) => {
+  it.each([
+    ['completed', 'new'], ['cancelled', 'new'],
+    ['completed', 'existing'], ['cancelled', 'existing'],
+  ] as const)(
+    'a %s turn settles the pending %s-project filing at the quiescent boundary', async (outcome, destination) => {
       const stateMod = await import('../../../../src/main/features/group_chat/state');
       const bus = await import('../../../../src/main/features/group_chat/bus');
       const chats = await import('../../../../src/main/features/chats');
@@ -10452,11 +11352,23 @@ describe('group_chat bus integration › deferred conversation filing', () => {
       const conv = await chats.createConversation(TEST_UID, { title: 'weekly competitor report' });
       const cid = conv.conversation_id;
       cidsToDrop.add(cid);
-      const filed = await filing.fileConversationUnderNewProject(
-        TEST_UID, cid, `Competitor tracking ${outcome}`, { moveNow: false },
-      );
-      expect(filed.ok).toBe(true);
-      const pid = (filed as { result: any }).result.project.project_id;
+      let pid: string;
+      if (destination === 'existing') {
+        const projects = await import('../../../../src/main/features/projects');
+        const created = await projects.createProject(TEST_UID, `Existing ${outcome}`);
+        if (!created.ok) throw new Error('project fixture failed');
+        pid = created.project.project_id;
+        const { createProjectSetupTool } = await import('../../../../src/main/features/project_setup_tool');
+        const tool = createProjectSetupTool({ userId: TEST_UID, cid });
+        const receipt = await tool.execute({ action: 'move_conversation', target_project: pid }, {} as never);
+        expect(JSON.parse(receipt.content as string)).toMatchObject({ ok: true, applies: 'when_this_turn_ends' });
+      } else {
+        const filed = await filing.fileConversationUnderNewProject(
+          TEST_UID, cid, `Competitor tracking ${outcome}`, { moveNow: false },
+        );
+        expect(filed.ok).toBe(true);
+        pid = (filed as { result: any }).result.project.project_id;
+      }
       // Deferred means deferred: nothing moved while the turn had not started.
       expect((await chats.getConversationMetadata(TEST_UID, cid))?.project_id).toBeFalsy();
 

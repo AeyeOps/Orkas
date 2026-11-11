@@ -29,6 +29,6 @@ exports.shape = z => ({
   timeout_ms: z.preprocess(value => defaultNumericRange(value, undefined, 250, 15000), z.number().int().min(250).max(15000).optional()),
   text_offset: z.number().int().min(0).max(5000000).optional().describe('observe/read_value UTF-16 offset.'),
   element_offset: z.number().int().min(0).max(100000).optional(),
-  option_offset: z.number().min(0).refine(Number.isInteger, 'Expected integer, received float').meta({ type: 'integer' }).optional(),
+  option_offset: z.number().int().min(0).optional(),
   scope: z.enum(['full','meta']).optional(),
 });

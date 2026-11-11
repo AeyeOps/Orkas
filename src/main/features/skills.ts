@@ -1,3 +1,4 @@
+import { frontmatterCloseIndex } from '../util/skill-frontmatter';
 /**
  * Skills — listing, custom CRUD, inline edit chat.
  *
@@ -331,9 +332,10 @@ export interface SkillOrkasMeta {
  *   - single-quoted with '' escape: `description: 'it''s fine'`
  */
 export function parseSkillFrontmatter(text: string): SkillFrontmatter {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   const meta: SkillFrontmatter = {};
   if (!text.startsWith('---')) return meta;
-  const end = text.indexOf('---', 3);
+  const end = frontmatterCloseIndex(text);
   if (end === -1) return meta;
   const lines = text.slice(3, end).split('\n');
   for (let i = 0; i < lines.length; i++) {
@@ -413,9 +415,12 @@ function skillMetaFile(dir: string): string {
   return path.join(dir, '_meta.json');
 }
 
-function hasSkillMd(dir: string): boolean {
+function hasSkillMd(dir: string, strict = false): boolean {
   try { return fs.statSync(skillMdFile(dir)).isFile(); }
-  catch { return false; }
+  catch (error) {
+    if (strict && (error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error;
+    return false;
+  }
 }
 
 function readSkillOrkasMetaSync(dir: string): SkillOrkasMeta {
@@ -523,16 +528,56 @@ function removeSkillSidecarDescriptionsSync(dir: string): void {
 }
 
 // Module-level cache for `listSkills`.
-const SKILL_CATALOG_CACHE_VERSION = 2;
+// Older projections may have lost ownership metadata after a failed entry read
+// or on BOM-prefixed files.
+// Rebuild derived rows once; the original Skill files stay untouched.
+const SKILL_CATALOG_CACHE_VERSION = 4;
 const SKILL_PERSISTED_TRUST_MS = 2_000;
+// A scan that skipped an unreadable Skill is reused only briefly, then
+// retried, so a repaired file reappears without a directory change.
+const SKILL_PARTIAL_CATALOG_TTL_MS = 2_000;
 
 interface SkillListCache {
   stamp: string;
   rootStamp: string;
   trustUntil: number;
   data: SkillListing[];
+  // Set only for partial scans; complete scans live until the stamp changes.
+  partialUntil?: number;
 }
 let _skillListCache: SkillListCache | null = null;
+
+interface SkillCatalogSnapshot {
+  data: SkillListing[];
+  // True when at least one Skill was skipped because it could not be read.
+  partial: boolean;
+}
+
+// Six content-free source/stage buckets bound diagnostics during read failures.
+const _skillCatalogFailureWarnedAt = new Map<string, number>();
+const SKILL_CATALOG_READ_ERROR_CODES = new Set([
+  'ENOENT', 'EACCES', 'EPERM', 'EIO', 'EBUSY', 'ENOTDIR', 'EISDIR',
+  'EMFILE', 'ENFILE', 'ENOSPC', 'EINVAL', 'ENAMETOOLONG', 'ELOOP',
+]);
+
+function _skillCatalogReadFailure(source: SkillSource, stage: 'stamp' | 'enumerate', error: unknown): Error {
+  _warnSkillCatalogReadFailure(source, stage, error);
+  return new Error('Skill catalog unavailable');
+}
+
+function _warnSkillCatalogReadFailure(source: SkillSource, stage: 'stamp' | 'enumerate' | 'definition', error: unknown): void {
+  const key = `${source}:${stage}`;
+  const now = Date.now();
+  const previous = _skillCatalogFailureWarnedAt.get(key);
+  if (previous === undefined || now < previous || now - previous >= 60_000) {
+    _skillCatalogFailureWarnedAt.set(key, now);
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    log.warn('skill catalog read failed', {
+      source, stage,
+      error_code: typeof code === 'string' && SKILL_CATALOG_READ_ERROR_CODES.has(code) ? code : 'unknown',
+    });
+  }
+}
 
 function _skillCatalogCacheFile(): string {
   return userSkillCatalogCacheFile(getActiveUserId());
@@ -540,9 +585,12 @@ function _skillCatalogCacheFile(): string {
 
 function _skillRootStamp(): string {
   let stamp = '';
-  for (const dir of [CUSTOM_SKILLS_DIR(), userMarketplaceSkillsDir(getActiveUserId())]) {
+  for (const [source, dir] of [['custom', CUSTOM_SKILLS_DIR()], ['marketplace', userMarketplaceSkillsDir(getActiveUserId())]] as const) {
     try { stamp += `${dir}:${fs.statSync(dir).mtimeMs};`; }
-    catch { stamp += `${dir}:0;`; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw _skillCatalogReadFailure(source, 'stamp', error);
+      stamp += `${dir}:0;`;
+    }
   }
   return stamp;
 }
@@ -652,7 +700,7 @@ export async function getSkillForEdit(skillId: string): Promise<SkillForEdit | n
 
 function _skillDirStamp(): string {
   let stamp = '';
-  for (const d of [CUSTOM_SKILLS_DIR(), userMarketplaceSkillsDir(getActiveUserId())]) {
+  for (const [source, d] of [['custom', CUSTOM_SKILLS_DIR()], ['marketplace', userMarketplaceSkillsDir(getActiveUserId())]] as const) {
     try {
       const root = fs.statSync(d);
       stamp += `${d}:${root.mtimeMs};`;
@@ -662,12 +710,19 @@ function _skillDirStamp(): string {
         .sort();
       for (const child of children) {
         const childDir = path.join(d, child);
-        let childMtime = 0;
-        try { childMtime = fs.statSync(childDir).mtimeMs; } catch { /* ignore */ }
-        stamp += `${child}:${childMtime}:${hasSkillMd(childDir) ? 1 : 0};`;
+        // One unreadable Skill is skipped by the scan; it must not fail the stamp.
+        try {
+          let childMtime = 0;
+          try { childMtime = fs.statSync(childDir).mtimeMs; }
+          catch (error) { if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw error; }
+          stamp += `${child}:${childMtime}:${hasSkillMd(childDir, true) ? 1 : 0};`;
+        } catch { stamp += `${child}:?;`; }
       }
     }
-    catch { stamp += `${d}:0;`; }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT') throw _skillCatalogReadFailure(source, 'stamp', error);
+      stamp += `${d}:0;`;
+    }
   }
   return stamp;
 }
@@ -676,14 +731,14 @@ function _skillDirStamp(): string {
  *  (`ownerAgent`) skills, cached by per-dir mtime. The two public listers
  *  below filter this: `listSkills` drops owner-private entries (the user
  *  panel), `listAgentPrivateSkills` keeps only them (dev inspection). */
-async function _allSkillListingsCached(): Promise<SkillListing[]> {
+async function _allSkillListingsCached(): Promise<SkillCatalogSnapshot> {
   const rootStamp = _skillRootStamp();
   if (
     _skillListCache
     && _skillListCache.rootStamp === rootStamp
     && _skillListCache.trustUntil > Date.now()
   ) {
-    return _skillListCache.data;
+    return { data: _skillListCache.data, partial: _skillListCache.partialUntil !== undefined };
   }
   if (!_skillListCache) {
     const persisted = _readPersistedSkillCatalog(rootStamp);
@@ -694,17 +749,23 @@ async function _allSkillListingsCached(): Promise<SkillListing[]> {
         trustUntil: Date.now() + SKILL_PERSISTED_TRUST_MS,
         data: persisted.data,
       };
-      return persisted.data;
+      return { data: persisted.data, partial: false };
     }
   }
   const stamp = _skillDirStamp();
   let out: SkillListing[];
+  let partial = false;
+  const now = Date.now();
+  const partialUntil = _skillListCache?.partialUntil;
   if (
     _skillListCache
     && _skillListCache.rootStamp === rootStamp
     && _skillListCache.stamp === stamp
+    // A backwards clock jump must not extend a partial scan's lifetime.
+    && (partialUntil === undefined || (partialUntil > now && partialUntil - now <= SKILL_PARTIAL_CATALOG_TTL_MS))
   ) {
     out = _skillListCache.data;
+    partial = partialUntil !== undefined;
   } else {
     out = [];
     const seen = new Set<string>();
@@ -712,7 +773,12 @@ async function _allSkillListingsCached(): Promise<SkillListing[]> {
     const sources: Array<[SkillSource, string]> = [['marketplace', userMarketplaceSkillsDir(getActiveUserId())], ['custom', CUSTOM_SKILLS_DIR()]];
     for (const [source, baseDir] of sources) {
       if (!fs.existsSync(baseDir)) continue;
-      const names = fs.readdirSync(baseDir, { withFileTypes: true })
+      // An unreadable root hides every Skill in that source, so the catalog
+      // is unknown rather than smaller.
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(baseDir, { withFileTypes: true }); }
+      catch (error) { throw _skillCatalogReadFailure(source, 'enumerate', error); }
+      const names = entries
         .filter((e) => e.isDirectory() && !e.name.startsWith('.'))
         .map((e) => e.name)
         .sort();
@@ -725,7 +791,16 @@ async function _allSkillListingsCached(): Promise<SkillListing[]> {
         }
         const skillDir = path.join(baseDir, name);
         const skillMd = skillMdFile(skillDir);
-        if (!hasSkillMd(skillDir)) continue;
+        // One unreadable Skill hides only itself. Its id stays reserved so a
+        // same-id custom copy cannot take an unreadable platform Skill's place,
+        // and no default row can publish an agent-private Skill as public.
+        const skip = (error: unknown) => {
+          _warnSkillCatalogReadFailure(source, 'definition', error);
+          partial = true;
+          seen.add(name);
+        };
+        try { if (!hasSkillMd(skillDir, true)) continue; }
+        catch (error) { skip(error); continue; }
         seen.add(name);
         let displayName = name;
         let descPair = { description_zh: '', description_en: '' };
@@ -737,17 +812,15 @@ async function _allSkillListingsCached(): Promise<SkillListing[]> {
         let defaultInstall: boolean | undefined;
         let isOpenSource: boolean | undefined;
         let ownerAgent = '';
-        if (fs.existsSync(skillMd)) {
-          try {
-            const meta = parseSkillFrontmatter(fs.readFileSync(skillMd, 'utf8'));
-            const sidecar = readSkillOrkasMetaSync(skillDir);
-            descPair = _resolveSkillDescriptions(meta, sidecar);
-            displayName = meta.name as string || name;
-            category = _resolveSkillCategory(meta, sidecar);
-            status = _resolveSkillStatus(meta, sidecar) || undefined;
-            ownerAgent = typeof meta.ownerAgent === 'string' ? meta.ownerAgent.trim() : '';
-          } catch { /* ignore */ }
-        }
+        try {
+          const meta = parseSkillFrontmatter(fs.readFileSync(skillMd, 'utf8'));
+          const sidecar = readSkillOrkasMetaSync(skillDir);
+          descPair = _resolveSkillDescriptions(meta, sidecar);
+          displayName = meta.name as string || name;
+          category = _resolveSkillCategory(meta, sidecar);
+          status = _resolveSkillStatus(meta, sidecar) || undefined;
+          ownerAgent = typeof meta.ownerAgent === 'string' ? meta.ownerAgent.trim() : '';
+        } catch (error) { skip(error); continue; }
         // Marketplace-installed skills carry `_install.json` with `version`. Author uid may also
         // be present for install/reconcile compatibility, but the global UI intentionally does
         // not surface it.
@@ -785,10 +858,12 @@ async function _allSkillListingsCached(): Promise<SkillListing[]> {
       rootStamp,
       trustUntil: 0,
       data: out,
+      ...(partial ? { partialUntil: Date.now() + SKILL_PARTIAL_CATALOG_TTL_MS } : {}),
     };
-    _writePersistedSkillCatalog(rootStamp, stamp, out);
+    // Never persist a partial scan: a later restart must retry the skipped Skill.
+    if (!partial) _writePersistedSkillCatalog(rootStamp, stamp, out);
   }
-  return out;
+  return { data: out, partial };
 }
 
 /** Overlay per-user enabled overrides outside the cache (same pattern as
@@ -832,18 +907,23 @@ function _repairLegacySkillEnabledIds(uid: string, listings: SkillListing[]): nu
   return migrated;
 }
 
-/** Repair stale platform-name preference keys for the active user. */
+/** Repair stale platform-name preference keys for the active user. Throws
+ *  while a Skill is unreadable so callers keep their retry-later path. */
 export async function repairLegacySkillEnabledIdsForActiveUser(): Promise<number> {
   const uid = getActiveUserId();
-  return _repairLegacySkillEnabledIds(uid, await _allSkillListingsCached());
+  const catalog = await _allSkillListingsCached();
+  // The skipped Skill may own the legacy id or be a second same-name match;
+  // moving a preference on an incomplete list could not be undone later.
+  if (catalog.partial) throw new Error('Skill catalog incomplete');
+  return _repairLegacySkillEnabledIds(uid, catalog.data);
 }
 
 /** User-facing skill list — custom + marketplace, EXCLUDING agent-private
  *  (`ownerAgent`) skills (those belong to one agent's internal pipeline and
  *  must not appear in the panel; see PC CLAUDE.md §Skills). */
 export async function listSkills(): Promise<SkillListing[]> {
-  const all = await _allSkillListingsCached();
-  _repairLegacySkillEnabledIds(getActiveUserId(), all);
+  const { data: all, partial } = await _allSkillListingsCached();
+  if (!partial) _repairLegacySkillEnabledIds(getActiveUserId(), all);
   return _overlaySkillEnabled(all.filter((s) => !s.ownerAgent));
 }
 
@@ -851,7 +931,7 @@ export async function listSkills(): Promise<SkillListing[]> {
  *  Surfaced behind a dev-gated IPC so the skill panel can show an inspection
  *  section in development; gated off in production. */
 export async function listAgentPrivateSkills(): Promise<SkillListing[]> {
-  return _overlaySkillEnabled((await _allSkillListingsCached()).filter((s) => !!s.ownerAgent));
+  return _overlaySkillEnabled((await _allSkillListingsCached()).data.filter((s) => !!s.ownerAgent));
 }
 
 /** Toggle the active user's enabled override for a skill. Triggers the
@@ -1046,8 +1126,9 @@ function platformSkillMdContent(
 }
 
 export function splitSkillMd(text: string): { meta: SkillFrontmatter; body: string } {
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
   if (!text.startsWith('---')) return { meta: {}, body: text };
-  const end = text.indexOf('---', 3);
+  const end = frontmatterCloseIndex(text);
   if (end === -1) return { meta: {}, body: text };
   return {
     meta: parseSkillFrontmatter(text),
@@ -1057,7 +1138,7 @@ export function splitSkillMd(text: string): { meta: SkillFrontmatter; body: stri
 
 function ensureSkillMdCategoryForWrite(content: string): string {
   if (!content.startsWith('---')) return content;
-  const end = content.indexOf('---', 3);
+  const end = frontmatterCloseIndex(content);
   if (end === -1) return content;
   const meta = parseSkillFrontmatter(content);
   const current = String(meta.category || '').trim();

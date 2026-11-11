@@ -15,6 +15,7 @@ import type {
 import {
   AuthError,
   ContextOverflowError,
+  ProviderCandidateChangedError,
   classifyRetryableError,
   isProviderRateLimitError,
   isRetryableError,
@@ -439,11 +440,17 @@ function estimateRequestInputTokens(
   toolDefs: unknown[],
   turnEphemeral?: string,
 ): number {
-  return session.estimateModelTokens()
-    + estimateFixedOverheadTokens(systemPrompt, toolDefs, turnEphemeral);
+  return estimateCompletionRequestInputTokens({
+    model: "",
+    messages: session.getMessagesForModel(turnEphemeral ? { turnContext: turnEphemeral } : undefined),
+    systemPrompt,
+    tools: toolDefs as CompletionParams["tools"],
+  });
 }
 
-/** Price the actual request view at candidate admission, including scoped
+const requestThinkingTokenCache = new WeakMap<object, { text: string; tokens: number }>();
+
+/** Price the actual request view at preparation and candidate admission, including scoped
  * controls already in messages. Reuse Session's block cache and tool schema
  * cache; never serialize binary media or read/mutate session state. Plaintext
  * thinking is conservatively included even if a foreign adapter omits it. */
@@ -451,7 +458,13 @@ export function estimateCompletionRequestInputTokens(params: CompletionParams): 
   let tokens = sumMessageTokens(params.messages)
     + estimateFixedOverheadTokens(params.systemPrompt || "", params.tools || []);
   for (const message of params.messages) for (const block of message.content) {
-    if (block.type === "thinking") tokens += estimateTextTokens(block.thinking);
+    if (block.type !== "thinking") continue;
+    let cached = requestThinkingTokenCache.get(block);
+    if (!cached || cached.text !== block.thinking) {
+      cached = { text: block.thinking, tokens: estimateTextTokens(block.thinking) };
+      requestThinkingTokenCache.set(block, cached);
+    }
+    tokens += cached.tokens;
   }
   return tokens;
 }
@@ -996,7 +1009,7 @@ function outputLimitToolRetryControl(maxChunkChars: number): string {
   return [
     "The preceding response reached the output-token limit before completing a valid tool call. No tool call from that response was executed or saved.",
     "Retry the intended action now as one complete, concise tool call; do not repeat explanatory prose before it.",
-    `For a long new text file, keep this file-content chunk at or below ${maxChunkChars} characters, use write_file only for the first chunk, and copy its returned revision into append_file.base_revision for later chunks (expected_size is legacy fallback only).`,
+    `For a long new text file, keep this file-content chunk at or below ${maxChunkChars} characters, use write_file only for the first chunk, and copy its returned revision into append_file.base_revision for later chunks.`,
     "For an existing file, prefer a targeted edit_file or apply_patch call instead of rewriting the whole file.",
   ].join("\n");
 }
@@ -1690,6 +1703,9 @@ export class AgentRunner {
     // blocks. Total recoveries stay bounded by the tool-loop budget (each
     // re-arm requires a completed call, and those are capped).
     let overflowRecoveryAttempted = false;
+    // One re-preparation when the provider's first candidate changes after
+    // preparation; re-armed by a completed call like overflow recovery.
+    let candidateRepreparationAttempted = false;
     const toolNamesSet = new Set<string>();
     const skillsLoadedSet = new Set<string>();
     let transientToolErrors = 0;
@@ -1772,8 +1788,9 @@ export class AgentRunner {
     // Injected by reference into each round's `toolState` under the
     // `readFileState` key — a host/tool contract (like `sandboxEnv`): file
     // tools stamp it on read and check/refresh it on edit. The runner itself
-    // never reads it.
-    const readFileState = new Map<string, unknown>();
+    // never reads it. A host may seed stamps for files whose complete bytes it
+    // injected into this turn; the copy keeps the seed from outliving the run.
+    const readFileState = new Map<string, unknown>(params.initialReadFileState ?? []);
     // Generic run-scoped counters/ledgers used by tools whose safety budgets
     // must survive the per-model-round ToolContext reconstruction.
     const runScopedLedger = new Map<string, unknown>();
@@ -1840,6 +1857,30 @@ export class AgentRunner {
         const budgetEphemeral = [params.turnEphemeral, continuationBudgetTail]
           .filter(Boolean)
           .join("\n\n");
+        // Preparation and dispatch must price the same view. This is read-only:
+        // controls are still acknowledged only after a completed provider call.
+        const requestControlsNow = (): string[] => {
+          const repeat = guards.pendingCompletedRepeatNudge();
+          return [
+            ...pendingRequestControls,
+            ...(repeat ? [repeat] : []),
+            ...(outputRecoveryControl ? [outputRecoveryControl] : []),
+            ...(toolBoundarySynthesisPending ? [toolBoundarySynthesisControl] : []),
+          ];
+        };
+        const requestMessagesNow = (controls = requestControlsNow()): Message[] => {
+          const persisted = this.session.getMessagesForModel(
+            params.turnEphemeral ? { turnContext: params.turnEphemeral } : undefined,
+          );
+          const messages: Message[] = outputContinuationDraft?.content.length
+            ? [...persisted, ...(outputContinuationDraft.replayContents ?? [outputContinuationDraft.content])
+                .map((content): Message => ({ role: "assistant", content }))]
+            : persisted;
+          return withRequestScopedControls(messages, controls);
+        };
+        const estimatePreparedRequest = (): number => estimateCompletionRequestInputTokens({
+          model: modelId, messages: requestMessagesNow(), systemPrompt, tools: toolDefs,
+        });
 
         const reconciledWorkspace = this.session.reconcileWorkspaceObservations();
         if (reconciledWorkspace) {
@@ -1850,7 +1891,11 @@ export class AgentRunner {
           });
         }
 
-        const historyModel = this.modelCatalogEntry(modelId, servedModelId);
+        // A provider that knows its next candidate names it, so a run that had
+        // to use a larger fallback once compacts back onto the earlier model
+        // instead of staying on the fallback for every later round.
+        const callBudgetModel = provider.contextBudgetModel?.() ?? servedModelId;
+        const historyModel = this.modelCatalogEntry(modelId, callBudgetModel);
         if (historyModel?.contextWindow && Number.isFinite(historyModel.contextWindow)) {
           const usable = historyModel.contextWindow - (historyModel.maxOutputTokens ?? 8_192);
           this.session.configureHistoryBudget(usable, Math.floor(usable * CONTEXT_COMPACTION_TRIGGER_RATIO),
@@ -1866,11 +1911,10 @@ export class AgentRunner {
           systemPrompt,
           toolDefs,
           budgetEphemeral || undefined,
-          servedModelId,
+          callBudgetModel,
         );
-        const callUsableInputTokens = this.resolveUsableInputTokens(modelId, servedModelId);
+        const callUsableInputTokens = this.resolveUsableInputTokens(modelId, callBudgetModel);
         // In-memory scalar evidence only; the provider emits it on failure.
-        // Reuse compaction's existing estimates rather than rescan healthy requests.
         const contextBudgetDiagnostics: Record<string, number | string> = {
           version: 1,
           budget_context_window: historyModel?.contextWindow ?? 200_000,
@@ -1882,7 +1926,7 @@ export class AgentRunner {
         const resultCapacityExhausted = exhaustedResultCallCount > 0 && calculateToolResultInlineBudget({
           requestTokensBeforeResults: anchoredRequestTokens(
             requestTokenAnchor,
-            estimateRequestInputTokens(this.session, systemPrompt, toolDefs, budgetEphemeral || undefined),
+            estimatePreparedRequest(),
             this.session.contentEpoch(),
             this.session.getEstimatorCalibration(),
           ).tokens,
@@ -1927,6 +1971,7 @@ export class AgentRunner {
             requestTokenAnchor,
             contextBudgetDiagnostics,
             exhaustedResultCallCount,
+            estimatePreparedRequest,
           );
           exhaustedResultCallCount = 0;
         } finally {
@@ -1953,34 +1998,16 @@ export class AgentRunner {
         // `CompletionResult`-shaped object at the end for the tool loop.
         const pendingControlCount = pendingRequestControls.length;
         const completedRepeatNudge = guards.pendingCompletedRepeatNudge();
-        const requestControls = [
-          ...pendingRequestControls,
-          ...(completedRepeatNudge ? [completedRepeatNudge] : []),
-          ...(outputRecoveryControl ? [outputRecoveryControl] : []),
-          ...(toolBoundarySynthesisPending ? [toolBoundarySynthesisControl] : []),
-        ];
-        const persistedMessages = this.session.getMessagesForModel(
-          params.turnEphemeral ? { turnContext: params.turnEphemeral } : undefined,
-        );
-        const requestMessages: Message[] = outputContinuationDraft?.content.length
-          ? [
-              ...persistedMessages,
-              ...(outputContinuationDraft!.replayContents ?? [outputContinuationDraft!.content])
-                .map((content): Message => ({ role: "assistant", content })),
-            ]
-          : persistedMessages;
+        const requestMessages = requestMessagesNow();
         await this.session.flushPending(params.signal);
         activeProviderStartedAt = Date.now();
         providerOutput = { terminalSeen: false, textChars: 0, thinkingChars: 0, toolCalls: 0 };
-        const streamIter = provider.stream({
+        const completionParams: CompletionParams = {
           model: modelId,
           // Only the real provider turn injects per-turn ephemeral context;
           // summary / reflection callers of getMessagesForModel do not, so the
           // block never leaks into those views (or into persistence).
-          messages: withRequestScopedControls(
-            requestMessages,
-            requestControls,
-          ),
+          messages: requestMessages,
           systemPrompt,
           tools: toolDefs.length > 0 ? toolDefs : undefined,
           // Main-turn output cap. Do NOT hard-code: a fixed cap (was 4096)
@@ -2002,7 +2029,28 @@ export class AgentRunner {
           // provider or upstream model apply its default; explicit `'off'`
           // opts out of a provider-configured default.
           ...(params.thinkingLevel !== undefined ? { reasoning: params.thinkingLevel } : {}),
+        };
+        const preparedTokens = anchoredRequestTokens(
+          requestTokenAnchor,
+          estimateCompletionRequestInputTokens(completionParams),
+          this.session.contentEpoch(),
+          this.session.getEstimatorCalibration(),
+        );
+        const measuredModel = callBudgetModel || modelId;
+        Object.assign(contextBudgetDiagnostics, {
+          estimated_input_tokens: preparedTokens.tokens, estimate_source: preparedTokens.source,
         });
+        // Reuse the calibrated/anchored result in either direction, rather
+        // than taking max(raw, measured). Identity guards keep it request-local;
+        // a different model, image projection, prompt or tool set cannot borrow it.
+        completionParams.requestTokenEstimate = {
+          model: measuredModel,
+          messages: requestMessages,
+          systemPrompt,
+          tools: completionParams.tools,
+          ...preparedTokens,
+        };
+        const streamIter = provider.stream(completionParams);
 
         let streamText = "";
         let streamContent: import("../shared/types.js").MessageContent[] | undefined;
@@ -2170,6 +2218,7 @@ export class AgentRunner {
         // growth with fresh foldable content: re-arm the one-shot recovery
         // (see the declaration comment for the bound).
         overflowRecoveryAttempted = false;
+        candidateRepreparationAttempted = false;
 
         // Fall back to a text-only content block if the provider didn't
         // include `content` in message_end (older providers / custom stream
@@ -2324,12 +2373,10 @@ export class AgentRunner {
         // prompt accounting clears the anchor instead of keeping a stale one.
         const anchorFootprint = usageRequestFootprintTokens(result.usage);
         if (anchorFootprint > 0) {
-          const estimatedAtAnchor = estimateRequestInputTokens(
-            this.session,
-            systemPrompt,
-            toolDefs,
-            budgetEphemeral || undefined,
-          );
+          const estimatedAtAnchor = estimateCompletionRequestInputTokens({
+            ...completionParams,
+            messages: [...requestMessages, { role: "assistant", content: responseContent }],
+          });
           requestTokenAnchor = {
             realTokens: anchorFootprint,
             estimatedTokens: estimatedAtAnchor,
@@ -3237,6 +3284,23 @@ export class AgentRunner {
           return;
         }
 
+        // Nothing reached the stream, so preparing again is safe: compaction
+        // now targets the candidate the provider will offer next. It does not
+        // consume a provider retry slot; a repeat surfaces the original cause.
+        if (err instanceof ProviderCandidateChangedError) {
+          if (!candidateRepreparationAttempted) {
+            candidateRepreparationAttempted = true;
+            log.warn("provider candidate changed after preparation; preparing again", {
+              sessionId: this.session.getSessionId(),
+              model: modelId,
+              cause: logErrorRef(err.cause ?? err),
+            });
+            attempt--;
+            continue;
+          }
+          err = err.cause ?? err;
+        }
+
         if (err instanceof AuthError) {
           const e = this.errorResult(startTime, modelId, provider.id, {
             kind: "auth",
@@ -3247,14 +3311,14 @@ export class AgentRunner {
           return;
         }
 
-                if (err instanceof ContextOverflowError
+        if (err instanceof ContextOverflowError
           || (err instanceof Error && err.name === "ContextOverflowError")) {
           // Candidate admission already checked the unchanged request against
           // every available window. This is not an upstream estimation miss:
           // folding Session or retrying would defeat the read-only skip contract.
           if ((err as ContextOverflowError).admissionChecked) {
             const e = this.errorResult(startTime, modelId, provider.id, {
-              kind: "context_overflow", message: err.message, code: (err as ContextOverflowError).code,
+              kind: "context_overflow", message: err.message, code: "CONTEXT_CAPACITY_INSUFFICIENT",
             }, lastUsage, toolLoops, compactionCount, false, [...toolNamesSet], [...skillsLoadedSet], transientToolErrors, permanentToolErrors, finalizedRunTimings(startTime, timings), convergenceSignals());
             yield { type: "done", result: e };
             return;
@@ -3577,6 +3641,7 @@ export class AgentRunner {
     anchor: RequestTokenAnchor | null = null,
     diagnostics?: Record<string, number | string>,
     exhaustedResultCallCount = 0,
+    estimatePreparedRequest?: () => number,
   ): AsyncIterable<AgentRunEvent> {
     // Anchored to the previous call's real usage when the anchor is still
     // valid; a fold earlier in this prepare phase bumps the content epoch, so
@@ -3584,7 +3649,8 @@ export class AgentRunner {
     // `after` reading below by construction.
     const requestTokens = () => anchoredRequestTokens(
       anchor,
-      estimateRequestInputTokens(this.session, systemPrompt, toolDefs, turnEphemeral),
+      estimatePreparedRequest?.()
+        ?? estimateRequestInputTokens(this.session, systemPrompt, toolDefs, turnEphemeral),
       this.session.contentEpoch(),
       this.session.getEstimatorCalibration(),
     );

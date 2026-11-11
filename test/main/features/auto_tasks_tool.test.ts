@@ -80,6 +80,28 @@ describe('auto_tasks shared tool', () => {
     expect((await run(tool, { action: 'get', task_id: result.taskId })).task.schedule).toEqual(schedule);
   });
 
+  it.each([
+    { connector: null }, { skill: null }, { connector: null, skill: null },
+  ])('creates exactly one disabled automation with absent optional associations from %j', async references => {
+    const tool = createTool({ userId: uid, projectId: null });
+    const input = { action: 'create', ...draft, ...references };
+    const accepts = new AjvJsonSchemaValidator().getValidator(tool.inputSchema);
+    expect(accepts(input).valid).toBe(true);
+    const result = await run(tool, input);
+    expect(result).toMatchObject({ ok: true, isError: false, kind: 'created' });
+    tasks.stopScheduler();
+    vi.resetModules();
+    tasks = await import('../../../src/main/features/auto_tasks');
+    const persisted = await tasks.getTask(uid, result.taskId);
+    expect(persisted).toMatchObject({ content: draft.content, schedule: draft.schedule, enabled: false });
+    for (const field of ['skill', 'connector', 'last_run_at']) expect(persisted).not.toHaveProperty(field);
+    expect((await tasks.listTasks(uid)).map(task => task.id)).toEqual([result.taskId]);
+    for (const invalid of [{ connector: {} }, { skill: { id: '', name: 'Invalid' } }]) {
+      expect(await run(tool, { action: 'create', ...draft, ...invalid })).toMatchObject({ ok: false, isError: true });
+      expect((await tasks.listTasks(uid)).map(task => task.id)).toEqual([result.taskId]);
+    }
+  });
+
   it('rejects conditional omissions and mixed variants without changing saved state, then clears nullable fields', async () => {
     const tool = createTool({ userId: uid, projectId: pid });
     const created = await run(tool, { action: 'create', ...draft, end_condition: { type: 'count', max_runs: 3 } });
@@ -146,14 +168,20 @@ describe('auto_tasks shared tool', () => {
     const scoped = createTool({ userId: uid, projectId: pid });
     const created = await run(scoped, { action: 'create', ...draft });
     expect(created.ok).toBe(true);
+    const byUser = await tasks.createTask(uid, draft as never);
+    expect(byUser.ok).toBe(true);
     const unscoped = createTool({ userId: uid });
     const globalCreate = await run(unscoped, { action: 'create', ...draft });
     expect(globalCreate.ok).toBe(true);
     const refused = await run(unscoped, { action: 'create', ...draft, project_id: 'p_missing' });
     expect(refused.isError).toBe(true);
-    // Reading, editing and deleting are not creations; neither is a rejected input.
+    // Reading and editing are not creations; neither is a rejected input.
     await run(scoped, { action: 'update', task_id: created.taskId, title: 'Renamed' });
     await run(scoped, { action: 'delete', task_id: created.taskId });
+    await run(unscoped, { action: 'delete', task_id: (byUser as { task: { id: string } }).task.id });
+    // A well-formed id with no record behind it reaches the delete; a malformed
+    // one is rejected by validation before it, like `missing` above.
+    await run(unscoped, { action: 'delete', task_id: tasks.allocateDraftTaskId() });
     await run(scoped, { action: 'create', content: draft.content });
 
     expect((await run(scoped, { action: 'get', task_id: created.taskId })).isError).toBe(true);

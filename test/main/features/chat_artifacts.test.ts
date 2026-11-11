@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import { syncBuiltinESMExports } from 'node:module';
 
 const UID = 'u-artifact-001';
 const CID = 'conv-art-1';
@@ -40,12 +41,12 @@ const MIN_FILES = [{ path: 'index.html', content: '<!doctype html><h1>hi</h1>' }
 it.each(['local','web'] as const)('accepts a valid base64 manifest for a %s artifact while preserving the host permission boundary',async appType=>{
   const m=await loadMod(),manifest={sdkVersion:1,capabilities:['data'],data:{version:1,tables:[]}};
   const result=await m.createArtifact(UID,CID,AGENT,{appType,files:[...MIN_FILES,{path:'orkas-app.json',content:Buffer.from(JSON.stringify(manifest)).toString('base64'),encoding:'base64'}]});
-  if (appType === 'web') { expect(result).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' }); expect(fs.existsSync(cidDir())).toBe(false); return; }
   expect(result.ok).toBe(true);if(!result.ok)throw new Error(result.error);
   const saved=JSON.parse(fs.readFileSync(path.join(cidDir(),result.artifactId,'orkas-app.json'),'utf8'));
   expect(saved).toMatchObject(manifest);expect(m.readArtifactMeta(UID,CID,result.artifactId)?.appType).toBe(appType);
+  if(appType==='web')expect(saved.minimumClient).toBe('1.9.0');
   const denied=await m.createArtifact(UID,CID,AGENT,{appType:'web',files:[...MIN_FILES,{path:'orkas-app.json',content:Buffer.from(JSON.stringify({sdkVersion:1,capabilities:['ai']})).toString('base64'),encoding:'base64'}]});
-  expect(denied).toMatchObject({ok:false,code:'E_COMMERCIAL_REQUIRED',feature:'web_apps'});
+  expect(denied).toMatchObject({ok:false,error:'web applications cannot use host interfaces: declared local-only capabilities ai; web apps may declare only data'});
   const missing=await m.createArtifact(UID,CID,AGENT,{appType,files:[...MIN_FILES,{path:'orkas-app.json',content:JSON.stringify({sdkVersion:1,capabilities:['data']})}]});
   expect(missing).toMatchObject({ok:false,error:'data definition is required'});
 });
@@ -76,7 +77,6 @@ it.each([
   const m = await loadMod();
   for (const appType of ['local', 'web'] as const) {
     const result = await m.createArtifact(UID, CID, AGENT, { appType, files: [...MIN_FILES, { path: 'orkas-app.json', ...file }] });
-    if (appType === 'web') { expect(result).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' }); continue; }
     expect(result.ok).toBe(false); if (result.ok) return;
     expect(result.error.startsWith(PREFIX)).toBe(true);
     expect(result.error).toContain(cause);
@@ -105,7 +105,7 @@ it('names the local-only capabilities a web manifest declared', async () => {
   const m = await loadMod();
   const result = await m.createArtifact(UID, CID, AGENT, { appType: 'web', files: [...MIN_FILES,
     { path: 'orkas-app.json', content: JSON.stringify({ sdkVersion: 1, capabilities: ['data', 'storage', 'ai'], data: { version: 1, tables: [] } }) }] });
-  expect(result).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
+  expect(result).toEqual({ ok: false, error: 'web applications cannot use host interfaces: declared local-only capabilities storage, ai; web apps may declare only data' });
   expect(fs.existsSync(cidDir()) ? fs.readdirSync(cidDir()) : []).toEqual([]);
 });
 
@@ -493,13 +493,7 @@ it('creates and serves the same media/model/font resources accepted by saved app
 describe('chat_artifacts › application type for bubble labels', () => {
   it.each(['local', 'web'] as const)('returns the actual %s bundle type during preview inspection', async appType => {
     const m = await loadMod();
-    let created: any;
-    if (appType === 'web') {
-      const dir = path.join(cidDir(), 'legacy-web'); fs.mkdirSync(dir, { recursive: true });
-      fs.writeFileSync(path.join(dir, 'index.html'), MIN_FILES[0].content);
-      fs.writeFileSync(path.join(dir, '__orkas-meta.json'), JSON.stringify({ title: 'Legacy web app', appType: 'web' }));
-      created = { ok: true, artifactId: 'legacy-web' };
-    } else created = await m.createArtifact(UID, CID, AGENT, { appType, files: MIN_FILES });
+    const created = await m.createArtifact(UID, CID, AGENT, { appType, files: MIN_FILES });
     if (!created.ok) throw new Error(created.error);
     expect(await m.inspectArtifactIndex(UID, CID, created.artifactId)).toEqual({ ok: true, status: 'ok', appType });
   });
@@ -522,11 +516,12 @@ describe('chat_artifacts › application type input', () => {
   // Sync notification is loaded through CommonJS require and cannot be
   // intercepted here; it is sent only after the staged directory is renamed,
   // so an absent directory is the observable no-publication oracle.
-  it('denies authoring through the legacy cloud alias without allocating a bundle', async () => {
+  it('stores the legacy cloud alias as a web application with the web declaration', async () => {
     const m = await loadMod();
     const created = await m.createArtifact(UID, CID, AGENT, { appType: 'cloud', files: MIN_FILES });
-    expect(created).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
-    expect(fs.existsSync(cidDir())).toBe(false);
+    expect(created.ok).toBe(true); if (!created.ok) return;
+    expect(m.readArtifactMeta(UID, CID, created.artifactId)?.appType).toBe('web');
+    expect(JSON.parse(fs.readFileSync(path.join(cidDir(), created.artifactId, '__orkas-meta.json'), 'utf8')).appType).toBe('web');
   });
 
   it.each([['desktop'], ['Web'], [1], [{ type: 'web' }]])('rejects unknown type %j without creating an artifact', async appType => {
@@ -534,18 +529,92 @@ describe('chat_artifacts › application type input', () => {
     const result = await m.createArtifact(UID, CID, AGENT, { appType, files: MIN_FILES });
     expect(result).toEqual({ ok: false, error: 'app type must match the task or editing source' });
     expect(fs.existsSync(cidDir()) ? fs.readdirSync(cidDir()) : []).toEqual([]);
-    expect(m.listArtifacts(UID, CID)).toEqual([]);
+    expect(await m.listArtifacts(UID, CID)).toEqual([]);
   });
 
-  it('denies an undeclared web app and retains local auto-sizing authoring', async () => {
+  it('gives a web artifact without a declaration the empty data-only declaration and leaves its entry bytes unchanged', async () => {
     const m = await loadMod();
     const html = '<!doctype html><html><head><title>Web</title></head><body><p>Plain</p></body></html>';
     const created = await m.createArtifact(UID, CID, AGENT, { appType: 'web', files: [{ path: 'index.html', content: html }] });
-    expect(created).toMatchObject({ ok: false, code: 'E_COMMERCIAL_REQUIRED', feature: 'web_apps' });
-    expect(fs.existsSync(cidDir())).toBe(false);
+    expect(created.ok).toBe(true); if (!created.ok) return;
+    const dir = path.join(cidDir(), created.artifactId);
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'orkas-app.json'), 'utf8'))).toEqual({ sdkVersion: 1, minimumClient: '1.9.0', capabilities: [] });
+    expect(fs.readFileSync(path.join(dir, 'index.html'))).toEqual(Buffer.from(html, 'utf8'));
+    // The local default keeps its auto-sizing bridge; only web skips it.
     const local = await m.createArtifact(UID, CID, AGENT, { files: [{ path: 'index.html', content: html }] });
     expect(local.ok).toBe(true); if (!local.ok) return;
     expect(fs.readFileSync(path.join(cidDir(), local.artifactId, 'index.html'), 'utf8')).toContain(m.BRIDGE_RELPATH);
     expect(fs.existsSync(path.join(cidDir(), local.artifactId, 'orkas-app.json'))).toBe(false);
+  });
+});
+
+describe('chat_artifacts › bundle summaries', () => {
+  it.each(['local', 'web'] as const)('includes nested resources and orders %s apps by their latest file update without changing served content', async appType => {
+    const m = await loadMod();
+    const first = await m.createArtifact(UID, CID, AGENT, { appType, files: [
+      ...MIN_FILES,
+      { path: 'assets/deep/labels.txt', content: '标签' },
+      { path: 'assets/image.png', content: 'AAEC/w==', encoding: 'base64' },
+    ] });
+    const second = await m.createArtifact(UID, CID, AGENT, { appType, files: MIN_FILES });
+    if (!first.ok) throw new Error(first.error);
+    if (!second.ok) throw new Error(second.error);
+    const firstDir = path.join(cidDir(), first.artifactId);
+    let rootBytes = 0;
+    for (const [id, seconds] of [[first.artifactId, 1000], [second.artifactId, 2000]] as const) {
+      const dir = path.join(cidDir(), id);
+      const rootFiles = appType === 'web'
+        ? ['index.html', 'orkas-app.json', '__orkas-meta.json']
+        : ['index.html', '__orkas-meta.json'];
+      for (const name of rootFiles) {
+        fs.utimesSync(path.join(dir, name), seconds, seconds);
+        if (id === first.artifactId) rootBytes += fs.statSync(path.join(dir, name)).size;
+      }
+    }
+    fs.utimesSync(path.join(firstDir, 'assets/image.png'), 1000, 1000);
+    fs.utimesSync(path.join(firstDir, 'assets/deep/labels.txt'), 3000, 3000);
+    const listed = await m.listArtifacts(UID, CID);
+    expect(listed.map(row => row.artifactId)).toEqual([first.artifactId, second.artifactId]);
+    expect(listed[0]).toMatchObject({ bytes: rootBytes + Buffer.byteLength('标签') + 4, mtime: 3000000 });
+    const { listConversationOutputs } = await import('../../../src/main/features/conversation_outputs');
+    const outputs = await listConversationOutputs(UID, CID);
+    const apps = outputs.items.filter(row => row.origin === 'artifact');
+    expect(apps.map(row => row.artifactId)).toEqual([first.artifactId, second.artifactId]);
+    expect(apps[0]).toMatchObject({ bytes: rootBytes + 10, mtime: 3000000 });
+    for (const [relPath, expected] of [
+      ['assets/deep/labels.txt', Buffer.from('标签')],
+      ['assets/image.png', Buffer.from([0, 1, 2, 255])],
+    ] as const) {
+      const served = m.resolveArtifactFilePath(UID, CID, first.artifactId, relPath);
+      expect(served.ok).toBe(true);
+      if (!served.ok) throw new Error(served.error);
+      expect(fs.readFileSync(served.absPath)).toEqual(expected);
+    }
+  });
+
+  it('skips links and a disappearing nested directory while retaining readable siblings', async () => {
+    const m = await loadMod();
+    const dir = path.join(cidDir(), 'nested_fixture');
+    fs.mkdirSync(path.join(dir, 'assets/gone'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'index.html'), 'entry');
+    fs.writeFileSync(path.join(dir, 'assets/keep.txt'), 'keep');
+    fs.writeFileSync(path.join(dir, 'assets/gone/lost.txt'), 'lost');
+    const outside = path.join(tmpDir, 'outside');
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, 'large.txt'), 'x'.repeat(10000));
+    fs.symlinkSync(outside, path.join(dir, 'assets/external'), 'junction');
+    fs.symlinkSync(dir, path.join(dir, 'assets/loop'), 'junction');
+    // A junction needs no Windows symlink privilege; file-link coverage runs on POSIX.
+    if (process.platform !== 'win32') fs.symlinkSync(path.join(outside, 'large.txt'), path.join(dir, 'external.txt'));
+    const realRead = fs.promises.readdir.bind(fs.promises);
+    const spy = vi.spyOn(fs.promises, 'readdir').mockImplementation((async (target: any, options: any) => {
+      if (String(target) === path.join(dir, 'assets/gone')) throw Object.assign(new Error('fixture removed directory'), { code: 'ENOENT' });
+      return realRead(target, options);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      expect(await m.listArtifacts(UID, CID)).toMatchObject([{ artifactId: 'nested_fixture', bytes: 9 }]);
+      expect(spy.mock.calls.some(([target]) => String(target) === path.join(dir, 'assets/gone'))).toBe(true);
+    } finally { spy.mockRestore(); syncBuiltinESMExports(); }
   });
 });

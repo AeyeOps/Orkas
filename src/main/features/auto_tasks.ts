@@ -5,8 +5,8 @@
  *   `<uid>/cloud/auto_tasks/<task_id>/` (global) or
  *   `<uid>/cloud/projects/<pid>/auto_tasks/<task_id>/` (project-scoped),
  * holding `config.json` (spec) + `attachments/<filename>` (per-task files
- * pre-staged by the user). Deletion is `rm -rf <task_id>/`; cloud sync
- * ships only the bytes that changed (no global file bottleneck).
+ * pre-staged by the user). Each task owns its config, attachments and handoff
+ * files; deletion removes that complete directory.
  *
  * Fire path: `chats.createConversation({projectId})` → copy attachments
  * into the new conv's resolved `chat_attachments/<cid>/` → `groupChat.send({text,
@@ -17,8 +17,8 @@
  *   - one_time: { at: ISO datetime }       fires once; after fire enabled=false
  *   - hourly:   { interval_hours }         every x hours from create / last run
  *   - daily:    { hour, minute }
- *   - weekly:   { weekday, hour, minute }
- *   - monthly:  { day, hour, minute }      day=31 → last day of shorter months
+ *   - weekly:   { weekday | weekdays[], hour, minute }; workdays = Monday–Friday
+ *   - monthly:  { day | days[], hour, minute }      day=31 → last day of shorter months
  *
  * Scheduler: per-task timers started by `startScheduler()` after
  * `activateUser()`. After system wake or startup, the most recent boundary
@@ -47,12 +47,12 @@ import {
 import {
   autoTaskLocationForTask,
   chatAttachmentDirForConversation,
-  cloudRelForAbs,
   findAutoTaskLocation,
   globalAutoTaskLocation,
   listAutoTaskLocations,
 } from '../util/project-layout';
 import { readJson, writeJson, nowIso, safeId } from '../storage';
+import { FileSnapshotCache, mapFileSnapshots } from '../util/file-snapshot';
 import { createLogger } from '../logger';
 import { logErrorSummary, maskId } from '../util/log-redact';
 import { replaceDirectoryAtomically } from '../util/atomic-directory-replace';
@@ -98,8 +98,14 @@ export function getCurrentDevice(): DeviceFingerprint {
 export type ScheduleOneTime = { type: 'one_time'; at: string };
 export type ScheduleHourly  = { type: 'hourly'; interval_hours: number };
 export type ScheduleDaily   = { type: 'daily';   hour: number; minute: number };
-export type ScheduleWeekly  = { type: 'weekly';  weekday: number; hour: number; minute: number };
-export type ScheduleMonthly = { type: 'monthly'; day: number; hour: number; minute: number };
+export type ScheduleWeekly = { type: 'weekly'; hour: number; minute: number } & (
+  | { weekday: number | 'workdays'; weekdays?: never }
+  | { weekdays: number[]; weekday?: never }
+);
+export type ScheduleMonthly = { type: 'monthly'; hour: number; minute: number } & (
+  | { day: number; days?: never }
+  | { days: number[]; day?: never }
+);
 export type Schedule = ScheduleOneTime | ScheduleHourly | ScheduleDaily | ScheduleWeekly | ScheduleMonthly;
 
 export type TaskEndCondition =
@@ -141,7 +147,7 @@ export interface AutoTask {
   scheduled_run_count?: number;
   attachments?: string[];                // file names under <task_dir>/attachments/
   /** Device the task is bound to — only this machine fires the schedule.
-   *  Every device can still read / edit the config (the file cloud-syncs).
+   *  The local installation can still read and edit the config.
    *  `device_id` is the persistent installation id from machine-global
    *  `device.json`; legacy releases stored a NIC MAC and migrate it only with
    *  local ownership evidence. `device_name` is display-only. */
@@ -150,6 +156,23 @@ export interface AutoTask {
   created_at: string;
   updated_at: string;
   last_run_at?: string;
+  /** Runs started (scheduled and manual) since this field existed. */
+  run_count?: number;
+  /** The most recent run and the one before it. A run stays `running` until
+   *  its own conversation reports a terminal; a restart can leave it there. */
+  last_run?: AutoTaskRun;
+  previous_run?: AutoTaskRun;
+}
+
+/** Terminal of one run as the group-chat bus reports it, plus `running`
+ *  before that and `unknown` for a terminal the bus could not classify. */
+export type AutoRunStatus = 'running' | 'completed' | 'failed' | 'cancelled' | 'stopped' | 'waiting_input' | 'unknown';
+
+export interface AutoTaskRun {
+  cid: string;
+  started_at: string;
+  ended_at?: string;
+  status: AutoRunStatus;
 }
 
 function genTaskId(): string { return 'at_' + crypto.randomBytes(4).toString('hex'); }
@@ -204,15 +227,31 @@ function _isValidSchedule(s: any): s is Schedule {
       && s.interval_hours <= MAX_INTERVAL_HOURS;
   }
   if (s.type === 'daily') return _isHM(s.hour, s.minute);
-  if (s.type === 'weekly') {
-    return _isHM(s.hour, s.minute)
-      && Number.isInteger(s.weekday) && s.weekday >= 0 && s.weekday <= 6;
-  }
-  if (s.type === 'monthly') {
-    return _isHM(s.hour, s.minute)
-      && Number.isInteger(s.day) && s.day >= 1 && s.day <= 31;
+  if (s.type === 'weekly' || s.type === 'monthly') {
+    const weekly = s.type === 'weekly';
+    const scalar = weekly ? s.weekday : s.day;
+    const values = weekly ? s.weekdays : s.days;
+    const min = weekly ? 0 : 1;
+    const max = weekly ? 6 : 31;
+    if (!_isHM(s.hour, s.minute)) return false;
+    if (values !== undefined) {
+      return scalar === undefined && Array.isArray(values) && values.length > 0
+        && values.length <= (weekly ? 7 : 31)
+        && new Set(values).size === values.length
+        && values.every(value => Number.isInteger(value) && value >= min && value <= max);
+    }
+    return (weekly && scalar === 'workdays')
+      || (Number.isInteger(scalar) && scalar >= min && scalar <= max);
   }
   return false;
+}
+
+/** Expand saved selectors without changing their single/multiple editor mode. */
+function _calendarSelection(s: ScheduleWeekly | ScheduleMonthly): number[] {
+  const values = s.type === 'weekly'
+    ? (s.weekdays || (s.weekday === 'workdays' ? [1, 2, 3, 4, 5] : [s.weekday]))
+    : (s.days || [s.day]);
+  return [...values].sort((a, b) => a - b);
 }
 
 function _schedulesEqual(a: Schedule, b: Schedule): boolean {
@@ -226,16 +265,10 @@ function _schedulesEqual(a: Schedule, b: Schedule): boolean {
   if (a.type === 'hourly') {
     return b.type === 'hourly' && a.interval_hours === b.interval_hours;
   }
-  if (a.type === 'weekly') {
-    return b.type === 'weekly'
-      && a.weekday === b.weekday
-      && a.hour === b.hour
-      && a.minute === b.minute;
-  }
-  return b.type === 'monthly'
-    && a.day === b.day
-    && a.hour === b.hour
-    && a.minute === b.minute;
+  return a.type === b.type
+    && a.hour === (b as ScheduleWeekly | ScheduleMonthly).hour
+    && a.minute === (b as ScheduleWeekly | ScheduleMonthly).minute
+    && JSON.stringify(_calendarSelection(a)) === JSON.stringify(_calendarSelection(b as ScheduleWeekly | ScheduleMonthly));
 }
 
 function _endConditionsEqual(
@@ -321,19 +354,8 @@ function _isValidTaskShape(t: any): t is AutoTask {
 // ── File IO (serialised per uid) ──────────────────────────────────────────
 
 const _tails = new Map<string, Promise<unknown>>();
-type SyncDirtyNotifier = (domain: string, relPath: string) => void;
-let _syncDirtyNotifierForTest: SyncDirtyNotifier | null = null;
-type SyncDeletedNotifier = (relPath: string) => void;
-let _syncDeletedNotifierForTest: SyncDeletedNotifier | null = null;
+
 let _markRanFailureForTest: Error | null = null;
-
-export function _setSyncDirtyNotifierForTest(fn: SyncDirtyNotifier | null): void {
-  _syncDirtyNotifierForTest = fn;
-}
-
-export function _setSyncDeletedNotifierForTest(fn: SyncDeletedNotifier | null): void {
-  _syncDeletedNotifierForTest = fn;
-}
 
 export function _setMarkRanFailureForTest(error: Error | null): void {
   _markRanFailureForTest = error;
@@ -349,16 +371,21 @@ function _runExclusive<T>(uid: string, fn: () => Promise<T>): Promise<T> {
 async function _readOne(
   uid: string, taskId: string,
   loc = findAutoTaskLocation(uid, taskId),
+  strict = false,
 ): Promise<AutoTask | null> {
   const cfg = loc?.configFile || globalAutoTaskLocation(uid, taskId).configFile;
-  if (!fs.existsSync(cfg)) return null;
+  if (!strict && !fs.existsSync(cfg)) return null;
   try {
-    const raw: any = await readJson(cfg);
+    const raw: any = await readJson(cfg, { strict });
+    if (strict && !_isValidTaskShape(raw)) throw new Error('Invalid automation configuration');
     if (!raw || typeof raw !== 'object') return null;
     if (!_isValidTaskShape(raw)) return null;
+    _dropMalformedRunFacts(raw as unknown as Record<string, unknown>);
     if (loc?.projectId && !raw.project_id) raw.project_id = loc.projectId;
     return raw;
   } catch (err) {
+    if (strict && (err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    if (strict) return null;
     log.warn(`read failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
     return null;
   }
@@ -404,7 +431,7 @@ async function _writeOne(uid: string, task: AutoTask): Promise<void> {
     : null
   );
   if (prev && prev.dir !== loc.dir && fs.existsSync(prev.dir)) {
-    const prevRelPaths = _relFilesUnder(uid, prev.dir, prev.configRelPath);
+
     const retired = path.join(path.dirname(prev.dir), `.${task.id}.moved-${crypto.randomUUID()}`);
     await replaceDirectoryAtomically(loc.dir, async (staged) => {
       if (fs.existsSync(loc.dir)) fs.cpSync(loc.dir, staged, { recursive: true });
@@ -421,52 +448,14 @@ async function _writeOne(uid: string, task: AutoTask): Promise<void> {
     });
     try { fs.rmSync(retired, { recursive: true, force: true }); }
     catch (err) { log.warn('task migration source cleanup failed', logErrorSummary(err)); }
-    for (const relPath of prevRelPaths) _notifyDeleted(relPath);
-    _notifyDirty(loc.configRelPath);
+
     return;
   }
   fs.mkdirSync(loc.dir, { recursive: true });
   await writeJson(loc.configFile, task);
-  _notifyDirty(loc.configRelPath);
+
 }
 
-// Sync engine dirty signal (lazy-require: `features/sync` is stripped from
-// the open-source build). Auto tasks live in per-task directories, so a single path hint is
-// enough to wake the sync debounce; the engine still scans the whole cloud tree.
-function _notifyDirty(relPath: string): void {
-  if (_syncDirtyNotifierForTest) {
-    _syncDirtyNotifierForTest('auto_tasks', relPath);
-    return;
-  }
-  try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, global-require
-    const sync = null as { markDirty?: (domain: string, relPath: string) => void };
-    sync?.markDirty?.('auto_tasks', relPath);
-  } catch { /* features/sync stripped */ }
-}
-
-function _notifyDeleted(relPath: string): void {
-  if (_syncDeletedNotifierForTest) {
-    _syncDeletedNotifierForTest(relPath);
-  }
-}
-
-function _relFilesUnder(uid: string, dir: string, fallback: string): string[] {
-  if (!fs.existsSync(dir)) return [fallback];
-  const out: string[] = [];
-  const walk = (absDir: string) => {
-    let entries: fs.Dirent[] = [];
-    try { entries = fs.readdirSync(absDir, { withFileTypes: true }); }
-    catch { return; }
-    for (const entry of entries) {
-      const abs = path.join(absDir, entry.name);
-      if (entry.isDirectory()) walk(abs);
-      else if (entry.isFile()) out.push(cloudRelForAbs(uid, abs));
-    }
-  };
-  walk(dir);
-  return out.length ? out : [fallback];
-}
 
 function _hasMatchingLocalLegacyClaim(uid: string, task: AutoTask): boolean {
   const assignedId = String(task.device_id || '').toLowerCase();
@@ -526,13 +515,13 @@ async function _migrateLegacyDeviceBindingsIfOwned(
   return out;
 }
 
-async function _readAll(uid: string): Promise<AutoTask[]> {
+async function _readAll(uid: string, strict = false): Promise<AutoTask[]> {
   const out: AutoTask[] = [];
-  for (const loc of listAutoTaskLocations(uid)) {
+  for (const loc of listAutoTaskLocations(uid, strict)) {
     if (!_isValidTaskId(loc.taskId)) continue;
     // Discovery already resolved scope and duplicate precedence. Re-scanning
     // all directories per item makes a list quadratic in filesystem work.
-    const task = await _readOne(uid, loc.taskId, loc);
+    const task = await _readOne(uid, loc.taskId, loc, strict);
     if (task) out.push(task);
   }
   // Newest-first by created_at — a brand-new task lands at the top so the
@@ -541,6 +530,15 @@ async function _readAll(uid: string): Promise<AutoTask[]> {
   // would scramble the list every fire).
   out.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
   return out;
+}
+
+/** Lifecycle read uses the scheduler's device migration/ownership contract, not armed timers. */
+export async function hasEnabledLocalAutomations(uid: string): Promise<boolean> {
+  return _runExclusive(uid, async () => {
+    const all = await _migrateLegacyDeviceBindingsIfOwned(uid, await _readAll(uid, true));
+    const device = getCurrentDevice().id;
+    return all.some(task => task.enabled && (!task.device_id || task.device_id === device));
+  });
 }
 
 // ── Public CRUD ───────────────────────────────────────────────────────────
@@ -619,12 +617,12 @@ function _normaliseDraft(d: TaskDraft): { ok: true; fields: NormalisedFields } |
     recipient = d.recipient;
   }
   let skill: TaskSkillRef | undefined;
-  if (d.skill !== undefined) {
+  if (d.skill !== undefined && d.skill !== null) {
     if (!_isValidRef(d.skill)) return { ok: false, error: 'invalid_skill' };
     skill = { id: d.skill.id, name: d.skill.name };
   }
   let connector: TaskConnectorRef | undefined;
-  if (d.connector !== undefined) {
+  if (d.connector !== undefined && d.connector !== null) {
     if (!_isValidRef(d.connector)) return { ok: false, error: 'invalid_connector' };
     connector = { id: d.connector.id, name: d.connector.name };
   }
@@ -681,6 +679,26 @@ export async function listTasks(uid: string, opts?: { projectId?: string | null 
       return all.filter((t) => t.project_id === pid);
     }
     return all;
+  });
+}
+
+type TaskSearchRow = Pick<AutoTask, 'id' | 'title' | 'content' | 'enabled' | 'project_id'>;
+const _searchSnapshots = new FileSnapshotCache<TaskSearchRow>(
+  row => 256 + 2 * ((row.title?.length || 0) + row.content.length),
+);
+
+/** Read-only search projections do not need scheduler device migration or
+ * run/attachment metadata. Validate sources on every query, with bounded I/O. */
+export async function listTaskSearchRows(uid: string): Promise<TaskSearchRow[]> {
+  return _runExclusive(uid, async () => {
+    const rows = await mapFileSnapshots(listAutoTaskLocations(uid).filter(loc => _isValidTaskId(loc.taskId)), loc => (
+      _searchSnapshots.read(loc.configFile, async () => {
+        const task = await _readOne(uid, loc.taskId, loc);
+        return task ? { id: task.id, title: task.title, content: task.content,
+          enabled: task.enabled, project_id: task.project_id } : null;
+      })
+    ));
+    return rows.filter((row): row is TaskSearchRow => row !== null);
   });
 }
 
@@ -838,10 +856,10 @@ export async function deleteTask(uid: string, taskId: string, expectedProjectId?
     if (expectedProjectId !== undefined && ((await _readOne(uid, taskId))?.project_id ?? null) !== expectedProjectId) return { ok: false };
     const loc = findAutoTaskLocation(uid, taskId);
     if (!loc || !fs.existsSync(loc.dir)) return { ok: false };
-    const relPaths = _relFilesUnder(uid, loc.dir, loc.configRelPath);
+
     try {
       fs.rmSync(loc.dir, { recursive: true, force: true });
-      for (const relPath of relPaths) _notifyDeleted(relPath);
+
       _removeFireBoundaryClaimDir(uid, taskId);
       log.info(`task deleted uid=${maskId(uid)} id=${taskId}`);
       _onTaskMutated(uid, null, taskId);
@@ -928,7 +946,10 @@ export async function applyAutoTaskMutation(
       if (taskId && ((await getTask(uid, taskId))?.project_id ?? null) !== opts.projectId) return { ok: false, error: 'not_found' };
     }
     if (action === 'create') {
-      const result = await createTask(uid, { ...mutation.updates, ...(opts.projectId ? { project_id: opts.projectId } : {}) } as TaskDraft);
+      const result = await createTask(
+        uid,
+        { ...mutation.updates, ...(opts.projectId ? { project_id: opts.projectId } : {}) } as TaskDraft,
+      );
       if (!result.ok) return { ok: false, error: (result as { error: string }).error };
       await _stageMutationAttachments(uid, result.task.id, mutation, opts);
       return {
@@ -999,7 +1020,7 @@ async function _stageMutationAttachments(
     if (!fs.existsSync(src)) continue;
     try {
       fs.copyFileSync(src, path.join(destDir, name));
-      _notifyDirty(`${loc.attachmentsRelBase}/${name}`);
+
     } catch (err) {
       log.warn(`attachment stage failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
     }
@@ -1037,6 +1058,121 @@ async function _markRan(
   });
 }
 
+// ── Run facts and handoff ────────────────────────────────────────────────
+//
+// A run opens a fresh conversation, so by itself it knows nothing about the
+// runs before it. The task record keeps a run count and the last two runs,
+// and each task owns one `handoff/` directory a run may read and write for
+// the next one. The turn guidance reads both; nothing else in the task
+// directory is writable from a run.
+
+export const AUTO_TASK_HANDOFF_NOTE = 'note.md';
+const RUN_STATUSES: ReadonlySet<string> = new Set<AutoRunStatus>([
+  'running', 'completed', 'failed', 'cancelled', 'stopped', 'waiting_input', 'unknown',
+]);
+
+function _isValidRun(run: unknown): run is AutoTaskRun {
+  if (!run || typeof run !== 'object') return false;
+  const r = run as Record<string, unknown>;
+  const isDate = (value: unknown) => typeof value === 'string' && !Number.isNaN(new Date(value).getTime());
+  return typeof r.cid === 'string' && safeId(r.cid)
+    && isDate(r.started_at)
+    && typeof r.status === 'string' && RUN_STATUSES.has(r.status)
+    && (r.ended_at === undefined || isDate(r.ended_at));
+}
+
+/** Run facts are additive: a malformed value is dropped instead of making
+ *  the task unreadable. */
+function _dropMalformedRunFacts(raw: Record<string, unknown>): void {
+  if (raw.run_count !== undefined
+      && !(Number.isSafeInteger(raw.run_count) && (raw.run_count as number) >= 0)) delete raw.run_count;
+  for (const key of ['last_run', 'previous_run'] as const) {
+    if (raw[key] !== undefined && !_isValidRun(raw[key])) delete raw[key];
+  }
+}
+
+/** The handoff note a run reads first and rewrites before it ends. */
+export function handoffNotePath(uid: string, task: Pick<AutoTask, 'id' | 'project_id'>): string {
+  return path.join(autoTaskLocationForTask(uid, task.id, task.project_id).handoffDir, AUTO_TASK_HANDOFF_NOTE);
+}
+
+/** Count the run and remember its conversation. The run before it moves to
+ *  `previous_run` so the new run can be told how that one ended. */
+export async function recordRunStart(uid: string, taskId: string, cid: string, startedAt: string): Promise<void> {
+  if (!_isValidTaskId(taskId) || !safeId(cid)) return;
+  await _runExclusive(uid, async () => {
+    const cur = await _readOne(uid, taskId);
+    if (!cur) return;
+    const next: AutoTask = {
+      ...cur,
+      run_count: (cur.run_count || 0) + 1,
+      ...(cur.last_run ? { previous_run: cur.last_run } : {}),
+      last_run: { cid, started_at: startedAt, status: 'running' },
+    };
+    await _writeOne(uid, next);
+  });
+}
+
+/** Close the run on record with the terminal of its own conversation. A
+ *  terminal for another conversation, or for a run no longer on record, is
+ *  ignored. */
+export async function recordRunTerminal(
+  uid: string, taskId: string, cid: string, status: AutoRunStatus, endedAt: string,
+): Promise<void> {
+  if (!_isValidTaskId(taskId) || !safeId(cid)) return;
+  await _runExclusive(uid, async () => {
+    const cur = await _readOne(uid, taskId);
+    if (!cur?.last_run || cur.last_run.cid !== cid) return;
+    await _writeOne(uid, { ...cur, last_run: { ...cur.last_run, status, ended_at: endedAt } });
+
+  });
+}
+
+/** Let the run's conversation write the task's handoff directory. The rest
+ *  of the task directory stays behind the automation tool. */
+async function _grantHandoffRoot(uid: string, task: AutoTask, cid: string): Promise<void> {
+  const loc = autoTaskLocationForTask(uid, task.id, task.project_id);
+  try {
+    fs.mkdirSync(loc.handoffDir, { recursive: true });
+    const state = await import('./group_chat/state');
+    await state.setToolExtraRoots(uid, cid, [loc.handoffDir]);
+  } catch (err) {
+    log.warn(`handoff root grant failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
+  }
+}
+
+/** Observe before dispatch, but persist a terminal only after the admitted
+ *  run's start is durable. A fast run can finish before send returns. */
+function _watchRunTerminal(uid: string, taskId: string, cid: string): { admit(): void; cancel(): void } {
+  const subscribe = (groupChat as { subscribeTaskTerminals?: typeof import('./group_chat/bus').subscribeTaskTerminals })
+    .subscribeTaskTerminals;
+  if (typeof subscribe !== 'function') return { admit() {}, cancel() {} };
+  let admitted = false;
+  let pending: (() => void) | undefined;
+  const unsubscribe = subscribe((event) => {
+    // Each fire owns a newly created conversation. Its first terminal belongs
+    // to this admitted run; later chat can only finish after that terminal.
+    if (event.user_id !== uid || event.conversation_id !== cid) return;
+    unsubscribe();
+    const status = RUN_STATUSES.has(event.status) ? event.status as AutoRunStatus : 'unknown';
+    const finish = () => {
+      recordRunTerminal(uid, taskId, cid, status, new Date(event.finished_at_ms).toISOString())
+        .catch((err) => log.warn(`run terminal record failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err)));
+    };
+    if (admitted) finish();
+    else pending = finish;
+  });
+  return {
+    admit() {
+      admitted = true;
+      const finish = pending;
+      pending = undefined;
+      finish?.();
+    },
+    cancel() { unsubscribe(); pending = undefined; },
+  };
+}
+
 // ── Attachment management ────────────────────────────────────────────────
 
 export async function listAttachments(uid: string, taskId: string): Promise<string[]> {
@@ -1065,7 +1201,7 @@ export async function uploadAttachment(
   try {
     fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(path.join(dir, safe), buf);
-    _notifyDirty(`${loc.attachmentsRelBase}/${safe}`);
+
     log.info(`attachment uploaded uid=${maskId(uid)} id=${taskId} bytes=${buf.length}`);
     return { ok: true, name: safe };
   } catch (err) {
@@ -1082,7 +1218,7 @@ export async function deleteAttachment(uid: string, taskId: string, name: string
   const target = path.join(loc.attachmentsDir, safe);
   try {
     if (fs.existsSync(target)) fs.unlinkSync(target);
-    _notifyDeleted(`${loc.attachmentsRelBase}/${safe}`);
+
     return { ok: true };
   } catch (err) {
     log.warn(`attachment delete failed uid=${maskId(uid)} id=${taskId}`, logErrorSummary(err));
@@ -1164,14 +1300,13 @@ function _dueBoundary(task: AutoTask, now: Date, lastRun: Date | null): Date | n
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
   }
   if (sched.type === 'weekly') {
-    if (now.getDay() !== sched.weekday) return null;
+    if (!_calendarSelection(sched).includes(now.getDay())) return null;
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
   }
   if (sched.type === 'monthly') {
     const todayDom = now.getDate();
     const lastDom = _lastDayOfMonth(now);
-    const targetDom = Math.min(sched.day, lastDom); // day=31 → last day of month
-    if (todayDom !== targetDom) return null;
+    if (!_calendarSelection(sched).some(day => Math.min(day, lastDom) === todayDom)) return null;
     return _crossedTodayBoundary(now, lastRun, sched.hour, sched.minute);
   }
   return null;
@@ -1208,27 +1343,35 @@ function _latestOccurrenceAtOrBefore(task: AutoTask, now: Date): Date | null {
     const boundary = new Date(baseline.getTime() + Math.floor(elapsed / intervalMs) * intervalMs);
     return Number.isNaN(boundary.getTime()) ? null : boundary;
   }
-  if (sched.type === 'daily' || sched.type === 'weekly') {
-    const stepDays = sched.type === 'daily' ? 1 : 7;
+  if (sched.type === 'daily') {
     const boundary = new Date(now);
-    if (sched.type === 'weekly') boundary.setDate(boundary.getDate() - ((now.getDay() - sched.weekday + 7) % 7));
     boundary.setHours(sched.hour, sched.minute, 0, 0);
     if (boundary.getTime() > now.getTime()) {
-      boundary.setDate(boundary.getDate() - stepDays);
+      boundary.setDate(boundary.getDate() - 1);
       boundary.setHours(sched.hour, sched.minute, 0, 0);
     }
     return boundary;
   }
-  if (sched.type === 'monthly') {
-    const inMonth = (year: number, month: number): Date => {
-      const first = new Date(year, month, 1);
-      const day = Math.min(sched.day, _lastDayOfMonth(first));
-      return new Date(first.getFullYear(), first.getMonth(), day, sched.hour, sched.minute, 0, 0);
-    };
-    const boundary = inMonth(now.getFullYear(), now.getMonth());
-    return boundary.getTime() <= now.getTime()
-      ? boundary
-      : inMonth(now.getFullYear(), now.getMonth() - 1);
+  if (sched.type === 'weekly' || sched.type === 'monthly') {
+    const candidates = _calendarSelection(sched).map(day => {
+      if (sched.type === 'weekly') {
+        const boundary = new Date(now);
+        boundary.setDate(boundary.getDate() - ((now.getDay() - day + 7) % 7));
+        boundary.setHours(sched.hour, sched.minute, 0, 0);
+        if (boundary.getTime() > now.getTime()) {
+          boundary.setDate(boundary.getDate() - 7);
+          boundary.setHours(sched.hour, sched.minute, 0, 0);
+        }
+        return boundary;
+      }
+      const inMonth = (month: number): Date => {
+        const first = new Date(now.getFullYear(), month, 1);
+        return new Date(first.getFullYear(), first.getMonth(), Math.min(day, _lastDayOfMonth(first)), sched.hour, sched.minute, 0, 0);
+      };
+      const boundary = inMonth(now.getMonth());
+      return boundary.getTime() <= now.getTime() ? boundary : inMonth(now.getMonth() - 1);
+    });
+    return new Date(Math.max(...candidates.map(date => date.getTime())));
   }
   return null;
 }
@@ -1503,6 +1646,9 @@ async function _fireTask(
     emitFailure('conv_create_failed');
     return { ok: false, error: 'conv_create_failed' };
   }
+  // The run may keep files for the next run in the task's handoff directory;
+  // grant it before the first turn so the turn's tools can already write there.
+  await _grantHandoffRoot(uid, task, cid);
   // Copy attachments into the new conversation's chat_attachments dir
   // BEFORE dispatch. The originals stay under the task's attachments/ so
   // recurring schedules re-use them next fire.
@@ -1517,18 +1663,37 @@ async function _fireTask(
   // automation that reads a page has no way to run at all. Binding stays out of
   // the foreground: the tab this fire opens must not take over the view.
   await _bindTaskBrowserWindow(uid, cid, task.id);
+  const terminal = _watchRunTerminal(uid, task.id, cid);
+  let preparingRun: Promise<void> | undefined;
+  const prepareRun = (): Promise<void> => preparingRun ||= (async () => {
+    // The accepted send prepares its facts before recipient work is queued:
+    // native and CLI context assembly can both run before send() returns.
+    try {
+      await recordRunStart(uid, task.id, cid, new Date(startedAt).toISOString());
+      terminal.admit();
+    } catch (err) {
+      terminal.cancel();
+      log.warn(`run start record failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
+    }
+  })();
   try {
     const res = await groupChat.send({
       userId: uid, cid, text,
+      beforeDispatch: prepareRun,
+      notificationKind: 'automation',
       ...(attachmentNames.length ? { attachments: attachmentNames } : {}),
     });
     if (!res.ok) {
+      terminal.cancel();
       log.warn(`fire send failed uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(res.error || 'unknown'));
       await rollbackEmptyConv('send_not_ok');
       emitFailure('send_not_ok');
       return { ok: false, error: 'send_not_ok' };
     }
     log.info(`fired uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)} project=${task.project_id || '-'} attachments=${attachmentNames.length}${catchUp ? ' catch_up=1' : ''}`);
+    // A successful send without recipient dispatch still counts as before.
+    // The shared promise prevents recording an ordinary dispatch twice.
+    await prepareRun();
     _emitFire({
       type: 'conv_created',
       source,
@@ -1540,6 +1705,7 @@ async function _fireTask(
     });
     return { ok: true, cid };
   } catch (err) {
+    terminal.cancel();
     log.error(`fire send threw uid=${maskId(uid)} id=${task.id} cid=${maskId(cid)}`, logErrorSummary(err));
     await rollbackEmptyConv('send_threw');
     emitFailure('send_threw');
@@ -1701,6 +1867,35 @@ let _schedulerSuspended = false;
 let _schedulerPowerMonitor: SchedulerPowerMonitor | null = null;
 let _schedulerEpoch = 0;
 
+// One bounded clock sample for the scheduler, not one poll or disk scan per task.
+// Date/Intl follow the device timezone; monotonic elapsed time exposes manual
+// clock corrections that ordinary setTimeout deadlines would otherwise miss.
+let _clockMonitor: ReturnType<typeof setInterval> | null = null;
+let _clockSample: { wall: number; monotonic: number; zone: string; offset: number } | null = null;
+function _sampleDeviceClock() {
+  return { wall: Date.now(), monotonic: performance.now(),
+    zone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    offset: new Date().getTimezoneOffset() };
+}
+function _startClockMonitor(): void {
+  if (_clockMonitor) return;
+  _clockSample = _sampleDeviceClock();
+  _clockMonitor = setInterval(() => {
+    const next = _sampleDeviceClock();
+    const previous = _clockSample;
+    _clockSample = next;
+    if (!previous || !_started || _schedulerSuspended || !_timers.size || !hasActiveUser()) return;
+    const changed = previous.zone !== next.zone || previous.offset !== next.offset
+      || Math.abs((next.wall - previous.wall) - (next.monotonic - previous.monotonic)) > 2000;
+    if (!changed) return;
+    const epoch = ++_schedulerEpoch;
+    _cancelAllTimers();
+    void _rescheduleAll(getActiveUserId(), 'restore', epoch, true)
+      .catch(err => log.warn('device clock reschedule failed', logErrorSummary(err)));
+  }, 30_000);
+  _clockMonitor.unref?.();
+}
+
 function schedulerEpochIsCurrent(schedulerEpoch?: number): boolean {
   if (schedulerEpoch === undefined) return true;
   return schedulerEpoch === _schedulerEpoch;
@@ -1744,8 +1939,12 @@ function _nextDueAt(task: AutoTask, now: Date, lastRun: Date | null): Date | nul
   }
   if (sched.type === 'hourly') candidate = _nextHourlyAt(now, lastRun, sched.interval_hours);
   if (sched.type === 'daily') candidate = _nextDailyAt(now, lastRun, sched.hour, sched.minute);
-  if (sched.type === 'weekly') candidate = _nextWeeklyAt(now, lastRun, sched.weekday, sched.hour, sched.minute);
-  if (sched.type === 'monthly') candidate = _nextMonthlyAt(now, lastRun, sched.day, sched.hour, sched.minute);
+  if (sched.type === 'weekly' || sched.type === 'monthly') {
+    const candidates = _calendarSelection(sched).map(day => sched.type === 'weekly'
+      ? _nextWeeklyAt(now, lastRun, day, sched.hour, sched.minute)
+      : _nextMonthlyAt(now, lastRun, day, sched.hour, sched.minute));
+    candidate = new Date(Math.min(...candidates.map(date => date.getTime())));
+  }
   return candidate && _endAllowsAt(task, candidate) ? candidate : null;
 }
 
@@ -1836,8 +2035,8 @@ function _scheduleStateKey(task: AutoTask): string {
       : task.schedule.type === 'daily'
         ? `daily:${task.schedule.hour}:${task.schedule.minute}`
         : task.schedule.type === 'weekly'
-          ? `weekly:${task.schedule.weekday}:${task.schedule.hour}:${task.schedule.minute}`
-          : `monthly:${task.schedule.day}:${task.schedule.hour}:${task.schedule.minute}`;
+          ? `weekly:${_calendarSelection(task.schedule).join(',')}:${task.schedule.hour}:${task.schedule.minute}`
+          : `monthly:${_calendarSelection(task.schedule).join(',')}:${task.schedule.hour}:${task.schedule.minute}`;
   const endCondition = !task.end_condition
     ? ''
     : task.end_condition.type === 'date'
@@ -2163,6 +2362,7 @@ export function startScheduler(): void {
   if (_started) return;
   _started = true;
   _schedulerSuspended = false;
+  _startClockMonitor();
   void _attachSchedulerPowerMonitor();
   if (!hasActiveUser()) return;
   const uid = getActiveUserId();
@@ -2183,6 +2383,9 @@ export async function rescheduleAllForActiveUser(): Promise<void> {
 }
 
 export function stopScheduler(): void {
+  if (_clockMonitor) clearInterval(_clockMonitor);
+  _clockMonitor = null;
+  _clockSample = null;
   _schedulerEpoch += 1;
   _cancelAllTimers();
   _detachSchedulerPowerMonitor();

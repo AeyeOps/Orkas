@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as fs from 'node:fs';
+import mutableFs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
@@ -30,6 +32,7 @@ beforeEach(async () => {
 
 afterEach(() => {
   vi.restoreAllMocks();
+  syncBuiltinESMExports();
   vi.useRealTimers();
   if (prevWs === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = prevWs;
@@ -119,10 +122,11 @@ describe('chat_attachments › common text inputs', () => {
       expect(m.resolveAttachmentAbsPath(UID, CID, name).ok).toBe(true);
     },
   );
-  it('rejects a binary file disguised as a newly supported text format without storing it', async () => {
+  it('stores a binary file disguised as a text format byte for byte so the reader can report it', async () => {
     const m = await loadMod();
-    expect(await m.uploadAttachment(UID, CID, 'input.jsonl', Buffer.from([0xff, 0xfe, 0]))).toMatchObject({ ok: false });
-    expect(m.listAttachments(UID, CID)).toEqual([]);
+    const bytes = Buffer.from([0xff, 0xfe, 0]);
+    expect(await m.uploadAttachment(UID, CID, 'input.jsonl', bytes)).toMatchObject({ ok: true, info: { name: 'input.jsonl', kind: 'text' } });
+    expect(fs.readFileSync(path.join(attDir(), 'input.jsonl'))).toEqual(bytes);
   });
 });
 
@@ -199,7 +203,7 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r.info.name).toBe('hello.txt');
     expect(r.info.kind).toBe('text');
     expect(fs.existsSync(path.join(attDir(), 'hello.txt'))).toBe(true);
-    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.') && n !== '.selected-attachments.json');
     expect(siblings).toEqual([]);
   });
 
@@ -258,7 +262,7 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.info.kind).toBe('pdf');
-    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.') && n !== '.selected-attachments.json');
     expect(siblings).toEqual([]);
   });
 
@@ -266,7 +270,7 @@ describe('chat_attachments › uploadAttachment', () => {
     const m = await loadMod();
     const r = await m.uploadAttachment(UID, CID, 'notes.docx', makeMinimalDocx({ heading: 'Title', paragraphs: ['Body.'] }));
     expect(r.ok).toBe(true);
-    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.') && n !== '.selected-attachments.json');
     expect(siblings).toEqual([]);
   });
 
@@ -285,7 +289,7 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(deck.info.kind).toBe('presentation');
     expect(macroSheet.info.kind).toBe('spreadsheet');
     expect(macroDeck.info.kind).toBe('presentation');
-    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.') && n !== '.selected-attachments.json');
     expect(siblings).toEqual([]);
   });
 
@@ -329,7 +333,7 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.info.kind).toBe('image');
-    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.') && n !== '.selected-attachments.json');
     expect(siblings).toEqual([]);
   });
 
@@ -345,8 +349,8 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(r.info.kind).toBe('video');
     expect(r.info.bytes).toBe(fakeMp4.length);
     // Video path must NOT generate extract/preview siblings — those are
-    // for text/pdf/docx/image. The only dotfile allowed is .cache_version.
-    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.'));
+    // for text/pdf/docx/image. Ownership metadata is not a preview cache.
+    const siblings = fs.readdirSync(attDir()).filter((n) => n.startsWith('.') && n !== '.selected-attachments.json');
     expect(siblings.filter((n) => n.startsWith('.clip.mp4.'))).toEqual([]);
   });
 
@@ -375,22 +379,52 @@ describe('chat_attachments › uploadAttachment', () => {
   });
 
   it.each([
-    { label: 'invalid leading bytes', bytes: [0xFF, 0xFE] },
-    { label: 'truncated four-byte character', bytes: [0xF0, 0x9F, 0x92] },
-    { label: 'interrupted four-byte character', bytes: [0xF0, 0x90, 0x80, 0x41] },
-    { label: 'truncated three-byte character', bytes: [0xE2, 0x82] },
-    { label: 'surrogate encoding', bytes: [0xED, 0xA0, 0x80] },
-  ])('rejects non-UTF-8 content for text types: $label', async ({ bytes }) => {
+    { label: 'GBK CSV', name: 'orders.csv', bytes: [0xD6, 0xD0, 0xCE, 0xC4, 0x2C, 0x31, 0x0A] },
+    { label: 'Big5 text', name: 'notes.txt', bytes: [0xA4, 0xA4, 0xA4, 0xE5] },
+    { label: 'UTF-16 with a byte-order mark', name: 'export.txt', bytes: [0xFF, 0xFE, 0x2D, 0x4E, 0x87, 0x65] },
+    { label: 'truncated four-byte character', name: 'cut.txt', bytes: [0xF0, 0x9F, 0x92] },
+    { label: 'interrupted four-byte character', name: 'cut.txt', bytes: [0xF0, 0x90, 0x80, 0x41] },
+    { label: 'surrogate encoding', name: 'cut.txt', bytes: [0xED, 0xA0, 0x80] },
+  ])('stores non-UTF-8 text byte for byte through both entry points: $label', async ({ name, bytes }) => {
     const m = await loadMod();
     const buffer = Buffer.from(bytes);
-    const r = await m.uploadAttachment(UID, CID, 'bad.txt', buffer);
-    expect(r.ok).toBe(false);
-    if (!r.ok) expect(r.error.toLowerCase()).toContain('utf-8');
-    expect(m.listAttachments(UID, CID)).toEqual([]);
-    const source = path.join(tmpDir, 'bad.txt');
+    const uploaded = await m.uploadAttachment(UID, CID, name, buffer);
+    expect(uploaded).toMatchObject({ ok: true, info: { name, kind: 'text', bytes: buffer.length } });
+    expect(fs.readFileSync(path.join(attDir(), name))).toEqual(buffer);
+    expect(m.listPendingAttachments(UID, CID).map(file => file.name)).toEqual([name]);
+
+    const importedCid = `${CID}-imported`;
+    const source = path.join(tmpDir, name);
     fs.writeFileSync(source, buffer);
-    expect((await m.importAttachmentFromPath(UID, CID, source)).ok).toBe(false);
+    const imported = await m.importAttachmentFromPath(UID, importedCid, source);
+    expect(imported).toMatchObject({
+      ok: true,
+      info: { name, kind: 'text', bytes: buffer.length },
+      sha256: crypto.createHash('sha256').update(buffer).digest('hex'),
+    });
     expect(fs.readFileSync(source)).toEqual(buffer);
+    const stored = m.resolveAttachmentAbsPath(UID, importedCid, name);
+    expect(stored.ok && fs.readFileSync(stored.absPath)).toEqual(buffer);
+  });
+
+  it('reuses a pending non-UTF-8 attachment when the same bytes are selected again', async () => {
+    const m = await loadMod();
+    const buffer = Buffer.from([0xD6, 0xD0, 0xCE, 0xC4]);
+    const source = path.join(tmpDir, 'again.csv');
+    fs.writeFileSync(source, buffer);
+    expect(await m.importAttachmentFromPath(UID, CID, source)).toMatchObject({ ok: true, info: { name: 'again.csv' } });
+    expect(await m.importAttachmentFromPath(UID, CID, source)).toMatchObject({ ok: true, reused: true, info: { name: 'again.csv' } });
+    expect(fs.readdirSync(attDir()).filter(file => !file.startsWith('.'))).toEqual(['again.csv']);
+  });
+
+  it('keeps the extension and size gates for non-UTF-8 bytes', async () => {
+    const m = await loadMod();
+    const bytes = Buffer.from([0xD6, 0xD0]);
+    expect(await m.uploadAttachment(UID, CID, 'orders.exe', bytes)).toMatchObject({ ok: false, error_code: 'invalid_attachment' });
+    const source = path.join(tmpDir, 'oversized.csv');
+    fs.closeSync(fs.openSync(source, 'w'));
+    fs.truncateSync(source, 200 * 1024 * 1024 + 1);
+    expect(await m.importAttachmentFromPath(UID, CID, source)).toMatchObject({ ok: false, error_code: 'file_too_large' });
     expect(m.listAttachments(UID, CID)).toEqual([]);
   });
 
@@ -545,8 +579,205 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(viaPath.ok).toBe(false);
     if (viaBytes.ok || viaPath.ok) return;
     expect(viaPath.error).toBe(viaBytes.error);
+    expect(viaBytes).toMatchObject({ error_code: 'file_too_large' });
+    expect(viaPath).toMatchObject({ error_code: 'file_too_large' });
     expect(viaPath.error).toContain('8');
     expect(fs.existsSync(path.join(attDir(), 'oversized.zip'))).toBe(false);
+  });
+
+  it.each([
+    ['docx', false], ['zip', false], ['pdf', true], ['xlsx', true], ['txt', true],
+  ])('diagnoses a 47,332,414-byte %s on both import routes without changing stored bytes', async (ext, admitted) => {
+    // Match the observed byte size, not a private production file. Size alone
+    // cannot establish rejection: the accepted per-kind limits are different.
+    const m = await loadMod();
+    const bytes = Buffer.alloc(47_332_414, 0x61);
+    const source = path.join(tmpDir, `size-fixture.${ext}`);
+    fs.writeFileSync(source, bytes);
+    const viaBytes = await m.uploadAttachment(UID, 'size-bytes', `size-fixture.${ext}`, bytes);
+    const viaPath = await m.importAttachmentFromPath(UID, 'size-path', source);
+    for (const [cid, result] of [['size-bytes', viaBytes], ['size-path', viaPath]] as const) {
+      expect(result.ok).toBe(admitted);
+      if (result.ok) {
+        expect(fs.readFileSync(path.join(cloudAttDir(cid), result.info.name)).equals(bytes)).toBe(true);
+      } else {
+        expect(result).toMatchObject({ error_code: 'file_too_large' });
+        expect(m.listAttachments(UID, cid)).toEqual([]);
+      }
+    }
+    expect(fs.readFileSync(source).equals(bytes)).toBe(true);
+  });
+
+  it('preserves structured filesystem causes without putting private exceptions in the cause code', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'private-source.md');
+    fs.writeFileSync(source, 'retained source');
+    vi.spyOn(fs.promises, 'copyFile').mockRejectedValue(Object.assign(new Error('Private filesystem detail'), { code: 'ENOSPC' }));
+    const result = await m.importAttachmentFromPath(UID, CID, source);
+    expect(result).toMatchObject({ ok: false, error_code: 'copy_failed', failure_kind: 'disk_full' });
+    expect(m.listAttachments(UID, CID)).toEqual([]);
+    expect(fs.readFileSync(source, 'utf8')).toBe('retained source');
+  });
+
+  it.each(['bytes', 'path'] as const)('does not restore a partially written %s attachment after a failed add', async route => {
+    const m = await loadMod();
+    const existing = Buffer.from('previous complete attachment');
+    await m.uploadAttachment(UID, CID, 'existing.txt', existing);
+    const body = Buffer.from('new complete attachment with different bytes');
+    const source = path.join(tmpDir, 'new.txt');
+    fs.writeFileSync(source, body);
+    const originalWrite = fs.writeFileSync;
+    const failure = () => Object.assign(new Error('Controlled partial IO failure'), { code: 'ENOSPC' });
+    if (route === 'bytes') {
+      // Both sync and async byte writers can fail after creating a short file.
+      vi.spyOn(mutableFs, 'writeFileSync').mockImplementation(((target: fs.PathOrFileDescriptor, data: any, ...args: any[]) => {
+        if (typeof target === 'string' && path.dirname(target) === attDir()) {
+          originalWrite(target, body.subarray(0, 4)); throw failure();
+        }
+        return (originalWrite as any)(target, data, ...args);
+      }) as any);
+      syncBuiltinESMExports();
+      vi.spyOn(fs.promises, 'writeFile').mockImplementation(async target => {
+        originalWrite(target, body.subarray(0, 4)); throw failure();
+      });
+      syncBuiltinESMExports();
+    } else {
+      vi.spyOn(fs.promises, 'copyFile').mockImplementation(async (_from, target) => {
+        originalWrite(target, body.subarray(0, 4)); throw failure();
+      });
+    }
+    const result = route === 'bytes' ? await m.uploadAttachment(UID, CID, 'new.txt', body)
+      : await m.importAttachmentFromPath(UID, CID, source);
+    expect(result).toMatchObject({ ok: false, failure_kind: 'disk_full' });
+    expect(m.listPendingAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt']);
+    expect(fs.readdirSync(attDir())).toEqual(['.selected-attachments.json', 'existing.txt']);
+    expect(fs.readFileSync(path.join(attDir(), 'existing.txt'))).toEqual(existing);
+    expect(fs.readFileSync(source)).toEqual(body);
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+    // A later retry must publish the full bytes without reviving a short file.
+    const retried = route === 'bytes' ? await m.uploadAttachment(UID, CID, 'new.txt', body)
+      : await m.importAttachmentFromPath(UID, CID, source);
+    expect(retried).toMatchObject({ ok: true, info: { name: 'new.txt', bytes: body.length } });
+    expect(fs.readFileSync(path.join(attDir(), 'new.txt'))).toEqual(body);
+  });
+
+  it('keeps a path import invisible to pending recovery until its complete copy is published', async () => {
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'selected.txt');
+    const body = Buffer.from('complete selected bytes');
+    fs.writeFileSync(source, body);
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    vi.spyOn(fs.promises, 'copyFile').mockImplementation(async (_from, target) => {
+      fs.writeFileSync(target, body.subarray(0, 4)); entered();
+      await blocked; fs.writeFileSync(target, body);
+    });
+    const adding = m.importAttachmentFromPath(UID, CID, source);
+    try {
+      await ready;
+      expect(m.listPendingAttachments(UID, CID)).toEqual([]);
+      expect(m.listAttachments(UID, CID)).toEqual([]);
+    } finally { release(); await adding; }
+    expect(await adding).toMatchObject({ ok: true, info: { bytes: body.length } });
+    expect(m.listPendingAttachments(UID, CID).map(file => file.name)).toEqual(['selected.txt']);
+    expect(fs.readFileSync(path.join(attDir(), 'selected.txt'))).toEqual(body);
+  });
+
+  it.each(['bytes', 'path'] as const)('keeps a %s publication failure recoverable without exposing staged data', async route => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'existing.txt', Buffer.from('previous attachment'));
+    const body = Buffer.from('selected complete attachment');
+    const source = path.join(tmpDir, 'selected.txt');
+    fs.writeFileSync(source, body);
+    vi.spyOn(fs.promises, 'rename').mockRejectedValue(Object.assign(new Error('Controlled publish failure'), { code: 'ENOSPC' }));
+    vi.spyOn(fs.promises, 'link').mockRejectedValue(Object.assign(new Error('Controlled publish failure'), { code: 'ENOSPC' }));
+    vi.spyOn(mutableFs, 'renameSync').mockImplementation(() => { throw Object.assign(new Error('Controlled publish failure'), { code: 'ENOSPC' }); });
+    syncBuiltinESMExports();
+    const result = route === 'bytes' ? await m.uploadAttachment(UID, CID, 'selected.txt', body)
+      : await m.importAttachmentFromPath(UID, CID, source);
+    expect(result).toMatchObject({ ok: false, failure_kind: 'disk_full' });
+    expect(m.listPendingAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt']);
+    expect(fs.readdirSync(attDir())).toEqual(['.selected-attachments.json', 'existing.txt']);
+    expect(fs.readFileSync(source)).toEqual(body);
+    vi.restoreAllMocks(); syncBuiltinESMExports();
+    const retry = await m.importAttachmentFromPath(UID, CID, source);
+    expect(retry).toMatchObject({ ok: true, info: { name: 'selected.txt', bytes: body.length } });
+    expect(fs.readFileSync(path.join(attDir(), 'selected.txt'))).toEqual(body);
+  });
+
+  it.each(['bytes', 'path'] as const)('publishes a valid near-limit Unicode filename through the %s route', async route => {
+    const m = await loadMod();
+    const name = '文'.repeat(80) + '.txt';
+    const body = Buffer.from('complete selected content');
+    const source = path.join(tmpDir, name); fs.writeFileSync(source, body);
+    const result = route === 'bytes' ? await m.uploadAttachment(UID, CID, name, body)
+      : await m.importAttachmentFromPath(UID, CID, source);
+    expect(result).toMatchObject({ ok: true, info: { name, bytes: body.length } });
+    expect(fs.readdirSync(attDir())).toEqual(['.selected-attachments.json', name]);
+    expect(fs.readFileSync(path.join(attDir(), name))).toEqual(body);
+  });
+
+  it('preserves the original copy failure when staging cleanup also fails', async () => {
+    const logger = await import('../../../src/main/logger');
+    const original = logger.createLogger;
+    const warnings: unknown[][] = [];
+    vi.spyOn(logger, 'createLogger').mockImplementation(scope => scope === 'chat_attachments'
+      ? { info() {}, debug() {}, error() {}, warn: (...args: unknown[]) => { warnings.push(args); } }
+      : original(scope));
+    const m = await loadMod();
+    const source = path.join(tmpDir, 'selected.txt'); fs.writeFileSync(source, 'complete source');
+    vi.spyOn(fs.promises, 'copyFile').mockImplementation(async (_from, target) => {
+      fs.writeFileSync(target, 'part');
+      throw Object.assign(new Error('Private copy detail'), { code: 'ENOSPC' });
+    });
+    vi.spyOn(fs.promises, 'rm').mockRejectedValue(Object.assign(new Error('Private cleanup detail'), { code: 'EACCES' }));
+    await expect(m.importAttachmentFromPath(UID, CID, source)).resolves.toMatchObject({
+      ok: false, error_code: 'copy_failed', failure_kind: 'disk_full',
+    });
+    expect(m.listPendingAttachments(UID, CID)).toEqual([]);
+    expect(fs.readFileSync(source, 'utf8')).toBe('complete source');
+    expect(warnings).toEqual([['attachment import staging cleanup failed', { error: expect.objectContaining({ code: 'EACCES' }) }]]);
+    expect(JSON.stringify(warnings)).not.toContain('Private');
+    const leftovers = fs.readdirSync(attDir());
+    expect(leftovers).toHaveLength(1);
+    expect(leftovers[0]).toMatch(/^\.attachment-import-[a-f0-9-]{36}\.tmp$/);
+  });
+
+  it.each(['valid-edit', 'changed-to-pending', 'non-utf8-edit', 'over-limit'] as const)('binds a mutable-source path import to the actually copied bytes: %s', async change => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'existing.txt', Buffer.from('prior selection'));
+    const name = change === 'over-limit' ? 'edited.zip' : 'edited.txt';
+    const source = path.join(tmpDir, name);
+    fs.writeFileSync(source, 'original valid source');
+    const updated = change === 'valid-edit' ? Buffer.from('current edited document')
+      : change === 'changed-to-pending' ? Buffer.from('prior selection')
+      : change === 'non-utf8-edit' ? Buffer.from([0xff, 0xfe, 0xfd]) : Buffer.alloc(8 * 1024 * 1024 + 1, 0x61);
+    const originalCopy = fs.promises.copyFile;
+    vi.spyOn(fs.promises, 'copyFile').mockImplementation(async (from, to, mode) => {
+      fs.writeFileSync(source, updated);
+      await originalCopy(from, to, mode);
+    });
+    const imported = await m.importAttachmentFromPath(UID, CID, source);
+    if (change !== 'over-limit') {
+      expect(imported.ok).toBe(true);
+      if (!imported.ok) return;
+      const stored = fs.readFileSync(path.join(attDir(), imported.info.name));
+      expect(stored).toEqual(updated);
+      expect(imported.sha256).toBe(crypto.createHash('sha256').update(stored).digest('hex'));
+      if (change === 'changed-to-pending') {
+        expect(imported).toMatchObject({ reused: true, info: { name: 'existing.txt' } });
+        expect(m.listPendingAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt']);
+      }
+    } else {
+      expect(imported).toMatchObject({ ok: false, error_code: 'file_too_large' });
+      expect(m.listAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt']);
+      expect(m.listPendingAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt']);
+    }
+    expect(fs.readFileSync(path.join(attDir(), 'existing.txt'), 'utf8')).toBe('prior selection');
+    expect(fs.readFileSync(source).equals(updated)).toBe(true);
   });
 
   it('imports text files above the legacy 5 MiB cap by path', async () => {
@@ -643,18 +874,7 @@ describe('chat_attachments › uploadAttachment', () => {
     expect(fs.readFileSync(path.join(attDir(), canonicalName), 'utf8')).toBe('same imported body');
   });
 
-  it('validates text encoding when importing by path', async () => {
-    const m = await loadMod();
-    const source = path.join(tmpDir, 'bad.txt');
-    fs.writeFileSync(source, Buffer.from([0xFF, 0xFE]));
-
-    const r = await m.importAttachmentFromPath(UID, CID, source);
-
-    expect(r.ok).toBe(false);
-    expect(fs.existsSync(path.join(attDir(), 'bad.txt'))).toBe(false);
-  });
-
-  it('detects invalid UTF-8 after the legacy 5 MiB boundary', async () => {
+  it('stores a non-UTF-8 byte beyond the legacy 5 MiB boundary unchanged', async () => {
     const m = await loadMod();
     const source = path.join(tmpDir, 'large-invalid.txt');
     const body = Buffer.alloc(6 * 1024 * 1024, 0x61);
@@ -663,10 +883,8 @@ describe('chat_attachments › uploadAttachment', () => {
 
     const r = await m.importAttachmentFromPath(UID, CID, source);
 
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.error.toLowerCase()).toContain('utf-8');
-    expect(fs.existsSync(path.join(attDir(), 'large-invalid.txt'))).toBe(false);
+    expect(r).toMatchObject({ ok: true, sha256: crypto.createHash('sha256').update(body).digest('hex') });
+    expect(fs.readFileSync(path.join(attDir(), 'large-invalid.txt')).equals(body)).toBe(true);
   });
 });
 
@@ -688,12 +906,258 @@ describe('chat_attachments › listAttachments', () => {
 });
 
 describe('chat_attachments › listPendingAttachments', () => {
+  it('restores only explicit selections, retaining unowned browser files across restart and later selection', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'my-draft.txt', Buffer.from('authored input'));
+    for (let i = 0; i < 6; i++) fs.writeFileSync(path.join(attDir(), `download-${i}.csv`), `row,${i}`);
+    expect.soft(m.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['my-draft.txt']);
+    vi.resetModules();
+    const restored = await loadMod();
+    expect.soft(restored.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['my-draft.txt']);
+    expect(restored.listAttachments(UID, CID)).toHaveLength(7);
+    const selected = await restored.importAttachmentFromPath(UID, CID, path.join(attDir(), 'download-0.csv'));
+    expect(selected.ok).toBe(true);
+    if (!selected.ok) return;
+    expect(selected.info.name).not.toBe('download-0.csv');
+    expect(restored.listPendingAttachments(UID, CID).map(item => item.name).sort())
+      .toEqual(['my-draft.txt', selected.info.name].sort());
+    expect(fs.readFileSync(path.join(attDir(), 'download-0.csv'), 'utf8')).toBe('row,0');
+  });
+
+  it('retains legacy mixed-pool files without guessing user selection, but recovers dedicated legacy drafts on adoption', async () => {
+    const m = await loadMod();
+    fs.mkdirSync(attDir(), { recursive: true });
+    fs.writeFileSync(path.join(attDir(), 'legacy-export.csv'), 'downloaded');
+    expect.soft(m.listPendingAttachments(UID, CID)).toEqual([]);
+    expect(m.resolveAttachmentAbsPath(UID, CID, 'legacy-export.csv').ok).toBe(true);
+    fs.mkdirSync(draftAttDir('main_chat'), { recursive: true });
+    fs.writeFileSync(path.join(draftAttDir('main_chat'), 'legacy-input.txt'), 'user draft');
+    expect(m.listPendingAttachments(UID, 'main_chat').map(item => item.name)).toEqual(['legacy-input.txt']);
+    const adopted = await m.adoptDraftAttachments(UID, 'main_chat', CID);
+    expect(adopted.ok).toBe(true);
+    vi.resetModules();
+    const restored = await loadMod();
+    expect(restored.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['legacy-input.txt']);
+    expect(restored.listAttachments(UID, CID)).toHaveLength(2);
+  });
+
+  it.each(['upload', 'path'] as const)('rolls back a new %s when selection ownership cannot commit, leaving a retry possible', async route => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'kept.txt', Buffer.from('existing draft'));
+    const source = path.join(tmpDir, 'new.txt');
+    fs.writeFileSync(source, 'new input');
+    const write = mutableFs.writeFileSync;
+    const fault = vi.spyOn(mutableFs, 'writeFileSync').mockImplementation((target, ...args: any[]) => {
+      if (typeof target === 'string' && path.basename(target).startsWith('.selected-attachments.json.')) {
+        throw Object.assign(new Error('Controlled selection ownership failure'), { code: 'ENOSPC' });
+      }
+      return (write as any)(target, ...args);
+    });
+    syncBuiltinESMExports();
+    const select = () => route === 'upload'
+      ? m.uploadAttachment(UID, CID, 'new.txt', Buffer.from('new input'))
+      : m.importAttachmentFromPath(UID, CID, source);
+    try {
+      expect.soft(await select()).toMatchObject({ ok: false });
+      expect.soft(m.listAttachments(UID, CID).map(item => item.name)).toEqual(['kept.txt']);
+      expect.soft(m.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['kept.txt']);
+    } finally { fault.mockRestore(); syncBuiltinESMExports(); }
+    expect(await select()).toMatchObject({ ok: true, info: { name: 'new.txt' } });
+    vi.resetModules();
+    expect((await loadMod()).listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['kept.txt', 'new.txt']);
+  });
+
+  it('fails closed for damaged selection metadata without deleting the selected file or adopting unknown files', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'chosen.txt', Buffer.from('intact input'));
+    fs.writeFileSync(path.join(attDir(), 'export.csv'), 'unowned bytes');
+    const ledger = path.join(attDir(), '.selected-attachments.json');
+    const intact = fs.readFileSync(ledger);
+    fs.writeFileSync(ledger, '{partial');
+    vi.resetModules();
+    const restored = await loadMod();
+    expect(restored.listPendingAttachments(UID, CID)).toEqual([]);
+    expect(restored.listAttachments(UID, CID)).toHaveLength(2);
+    expect(fs.readFileSync(path.join(attDir(), 'chosen.txt'), 'utf8')).toBe('intact input');
+    fs.writeFileSync(ledger, intact);
+    expect(restored.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['chosen.txt']);
+  });
+
+  it('preserves a selection failure and keeps an undeletable orphan out of subsequent drafts', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'kept.txt', Buffer.from('existing draft'));
+    const write = mutableFs.writeFileSync;
+    const remove = mutableFs.rmSync;
+    vi.spyOn(mutableFs, 'writeFileSync').mockImplementation((target, ...args: any[]) => {
+      if (typeof target === 'string' && path.basename(target).startsWith('.selected-attachments.json.')) {
+        throw Object.assign(new Error('Controlled ownership disk failure'), { code: 'ENOSPC' });
+      }
+      return (write as any)(target, ...args);
+    });
+    vi.spyOn(mutableFs, 'rmSync').mockImplementation((target, options) => {
+      if (String(target) === path.join(attDir(), 'orphan.txt')) throw Object.assign(new Error('Controlled cleanup lock'), { code: 'EPERM' });
+      return remove(target, options);
+    });
+    syncBuiltinESMExports();
+    try {
+      expect(await m.uploadAttachment(UID, CID, 'orphan.txt', Buffer.from('complete but unselected')))
+        .toMatchObject({ ok: false, error_code: 'write_failed', failure_kind: 'disk_full' });
+      expect(m.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['kept.txt']);
+      expect(m.listAttachments(UID, CID)).toHaveLength(2);
+    } finally { vi.restoreAllMocks(); syncBuiltinESMExports(); }
+    vi.resetModules();
+    const restored = await loadMod();
+    expect(restored.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['kept.txt']);
+    expect(restored.deleteAttachment(UID, CID, 'orphan.txt')).toMatchObject({ ok: true });
+    expect(await restored.uploadAttachment(UID, CID, 'orphan.txt', Buffer.from('explicit retry'))).toMatchObject({ ok: true });
+  });
+
+  it('keeps queued and blocked message files out of drafts across edits and sync, without losing independent drafts or cancellation recovery', async () => {
+    const m = await loadMod();
+    const tb = await import('../../../src/main/features/group_chat/task_board');
+    tb._resetForTest();
+    try {
+      for (const name of ['draft.txt', 'queued.txt', 'added.txt']) {
+        expect(await m.uploadAttachment(UID, CID, name, Buffer.from(name))).toMatchObject({ ok: true });
+      }
+      const queued = await tb.createTask(UID, CID, {
+        assignee: 'commander', instruction: 'original', createdBy: 'user', attachments: ['queued.txt'],
+      });
+      const pending = () => m.listPendingAttachments(UID, CID).map(item => item.name).sort();
+      expect.soft(pending()).toEqual(['added.txt', 'draft.txt']);
+      expect(await tb.editQueued(UID, CID, queued.task_id, 'with new attachment', 'original',
+        () => ({ attachments: ['queued.txt', 'added.txt'] }))).toHaveProperty('task');
+      expect.soft(pending()).toEqual(['draft.txt']);
+
+      // Sync invalidates the board cache, but these local tasks still own
+      // their files. Attachment refresh may be the first reader afterwards.
+      await tb.flushBoards();
+      tb.dropBoard(UID, CID, { persistPending: false });
+      expect.soft(pending()).toEqual(['draft.txt']);
+      const sibling = await tb.createTask(UID, CID, {
+        assignee: 'agent', instruction: 'shared attachment', createdBy: 'user', attachments: ['queued.txt'],
+      });
+      await tb.editQueued(UID, CID, queued.task_id, 'only added attachment', 'with new attachment',
+        () => ({ attachments: ['added.txt'] }));
+      expect.soft(pending()).toEqual(['draft.txt']);
+      await tb.cancelPending(UID, CID, sibling.task_id);
+      expect.soft(pending()).toEqual(['draft.txt', 'queued.txt']);
+      await tb.markBlocked(UID, CID, queued.task_id);
+      expect.soft(pending()).toEqual(['draft.txt', 'queued.txt']);
+      await tb.requeueBlocked(UID, CID, queued.task_id);
+      await tb.claimTask(UID, CID, queued.task_id);
+      expect.soft(pending()).toEqual(['draft.txt', 'queued.txt']);
+
+      // Once execution has a history record, ownership must survive runtime
+      // teardown rather than depending on a retained in-memory board.
+      const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
+      fs.mkdirSync(chatsDir, { recursive: true });
+      fs.writeFileSync(path.join(chatsDir, `${CID}.jsonl`), JSON.stringify({ attachments: ['added.txt'] }) + '\n');
+      await tb.finishTask(UID, CID, queued.task_id, 'done');
+      await tb.flushBoards();
+      tb._resetForTest();
+      expect(pending()).toEqual(['draft.txt', 'queued.txt']);
+      expect(m.listAttachments(UID, CID)).toHaveLength(3);
+    } finally { await tb.flushBoards(); tb._resetForTest(); }
+  });
+
+  it.each(['upload', 'path'])('admits a fresh %s selection after a full message was queued, with its own recoverable file', async (route) => {
+    const m = await loadMod();
+    const tb = await import('../../../src/main/features/group_chat/task_board');
+    tb._resetForTest();
+    try {
+      const names: string[] = [];
+      for (let index = 0; index < m.MAX_PENDING_ATTACHMENTS_PER_MESSAGE; index += 1) {
+        const name = `queued-${index}.txt`;
+        expect(await m.uploadAttachment(UID, CID, name, Buffer.from(`queued bytes ${index}`))).toMatchObject({ ok: true });
+        names.push(name);
+      }
+      await tb.createTask(UID, CID, { assignee: 'commander', instruction: 'full queued message', createdBy: 'user', attachments: names });
+      const select = async (name: string, content: string) => {
+        if (route === 'upload') return m.uploadAttachment(UID, CID, name, Buffer.from(content));
+        const source = path.join(tmpDir, name);
+        fs.writeFileSync(source, content);
+        return m.importAttachmentFromPath(UID, CID, source);
+      };
+      // A queued message must not consume the next composer's attachment cap.
+      const fresh = await select('fresh.txt', 'independent draft');
+      expect.soft(fresh).toMatchObject({ ok: true });
+      const selected = await select(names[0], 'queued bytes 0');
+      expect(selected.ok).toBe(true);
+      if (!selected.ok) return;
+      expect.soft(selected.info.name).not.toBe(names[0]);
+      expect.soft(m.listPendingAttachments(UID, CID).map(item => item.name).sort())
+        .toEqual(['fresh.txt', selected.info.name].sort());
+      // Same cid on another account and the same filename on another task
+      // remain independent; a process restart cancels the volatile queue and
+      // preserves its files for the existing unsent recovery path.
+      expect(await m.uploadAttachment('another-user', CID, names[0], Buffer.from('other account'))).toMatchObject({ ok: true });
+      expect(m.listPendingAttachments('another-user', CID).map(item => item.name)).toEqual([names[0]]);
+      expect(await m.uploadAttachment(UID, 'another-conv', names[0], Buffer.from('other task'))).toMatchObject({ ok: true });
+      expect(m.listPendingAttachments(UID, 'another-conv').map(item => item.name)).toEqual([names[0]]);
+      await tb.flushBoards();
+      tb._resetForTest();
+      expect(m.listPendingAttachments(UID, CID)).toHaveLength(names.length + 2);
+    } finally { await tb.flushBoards(); tb._resetForTest(); }
+  });
+
+  it('never restores generated media as composer uploads before the assistant finishes or after restart', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'my-notes.txt', Buffer.from('user draft'));
+    const generated = m.saveGeneratedMediaAttachment(UID, CID, MP4_FTYP, 'preview.mp4', 'video');
+    expect(generated.ok).toBe(true);
+    // No terminal assistant row exists yet. Reloading the composer must keep
+    // the user's draft, without implicitly selecting the live output.
+    expect(m.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['my-notes.txt']);
+    vi.resetModules();
+    const restored = await loadMod();
+    expect(restored.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['my-notes.txt']);
+    expect(restored.listAttachments(UID, CID).map(item => item.name)).toEqual(['my-notes.txt', 'preview.mp4']);
+    // Explicitly attaching the generated bytes is still a user choice, and
+    // must survive another composer restore with a distinct attachment name.
+    const selected = await restored.importAttachmentFromPath(UID, CID, path.join(attDir(), 'preview.mp4'));
+    expect(selected.ok).toBe(true);
+    if (!selected.ok) return;
+    expect(selected.info.name).not.toBe('preview.mp4');
+    expect(restored.listPendingAttachments(UID, CID).map(item => item.name).sort())
+      .toEqual(['my-notes.txt', selected.info.name].sort());
+  });
+
   it('returns all files when the conversation has no jsonl yet (new conv)', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, CID, 'a.txt', Buffer.from('x'));
     await m.uploadAttachment(UID, CID, 'b.pdf', makeMinimalPdf(['P']));
     const items = m.listPendingAttachments(UID, CID);
     expect(items.map((i) => i.name).sort()).toEqual(['a.txt', 'b.pdf']);
+  });
+
+  it('keeps unknown audio unselected, scopes generated ownership, and permits explicit upload after deletion', async () => {
+    const m = await loadMod();
+    fs.mkdirSync(attDir(), { recursive: true });
+    const audio = path.join(attDir(), 'voice.mp3');
+    fs.writeFileSync(audio, 'generated');
+    m.recordGeneratedAttachment(UID, 'another-conversation', audio);
+    expect(m.listPendingAttachments(UID, CID)).toEqual([]);
+    expect(fs.existsSync(path.join(attDir(), '.generated-attachments.json'))).toBe(false);
+    m.recordGeneratedAttachment(UID, CID, audio);
+    expect(m.listPendingAttachments(UID, CID)).toEqual([]);
+    expect(m.deleteAttachment(UID, CID, 'voice.mp3')).toEqual({ ok: true });
+    expect(fs.existsSync(attDir())).toBe(false);
+    await m.uploadAttachment(UID, CID, 'voice.mp3', Buffer.from('user selection'));
+    expect(m.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['voice.mp3']);
+  });
+
+  it('preserves output ownership when adopting a draft pool with filename collisions', async () => {
+    const m = await loadMod();
+    const saved = m.saveGeneratedMediaAttachment(UID, 'main_chat', MP4_FTYP, 'preview.mp4', 'video');
+    expect(saved.ok).toBe(true);
+    await m.uploadAttachment(UID, 'main_chat', 'notes.txt', Buffer.from('user notes'));
+    await m.uploadAttachment(UID, CID, 'preview.mp4', Buffer.from('user video'));
+    const adopted = await m.adoptDraftAttachments(UID, 'main_chat', CID);
+    expect(adopted.ok).toBe(true);
+    expect(m.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['notes.txt', 'preview.mp4']);
+    expect(m.listAttachments(UID, CID)).toHaveLength(3);
+    expect(fs.existsSync(draftAttDir('main_chat'))).toBe(false);
   });
 
   it('filters out files already referenced by any user message in the jsonl', async () => {
@@ -770,6 +1234,211 @@ describe('chat_attachments › listPendingAttachments', () => {
     });
   });
 
+  it.each(['bytes', 'path'] as const)('preserves selected and generated same-name images during an in-flight %s import', async route => {
+    const m = await loadMod();
+    const selected = Buffer.from('a distinct user-selected image payload');
+    const source = path.join(tmpDir, 'result.png');
+    fs.writeFileSync(source, selected);
+    let release!: () => void;
+    let entered!: () => void;
+    const blocked = new Promise<void>(resolve => { release = resolve; });
+    const ready = new Promise<void>(resolve => { entered = resolve; });
+    const originalWrite = fs.promises.writeFile;
+    const originalCopy = fs.promises.copyFile;
+    if (route === 'bytes') {
+      vi.spyOn(fs.promises, 'writeFile').mockImplementation(async (...args: Parameters<typeof fs.promises.writeFile>) => {
+        await originalWrite(...args); entered(); await blocked;
+      });
+    } else {
+      vi.spyOn(fs.promises, 'copyFile').mockImplementation(async (...args: Parameters<typeof fs.promises.copyFile>) => {
+        await originalCopy(...args); entered(); await blocked;
+      });
+    }
+    const adding = route === 'bytes' ? m.uploadAttachment(UID, CID, 'result.png', selected)
+      : m.importAttachmentFromPath(UID, CID, source);
+    let generated: ReturnType<typeof m.saveGeneratedImageAttachment> | undefined;
+    try {
+      await ready;
+      expect(m.listPendingAttachments(UID, CID)).toEqual([]);
+      generated = m.saveGeneratedImageAttachment(UID, CID, PNG_1X1, 'result.png');
+      expect(generated.ok).toBe(true);
+    } finally { release(); await adding; }
+    const imported = await adding;
+    expect(imported.ok).toBe(true);
+    if (!(imported.ok && generated?.ok)) return;
+    expect(imported.info.name).not.toBe(generated.info.name);
+    expect(fs.readFileSync(generated.absPath)).toEqual(PNG_1X1);
+    expect(fs.readFileSync(path.join(attDir(), imported.info.name))).toEqual(selected);
+    expect(fs.readFileSync(source)).toEqual(selected);
+    vi.restoreAllMocks(); syncBuiltinESMExports(); vi.resetModules();
+    const reopened = await loadMod();
+    expect(reopened.listAttachments(UID, CID)).toHaveLength(2);
+    expect(reopened.listPendingAttachments(UID, CID).map(file => file.name)).toEqual([imported.info.name]);
+  });
+
+  it('preserves a competing filesystem writer that claims a selected name at publication', async () => {
+    const m = await loadMod();
+    const selected = Buffer.from('selected complete bytes');
+    const winner = Buffer.from('independently completed winner');
+    const originalLink = fs.promises.link;
+    let competingWrite = false;
+    vi.spyOn(fs.promises, 'link').mockImplementation(async (from, to) => {
+      if (!competingWrite && path.basename(String(to)) === 'shared.txt') {
+        competingWrite = true;
+        fs.writeFileSync(to, winner, { flag: 'wx' });
+      }
+      await originalLink(from, to);
+    });
+    syncBuiltinESMExports();
+    const result = await m.uploadAttachment(UID, CID, 'shared.txt', selected);
+    expect(competingWrite).toBe(true);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.info.name).not.toBe('shared.txt');
+    expect(fs.readFileSync(path.join(attDir(), 'shared.txt'))).toEqual(winner);
+    expect(fs.readFileSync(path.join(attDir(), result.info.name))).toEqual(selected);
+    expect(m.listPendingAttachments(UID, CID).map(item => item.name)).toEqual([result.info.name]);
+    expect(fs.readdirSync(attDir()).filter(name => name.startsWith('.'))).toEqual(['.selected-attachments.json']);
+  });
+
+  it('retains a generated image that takes a selected filename during a Windows publication retry', async () => {
+    const m = await loadMod();
+    const selected = Buffer.from('selected bytes retained across rename retry');
+    const originalLink = fs.promises.link;
+    let blocked = false;
+    let generated: ReturnType<typeof m.saveGeneratedImageAttachment> | undefined;
+    vi.spyOn(fs.promises, 'link').mockImplementation(async (from, to) => {
+      if (!blocked && path.basename(String(to)) === 'retry.png') {
+        blocked = true;
+        setTimeout(() => { generated = m.saveGeneratedImageAttachment(UID, CID, PNG_1X1, 'retry.png'); }, 0);
+        throw Object.assign(new Error('Controlled Windows publication lock'), { code: 'EBUSY' });
+      }
+      await originalLink(from, to);
+    });
+    syncBuiltinESMExports();
+    const imported = await m.uploadAttachment(UID, CID, 'retry.png', selected);
+    expect(imported.ok).toBe(true);
+    expect(generated?.ok).toBe(true);
+    if (!(imported.ok && generated?.ok)) return;
+    expect(imported.info.name).not.toBe(generated.info.name);
+    expect(fs.readFileSync(generated.absPath)).toEqual(PNG_1X1);
+    expect(fs.readFileSync(path.join(attDir(), imported.info.name))).toEqual(selected);
+    expect(m.listPendingAttachments(UID, CID).map(file => file.name)).toEqual([imported.info.name]);
+  });
+
+  it('keeps a failed generated-media publication recoverable and supports a near-limit Unicode retry name', async () => {
+    const m = await loadMod();
+    const name = '文'.repeat(80) + '.png';
+    const originalLink = fs.linkSync;
+    vi.spyOn(mutableFs, 'linkSync').mockImplementation((from, to) => {
+      if (path.basename(String(to)) === name) throw Object.assign(new Error('Controlled publication failure'), { code: 'ENOSPC' });
+      originalLink(from, to);
+    });
+    syncBuiltinESMExports();
+    expect(m.saveGeneratedImageAttachment(UID, CID, PNG_1X1, name)).toMatchObject({ ok: false });
+    expect(m.listAttachments(UID, CID)).toEqual([]);
+    expect(m.listPendingAttachments(UID, CID)).toEqual([]);
+    vi.restoreAllMocks(); syncBuiltinESMExports();
+    const retried = m.saveGeneratedImageAttachment(UID, CID, PNG_1X1, name);
+    expect(retried).toMatchObject({ ok: true, info: { name, bytes: PNG_1X1.length } });
+    if (!retried.ok) return;
+    expect(fs.readFileSync(retried.absPath)).toEqual(PNG_1X1);
+    expect(m.listPendingAttachments(UID, CID)).toEqual([]);
+  });
+
+  it.each(['image', 'video'] as const)('does not restore a failed generated %s as a pending user attachment', async kind => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'existing.txt', Buffer.from('previous complete user selection'));
+    const bytes = kind === 'image' ? PNG_1X1 : MP4_FTYP;
+    const name = kind === 'image' ? 'generated.png' : 'generated.mp4';
+    const save = (api: typeof m) => kind === 'image'
+      ? api.saveGeneratedImageAttachment(UID, CID, bytes, name)
+      : api.saveGeneratedMediaAttachment(UID, CID, bytes, name, kind);
+    const originalWrite = fs.writeFileSync;
+    vi.spyOn(mutableFs, 'writeFileSync').mockImplementation(((target: fs.PathOrFileDescriptor, data: any, ...args: any[]) => {
+      if (typeof target === 'string' && path.dirname(target) === attDir() && Buffer.isBuffer(data) && data.equals(bytes)) {
+        originalWrite(target, bytes.subarray(0, 4));
+        throw Object.assign(new Error('Controlled partial generated-media write'), { code: 'ENOSPC' });
+      }
+      return (originalWrite as any)(target, data, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    expect(save(m)).toMatchObject({ ok: false });
+    expect(fs.readFileSync(path.join(attDir(), 'existing.txt'), 'utf8')).toBe('previous complete user selection');
+    expect(m.listAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt']);
+    vi.restoreAllMocks();
+    syncBuiltinESMExports();
+    vi.resetModules();
+    const reopened = await loadMod();
+    expect(reopened.listPendingAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt']);
+    const retried = save(reopened);
+    expect(retried).toMatchObject({ ok: true, info: { name, bytes: bytes.length } });
+    if (!retried.ok) return;
+    expect(fs.readFileSync(retried.absPath)).toEqual(bytes);
+    expect(reopened.listAttachments(UID, CID).map(file => file.name).sort()).toEqual(['existing.txt', name].sort());
+    expect(reopened.listPendingAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt']);
+  });
+
+  it.each(['generated', 'cache'] as const)('rolls back a new %s image when durable output ownership cannot commit', async route => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'existing.txt', Buffer.from('prior user selection'));
+    const prior = m.saveGeneratedImageAttachment(UID, CID, PNG_1X1, 'prior.png');
+    expect(prior.ok).toBe(true);
+    if (!prior.ok) return;
+    const messages = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(messages, { recursive: true });
+    fs.writeFileSync(path.join(messages, CID + '.jsonl'), '{}\n');
+    const save = (api: typeof m) => route === 'generated'
+      ? Promise.resolve(api.saveGeneratedImageAttachment(UID, CID, PNG_1X1, 'new.png'))
+      : api.saveGeneratedMediaCacheAttachment(UID, CID, PNG_1X1, 'new.png', 'image');
+    const ledger = fs.readFileSync(path.join(attDir(), '.generated-attachments.json'));
+    const originalWrite = fs.writeFileSync;
+    vi.spyOn(mutableFs, 'writeFileSync').mockImplementation(((target: fs.PathOrFileDescriptor, data: any, ...args: any[]) => {
+      if (typeof target === 'string' && path.dirname(target) === attDir() && path.basename(target).startsWith('.generated-attachments.json.')) {
+        originalWrite(target, '[');
+        throw Object.assign(new Error('Controlled generated ownership commit failure'), { code: 'ENOSPC' });
+      }
+      return (originalWrite as any)(target, data, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    let result: Awaited<ReturnType<typeof m.saveGeneratedMediaCacheAttachment>> | undefined;
+    let thrown: unknown;
+    try { result = await save(m); } catch (error) { thrown = error; }
+    expect.soft(thrown).toBeUndefined();
+    expect.soft(result).toMatchObject({ ok: false });
+    expect.soft(m.listAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt', 'prior.png']);
+    expect(fs.readFileSync(prior.absPath)).toEqual(PNG_1X1);
+    expect(fs.readFileSync(path.join(attDir(), '.generated-attachments.json'))).toEqual(ledger);
+    vi.restoreAllMocks(); syncBuiltinESMExports(); vi.resetModules();
+    const reopened = await loadMod();
+    expect.soft(reopened.listPendingAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt']);
+    const retry = await save(reopened);
+    expect(retry.ok).toBe(true);
+    if (!retry.ok) return;
+    expect(fs.readFileSync(retry.absPath)).toEqual(PNG_1X1);
+    expect.soft(reopened.listAttachments(UID, CID)).toHaveLength(3);
+    expect.soft(reopened.listPendingAttachments(UID, CID).map(file => file.name)).toEqual(['existing.txt']);
+  });
+
+  it('preserves an existing cache target when recovering its output ownership fails', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'existing.png', PNG_1X1);
+    const messages = path.join(tmpDir, UID, 'cloud', 'chats');
+    fs.mkdirSync(messages, { recursive: true });
+    fs.writeFileSync(path.join(messages, CID + '.jsonl'), '{}\n');
+    const originalWrite = fs.writeFileSync;
+    vi.spyOn(mutableFs, 'writeFileSync').mockImplementation(((target: fs.PathOrFileDescriptor, data: any, ...args: any[]) => {
+      if (typeof target === 'string' && path.basename(target).startsWith('.generated-attachments.json.')) {
+        throw Object.assign(new Error('Controlled ownership recovery failure'), { code: 'ENOSPC' });
+      }
+      return (originalWrite as any)(target, data, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    await expect(m.saveGeneratedMediaCacheAttachment(UID, CID, PNG_1X1, 'existing.png', 'image')).resolves.toMatchObject({ ok: false });
+    expect(fs.readFileSync(path.join(attDir(), 'existing.png'))).toEqual(PNG_1X1);
+    expect(m.listPendingAttachments(UID, CID).map(file => file.name)).toEqual(['existing.png']);
+  });
+
   it('keeps a background media cache name stable and refuses to recreate a deleted conversation pool', async () => {
     const m = await loadMod();
     const chatsDir = path.join(tmpDir, UID, 'cloud', 'chats');
@@ -785,7 +1454,9 @@ describe('chat_attachments › listPendingAttachments', () => {
     if (first.ok) expect(first.reused).toBeUndefined();
     expect(second).toMatchObject({ ok: true, info: { name: stableName }, reused: true });
     expect(fs.readFileSync(path.join(attDir(), stableName))).toEqual(PNG_1X1);
-    expect(fs.readdirSync(attDir()).filter(name => name.startsWith('.'))).toEqual([]);
+    // Ownership metadata is durable; temporary download files must still be removed.
+    expect(fs.readdirSync(attDir()).filter(name => name.endsWith('.tmp'))).toEqual([]);
+    expect(m.listPendingAttachments(UID, CID)).toEqual([]);
 
     fs.unlinkSync(messageFile);
     await m.purgeByCid(UID, CID);
@@ -848,6 +1519,37 @@ describe('chat_attachments › purgeByCid', () => {
 describe('chat_attachments › adoptDraftAttachments', () => {
   const DRAFT = 'main_chat';
 
+  it('keeps both drafts retryable when selection publication fails after files were moved', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'same.txt', Buffer.from('existing draft'));
+    await m.uploadAttachment(UID, DRAFT, 'same.txt', Buffer.from('new draft'));
+    expect(m.saveGeneratedMediaAttachment(UID, DRAFT, MP4_FTYP, 'preview.mp4', 'video').ok).toBe(true);
+    const original = mutableFs.writeFileSync;
+    const fault = vi.spyOn(mutableFs, 'writeFileSync').mockImplementation((target, ...args: any[]) => {
+      if (typeof target === 'string' && path.dirname(target) === attDir()
+          && path.basename(target).startsWith('.selected-attachments.json.')) {
+        throw Object.assign(new Error('Controlled adoption ownership failure'), { code: 'ENOSPC' });
+      }
+      return (original as any)(target, ...args);
+    });
+    syncBuiltinESMExports();
+    try {
+      expect(await m.adoptDraftAttachments(UID, DRAFT, CID)).toMatchObject({ ok: false });
+      expect(m.listPendingAttachments(UID, CID).map(item => item.name)).toEqual(['same.txt']);
+      expect(m.listPendingAttachments(UID, DRAFT).map(item => item.name)).toEqual(['same.txt']);
+      expect(fs.readFileSync(path.join(attDir(), 'same.txt'), 'utf8')).toBe('existing draft');
+      expect(fs.readFileSync(path.join(draftAttDir(DRAFT), 'same.txt'), 'utf8')).toBe('new draft');
+      expect(fs.readFileSync(path.join(draftAttDir(DRAFT), 'preview.mp4'))).toEqual(MP4_FTYP);
+      expect(m.listAttachments(UID, CID).map(item => item.name)).toEqual(['same.txt']);
+      expect(fs.existsSync(path.join(attDir(), '.generated-attachments.json'))).toBe(false);
+    } finally { fault.mockRestore(); syncBuiltinESMExports(); }
+    const retry = await m.adoptDraftAttachments(UID, DRAFT, CID);
+    expect(retry.ok).toBe(true);
+    if (!retry.ok) return;
+    expect(m.listPendingAttachments(UID, CID).map(item => item.name).sort())
+      .toEqual(['same.txt', retry.items.find(item => item.sourceName === 'same.txt')!.targetName].sort());
+  });
+
   it('adopts the intact draft after a transient Windows lock releases on the event loop', async () => {
     const m = await loadMod();
     await m.uploadAttachment(UID, DRAFT, 'note.txt', Buffer.from('draft survives the lock'));
@@ -904,7 +1606,7 @@ describe('chat_attachments › adoptDraftAttachments', () => {
       const lockedModule = await loadMod();
       expect(await lockedModule.adoptDraftAttachments(UID, DRAFT, CID)).toMatchObject({ ok: false });
       expect(attempts).toBeGreaterThan(1);
-      expect(fs.readdirSync(draftAttDir(DRAFT))).toEqual(['note.txt']);
+      expect(fs.readdirSync(draftAttDir(DRAFT))).toEqual(['.selected-attachments.json', 'note.txt']);
       expect(fs.readFileSync(path.join(draftAttDir(DRAFT), 'note.txt'), 'utf8')).toBe('recoverable draft');
       expect(fs.existsSync(cloudAttDir(CID))).toBe(false);
     } finally {
@@ -1006,8 +1708,8 @@ describe('chat_attachments › adoptDraftAttachments', () => {
       const result = await moduleWithFailingMove.adoptDraftAttachments(UID, DRAFT, CID);
 
       expect(result.ok).toBe(false);
-      expect(fs.readdirSync(draftAttDir(DRAFT)).sort()).toEqual(['first.txt', 'second.txt']);
-      expect(fs.readdirSync(cloudAttDir(CID))).toEqual(['kept.txt']);
+      expect(fs.readdirSync(draftAttDir(DRAFT)).sort()).toEqual(['.selected-attachments.json', 'first.txt', 'second.txt']);
+      expect(fs.readdirSync(cloudAttDir(CID))).toEqual(['.selected-attachments.json', 'kept.txt']);
     } finally {
       vi.doUnmock('node:fs');
       vi.doUnmock('node:fs/promises');
@@ -1048,6 +1750,22 @@ describe('chat_attachments › adoptDraftAttachments', () => {
     expect(items.map((i) => i.name)).toEqual(['legacy.txt']);
     expect(fs.existsSync(path.join(draftAttDir(DRAFT), 'legacy.txt'))).toBe(true);
     expect(fs.existsSync(cloudAttDir(DRAFT))).toBe(false);
+  });
+
+  it('preserves legacy dedicated drafts when they merge into a newer local selection with a filename collision', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, DRAFT, 'same.txt', Buffer.from('local draft'));
+    fs.mkdirSync(cloudAttDir(DRAFT), { recursive: true });
+    fs.writeFileSync(path.join(cloudAttDir(DRAFT), 'same.txt'), 'legacy draft');
+    const pending = m.listPendingAttachments(UID, DRAFT);
+    expect(pending).toHaveLength(2);
+    expect(pending.map(item => fs.readFileSync(path.join(draftAttDir(DRAFT), item.name), 'utf8')).sort())
+      .toEqual(['legacy draft', 'local draft']);
+    vi.resetModules();
+    const restored = await loadMod();
+    expect(restored.listPendingAttachments(UID, DRAFT)).toHaveLength(2);
+    expect(await restored.adoptDraftAttachments(UID, DRAFT, CID)).toMatchObject({ ok: true, count: 2 });
+    expect(restored.listPendingAttachments(UID, CID)).toHaveLength(2);
   });
 });
 
@@ -1491,6 +2209,24 @@ describe('chat_attachments › mediaMimeFor (preview docs)', () => {
 });
 
 describe('chat_attachments › buildAttachmentManifest', () => {
+  it('keeps filenames, image ordinals and vision pixels aligned in user order after draft adoption', async () => {
+    const m = await loadMod();
+    const names = ['z-red.png', 'a-green.png', 'm-blue.png'];
+    const colors = [0xDC2020FF, 0x20B040FF, 0x2040DCFF];
+    for (const index of [2, 1, 0]) await m.uploadAttachment(UID, 'main_chat', names[index], await makePng(colors[index]));
+    expect(await m.adoptDraftAttachments(UID, 'main_chat', CID)).toMatchObject({ ok: true });
+    const { Jimp } = await import('jimp' as any);
+    const r = await m.buildAttachmentManifest(UID, CID, names);
+    expect([...r.manifest.matchAll(/<file name="([^"]+)"[^>]*image_order="(\d+)"/g)].map((match) => [match[1], Number(match[2])]))
+      .toEqual([['z-red.png', 1], ['a-green.png', 2], ['m-blue.png', 3]]);
+    expect(r.images).toHaveLength(3);
+    for (let i = 0; i < colors.length; i += 1) {
+      const image: any = await Jimp.read(Buffer.from(r.images[i].data, 'base64'));
+      const pixel = image.getPixelColor(0, 0);
+      for (const shift of [24, 16, 8]) expect(Math.abs(((pixel >>> shift) & 255) - ((colors[i] >>> shift) & 255))).toBeLessThan(15);
+    }
+  });
+
   it('surfaces a ZIP by path without parsing archive bytes into model context', async () => {
     const m = await loadMod();
     const opaqueBytes = Buffer.from('PK\u0003\u0004private-package-body');
@@ -1704,7 +2440,7 @@ describe('chat_attachments › buildAttachmentManifest', () => {
       for (const shift of [24, 16, 8]) expect((background >>> shift) & 0xFF).toBeGreaterThan(240);
     }
     expect(fs.readFileSync(path.join(attDir(), 'reference.png'))).toEqual(png);
-    expect(fs.readdirSync(attDir())).toEqual(['reference.png']);
+    expect(fs.readdirSync(attDir())).toEqual(['.selected-attachments.json', 'reference.png']);
   });
 
   it('skips missing files gracefully', async () => {
@@ -1753,6 +2489,17 @@ describe('chat_attachments › buildConversationAttachmentIndex', () => {
     expect(index).toContain('kind="image"');
     expect(index).toContain('inline="false"');
     expect(index).not.toContain('local attachment index stays lightweight');
+  });
+
+  it('lists a non-UTF-8 text attachment as ordinary text without leaking its body', async () => {
+    const m = await loadMod();
+    await m.uploadAttachment(UID, CID, 'orders.csv', Buffer.from([0xD6, 0xD0, 0xCE, 0xC4, 0x2C, 0x31]));
+
+    const index = await m.buildConversationAttachmentIndex(UID, CID);
+
+    expect(index).toContain('name="orders.csv"');
+    expect(index).toContain('kind="text"');
+    expect(index).not.toContain('\uFFFD');
   });
 
   it('excludes current-turn attachment names already covered by the manifest', async () => {

@@ -18,6 +18,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { Semaphore } from 'async-mutex';
 
 import { projectFilesDir } from '../paths';
+import { writeBytesAtomicSync, writeTextAtomicSync } from '../storage';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { invalidateFileCache } from './file_indexer';
@@ -31,6 +32,7 @@ import { officeFileToPreviewHtml } from './office/office_preview_layout';
 import {
   assertLocalImportTarget,
   copyLocalFileAtomic,
+  copyLocalEntryExclusiveSync,
   inspectLocalImportSource,
   isUtf8File,
   withLocalImportLock,
@@ -38,6 +40,11 @@ import {
 import { logErrorSummary, logPathRef, maskId } from '../util/log-redact';
 
 const log = createLogger('project_files');
+
+function enqueueCommittedProjectSource(uid: string, pid: string, name: string, op: 'upsert' | 'delete'): void {
+  try { projectLibraryIndexer.enqueue(uid, pid, name, op); }
+  catch (error) { log.warn('project library indexing deferred after local source change', { error: logErrorSummary(error) }); }
+}
 
 const TEXT_EXTS: ReadonlySet<string> = new Set([
   '.md', '.markdown', '.txt', '.csv', '.tsv', '.jsonl', '.ndjson', '.rst', '.tex', '.srt', '.vtt',
@@ -212,11 +219,6 @@ async function ensureProjectFilesDir(userId: string, projectId: string): Promise
 
 function _notifyDirty(userId: string, projectId: string): void {
   invalidateProjectFileTree(userId, projectId);
-}
-
-function _notifyDeleted(projectId: string, relPath: string): void {
-  void projectId;
-  void relPath;
 }
 
 function infoFor(absPath: string, root?: string): ProjectFileInfo | null {
@@ -429,12 +431,12 @@ export async function uploadProjectFile(
   try { fs.mkdirSync(targetDir, { recursive: true }); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   const target = uniqueTarget(targetDir, path.basename(safeName));
-  try { fs.writeFileSync(target, buf); }
+  try { writeBytesAtomicSync(target, buf); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
 
   const info = infoFor(target, dir);
   if (!info) return { ok: false, error: 'write failed' };
-  projectLibraryIndexer.enqueue(userId, pid, info.relPath, 'upsert');
+  enqueueCommittedProjectSource(userId, pid, info.relPath, 'upsert');
   _notifyDirty(userId, pid);
   log.info('uploaded project library file', {
     user_id: maskId(userId),
@@ -479,7 +481,7 @@ export async function importProjectFileFromPath(
       await copyLocalFileAtomic(source.absPath, target, source);
       const imported = infoFor(target, dir);
       if (!imported) throw Object.assign(new Error('write failed'), { code: 'E_IMPORT_PUBLISH' });
-      projectLibraryIndexer.enqueue(userId, pid, imported.relPath, 'upsert');
+      enqueueCommittedProjectSource(userId, pid, imported.relPath, 'upsert');
       _notifyDirty(userId, pid);
       return imported;
     });
@@ -552,8 +554,7 @@ export async function deleteProjectFile(userId: string, projectId: string, name:
   } catch { return { ok: false, error: 'not_found' }; }
   try { fs.unlinkSync(abs); }
   catch (err) { return { ok: false, error: (err as Error).message }; }
-  projectLibraryIndexer.enqueue(userId, pid, safeName, 'delete');
-  _notifyDeleted(pid, safeName);
+  enqueueCommittedProjectSource(userId, pid, safeName, 'delete');
   try { invalidateFileCache(userId, abs); }
   catch (err) { log.warn('project file cache invalidation failed', { path: logPathRef(abs), error: logErrorSummary(err) }); }
   try {
@@ -563,7 +564,9 @@ export async function deleteProjectFile(userId: string, projectId: string, name:
   return { ok: true };
 }
 
-export async function deleteProjectEntry(userId: string, projectId: string, name: string): Promise<Result> {
+export async function deleteProjectEntry(
+  userId: string, projectId: string, name: string, beforeDelete?: () => boolean,
+): Promise<Result> {
   let safeName: string;
   let pid: string;
   try {
@@ -583,13 +586,13 @@ export async function deleteProjectEntry(userId: string, projectId: string, name
 
   const files = await filesUnderEntry(abs, root);
   try {
+    if (beforeDelete && !beforeDelete()) return { ok: false, error: 'source_changed' };
     if (st.isDirectory()) fs.rmSync(abs, { recursive: true, force: false });
     else fs.unlinkSync(abs);
   } catch (err) { return { ok: false, error: (err as Error).message }; }
 
   for (const file of files) {
-    projectLibraryIndexer.enqueue(userId, pid, file.relPath, 'delete');
-    _notifyDeleted(pid, file.relPath);
+    enqueueCommittedProjectSource(userId, pid, file.relPath, 'delete');
     try { invalidateFileCache(userId, file.path); }
     catch (err) { log.warn('project file cache invalidation failed', { path: logPathRef(file.path), error: logErrorSummary(err) }); }
   }
@@ -706,6 +709,7 @@ export async function copyProjectEntryFromPath(
   projectId: string,
   sourceAbs: string,
   targetName: string,
+  onCopied?: (absolutePath: string) => void,
 ): Promise<Result<{ name: string; fileCount: number; bytes: number }>> {
   let pid: string;
   let root: string;
@@ -735,20 +739,17 @@ export async function copyProjectEntryFromPath(
   if (fs.existsSync(targetAbs)) return { ok: false, error: 'target_exists' };
 
   try {
-    fs.cpSync(sourceAbs, targetAbs, {
-      recursive: sourceStat.isDirectory(),
-      errorOnExist: true,
-      force: false,
-      dereference: false,
-    });
+    copyLocalEntryExclusiveSync(sourceAbs, targetAbs, sourceStat.isDirectory());
+    onCopied?.(targetAbs);
   } catch (err) {
-    try { fs.rmSync(targetAbs, { recursive: true, force: true }); } catch { /* best-effort rollback */ }
-    return { ok: false, error: (err as Error).message };
+    const code = (err as NodeJS.ErrnoException).code;
+    return { ok: false, error: code === 'EEXIST' || code === 'ERR_FS_CP_EEXIST'
+      ? 'target_exists' : (err as Error).message };
   }
 
   const copiedFiles = await filesUnderEntry(targetAbs, root);
   for (const file of copiedFiles) {
-    projectLibraryIndexer.enqueue(userId, pid, file.relPath, 'upsert');
+    enqueueCommittedProjectSource(userId, pid, file.relPath, 'upsert');
     try { invalidateFileCache(userId, file.path); } catch { /* new path; best effort */ }
   }
   _notifyDirty(userId, pid);
@@ -819,7 +820,7 @@ export async function replaceProjectFileFromPath(
         user_id: maskId(userId), project_id: maskId(projectId), error: logErrorSummary(error),
       });
     }
-    projectLibraryIndexer.enqueue(userId, projectId, safeName, 'upsert');
+    enqueueCommittedProjectSource(userId, projectId, safeName, 'upsert');
     _notifyDirty(userId, projectId);
     return { ok: true, name: safeName, bytes: checked.bytes, revision };
   } catch (error) {
@@ -880,11 +881,14 @@ export async function updateProjectTextFile(
   if (bytes > MAX_BYTES_TEXT) {
     return { ok: false, error: t('errors.file_too_large_mb', { mb: Math.round(MAX_BYTES_TEXT / 1024 / 1024) }) };
   }
-  try { fs.writeFileSync(r.absPath, body, 'utf8'); }
+  try {
+    fs.accessSync(r.absPath, fs.constants.W_OK);
+    writeTextAtomicSync(r.absPath, body, 'utf8', { mode: fs.statSync(r.absPath).mode & 0o777 });
+  }
   catch (err) { return { ok: false, error: (err as Error).message }; }
   try { invalidateFileCache(userId, r.absPath); }
   catch (err) { log.warn('project file cache invalidation failed', { path: logPathRef(r.absPath), error: logErrorSummary(err) }); }
-  projectLibraryIndexer.enqueue(userId, projectId, name, 'upsert');
+  enqueueCommittedProjectSource(userId, projectId, name, 'upsert');
   _notifyDirty(userId, projectId);
   return { ok: true, name };
 }
@@ -939,9 +943,8 @@ export async function renameProjectFile(
     const nextAbs = path.resolve(root, nextRel);
     try { invalidateFileCache(userId, file.path); invalidateFileCache(userId, nextAbs); }
     catch (err) { log.warn('renamed project file cache invalidation failed', { path: logPathRef(file.relPath), error: logErrorSummary(err) }); }
-    projectLibraryIndexer.enqueue(userId, pid, file.relPath, 'delete');
-    projectLibraryIndexer.enqueue(userId, pid, nextRel, 'upsert');
-    _notifyDeleted(pid, file.relPath);
+    enqueueCommittedProjectSource(userId, pid, file.relPath, 'delete');
+    enqueueCommittedProjectSource(userId, pid, nextRel, 'upsert');
   }
   _notifyDirty(userId, pid);
   if (type === 'dir') return { ok: true, oldName: safeOld, name: safeNext, type };

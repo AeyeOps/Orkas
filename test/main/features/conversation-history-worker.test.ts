@@ -14,6 +14,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await (await import('../../../src/main/features/conversation-history-client')).closeConversationHistoryWorker();
+  vi.restoreAllMocks();
   if (previous === undefined) delete process.env.ORKAS_WORKSPACE_ROOT;
   else process.env.ORKAS_WORKSPACE_ROOT = previous;
   fs.rmSync(root, { recursive: true, force: true });
@@ -21,6 +22,156 @@ afterEach(async () => {
 const row = (id: string, output = '') => ({ id, from: 'commander', to: ['user'], ts: '2026-09-23',
   text: `完整消息 ${id} \\(x^2\\)`, process: [{ type: 'event', event: { stream: 'tool',
     data: { name: 'bash', phase: 'end', output } } }] });
+
+
+const gate = () => {
+  let release!: () => void;
+  const pending = new Promise<void>(resolve => { release = resolve; });
+  return { pending, release };
+};
+function historySource(name: string, output = '') {
+  const file = path.join(root, `${name}.jsonl`);
+  fs.writeFileSync(file, JSON.stringify(row(name, output)) + '\n');
+  return file;
+}
+
+it.each([
+  { lane: 'live', warm: false }, { lane: 'navigation', warm: false },
+  { lane: 'live', warm: true }, { lane: 'navigation', warm: true },
+] as const)('waits for all history cleanup before $lane work resumes (warm=$warm)', async ({ lane, warm }) => {
+  const client = await import('../../../src/main/features/conversation-history-client');
+  const cache = await import('../../../src/main/features/conversation_history_cache');
+  const realRequest = client.ConversationHistoryWorker.prototype.request;
+  const realClose = client.ConversationHistoryWorker.prototype.close;
+  const owners = new Set<any>(), released = gate();
+  const posted: string[] = [];
+  let closingStarted = false, closed = false, prematureDispatch = false;
+  vi.spyOn(client.ConversationHistoryWorker.prototype, 'request').mockImplementation(function(command) {
+    if (closingStarted && !closed) prematureDispatch = true;
+    owners.add(this); posted.push(command.kind); return realRequest.call(this, command);
+  });
+  const sourceFile = historySource('late-shutdown', 'Preserved complete output '.repeat(1000));
+  const original = fs.readFileSync(sourceFile);
+  await cache.readConversationHistoryPage('user', sourceFile, 1);
+  const request = () => lane === 'live'
+    ? cache.projectLiveConversationHistoryRecords('user', sourceFile, [row('late-live')])
+    : client.turnIndexRequest({ kind: 'turns', userId: 'user', cid: 'late-shutdown', sourceFile });
+  if (warm) await request();
+  const admitted = [...posted];
+  const oldOwners = [...owners];
+  vi.spyOn(client.ConversationHistoryWorker.prototype, 'close').mockImplementation(async function() {
+    await realClose.call(this); await released.pending;
+  });
+  closingStarted = true;
+  const closing = client.closeConversationHistoryWorker();
+  void closing.then(() => { closed = true; });
+  const late = request();
+  const outcome = Promise.allSettled([late]);
+  try {
+    await vi.waitFor(() => expect(oldOwners.every(owner => owner.worker.threadId === -1)).toBe(true));
+    const beforeRelease = [...posted];
+    released.release(); await closing;
+    const results = await outcome;
+    expect(beforeRelease).toEqual(admitted);
+    expect(prematureDispatch).toBe(false);
+    expect(results[0].status).toBe('fulfilled');
+    expect(oldOwners.every(owner => owner.worker.threadId === -1)).toBe(true);
+    expect(fs.readFileSync(sourceFile)).toEqual(original);
+    if (lane === 'live') {
+      expect((await cache.projectLiveConversationHistoryRecords('user', sourceFile, [row('fresh-live')]))[0].id).toBe('fresh-live');
+    } else {
+      const fresh = await client.turnIndexRequest<any>({ kind: 'turns', userId: 'user', cid: 'late-shutdown', sourceFile });
+      expect(fresh.total).toBe(0);
+    }
+  } finally { released.release(); await Promise.allSettled([closing, late]); }
+});
+
+it('keeps every live process item inline and isolates its queue from persisted-history reads', async () => {
+  const client = await import('../../../src/main/features/conversation-history-client');
+  const real = client.ConversationHistoryWorker.prototype.request;
+  const lanes: Record<string, unknown> = {};
+  const spy = vi.spyOn(client.ConversationHistoryWorker.prototype, 'request').mockImplementation(function(command) {
+    lanes[command.kind] = this;
+    return real.call(this, command);
+  });
+  try {
+    const cache = await import('../../../src/main/features/conversation_history_cache');
+    const process = Array.from({ length: 2500 }, (_, n) => ({ type: 'progress', text: `event-${n}` }));
+    const file = path.join(root, 'live.jsonl');
+    const [live] = await cache.projectLiveConversationHistoryRecords('user', file, [{ ...row(''), process } as any]);
+    await cache.readConversationHistoryPage('user', file, 10);
+    expect(live.process).toEqual(process);
+    expect(live.process_parts).toBeUndefined();
+    expect(lanes.project).not.toBe(lanes.page);
+    expect(fs.existsSync(file)).toBe(false);
+  } finally { spy.mockRestore(); }
+});
+
+it('orders cache clearing after already-admitted live projections', async () => {
+  const client = await import('../../../src/main/features/conversation-history-client');
+  const real = client.ConversationHistoryWorker.prototype.request;
+  let release!: () => void, purgePosted = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const spy = vi.spyOn(client.ConversationHistoryWorker.prototype, 'request').mockImplementation(function(command) {
+    if (command.kind === 'purge') purgePosted = true;
+    if (command.kind === 'project') return gate.then(() => real.call(this, command));
+    return real.call(this, command);
+  });
+  const cache = await import('../../../src/main/features/conversation_history_cache');
+  const file = path.join(root, 'clear-live.jsonl');
+  const projection = cache.projectLiveConversationHistoryRecords('user', file, [row('', 'complete output '.repeat(1000))]);
+  const purge = cache.purgeConversationHistoryCache('user', file);
+  try {
+    await Promise.resolve();
+    const ordered = !purgePosted;
+    release();
+    const [record] = await projection;
+    const output = (record.process![0] as any).event.data.result_path;
+    await purge;
+    expect(ordered).toBe(true);
+    expect(fs.existsSync(output)).toBe(false);
+  } finally { release(); await Promise.allSettled([projection, purge]); spy.mockRestore(); }
+});
+
+it('does not turn a failed cache clear into a live-query failure', async () => {
+  const client = await import('../../../src/main/features/conversation-history-client');
+  const real = client.ConversationHistoryWorker.prototype.request;
+  const spy = vi.spyOn(client.ConversationHistoryWorker.prototype, 'request').mockImplementation(function(command) {
+    return command.kind === 'purge' ? Promise.reject(new Error('injected clear failure')) : real.call(this, command);
+  });
+  try {
+    const cache = await import('../../../src/main/features/conversation_history_cache');
+    const file = path.join(root, 'failed-clear.jsonl');
+    const clear = cache.purgeConversationHistoryCache('user', file);
+    const live = cache.projectLiveConversationHistoryRecords('user', file, [row('unchanged')]);
+    await expect(clear).rejects.toThrow('injected clear failure');
+    expect((await live)[0].id).toBe('unchanged');
+  } finally { spy.mockRestore(); }
+});
+
+it('cancels delayed projection and clear work at shutdown without reopening a worker', async () => {
+  const client = await import('../../../src/main/features/conversation-history-client');
+  const real = client.ConversationHistoryWorker.prototype.request;
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const commands: string[] = [];
+  const spy = vi.spyOn(client.ConversationHistoryWorker.prototype, 'request').mockImplementation(function(command) {
+    commands.push(command.kind);
+    return command.kind === 'project' ? gate.then(() => real.call(this, command)) : real.call(this, command);
+  });
+  const cache = await import('../../../src/main/features/conversation_history_cache');
+  const file = path.join(root, 'closing-live.jsonl');
+  const live = cache.projectLiveConversationHistoryRecords('user', file, [row('cancelled')]);
+  const clear = cache.purgeConversationHistoryCache('user', file);
+  const settled = Promise.allSettled([live, clear]);
+  try {
+    await client.closeConversationHistoryWorker();
+    release();
+    expect((await settled).every(result => result.status === 'rejected')).toBe(true);
+    expect(commands).toEqual(['project']);
+    expect((await cache.projectLiveConversationHistoryRecords('user', file, [row('fresh')]))[0].id).toBe('fresh');
+  } finally { release(); await settled; spy.mockRestore(); }
+});
 
 it('reads cold/older pages without main-thread spill I/O and preserves exact expandable output', async () => {
   const file = path.join(root, 'history.jsonl');
@@ -135,4 +286,66 @@ it('loads a 20 MiB single-record older page without truncating its expandable Un
   expect(tool.result_size).toBe(Buffer.byteLength(output));
   expect(await digest(tool.result_path)).toBe(createHash('sha256').update(output).digest('hex'));
   expect(await digest(file)).toBe(canonicalHash);
+});
+
+// PF-02: parent-page size must not hide nested work or another conversation's wait.
+it.each([1000, 30000, 100000])('PF-02 preserves %i nested events across cold/warm reads and queued small conversations', async count => {
+  const cache = await import('../../../src/main/features/conversation_history_cache');
+  const file = path.join(root, 'nested.jsonl'), small = path.join(root, 'small.jsonl');
+  const events = Array.from({ length: count }, (_, n) => ({ type: 'progress', text: `event-${n}-界` }));
+  const records = Array.from({ length: 10 }, (_, n) => ({ ...row(`parent-${n}`), process: n === 0 ? events : [] }));
+  const canonical = records.map(record => JSON.stringify(record)).join('\n') + '\n';
+  fs.writeFileSync(file, canonical); fs.writeFileSync(small, JSON.stringify(row('small')) + '\n');
+  await cache.readConversationHistoryPage('user', small, 10); // worker startup excluded
+  const start = performance.now();
+  const heavy = cache.readConversationHistoryPage('user', file, 10);
+  const smallWaits: number[] = [];
+  const queued = Array.from({ length: 8 }, () => cache.readConversationHistoryPage('user', small, 10).then(page => {
+    smallWaits.push(performance.now() - start); expect(page.records.map(record => record.id)).toEqual(['small']);
+  }));
+  const cold = await heavy; const coldMs = performance.now() - start; await Promise.all(queued);
+  const warmStart = performance.now(); const warm = await cache.readConversationHistoryPage('user', file, 10);
+  const warmMs = performance.now() - warmStart;
+  expect(warm).toEqual(cold); expect(cold.records.map(record => record.id)).toEqual(records.map(record => record.id));
+  const projected = cold.records[0]; const complete: unknown[] = [];
+  for (const part of projected.process_parts || []) {
+    if (!('ref' in part)) throw new Error('Expected expandable process');
+    let cursor: number | null = 0;
+    do {
+      const page = await cache.readConversationProcessPage('user', file, part.ref, cursor, projected.id);
+      complete.push(...page.items); cursor = page.nextCursor;
+    } while (cursor !== null);
+  }
+  if (!projected.process_parts?.length) complete.push(...projected.process || []);
+  expect(complete).toEqual(events);
+  expect(fs.readFileSync(file, 'utf8')).toBe(canonical);
+  console.log('[PF-02 nested history]', JSON.stringify({ parents: 10, events: count, sourceBytes: Buffer.byteLength(canonical),
+    coldMs, warmMs, queuedSmallMs: smallWaits, expandedEvents: complete.length,
+    scope: 'actual shared history worker; warm OS cache; queue wait includes heavy cold read; no UI/p95 claim' }));
+}, 30000);
+
+it('shares pending cleanup, rejects new persisted reads, and reopens unchanged history after release', async () => {
+  const client = await import('../../../src/main/features/conversation-history-client');
+  const cache = await import('../../../src/main/features/conversation_history_cache');
+  const sourceFile = historySource('repeat-close');
+  const original = fs.readFileSync(sourceFile);
+  await cache.readConversationHistoryPage('user', sourceFile, 1);
+  const released = gate();
+  const realClose = client.ConversationHistoryWorker.prototype.close;
+  vi.spyOn(client.ConversationHistoryWorker.prototype, 'close').mockImplementation(async function() {
+    await realClose.call(this);
+    await released.pending;
+  });
+  const closing = client.closeConversationHistoryWorker();
+  const repeated = client.closeConversationHistoryWorker();
+  const late = client.historyRequest({ kind: 'page', userId: 'user', sourceFile, limit: 1 });
+  try {
+    expect(repeated).toBe(closing);
+    await expect(late).rejects.toThrow('Conversation history worker stopped');
+  } finally {
+    released.release();
+    await Promise.allSettled([closing, repeated, late]);
+  }
+  expect((await cache.readConversationHistoryPage('user', sourceFile, 1)).records[0].id).toBe('repeat-close');
+  expect(fs.readFileSync(sourceFile)).toEqual(original);
 });

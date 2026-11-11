@@ -55,6 +55,270 @@ afterEach(() => {
 });
 
 describe('features/connectors/oauth', () => {
+  it.each([
+    ['connector_oauth', 1, false, 'rejected'],
+    ['connector_oauth', 0, false, 'success'],
+    ['connector_oauth', 'private-code-canary', true, 'invalid'],
+    ['composio', 1, false, 'rejected'],
+    ['composio', 0, false, 'success'],
+  ] as const)('diagnoses %s exchange API result %s with safe field presence only', async (kind, code, present, apiResult) => {
+    const fetchMock = vi.fn(async (url: string) => new Response(JSON.stringify(
+      String(url).endsWith('/composio/start')
+        ? { code: 0, redirect_url: 'https://connect.test/oauth' }
+        : { code, msg: 'private-message-canary',
+          ...(present ? { access_token: 'private-access-canary' } : {}),
+          refresh_token: 'private-refresh-canary' },
+    )));
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const pending = kind === 'composio'
+      ? oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any)
+      : oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!);
+    // Composio must finish its start request before the deep link arrives.
+    const { shell } = await import('electron');
+    await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalled());
+    const rejected = expect(pending).rejects.toMatchObject({ code: kind === 'composio' && code !== 0 ? 'exchange_http_4xx' : 'invalid_exchange_response' });
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=private-exchange-canary');
+    await rejected;
+    expect(logWarn).toHaveBeenCalledWith('connector OAuth exchange failed', expect.objectContaining({
+      exchange_response: { kind, api_result: apiResult, required_fields_present: present },
+    }));
+    expect(JSON.stringify(logWarn.mock.calls)).not.toMatch(/private-/);
+    expect(fetchMock).toHaveBeenCalledTimes(kind === 'composio' ? 2 : 1);
+  });
+
+
+  it.each(['missing_key', 'interrupted_body'] as const)('releases the pending start after %s and allows a fresh flow', async (failure) => {
+    if (failure === 'missing_key') {
+      vi.doMock('../../../../src/main/features/connectors/api-key', () => ({
+        connectorApiKeyHeaders: () => { throw Object.assign(new Error('Configure an Orkas API Key.'), { code: 'orkas_api_key_required' }); },
+      }));
+    }
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200,
+      text: async () => { throw new Error('Controlled interrupted start body'); } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const { shell } = await import('electron');
+    const error = await oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any).catch(error => error);
+    if (failure === 'missing_key') expect(error).toMatchObject({ code: 'orkas_api_key_required' });
+    else expect(error).toMatchObject({ message: 'Controlled interrupted start body' });
+    expect(fetchMock).toHaveBeenCalledTimes(failure === 'missing_key' ? 0 : 1);
+    expect(shell.openExternal).not.toHaveBeenCalled();
+    expect(oauth.cancelInFlightOAuth()).toBe(false);
+    const retry = oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!)
+      .then(value => ({ value }), error => ({ error }));
+    expect(oauth.cancelInFlightOAuth()).toBe(true);
+    await expect(retry).resolves.toMatchObject({ error: { code: 'user_cancelled' } });
+  });
+
+  it('keeps the full consent timeout after the Composio start completes and permits retry after expiry', async () => {
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const { shell } = await import('electron');
+    let finish!: (response: Response) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(resolve => { finish = resolve; })));
+    vi.useFakeTimers();
+    try {
+      let result: unknown;
+      void oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any)
+        .then(value => { result = { value }; }, error => { result = { error }; });
+      await vi.advanceTimersByTimeAsync(1000);
+      finish(new Response(JSON.stringify({ code: 0, redirect_url: 'https://provider.example/connect' })));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(shell.openExternal).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000 - 1);
+      expect(result).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(1);
+      expect(result).toMatchObject({ error: { code: 'flow_timeout' } });
+      expect(oauth.cancelInFlightOAuth()).toBe(false);
+      const retry = oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!)
+        .then(value => ({ value }), error => ({ error }));
+      expect(oauth.cancelInFlightOAuth()).toBe(true);
+      await expect(retry).resolves.toMatchObject({ error: { code: 'user_cancelled' } });
+    } finally {
+      oauth.cancelInFlightOAuth();
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels an unfinished Composio start without opening its late consent URL', async () => {
+    let finish!: (response: Response) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise<Response>(resolve => { finish = resolve; })));
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const { shell } = await import('electron');
+    const result = oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any)
+      .then(value => ({ value }), error => ({ error }));
+    const cancelled = oauth.cancelInFlightOAuth();
+    finish(new Response(JSON.stringify({ code: 0, redirect_url: 'https://provider.example/old' })));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const opened = vi.mocked(shell.openExternal).mock.calls.length;
+    oauth.cancelInFlightOAuth();
+    expect(await result).toMatchObject({ error: { code: 'user_cancelled' } });
+    expect(cancelled).toBe(true);
+    expect(opened).toBe(0);
+  });
+
+  it.each(['success', 'failure'] as const)('preserves the current authorization after a late Composio start %s', async (outcome) => {
+    let finish!: (response: Response) => void;
+    vi.stubGlobal('fetch', vi.fn((url: string) => String(url).endsWith('/composio/start')
+      ? new Promise<Response>(resolve => { finish = resolve; })
+      : Promise.resolve(new Response(JSON.stringify({ code: 0, access_token: 'current-access', scope: 'webmaster.read',
+        connection_id: 'old-connection', connection_token: 'a'.repeat(43), toolkit: 'gmail', auth_config_id: 'ac_public' })))));
+    const timers = vi.spyOn(globalThis, 'setTimeout');
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const { shell } = await import('electron');
+    const outcomes: unknown[] = [];
+    try {
+      void oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any).then(
+        () => outcomes.push(['old', 'success']), error => outcomes.push(['old', error.code]));
+      void oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!).then(
+        grant => outcomes.push(['current', grant.access_token]), error => outcomes.push(['current', error.code]));
+      finish(new Response(JSON.stringify(outcome === 'success'
+        ? { code: 0, redirect_url: 'https://provider.example/old' } : { code: 1, msg: 'Controlled old start failure' }),
+      { status: outcome === 'success' ? 200 : 400 }));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=current');
+      await new Promise<void>(resolve => setImmediate(resolve));
+      expect(outcomes).toEqual([['old', 'superseded'], ['current', 'current-access']]);
+      expect(shell.openExternal).toHaveBeenCalledTimes(1);
+    } finally {
+      oauth.cancelInFlightOAuth();
+      for (const result of timers.mock.results) if (result.type === 'return') clearTimeout(result.value);
+      timers.mockRestore();
+    }
+  });
+
+  it.each(['connector_oauth', 'google_picker', 'composio'] as const)(
+    'ignores an obsolete %s browser-open failure', async (kind) => {
+      vi.stubGlobal('fetch', vi.fn(async (url: string) => new Response(JSON.stringify(
+        String(url).endsWith('/composio/start') ? { code: 0, redirect_url: 'https://provider.example/old' }
+          : { code: 0, access_token: 'current-access', scope: 'webmaster.read' }))));
+      const oauth = await import('../../../../src/main/features/connectors/oauth');
+      const catalog = await import('../../../../src/main/features/connectors/catalog');
+      const { shell } = await import('electron');
+      let failOpen!: (error: Error) => void;
+      vi.mocked(shell.openExternal).mockImplementationOnce(() => new Promise((_resolve, reject) => { failOpen = reject; }));
+      const old = (kind === 'composio' ? oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any)
+        : kind === 'google_picker' ? oauth.startGoogleSheetsPicker(['sheet-1'])
+          : oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!))
+        .then(value => ({ value }), error => ({ error }));
+      await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledTimes(1));
+      const current = oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!)
+        .then(value => ({ value }), error => ({ error }));
+      failOpen(new Error('Controlled browser-open failure'));
+      await new Promise<void>(resolve => setImmediate(resolve));
+      await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=current');
+      expect(await old).toMatchObject({ error: { code: 'superseded' } });
+      expect(await current).toMatchObject({ value: { access_token: 'current-access' } });
+      oauth.cancelInFlightOAuth();
+    });
+
+  it('ignores callbacks while Composio is starting and exchanges only after consent opens', async () => {
+    let finish!: (response: Response) => void;
+    const fetchMock = vi.fn((url: string) => String(url).endsWith('/composio/start')
+      ? new Promise<Response>(resolve => { finish = resolve; })
+      : Promise.resolve(new Response(JSON.stringify({ code: 0, connection_id: 'current-connection',
+        connection_token: 'a'.repeat(43), toolkit: 'gmail', auth_config_id: 'ac_public' }))));
+    vi.stubGlobal('fetch', fetchMock);
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const { shell } = await import('electron');
+    const pending = oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any);
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=obsolete');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    finish(new Response(JSON.stringify({ code: 0, redirect_url: 'https://provider.example/current' })));
+    await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledTimes(1));
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=current');
+    await expect(pending).resolves.toMatchObject({ connection_id: 'current-connection' });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['connector_oauth', 'success'], ['connector_oauth', 'failure'],
+    ['google_picker', 'success'], ['google_picker', 'failure'],
+    ['composio', 'success'], ['composio', 'failure'],
+  ] as const)('keeps a replacement %s flow active when its old exchange returns %s', async (kind, outcome) => {
+    let finishOld!: (response: Response) => void;
+    let exchanges = 0;
+    const grant = (access: string) => ({ code: 0, access_token: access,
+      scope: 'webmaster.read https://www.googleapis.com/auth/drive.file', picked_file_ids: 'sheet-1',
+      connection_id: access, connection_token: 'a'.repeat(43), toolkit: 'gmail', auth_config_id: 'ac_public' });
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      if (String(url).endsWith('/composio/start')) return Promise.resolve(new Response(JSON.stringify({
+        code: 0, redirect_url: 'https://provider.example/connect',
+      })));
+      if (++exchanges === 1) return new Promise<Response>(resolve => { finishOld = resolve; });
+      return Promise.resolve(new Response(JSON.stringify(grant('current-access'))));
+    }));
+    const oauth = await import('../../../../src/main/features/connectors/oauth');
+    const catalog = await import('../../../../src/main/features/connectors/catalog');
+    const { shell } = await import('electron');
+    const start = () => kind === 'composio'
+      ? oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any)
+      : kind === 'google_picker' ? oauth.startGoogleSheetsPicker(['sheet-1'])
+        : oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!);
+    const old = start().then(value => ({ value }), error => ({ error }));
+    await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledTimes(1));
+    const oldCallback = oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=old');
+    await vi.waitFor(() => expect(finishOld).toBeTypeOf('function'));
+    const settled = vi.fn();
+    let currentResult: unknown;
+    void start().then(value => { settled('success'); currentResult = { value }; },
+      error => { settled('failure'); currentResult = { error }; });
+    await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledTimes(2));
+    await expect(old).resolves.toMatchObject({ error: { code: 'superseded' } });
+    finishOld(new Response(JSON.stringify(outcome === 'success' ? grant('stale-access') : { code: 1, msg: 'old exchange rejected' })));
+    await oldCallback;
+    const settledByOld = settled.mock.calls.length;
+    await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?exchange_code=current');
+    await new Promise<void>(resolve => setImmediate(resolve));
+    // Clean up even a broken implementation that loses the replacement handle.
+    oauth.cancelInFlightOAuth();
+    expect(settledByOld).toBe(0);
+    expect(currentResult).toMatchObject({ value: kind === 'composio'
+      ? { connection_id: 'current-access', connection_token: 'a'.repeat(43) }
+      : kind === 'google_picker' ? { grant: { access_token: 'current-access' }, pickedFileIds: ['sheet-1'] }
+        : { access_token: 'current-access' } });
+  });
+
+  it.each(['connector_oauth', 'google_picker', 'composio'] as const)(
+    'redeems a %s callback only once and ignores duplicate terminal callbacks during exchange', async (kind) => {
+      const finishes: Array<(response: Response) => void> = [];
+      const fetchMock = vi.fn((url: string) => String(url).endsWith('/composio/start')
+        ? Promise.resolve(new Response(JSON.stringify({ code: 0, redirect_url: 'https://provider.example/connect' })))
+        : new Promise<Response>(resolve => { finishes.push(resolve); }));
+      vi.stubGlobal('fetch', fetchMock);
+      const oauth = await import('../../../../src/main/features/connectors/oauth');
+      const catalog = await import('../../../../src/main/features/connectors/catalog');
+      const { shell } = await import('electron');
+      const pending = kind === 'composio'
+        ? oauth.startComposioConnect({ id: 'gmail', auth_mode: 'composio' } as any, { attemptId: 'one-attempt' })
+        : kind === 'google_picker' ? oauth.startGoogleSheetsPicker(['sheet-1'])
+          : oauth.startOAuth('u1', catalog.findCatalogEntry('bing-webmaster')!, { attemptId: 'one-attempt' });
+      const result = pending.then(value => ({ value }), error => ({ error }));
+      await vi.waitFor(() => expect(shell.openExternal).toHaveBeenCalledTimes(1));
+      const callback = 'orkas://connectors/oauth/callback?exchange_code=one-time-code';
+      const first = oauth.handleCallbackUrl(callback);
+      await vi.waitFor(() => expect(finishes).toHaveLength(1));
+      const duplicate = oauth.handleCallbackUrl(callback);
+      await oauth.handleCallbackUrl('orkas://connectors/oauth/callback?status=cancelled');
+      const exchangeCount = fetchMock.mock.calls.filter(([url]) => String(url).endsWith('/exchange')).length;
+      for (const finish of finishes) finish(new Response(JSON.stringify({ code: 0, access_token: 'access-1',
+        scope: 'webmaster.read https://www.googleapis.com/auth/drive.file', picked_file_ids: 'sheet-1',
+        connection_id: 'conn-1', connection_token: 'a'.repeat(43), toolkit: 'gmail', auth_config_id: 'ac_public' })));
+      await Promise.all([first, duplicate]);
+      const outcome = await result;
+      expect(exchangeCount).toBe(1);
+      expect(outcome).toMatchObject({ value: kind === 'composio'
+        ? { connection_id: 'conn-1', connection_token: 'a'.repeat(43) }
+        : kind === 'google_picker' ? { grant: { access_token: 'access-1' }, pickedFileIds: ['sheet-1'] }
+          : { access_token: 'access-1' } });
+      expect(oauthProgress).toHaveBeenCalledTimes(kind === 'google_picker' ? 0 : 1);
+      expect(oauth.cancelInFlightOAuth()).toBe(false);
+    });
+
   it('never logs callback URL components even when a stale deep link is malformed', async () => {
     const oauth = await import('../../../../src/main/features/connectors/oauth');
     await oauth.handleCallbackUrl('orkas://connectors/oauth/callback/private_callback_canary#private_fragment_canary');

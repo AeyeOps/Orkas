@@ -131,7 +131,7 @@ function _uiKeepDialogFocus(overlay, preferredFocus) {
   return () => document.removeEventListener('focusin', onFocusIn, true);
 }
 
-function _uiShowDialog({ message, context, showCancel, okLabel, cancelLabel, signal }) {
+function _uiShowDialog({ message, context, showCancel, okLabel, cancelLabel, signal, onConfirm }) {
   return new Promise((resolve) => {
     if (signal && signal.aborted) {
       resolve(false);
@@ -162,12 +162,14 @@ function _uiShowDialog({ message, context, showCancel, okLabel, cancelLabel, sig
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
     const releaseFocusGuard = _uiKeepDialogFocus(overlay, okBtn);
     let finished = false;
+    let busy = false;
     const onKey = (e) => {
       // IME guard (CLAUDE.md §8) — Enter while composing should commit
       // the IME candidate, not auto-confirm the dialog.
       if (e.isComposing || e.keyCode === 229) return;
       if (!_uiIsTopDialogOverlay(overlay)) return;
       if (_uiTrapDialogTab(overlay, e)) return;
+      if (busy) { if (e.key === 'Escape' || e.key === 'Enter') e.preventDefault(); return; }
       if (e.key === 'Escape') {
         e.preventDefault();
         finish(false);
@@ -180,7 +182,7 @@ function _uiShowDialog({ message, context, showCancel, okLabel, cancelLabel, sig
           : null;
         if (interactive) return;
         e.preventDefault();
-        finish(true);
+        confirm();
       }
     };
     const finish = (val) => {
@@ -195,9 +197,30 @@ function _uiShowDialog({ message, context, showCancel, okLabel, cancelLabel, sig
       resolve(val);
     };
     const onAbort = () => finish(false);
+    const confirm = async () => {
+      if (finished || busy) return;
+      if (typeof onConfirm !== 'function') { finish(true); return; }
+      busy = true;
+      okBtn.disabled = true;
+      okBtn.classList.add('is-loading');
+      okBtn.setAttribute('aria-busy', 'true');
+      if (cancelBtn) cancelBtn.disabled = true;
+      try {
+        // The action owns failure feedback; false keeps the dialog retryable.
+        if (await onConfirm() !== false) finish(true);
+      } catch (_) { /* Restore the action after an unexpected rejection. */ }
+      finally {
+        busy = false;
+        okBtn.disabled = false;
+        okBtn.classList.remove('is-loading');
+        okBtn.removeAttribute('aria-busy');
+        if (cancelBtn) cancelBtn.disabled = false;
+        if (!finished) okBtn.focus();
+      }
+    };
     if (signal) signal.addEventListener('abort', onAbort, { once: true });
-    okBtn.addEventListener('click', () => finish(true));
-    if (cancelBtn) cancelBtn.addEventListener('click', () => finish(false));
+    okBtn.addEventListener('click', confirm);
+    if (cancelBtn) cancelBtn.addEventListener('click', () => { if (!busy) finish(false); });
     document.addEventListener('keydown', onKey, true);
     setTimeout(() => {
       if (_uiIsTopDialogOverlay(overlay) && document.body.contains(overlay)) okBtn.focus();
@@ -210,6 +233,8 @@ function _uiShowDialog({ message, context, showCancel, okLabel, cancelLabel, sig
 // the action wants a more specific verb (e.g. "Open Folder" for the
 // preview-fallback dialog) — avoids forking a near-duplicate confirm
 // helper per CLAUDE.md §"Reuse UI components".
+// Optional onConfirm keeps the action loading until it resolves; return false
+// after showing failure feedback to leave the dialog available for retry.
 function uiConfirm(arg) {
   if (arg && typeof arg === 'object') {
     return _uiShowDialog({
@@ -219,6 +244,7 @@ function uiConfirm(arg) {
       okLabel: arg.okLabel,
       cancelLabel: arg.cancelLabel,
       signal: arg.signal,
+      onConfirm: arg.onConfirm,
     });
   }
   return _uiShowDialog({ message: arg, showCancel: true });
@@ -392,7 +418,7 @@ function uiConfirmDanger({ title, message, dangerLabel, cancelLabel, onConfirm, 
  * row is one non-wrapping line, so more than a few of them collapse to their
  * min-width and the labels wrap into unreadable columns. The default keeps
  * short confirm choices beside cancel on the action row. */
-function uiChoice({ title, message, context, choices = [], leadingChoices = [], cancelLabel, signal, multiple = false, choiceLayout = 'actions' } = {}) {
+function uiChoice({ title, message, context, choices = [], leadingChoices = [], cancelLabel, signal, multiple = false, choiceLayout = 'actions', onChoice, errorMessage } = {}) {
   return new Promise((resolve) => {
     if (signal && signal.aborted) {
       resolve(null);
@@ -427,6 +453,7 @@ function uiChoice({ title, message, context, choices = [], leadingChoices = [], 
         ${_uiDialogContextHtml(context)}
         <div class="modal-body ui-dialog-message" id="${messageId}">${msgHtml}</div>
         ${choiceGroupHtml}
+        <div class="ui-dialog-error" role="alert" hidden></div>
         <div class="modal-actions">
           ${leadingChoiceHtml}
           <button class="btn" data-act="cancel">${cancelText}</button>
@@ -441,13 +468,14 @@ function uiChoice({ title, message, context, choices = [], leadingChoices = [], 
     const cancelBtn = overlay.querySelector('[data-act="cancel"]');
     const releaseFocusGuard = _uiKeepDialogFocus(overlay, cancelBtn);
     let finished = false;
+    let saving = false;
     const onKey = (e) => {
       if (e.isComposing || e.keyCode === 229) return;
       if (!_uiIsTopDialogOverlay(overlay)) return;
       if (_uiTrapDialogTab(overlay, e)) return;
       if (e.key === 'Escape') {
         e.preventDefault();
-        finish(null);
+        if (!saving) finish(null);
       }
       // No Enter-to-confirm — caller must pick a choice explicitly.
     };
@@ -469,8 +497,30 @@ function uiChoice({ title, message, context, choices = [], leadingChoices = [], 
         btn.setAttribute('aria-pressed', 'false');
         btn.classList.remove('btn-primary');
       }
-      btn.addEventListener('click', () => {
-        if (!multiple) { finish(btn.dataset.id || null); return; }
+      btn.addEventListener('click', async () => {
+        if (saving) return;
+        if (!multiple) {
+          const id = btn.dataset.id || null;
+          if (onChoice) {
+            saving = true;
+            const buttons = overlay.querySelectorAll('button');
+            buttons.forEach(button => { button.disabled = true; });
+            let error;
+            overlay.querySelector('.ui-dialog-error').hidden = true;
+            try { error = await onChoice(id); }
+            catch { error = errorMessage || _dialogLabel('chat.retry_btn', 'Retry'); }
+            finally { saving = false; buttons.forEach(button => { button.disabled = false; }); }
+            if (finished) return;
+            if (error) {
+              const status = overlay.querySelector('.ui-dialog-error');
+              status.textContent = error;
+              status.hidden = false;
+              cancelBtn.focus();
+              return;
+            }
+          }
+          finish(id); return;
+        }
         const id = btn.dataset.id;
         if (selectedIds.has(id)) selectedIds.delete(id);
         else selectedIds.add(id);
@@ -480,7 +530,7 @@ function uiChoice({ title, message, context, choices = [], leadingChoices = [], 
       });
     });
     if (multiple) overlay.querySelector('[data-act="confirm"]').addEventListener('click', () => finish([...selectedIds]));
-    cancelBtn.addEventListener('click', () => finish(null));
+    cancelBtn.addEventListener('click', () => { if (!saving) finish(null); });
     document.addEventListener('keydown', onKey, true);
     setTimeout(() => {
       if (_uiIsTopDialogOverlay(overlay) && document.body.contains(overlay)) cancelBtn.focus();

@@ -6,10 +6,10 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import {
   nowIso, genUserId, genId12, safeId,
-  readJson, readJsonSync, writeJson, writeJsonSync,
+  readJson, readJsonSync, writeJson, writeJsonSync, linkWithRetry,
   writeTextAtomicSync, writeTextAtomicGuardedSync, appendJsonl, appendJsonlAtomic,
-  invalidateLineCount, readJsonl, readJsonlPage, readJsonlPageWithOffsets,
-  readJsonlWindow, readJsonlWindowAtMatch, __storageTestHooks,
+  invalidateLineCount, rewriteJsonlLine, readJsonl, readJsonlPage, readJsonlPageWithOffsets,
+  readJsonlWindow, readJsonlWindowAtMatch, readJsonlAppendRecord, __storageTestHooks,
 } from '../../src/main/storage';
 
 let tmpDir: string;
@@ -81,12 +81,117 @@ describe('storage › safeId guard', () => {
   });
 });
 
+describe('storage › exclusive file publication', () => {
+  it('retains both byte sequences when a destination already exists', async () => {
+    const source = path.join(tmpDir, 'complete.tmp');
+    const target = path.join(tmpDir, 'winner.txt');
+    fs.writeFileSync(source, 'new complete bytes');
+    fs.writeFileSync(target, 'existing winner');
+    await expect(linkWithRetry(source, target)).rejects.toMatchObject({ code: 'EEXIST' });
+    expect(fs.readFileSync(source, 'utf8')).toBe('new complete bytes');
+    expect(fs.readFileSync(target, 'utf8')).toBe('existing winner');
+  });
+
+  it('recovers from a transient Windows publication lock without blocking the event loop', async () => {
+    const source = path.join(tmpDir, 'complete.tmp');
+    const target = path.join(tmpDir, 'published.txt');
+    fs.writeFileSync(source, 'complete bytes');
+    const originalLink = fs.promises.link;
+    let first = true;
+    let timerRan = false;
+    const timer = setTimeout(() => { timerRan = true; }, 0);
+    vi.spyOn(fs.promises, 'link').mockImplementation(async (from, to) => {
+      if (first) { first = false; throw eperm(); }
+      await originalLink(from, to);
+    });
+    syncBuiltinESMExports();
+    try {
+      await linkWithRetry(source, target);
+      expect(timerRan).toBe(true);
+      expect(fs.readFileSync(target, 'utf8')).toBe('complete bytes');
+      expect(fs.readFileSync(source, 'utf8')).toBe('complete bytes');
+    } finally { clearTimeout(timer); vi.restoreAllMocks(); syncBuiltinESMExports(); }
+  });
+});
+
 describe('storage › JSON IO', () => {
+  it.each(['\n', '\r\n'])('reads one leading UTF-8 BOM without changing JSON values or source bytes (%j)', async (newline) => {
+    const file = path.join(tmpDir, 'bom.json');
+    const data = { name: 'Fixture', text: 'inside\uFEFFvalue', nested: [false, 3] };
+    const bytes = Buffer.from('\uFEFF' + JSON.stringify(data, null, 2).replace(/\n/g, newline));
+    fs.writeFileSync(file, bytes);
+    expect(await readJson(file, { strict: true })).toEqual(data);
+    expect(await readJson(file)).toEqual(data);
+    expect(readJsonSync(file)).toEqual(data);
+    expect(fs.readFileSync(file)).toEqual(bytes);
+  });
+
+  it('does not repair malformed JSON or consume repeated BOMs', async () => {
+    const file = path.join(tmpDir, 'invalid-bom.json');
+    for (const text of ['\uFEFF{broken', '\uFEFF\uFEFF{"name":"Fixture"}']) {
+      fs.writeFileSync(file, text);
+      await expect(readJson(file, { strict: true })).rejects.toBeInstanceOf(SyntaxError);
+      expect(await readJson(file)).toEqual({});
+      expect(readJsonSync(file)).toEqual({});
+      expect(fs.readFileSync(file, 'utf8')).toBe(text);
+    }
+  });
+
+  it('strict reads preserve read failures and parse failures while tolerant callers retain compatibility', async () => {
+    const missing = path.join(tmpDir, 'missing-strict.json');
+    await expect(readJson(missing, { strict: true })).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await readJson(missing)).toEqual({});
+    const file = path.join(tmpDir, 'recoverable.json');
+    fs.writeFileSync(file, '{broken');
+    await expect(readJson(file, { strict: true })).rejects.toBeInstanceOf(SyntaxError);
+    expect(await readJson(file)).toEqual({});
+    fs.writeFileSync(file, JSON.stringify({ agents: ['kept'] }));
+    expect(await readJson(file, { strict: true })).toEqual({ agents: ['kept'] });
+  });
+
+  it.each(['EACCES', 'EIO'])('preserves %s on BOM files and reads them after the fault clears', async (code) => {
+    const file = path.join(tmpDir, 'denied-bom.json');
+    const bytes = Buffer.from('\uFEFF{"name":"Preserved fixture"}');
+    fs.writeFileSync(file, bytes);
+    const error = Object.assign(new Error('Controlled read failure'), { code });
+    const asyncRead = vi.spyOn(nativeFs.promises, 'readFile').mockRejectedValue(error);
+    const syncRead = vi.spyOn(nativeFs, 'readFileSync').mockImplementation(() => { throw error; });
+    syncBuiltinESMExports();
+    try {
+      await expect(readJson(file, { strict: true })).rejects.toMatchObject({ code });
+      expect(await readJson(file)).toEqual({});
+      expect(readJsonSync(file)).toEqual({});
+    } finally {
+      asyncRead.mockRestore(); syncRead.mockRestore(); syncBuiltinESMExports();
+    }
+    expect(fs.readFileSync(file)).toEqual(bytes);
+    expect(await readJson(file, { strict: true })).toEqual({ name: 'Preserved fixture' });
+    expect(readJsonSync(file)).toEqual({ name: 'Preserved fixture' });
+  });
+
   it('writeJson + readJson roundtrip preserves UTF-8 and structure', async () => {
     const p = path.join(tmpDir, 'nested', 'a.json');
     const data = { x: 1, 中: '文', arr: [1, 2, 3], nested: { a: true } };
     await writeJson(p, data);
     expect(await readJson(p)).toEqual(data);
+  });
+
+  it('preserves committed JSON and removes a partial sibling when a synchronous write runs out of space', () => {
+    const target = path.join(tmpDir, 'state.json');
+    fs.writeFileSync(target, JSON.stringify({ retained: true }));
+    const originalWrite = fs.writeFileSync;
+    vi.spyOn(nativeFs, 'writeFileSync').mockImplementation(((file: fs.PathOrFileDescriptor, data: any, ...args: any[]) => {
+      if (typeof file === 'string' && file.startsWith(target + '.') && file.endsWith('.tmp')) {
+        originalWrite(file, '{'); throw Object.assign(new Error('Controlled partial JSON write'), { code: 'ENOSPC' });
+      }
+      return (originalWrite as any)(file, data, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    try {
+      expect(() => writeJsonSync(target, { next: true })).toThrow('Controlled partial JSON write');
+      expect(readJsonSync(target)).toEqual({ retained: true });
+      expect(fs.readdirSync(tmpDir)).toEqual(['state.json']);
+    } finally { vi.restoreAllMocks(); syncBuiltinESMExports(); }
   });
 
   it('writeJson is atomic — no .tmp file left behind', async () => {
@@ -536,6 +641,106 @@ describe('storage › appendJsonlAtomic', () => {
     expect(indices).toEqual(Array.from({ length: N }, (_, i) => i));
   });
 
+  it('starts on a clean line after a crash left a partial row, keeping valid-record numbering', async () => {
+    const p = path.join(tmpDir, 'torn.jsonl');
+    fs.writeFileSync(p, '{"i":0}\n{"i":1,"text":"half a re');
+    invalidateLineCount(p);
+    const appended = await appendJsonlAtomic(p, { i: 2 }, true);
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 2 }]);
+    // The next read of this index must land on the same record it just wrote.
+    expect(appended.msgIndex).toBe(1);
+    expect((await readJsonlWindow(p, appended.msgIndex, 1)).records).toEqual([{ i: 2 }]);
+    const bytes = fs.readFileSync(p);
+    const source = appended.source!;
+    expect(JSON.parse(bytes.subarray(source.offset, source.offset + source.bytes).toString('utf8'))).toEqual({ i: 2 });
+    expect((await appendJsonlAtomic(p, { i: 3 })).msgIndex).toBe(2);
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 2 }, { i: 3 }]);
+  });
+
+  it('keeps recovered message indexes stable after a cold reopen', async () => {
+    const p = path.join(tmpDir, 'reopened-torn.jsonl');
+    fs.writeFileSync(p, '{"i":0}\n{"i":1,"text":"partial');
+    expect((await appendJsonlAtomic(p, { i: 2 })).msgIndex).toBe(1);
+    // Restart and sync invalidate this cache; the preserved damaged row must
+    // never become a message slot on the next cold append.
+    for (const i of [3, 4]) {
+      invalidateLineCount(p);
+      const appended = await appendJsonlAtomic(p, { i }, true);
+      expect(appended.msgIndex).toBe(i - 1);
+      expect((await readJsonlWindow(p, appended.msgIndex, 1)).records).toEqual([{ i }]);
+    }
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 2 }, { i: 3 }, { i: 4 }]);
+  });
+
+  it('edits a recovered message by the same index used to read it', async () => {
+    const p = path.join(tmpDir, 'edit-recovered.jsonl');
+    const prefix = '{"i":0}\n{"i":1,"text":"partial';
+    fs.writeFileSync(p, prefix);
+    const appended = await appendJsonlAtomic(p, { i: 2 });
+    expect(await rewriteJsonlLine<{ i: number; edited?: boolean }>(p, appended.msgIndex,
+      record => record.i === 2 ? { ...record, edited: true } : null))
+      .toEqual({ ok: true, record: { i: 2, edited: true } });
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 2, edited: true }]);
+    expect(fs.readFileSync(p, 'utf8').startsWith(prefix + '\n')).toBe(true);
+  });
+
+  it('counts only readable records across already terminated corruption and blank lines', async () => {
+    const p = path.join(tmpDir, 'existing-corruption.jsonl');
+    fs.writeFileSync(p, '\n{"i":0}\ninvalid\n  \n{"i":1}\n');
+    const appended = await appendJsonlAtomic(p, { i: 2 });
+    expect(appended.msgIndex).toBe(2);
+    expect((await readJsonlWindow(p, appended.msgIndex, 1)).records).toEqual([{ i: 2 }]);
+    expect(await rewriteJsonlLine(p, 3, record => record)).toMatchObject({ ok: false });
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 1 }, { i: 2 }]);
+  });
+
+  it('keeps a complete record that only lost its newline', async () => {
+    const p = path.join(tmpDir, 'unterminated.jsonl');
+    fs.writeFileSync(p, '{"i":0}\n{"i":1}');
+    invalidateLineCount(p);
+    expect((await appendJsonlAtomic(p, { i: 2 })).msgIndex).toBe(2);
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 1 }, { i: 2 }]);
+    const blankTail = path.join(tmpDir, 'blank-tail.jsonl');
+    fs.writeFileSync(blankTail, '{"i":0}\n   ');
+    invalidateLineCount(blankTail);
+    expect((await appendJsonlAtomic(blankTail, { i: 1 })).msgIndex).toBe(1);
+    expect(await readJsonl(blankTail, 0)).toEqual([{ i: 0 }, { i: 1 }]);
+  });
+
+  it('does not touch a file that already ends cleanly or holds nothing', async () => {
+    const clean = path.join(tmpDir, 'clean.jsonl');
+    fs.writeFileSync(clean, '{"i":0}\n');
+    invalidateLineCount(clean);
+    await appendJsonlAtomic(clean, { i: 1 });
+    expect(fs.readFileSync(clean, 'utf8')).toBe('{"i":0}\n{"i":1}\n');
+    const empty = path.join(tmpDir, 'empty.jsonl');
+    fs.writeFileSync(empty, '');
+    invalidateLineCount(empty);
+    await appendJsonlAtomic(empty, { i: 0 });
+    expect(fs.readFileSync(empty, 'utf8')).toBe('{"i":0}\n');
+  });
+
+  it.each([false, true])('recovers the next append after a write failed part way (withSource=%s)', async withSource => {
+    const p = path.join(tmpDir, `enospc-${withSource}.jsonl`);
+    invalidateLineCount(p);
+    expect((await appendJsonlAtomic(p, { i: 0 }, withSource)).msgIndex).toBe(0);
+    const enospc = Object.assign(new Error('controlled disk full'), { code: 'ENOSPC' });
+    const fail = async () => { fs.appendFileSync(p, '{"i":1,"text":"half'); throw enospc; };
+    const open = fs.promises.open.bind(fs.promises);
+    const spy = withSource
+      ? vi.spyOn(fs.promises, 'open').mockImplementationOnce((async (...args: any[]) => {
+        const handle = await (open as any)(...args);
+        handle.writeFile = fail;
+        return handle;
+      }) as any)
+      : vi.spyOn(fs.promises, 'appendFile').mockImplementationOnce(fail as any);
+    syncBuiltinESMExports();
+    try { await expect(appendJsonlAtomic(p, { i: 1 }, withSource)).rejects.toMatchObject({ code: 'ENOSPC' }); }
+    finally { spy.mockRestore(); syncBuiltinESMExports(); }
+    expect((await appendJsonlAtomic(p, { i: 2 }, withSource)).msgIndex).toBe(1);
+    expect(await readJsonl(p, 0)).toEqual([{ i: 0 }, { i: 2 }]);
+  });
+
   it('invalidateLineCount forces recount from disk', async () => {
     const p = path.join(tmpDir, 'log.jsonl');
     invalidateLineCount(p);
@@ -545,5 +750,52 @@ describe('storage › appendJsonlAtomic', () => {
     invalidateLineCount(p);
     const r = await appendJsonlAtomic(p, { i: 1 });
     expect(r.msgIndex).toBe(0);
+  });
+});
+
+describe('storage › immutable append receipt reads', () => {
+  it('reads the exact Unicode/formula record after later appends without substituting the next row', async () => {
+    const file = path.join(tmpDir, 'receipt-read.jsonl');
+    const first = { id: 'first', text: '完整记录 $x^2$\n🌊'.repeat(256) };
+    const second = { id: 'second', text: 'unrelated later task' };
+    const one = await appendJsonlAtomic(file, first, true);
+    const two = await appendJsonlAtomic(file, second, true);
+    expect(await readJsonlAppendRecord(one.source!)).toEqual(first);
+    expect(await readJsonlAppendRecord(two.source!)).toEqual(second);
+  });
+
+  it.each(['replace', 'truncate', 'delete', 'same-inode edit'])(
+    'rejects a receipt after %s instead of reading another task', async failure => {
+      const file = path.join(tmpDir, 'receipt-stale.jsonl');
+      const original = { id: 'message', text: 'original' };
+      const replacement = { id: 'message', text: 'changed!' };
+      const { source } = await appendJsonlAtomic(file, original, true);
+      if (failure === 'replace') {
+        fs.writeFileSync(`${file}.new`, JSON.stringify(replacement) + '\n');
+        fs.renameSync(`${file}.new`, file);
+      } else if (failure === 'truncate') {
+        fs.truncateSync(file, 0);
+      } else if (failure === 'delete') {
+        fs.unlinkSync(file);
+      } else {
+        const inode = fs.statSync(file).ino;
+        fs.writeFileSync(file, JSON.stringify(replacement) + '\n');
+        fs.utimesSync(file, new Date(), new Date(source!.mtime + 5000));
+        expect(fs.statSync(file).ino).toBe(inode);
+        expect(fs.statSync(file).size).toBe(source!.size);
+      }
+      await expect(readJsonlAppendRecord(source!)).rejects.toThrow();
+    },
+  );
+
+  it.each([
+    { label: 'negative offset', override: { offset: -1 } },
+    { label: 'unsafe offset', override: { offset: Number.MAX_SAFE_INTEGER + 1 } },
+    { label: 'empty range', override: { bytes: 0 } },
+    { label: 'mismatched end', override: { size: 1 } },
+  ])('rejects a corrupt $label without returning stored content', async ({ override }) => {
+    const file = path.join(tmpDir, 'receipt-corrupt.jsonl');
+    const { source } = await appendJsonlAtomic(file, { text: 'private fixture body' }, true);
+    await expect(readJsonlAppendRecord({ ...source!, ...override })).rejects.toThrow();
   });
 });

@@ -17,6 +17,8 @@ import {
 } from '../../../../src/main/features/local_agents/backends/claude';
 import * as userInput from '../../../../src/main/features/local_agents/cli_user_input';
 import { ClaudeStreamDiagnostics } from '../../../../src/main/features/local_agents/backends/claude-stream-diagnostics';
+import { createModelEvalLogCollector } from '../../../../scripts/model-eval-log-policy.mjs';
+import { ingestLocalAgentLogEvent } from '../../../../scripts/local-agent-live-support.mjs';
 
 const isWindows = process.platform === 'win32';
 const itPosix = isWindows ? it.skip : it;
@@ -61,6 +63,28 @@ describe('local_agents/backends/claude › end-to-end with fake CLI', () => {
         retryDelay: isWindows ? 100 : 0,
       });
     }
+  });
+
+  it('assembles split UTF-8 diagnostics and flushes the last native warning before terminal delivery', async () => {
+    const info = JSON.stringify({ timestamp: '2031-04-17T01:02:03Z', level: 'INFO', target: 'fixture::transport', fields: { message: '中文 diagnostic' } });
+    const warning = '[claude-code:unrecognized_model] {"model":"gpt-6.1-sol","query_source":"sdk"}';
+    const fake = writeNodeExecutable(tmpDir, 'claude-split-stderr', `
+process.stdin.once('data', async () => {
+  process.stdout.write(JSON.stringify({type:'system',subtype:'init',session_id:'fixture-session'})+'\\n');
+  const bytes=Buffer.from(${JSON.stringify(info + '\r\n')});
+  for(let at=0;at<bytes.length;at+=13){process.stderr.write(bytes.subarray(at,at+13));await new Promise(resolve=>setTimeout(resolve,20));}
+  process.stderr.write(${JSON.stringify(warning)});
+  await new Promise(resolve=>setTimeout(resolve,40));
+  process.stdout.write(JSON.stringify({type:'result',subtype:'success',result:'Fixture reply.'})+'\\n');
+});`);
+    const events: any[] = [];
+    await claudeBackend.run({ binPath: fake, cwd: tmpDir, prompt: 'Complete the protocol fixture',
+      signal: new AbortController().signal, timeoutMs: 3000, onEvent: event => events.push(event) });
+    expect(events.filter(event => event.type === 'stderr-line').map(event => event.line)).toEqual([info, warning]);
+    expect(events.at(-1)).toMatchObject({ type: 'done', status: 'completed' });
+    const logs = createModelEvalLogCollector('claude/framing');
+    for (const event of events) ingestLocalAgentLogEvent(logs, event);
+    expect(logs.finish()).toMatchObject({ passed: true, requiresReview: true, coveragePassed: true, levelCounts: { warn: 1, error: 0 } });
   });
 
   it.each([false, true])('preserves streamed replies with diagnostic collection enabled=%s', async enabled => {
@@ -217,6 +241,45 @@ if (${version === '2.0.0'} && (args.includes('--include-hook-events') || args.in
     expect(done.status).toBe('completed');
     expect(done.output).toBe('  Hello world.  ');
     expect(done.sessionId).toBe('sess-fake');
+  });
+
+  it.each(['success', 'failure', 'truncated'])('preserves the final stdout record at EOF: %s', async scenario => {
+    const prefix = scenario === 'success' ? '' : [
+      { type: 'system', subtype: 'init', session_id: 'eof-session' },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'Partial reply.' }] } },
+    ].map(record => JSON.stringify(record) + '\n').join('');
+    const final = scenario === 'truncated' ? '{"type":"result","result":' : JSON.stringify({
+      type: 'result', subtype: 'success', session_id: 'eof-session',
+      result: scenario === 'success' ? '  Final 中文🙂 reply.  ' : '',
+      ...(scenario === 'failure' ? { is_error: true, errors: ['Fixture connection failed'] } : {}),
+      usage: { input_tokens: 7, output_tokens: 3 },
+    });
+    const fake = writeNodeExecutable(tmpDir, 'claude-eof', `
+process.stdin.once('data', () => {
+  process.stdout.write(${JSON.stringify(prefix)});
+  const bytes = Buffer.from(${JSON.stringify(final)});
+  const split = bytes.indexOf(Buffer.from('中')) + 1;
+  process.stdout.write(bytes.subarray(0, split));
+  setTimeout(() => process.stdout.end(bytes.subarray(split), () => process.exit(0)), 20);
+});`);
+    const events: any[] = [];
+    await claudeBackend.run({ binPath: fake, prompt: 'Complete the EOF fixture', cwd: tmpDir,
+      signal: new AbortController().signal, timeoutMs: 3_000, onEvent: event => events.push(event) });
+    expect(events.filter(event => event.type === 'done')).toHaveLength(1);
+    expect(events.at(-1)).toMatchObject({ type: 'done', sessionId: 'eof-session' });
+    if (scenario === 'success') {
+      expect(events.at(-1)).toMatchObject({ status: 'completed', output: '  Final 中文🙂 reply.  ',
+        finalMessageText: '  Final 中文🙂 reply.  ', usage: { input: 7, output: 3 } });
+      expect(events.filter(event => event.type === 'text-delta')).toEqual([]);
+    } else {
+      expect(events.filter(event => event.type === 'text-delta').map(event => event.text)).toEqual(['Partial reply.']);
+      expect(events.at(-1).status).toBe('failed');
+      if (scenario === 'failure') {
+        expect(events.at(-1)).toMatchObject({ error: 'Fixture connection failed', usage: { input: 7, output: 3 } });
+      } else {
+        expect(events).toContainEqual({ type: 'raw-line', line: final });
+      }
+    }
   });
 
   it('classifies non-JSON stdout before and after session initialization', async () => {

@@ -86,6 +86,7 @@ vi.mock('../../../../src/main/features/local_agents/backends/hermes', () => ({
 
 let tmpDir: string;
 let prevWs: string | undefined;
+let restoreCapabilities: (() => void) | undefined;
 const TEST_UID = 'u1';
 const PNG_1X1_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Wl6nKsAAAAASUVORK5CYII=';
 const MP4_FTYP = Buffer.from('000000186674797069736f6d0000020069736f6d69736f32', 'hex');
@@ -99,6 +100,14 @@ beforeEach(async () => {
   vi.resetModules();
   const users = await import('../../../../src/main/features/users');
   users.activateUser(TEST_UID);
+  // These backend tests use synthetic executable paths. Supply a successful
+  // OpenCode help probe unless the scenario explicitly injects its failure.
+  const capabilities = await import('../../../../src/main/features/local_agents/runtime_options');
+  const originalFlags = capabilities.getLocalCliSupportedFlags;
+  const capabilitySpy = vi.spyOn(capabilities, 'getLocalCliSupportedFlags').mockImplementation((entry, cwd, args) => (
+    entry.type === 'opencode' ? Promise.resolve(['--dir', '--model', '--variant']) : originalFlags(entry, cwd, args)
+  ));
+  restoreCapabilities = () => capabilitySpy.mockRestore();
   mockDetect.mockReset();
   mockCliFallback.mockReset();
   mockCliFallback.mockReturnValue(null);
@@ -116,6 +125,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  restoreCapabilities?.();
   process.env.ORKAS_WORKSPACE_ROOT = prevWs;
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -403,6 +413,19 @@ describe('local_agents/runner', () => {
     expect(serialized).not.toContain('secretText');
     expect(serialized).not.toContain('local-secret-123456');
     expect(serialized).not.toContain('local-secret-abcdef');
+  });
+
+  it('redacts Hermes tool-title paths in diagnostic dictionary keys as well as timeline values', async () => {
+    const runner = await loadRunner();
+    const stats = runner.createLocalAgentRunLogDiagnostics();
+    for (const phase of ['use', 'result']) runner.recordLocalAgentEventForLog(stats, {
+      type: 'tool-event', tool: 'read: /Users/test/private-project/secret.txt', phase,
+    });
+    const summary = runner.summarizeLocalAgentRunForLog(stats);
+    expect(JSON.stringify(summary)).not.toContain('/Users/test');
+    expect(JSON.stringify(summary)).not.toContain('private-project');
+    expect(summary.toolEvents).toBe(2);
+    expect(Object.values(summary.toolCounts as object)).toEqual([{ use: 1, result: 1, other: 0 }]);
   });
 
   it('emits missing_cli when registry reports unavailable', async () => {
@@ -792,6 +815,40 @@ describe('local_agents/runner', () => {
       expect(capabilities).toHaveBeenCalledTimes(2);
       expect(result).toMatchObject({ status: 'completed', output: 'compatible fallback completed' });
     } finally { capabilities.mockRestore(); if (previous === undefined) delete process.env.ORKAS_BRIDGE_DISABLED; else process.env.ORKAS_BRIDGE_DISABLED = previous; }
+  });
+
+  it.each([undefined, 'provider/model'])('stops OpenCode before dispatch on failed help and permits a later retry (model=%s)', async modelOverride => {
+    mockDetect.mockResolvedValue({ type: 'opencode', available: true, path: '/fake/opencode', version: '2.2.6' });
+    const capabilities = vi.spyOn(await import('../../../../src/main/features/local_agents/runtime_options'), 'getLocalCliSupportedFlags')
+      .mockRejectedValueOnce(new Error('PRIVATE_PROBE_OUTPUT'))
+      .mockResolvedValue(['--model', '--standalone']);
+    const backend = vi.fn(async ({ onEvent }: any) => onEvent({ type: 'done', status: 'completed', output: 'recovered' }));
+    mockOpencodeBackendImpl = backend;
+    const previous = process.env.ORKAS_BRIDGE_DISABLED;
+    process.env.ORKAS_BRIDGE_DISABLED = '1';
+    try {
+      const runner = await loadRunner();
+      const events: any[] = [];
+      const options = { uid: TEST_UID, cid: 'c-opencode-probe-retry', agentId: 'agent-x', cli: 'opencode' as const,
+        prompt: 'fixture', cwd: tmpDir, modelOverride, signal: new AbortController().signal,
+        resumeSessionId: 'existing-session', resumeFallbackPrompt: 'retained history', onEvent: (e: any) => events.push(e) };
+      const failed = await runner.run(options);
+      expect(failed.status).toBe('failed');
+      expect(failed.error).toContain('OpenCode');
+      expect(failed.error).not.toContain('PRIVATE_PROBE_OUTPUT');
+      expect(backend).not.toHaveBeenCalled();
+      expect(mockCliFallback).not.toHaveBeenCalled();
+      expect(events.filter(e => e.type === 'done')).toEqual([
+        expect.objectContaining({ status: 'failed', failureKind: 'cli_compatibility', retrySafe: false }),
+      ]);
+      const recovered = await runner.run(options);
+      expect(recovered).toMatchObject({ status: 'completed', output: 'recovered' });
+      expect(backend).toHaveBeenCalledTimes(1);
+    } finally {
+      capabilities.mockRestore();
+      if (previous === undefined) delete process.env.ORKAS_BRIDGE_DISABLED;
+      else process.env.ORKAS_BRIDGE_DISABLED = previous;
+    }
   });
 
   it('cancels promptly while shared capability discovery is still pending', async () => {
@@ -1244,6 +1301,20 @@ describe('local_agents/runner', () => {
     }
   });
 
+  it('provides host-only Bridge observations for an opaque CLI without adding public tool events', async () => {
+    mockDetect.mockResolvedValue({type:'openclaw',available:true,path:'/fake/openclaw',version:'2026.4.11'});
+    mockOpenclawBackendImpl=async ({bridge,onEvent})=>{
+      expect((await callRunnerBridge(bridge,'skills.list',{})).ok).toBe(true);
+      onEvent({type:'done',status:'completed',output:'Ready'});
+    };
+    const runner=await loadRunner();const observed:any[]=[];const events:any[]=[];
+    const result=await runner.run({uid:TEST_UID,cid:'c-observe',agentId:'agent-observe',currentMessageId:'observe-trigger',cli:'openclaw',
+      prompt:'List available Skills',cwd:tmpDir,signal:new AbortController().signal,onEvent:event=>events.push(event),
+      onBridgeCallObserved:observation=>observed.push(observation)});
+    expect(result.status).toBe('completed');expect(observed).toEqual([{method:'skills.list',params:{},ok:true}]);
+    expect(events.some(event=>event.type==='tool-event')).toBe(false);
+  });
+
   it('forwards file publication through the live runner bridge without changing file bytes', async () => {
     mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
     const output = path.join(tmpDir, 'report.txt');
@@ -1606,6 +1677,128 @@ describe('local_agents/runner', () => {
     }
   });
 
+  // A CLI that exits on its own explains why on stderr (sign-in, config,
+  // provider). The user needs that text to act; analytics only needs the stage.
+  it.each([
+    {
+      label: 'before any output',
+      events: [] as any[],
+      done: { type: 'done', status: 'failed', error: 'claude exited with code 1' },
+      category: 'cli_failed_before_output',
+    },
+    {
+      label: 'after output started',
+      events: [{ type: 'text-delta', text: 'Starting the task.' }],
+      done: { type: 'done', status: 'failed', error: 'claude exited with code 1' },
+      category: 'cli_failed_after_output',
+    },
+    {
+      label: 'when the process cannot start',
+      events: [] as any[],
+      done: { type: 'done', status: 'failed', error: 'spawn EACCES', failureKind: 'cli_spawn', retrySafe: true },
+      category: 'cli_spawn_failed',
+    },
+  ])('returns the redacted stderr excerpt and failure stage $label', async ({ events, done, category }) => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockCliFallback.mockReturnValue(null);
+    const privateToken = 'sk-proj-local-agent-secret-123456789';
+    mockBackendImpl = async ({ onEvent }) => {
+      for (const event of events) onEvent(event);
+      onEvent({
+        ...done,
+        // Only the last three lines are kept; the first is older context.
+        stderrTail: [
+          'older context line',
+          '\u001b[31mError: no provider credentials\u001b[0m',
+          `config /Users/test/.claude/settings.json api_key=${privateToken}`,
+          'Run `claude /login` and try again.',
+          '',
+        ].join('\n'),
+      });
+    };
+
+    const runner = await loadRunner();
+    const result = await runner.run({
+      uid: TEST_UID, cid: `c-stderr-${category}`, agentId: 'agent-x',
+      cli: 'claude', prompt: 'run', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+
+    expect(result.status).toBe('failed');
+    expect(result.failureCategory).toBe(category);
+    expect(result.stderrExcerpt).toContain('Error: no provider credentials');
+    expect(result.stderrExcerpt).toContain('Run `claude /login` and try again.');
+    expect(result.stderrExcerpt).not.toContain('older context line');
+    expect(result.stderrExcerpt).not.toContain('\u001b[');
+    expect(result.stderrExcerpt).not.toContain('/Users/alice');
+    expect(result.stderrExcerpt).not.toContain(privateToken);
+  });
+
+  it('bounds the stderr excerpt to its end, keeps a lone reason, and omits empty stderr', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    // A long tail is bounded to its end, where the reason is; its first
+    // retained line is partial and must not appear.
+    const privateToken = 'sk-proj-local-agent-secret-123456789';
+    let tail = `api_key=${privateToken} ${'w'.repeat(8_000)}\n${'x'.repeat(2_000)}\nfinal reason`;
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'done', status: 'failed', error: 'claude exited with code 1', stderrTail: tail });
+    };
+    const runner = await loadRunner();
+    const run = () => runner.run({
+      uid: TEST_UID, cid: 'c-stderr-bounds', agentId: 'agent-x',
+      cli: 'claude', prompt: 'run', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+    const long = await run();
+    expect(long.stderrExcerpt!.length).toBeLessThanOrEqual(401);
+    expect(long.stderrExcerpt!.startsWith('…')).toBe(true);
+    expect(long.stderrExcerpt!.endsWith('final reason')).toBe(true);
+    expect(long.stderrExcerpt).not.toContain('w');
+    expect(long.stderrExcerpt).not.toContain(privateToken);
+
+    // A CLI that prints one short reason and exits (the common startup case).
+    tail = 'Error: no inference provider configured. Run setup, then try again.\n';
+    const lone = await run();
+    expect(lone.stderrExcerpt).toBe('Error: no inference provider configured. Run setup, then try again.');
+
+    tail = ' \n\n ';
+    const empty = await run();
+    expect(empty).not.toHaveProperty('stderrExcerpt');
+    expect(empty.failureCategory).toBe('cli_failed_before_output');
+  });
+
+  it('classifies a failure after a completed tool as after-output work', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'tool-event', tool: 'read_files', phase: 'use', callId: 'read-completed', input: {} });
+      onEvent({ type: 'tool-event', tool: 'read_files', phase: 'result', callId: 'read-completed', text: 'Done.' });
+      onEvent({ type: 'done', status: 'failed', error: 'test interruption' });
+    };
+    const runner = await loadRunner();
+    const result = await runner.run({ uid: TEST_UID, cid: 'c-completed-tool-failure', agentId: 'agent-x',
+      cli: 'claude', prompt: 'run', cwd: tmpDir, signal: new AbortController().signal, onEvent: () => {} });
+    expect(result.failureCategory).toBe('cli_failed_after_output');
+  });
+
+  it('reports no failure stage or stderr for a completed run', async () => {
+    mockDetect.mockResolvedValue({ type: 'claude', available: true, path: '/fake/claude', version: '2.0.0' });
+    mockBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'done', status: 'completed', output: 'done', stderrTail: 'warning: slow network' });
+    };
+    const runner = await loadRunner();
+    const result = await runner.run({
+      uid: TEST_UID, cid: 'c-stderr-completed', agentId: 'agent-x',
+      cli: 'claude', prompt: 'run', cwd: tmpDir,
+      signal: new AbortController().signal,
+      onEvent: () => {},
+    });
+    expect(result.status).toBe('completed');
+    expect(result).not.toHaveProperty('failureCategory');
+    expect(result).not.toHaveProperty('stderrExcerpt');
+  });
+
   it('keeps useful tool metadata while stripping private command, path, and body data before forwarding and persistence', async () => {
     const privateToken = 'sk-proj-local-agent-secret-123456789';
     const opaqueToken = 'opaque-secret-value';
@@ -1729,6 +1922,31 @@ describe('local_agents/runner', () => {
     }
   });
 
+  it.each([['codex', 'WARN'], ['codex', 'ERROR'], ['openclaw', 'WARN'], ['openclaw', 'ERROR']] as const)('retains authoritative native %s/%s severity when private diagnostic text is capped', async (format, level) => {
+    const runner = await loadRunner();
+    const { createModelEvalLogCollector } = await import('../../../../scripts/model-eval-log-policy.mjs');
+    const { ingestLocalAgentLogEvent } = await import('../../../../scripts/local-agent-live-support.mjs');
+    const source = format === 'codex' ? 'fixture::transport' : 'agent/embedded';
+    const fields = { path: '/Users/test/private', token: 'PRIVATE_SECRET', message: 'Synthetic diagnostic sentence. '.repeat(300) };
+    const line = JSON.stringify(format === 'codex'
+      ? { timestamp: '2031-04-17T01:02:03Z', level, target: source, fields }
+      : { time: '2031-04-17T01:02:03Z', level, subsystem: source, message: fields.message, path: fields.path, token: fields.token });
+    const event = runner.redactPrivateLocalAgentEvent({ type: 'stderr-line', line });
+    expect(String(event.line)).toHaveLength(4097);
+    expect(JSON.stringify(event)).not.toContain('/Users/test');
+    expect(JSON.stringify(event)).not.toContain('PRIVATE_SECRET');
+    const logs = createModelEvalLogCollector('public-diagnostic');
+    ingestLocalAgentLogEvent(logs, event);
+    const analysis = logs.finish();
+    expect(analysis).toMatchObject({ coveragePassed: true, passed: level === 'WARN',
+      levelCounts: { warn: level === 'WARN' ? 1 : 0, error: level === 'ERROR' ? 1 : 0 } });
+    expect(analysis.findings.some(finding => finding.code === 'unclassified-stderr')).toBe(false);
+    expect(event.nativeLog).toEqual({ level: level.toLowerCase(), source, timestamp: '2031-04-17T01:02:03.000Z' });
+    const untrusted = runner.redactPrivateLocalAgentEvent({ type: 'stderr-line', line: 'Unclassified diagnostic',
+      nativeLog: { level: 'info', source: 'forged', timestamp: '2031-04-17T01:02:03Z' } });
+    expect(untrusted.nativeLog).toBeUndefined();
+  });
+
   it('marks nested Windows traversal as display-only metadata', async () => {
     const runner = await loadRunner();
     const event = runner.redactPrivateLocalAgentEvent({
@@ -1756,7 +1974,7 @@ describe('local_agents/runner', () => {
 
     const serialized = JSON.stringify(event);
     expect(serialized).not.toContain('PRIVATE_WRITE_BODY');
-    expect(serialized).not.toContain('/Users/alice');
+    expect(serialized).not.toContain('/Users/test');
     expect(event).toMatchObject({
       type: 'permission-request', id: 'req-1', tool: 'Write', autoDecided: 'allow', reason: 'full_access',
     });
@@ -1774,7 +1992,7 @@ describe('local_agents/runner', () => {
     });
     expect(status).toMatchObject({ type: 'status', status: 'background-started', taskId: 'bz0apow42' });
     expect((status as any).message).toContain('Run npm test');
-    expect((status as any).message).not.toContain('/Users/alice');
+    expect((status as any).message).not.toContain('/Users/test');
 
     const idle = runner.redactPrivateLocalAgentEvent({
       type: 'idle',
@@ -1784,7 +2002,7 @@ describe('local_agents/runner', () => {
     expect((idle as any).stalledMs).toBe(95_000);
     expect((idle as any).waitingOn[0].taskId).toBe('bz0apow42');
     expect((idle as any).waitingOn[0].label).toContain('Run npm test');
-    expect((idle as any).waitingOn[0].label).not.toContain('/Users/alice');
+    expect((idle as any).waitingOn[0].label).not.toContain('/Users/test');
 
     // Negative controls: events without free text keep their exact shape.
     const anonymousIdle = { type: 'idle', stalledMs: 95_000 };
@@ -1801,7 +2019,7 @@ describe('local_agents/runner', () => {
 
     expect(error).toContain('Selected model is at capacity');
     expect(error).not.toContain('secret-value');
-    expect(error).not.toContain('/Users/alice');
+    expect(error).not.toContain('/Users/test');
     expect(runner.sanitizePublicCliError('   ')).toBe('');
   });
 
@@ -2238,11 +2456,11 @@ describe('local_agents/runner', () => {
         expect(e.waitingOn).toHaveLength(1);
         expect(e.waitingOn[0].taskId).toBe('bz0apow42');
         expect(e.waitingOn[0].label).toContain('Start Web dev server on :9000');
-        expect(e.waitingOn[0].label).not.toContain('/Users/alice');
+        expect(e.waitingOn[0].label).not.toContain('/Users/test');
       }
       const statusRow = events.find(e => e.type === 'status' && e.status === 'background-running');
       expect(statusRow?.message).toContain('Start Web dev server on :9000');
-      expect(statusRow?.message).not.toContain('/Users/alice');
+      expect(statusRow?.message).not.toContain('/Users/test');
 
       // Once the task closes, the wait goes back to being anonymous rather
       // than naming a task that is no longer holding anything.
@@ -2446,6 +2664,38 @@ describe('local_agents/runner', () => {
     expect(fs.existsSync(path.join(
       tmpDir, TEST_UID, 'local', 'tool-results', `cli-codex-${result.runId}`,
     ))).toBe(false);
+  });
+
+  it('reports a generated-image save failure without publishing an unowned file event', async () => {
+    mockDetect.mockResolvedValue({ type: 'codex', available: true, path: '/fake/codex', version: '1.2.3' });
+    mockCodexBackendImpl = async ({ onEvent }) => {
+      onEvent({ type: 'tool-event', tool: 'image_generation', callId: 'image-failed', phase: 'result', output: PNG_1X1_BASE64 });
+      onEvent({ type: 'done', status: 'completed', output: 'Image generated.', durationMs: 1 });
+    };
+    const runner = await loadRunner();
+    const nativeFs = (await import('node:fs')).default;
+    const { syncBuiltinESMExports } = await import('node:module');
+    const originalWrite = nativeFs.writeFileSync;
+    const fault = vi.spyOn(nativeFs, 'writeFileSync').mockImplementation(((file: any, data: any, ...args: any[]) => {
+      if (typeof file === 'string' && path.basename(file).startsWith('.generated-attachments.json.')) {
+        originalWrite(file, '[');
+        throw Object.assign(new Error('Controlled generated ownership failure'), { code: 'ENOSPC' });
+      }
+      return (originalWrite as any)(file, data, ...args);
+    }) as any);
+    syncBuiltinESMExports();
+    const events: any[] = [];
+    const cid = 'c-failed-generated-ownership';
+    try {
+      await runner.run({ uid: TEST_UID, cid, agentId: 'a', cli: 'codex', prompt: 'generate an image', cwd: tmpDir,
+        signal: new AbortController().signal, onEvent: event => events.push(event) });
+    } finally { fault.mockRestore(); syncBuiltinESMExports(); }
+    expect(events.find(event => event.type === 'tool-event' && event.callId === 'image-failed'))
+      .toMatchObject({ error: 'generated_image_save_failed', output: 'Generated image could not be saved by Orkas.' });
+    expect(events.filter(event => event.type === 'file-change')).toEqual([]);
+    const attachments = await import('../../../../src/main/features/chat_attachments');
+    expect(attachments.listAttachments(TEST_UID, cid)).toEqual([]);
+    expect(attachments.listPendingAttachments(TEST_UID, cid)).toEqual([]);
   });
 
   it('materializes CLI media privately, keeps safe remote images, and rejects paths outside cwd', async () => {

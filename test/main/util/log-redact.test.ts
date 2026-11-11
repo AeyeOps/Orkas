@@ -7,12 +7,31 @@ import {
   fileToolBuildRef,
   logErrorRef,
   logErrorSummary,
+  logPathRef,
+  logPathRefs,
   maskId,
   safeUrlAction,
   sanitizeLogText,
 } from '../../../src/main/util/log-redact';
 
 describe('log-redact', () => {
+  it('summarizes local and legacy cloud paths without exposing filenames or ids', () => {
+    const ref = logPathRef('cloud/chats/private-conversation-title.jsonl');
+    expect(ref).toMatchObject({ domain: 'chats', depth: 3, ext: '.jsonl' });
+    expect(ref.path_hash).toMatch(/^[a-f0-9]{12}$/);
+    expect(JSON.stringify(ref)).not.toContain('private-conversation-title');
+    const refs = logPathRefs([
+      'local/config/private-connector-name.json',
+      'cloud/agents/agent-secret-name/agent.json',
+    ]);
+    expect(refs.count).toBe(2);
+    expect(JSON.stringify(refs)).not.toContain('private-connector-name');
+    expect(JSON.stringify(refs)).not.toContain('agent-secret-name');
+    const relative = logPathRef('private-filename.md');
+    expect(relative).toMatchObject({ domain: 'relative', ext: '.md' });
+    expect(JSON.stringify(relative)).not.toContain('private-filename');
+  });
+
   it('identifies different file-tool builds without logging source bytes or inventing a partial build id', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'file-tool-build-'));
     const sources = [
@@ -77,6 +96,14 @@ describe('log-redact', () => {
     expect(serialized).not.toContain('/Users/test');
     expect(serialized).not.toContain('Private Clips');
     expect(serialized).not.toContain('not-a-directory');
+  });
+
+  it('keeps malformed Basic authentication private in failed-request diagnostics', () => {
+    const value = Buffer.from('synthetic-only').toString('base64');
+    const ref = logErrorRef(new Error(`request rejected Authorization: Basic ${value}`));
+    expect(ref.message).toBe('request rejected Authorization: Basic ***');
+    expect(JSON.stringify(ref)).not.toContain(value);
+    expect(sanitizeLogText('falling back to basic retrieval')).toBe('falling back to basic retrieval');
   });
 
   it('preserves safe URLs adjacent to cloud paths while redacting secrets', () => {

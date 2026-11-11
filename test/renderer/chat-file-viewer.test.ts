@@ -92,6 +92,50 @@ describe('chat-file-viewer › _kindOf', () => {
 });
 
 describe('file preview availability feedback', () => {
+  it.each([
+    ['archive.zip', 'Download report.pdf', false],
+    ['ARCHIVE.ZIP', 'Archive', true],
+    ['README', 'Read me', false],
+  ])('shows the fallback in the owner without opening a preview for %s', async (name, label, confirm) => {
+    const path = `/fixture/${name}`;
+    const open = vi.fn();
+    const image = vi.fn();
+    const invoke = vi.fn(async () => ({ ok: true, exists: true, isFile: true }));
+    const uiConfirm = vi.fn(async () => confirm);
+    const context = vm.createContext({
+      window: { orkas: { invoke }, OrkasPreviewWindows: { open, image, options: (value: unknown) => value } },
+      uiConfirm,
+    });
+    vm.runInContext(readFileSync(require.resolve('../../src/renderer/modules/chat-file-viewer.js'), 'utf8'), context);
+    await context.openChatFileViewer(path, label, { cid: 'task', projectId: 'project' });
+    expect(uiConfirm).toHaveBeenCalledExactlyOnceWith({
+      message: `Cannot preview ${name === 'README' ? '(no extension)' : '.zip'} files in app. Open the containing folder?`,
+      okLabel: 'Open Folder', cancelLabel: 'Close',
+    });
+    expect(open).not.toHaveBeenCalled();
+    expect(image).not.toHaveBeenCalled();
+    expect(invoke.mock.calls).toEqual([
+      ['workspace.statPath', { path, cid: 'task', projectId: 'project' }],
+      ...(confirm ? [['workspace.revealPath', { path, cid: 'task', projectId: 'project' }]] : []),
+    ]);
+  });
+
+  it('reports a missing unsupported file without opening a preview or offering to reveal it', async () => {
+    const open = vi.fn();
+    const uiConfirm = vi.fn();
+    const uiToast = vi.fn();
+    const context = vm.createContext({
+      window: { orkas: { invoke: vi.fn(async () => ({ ok: true, exists: false })) },
+        OrkasPreviewWindows: { open, options: (value: unknown) => value } },
+      uiConfirm, uiToast,
+    });
+    vm.runInContext(readFileSync(require.resolve('../../src/renderer/modules/chat-file-viewer.js'), 'utf8'), context);
+    await context.openChatFileViewer('/fixture/missing.zip', 'missing.zip');
+    expect(uiToast).toHaveBeenCalledExactlyOnceWith('The file no longer exists.', { variant: 'warning' });
+    expect(uiConfirm).not.toHaveBeenCalled();
+    expect(open).not.toHaveBeenCalled();
+  });
+
   it.each(['stat', 'reveal', 'reveal-response'])('keeps private file details out of %s failure diagnostics', async (failure) => {
     const privatePath = '/private/account/todo/brief.png';
     const privateError = `EACCES: ${privatePath}`;
@@ -105,7 +149,7 @@ describe('file preview availability feedback', () => {
       throw new Error(privateError);
     });
     const openChatImageLightbox = vi.fn();
-    const context = vm.createContext({
+    const context = vm.createContext({ clearTimeout, setTimeout,
       window: { orkas: { invoke } },
       createLogger: () => ({ warn: (...args: unknown[]) => warnings.push(args), info: () => {}, error: () => {} }),
       uiConfirm: vi.fn(async () => true),
@@ -139,7 +183,7 @@ describe('file preview availability feedback', () => {
       setAttribute: vi.fn(),
     };
     const setDirty = vi.fn();
-    const context = vm.createContext({
+    const context = vm.createContext({ clearTimeout, setTimeout,
       window: { orkas: { invoke }, OrkasPreviewHost: { setDirty } },
       createLogger: () => ({ warn: (...args: unknown[]) => warnings.push(args), info: () => {}, error: () => {} }),
       uiConfirm: vi.fn(async () => false),
@@ -180,7 +224,7 @@ describe('file preview availability feedback', () => {
     const uiToast = vi.fn();
     const uiConfirm = vi.fn(async () => false);
     const openChatImageLightbox = vi.fn();
-    const context = vm.createContext({
+    const context = vm.createContext({ clearTimeout, setTimeout,
       window: { orkas: { invoke } }, uiToast, uiConfirm, openChatImageLightbox,
       console,
     });
@@ -258,6 +302,25 @@ describe('chat-file-viewer › _viewerCanAddToLibrary', () => {
     expect(_viewerCanAddToLibrary('/tmp/voice.mp3', { projectScoped: true })).toBe(false);
     expect(_viewerCanAddToLibrary('/tmp/archive.zip')).toBe(false);
     expect(_viewerCanAddToLibrary('/tmp/no-extension')).toBe(false);
+  });
+});
+
+describe('file-backed native video entry', () => {
+  it.each([true, false])('preserves file validation and playback context when normalizing a video source: exists=%s', async (exists) => {
+    const open = vi.fn();
+    const context: any = vm.createContext({ clearTimeout, setTimeout,
+      window: { orkas: { invoke: async () => ({ ok: true, exists, isFile: true }) },
+        OrkasPreviewWindows: { open, options: (value: unknown) => value } },
+      uiToast: vi.fn(),
+    });
+    vm.runInContext(readFileSync(require.resolve('../../src/renderer/modules/chat-file-viewer.js'), 'utf8'), context);
+    await context.openChatFileViewer('/fixture/clip.mp4', 'Clip', { cid: 'task', projectId: 'project', autoplay: true, startTime: 2 });
+    if (exists) expect(open).toHaveBeenCalledWith({ kind: 'video', src: 'chat-media://local/fixture/clip.mp4', title: 'Clip',
+      options: { cid: 'task', projectId: 'project', autoplay: true, startTime: 2, absPath: '/fixture/clip.mp4' } });
+    else {
+      expect(open).not.toHaveBeenCalled();
+      expect(context.uiToast).toHaveBeenCalledOnce();
+    }
   });
 });
 

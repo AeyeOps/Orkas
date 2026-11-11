@@ -20,6 +20,7 @@ if (!['win32', 'darwin', 'linux'].includes(process.platform)) {
 // runs after dependency provisioning in the platform-specific Windows and
 // Linux lanes because it requires downloaded FFmpeg, model, and native payloads.
 const commonSuites = [
+  'test/main/windows-install-data-root.test.ts',
   'test/main/util/ensure-dev-dependencies.test.ts',
   'test/main/util/verify-native-dependencies.test.ts',
   'test/main/util/ensure-sqlite-electron-abi.test.ts',
@@ -29,12 +30,14 @@ const commonSuites = [
   'src/core-agent/test/process-session.test.ts',
   'src/core-agent/test/workspace-state.test.ts',
   'src/core-agent/test/sandbox.test.ts',
+  'src/core-agent/test/windows-cleanup-batch.test.ts',
   'test/main/model/core-agent/file-tools.test.ts',
   'test/main/model/core-agent/tool-result-tools.test.ts',
   'test/main/model/core-agent/local-tools.test.ts',
   'test/main/model/core-agent/html-preview-tool.test.ts',
   'test/main/features/html_preview.test.ts',
   'test/main/features/connectors/local-cli.test.ts',
+  'test/main/features/connectors/local-cli-stdio-adapter.test.ts',
   'test/main/model/local-tools.test.ts',
   'test/main/model/core-agent/video-studio-state-tool.test.ts',
   'test/main/model/core-agent/image-studio-tool.test.ts',
@@ -42,30 +45,42 @@ const commonSuites = [
   'test/main/model/core-agent/pdf-tools.test.ts',
   'test/main/features/office/office_engine.test.ts',
   'test/main/features/notification_permissions.test.ts',
+  'test/main/features/connectors/mcp-client.test.ts',
+  'test/main/util/shutdown.test.ts',
+  'test/main/features/desktop_background.test.ts',
+  'test/main/features/desktop_shutdown.test.ts',
+  'test/main/features/login_startup_boot.test.ts',
+  'test/main/features/login_startup.test.ts',
+  'test/main/util/app-tray.test.ts',
   'test/main/features/generation_reference_assets.test.ts',
   'test/main/index-process.test.ts',
   'test/main/features/local_agents/base.test.ts',
+  'test/main/features/local_agents/bridge_skill_runner.test.ts',
   'test/main/features/local_agents/spawn-command.test.ts',
   'test/main/features/local_agents/version.test.ts',
   'test/main/features/local_agents/upgrade.test.ts',
   'test/main/util/bundled-runtime.test.ts',
   'test/main/util/run-skill.test.ts',
+  'test/main/util/orkas-pkg.test.ts',
+  'test/main/util/sharp-runtime.test.ts',
   'test/main/features/packages.test.ts',
   'test/main/util/extract-xls.test.ts',
   'test/main/util/media_probe.test.ts',
   'test/main/features/video_studio_native_qa.test.ts',
   'test/main/features/video_studio_delivery.test.ts',
   'test/main/paths.test.ts',
-  'test/main/install-data-root.test.ts',
+  'test/main/util/migrate-source-data-root.test.ts',
   'test/main/features/web_assist_passkey.test.ts',
 ];
 
 const platformSuites = process.platform === 'win32'
   ? [
       'test/main/features/connectors/local-cli-lark-contract.test.ts',
-      'test/main/features/connectors/local-cli-stdio-adapter.test.ts',
       'test/main/util/prepare-win-native-deps.test.ts',
       'test/main/util/fetch-win-vc-runtime.test.ts',
+      'test/main/util/windows-shutdown-processes.test.ts',
+      'test/main/util/windows-installer-processes.test.ts',
+      'test/main/util/nsis-installer-processes.test.ts',
     ]
   : process.platform === 'darwin'
     ? [

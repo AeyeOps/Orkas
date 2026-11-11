@@ -16,7 +16,7 @@ Orkas 为持续推进的项目而设计，而不只是回答一次提问。**项
 [![X: @leochenpm](https://img.shields.io/badge/X-%40leochenpm-black?logo=x)](https://x.com/leochenpm)
 [![官网：orkas.ai](https://img.shields.io/badge/Website-orkas.ai-5b57d6)](https://orkas.ai/?source=gh-orkas)
 
-[English](./README.md) · [简体中文](./README.zh-CN.md)
+[English](./README.md) · [简体中文](./README.zh-CN.md) · [日本語](./README.ja.md)
 
 ---
 
@@ -49,7 +49,7 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 | 内容与媒体 | **ContentWriter** | 将目标、来源或初稿写成可发布的帖子、文章、简报与案例 |
 | | **PptMaker** | 从主题、大纲或文档制作可编辑、可审核的 PPTX 幻灯片 |
 | | **ImageStudio** | 海报、封面、社媒图片与信息图 |
-| | **VideoStudio** | 视频制作与编辑，包括旁白、AI 主播、字幕、配音、片段提取与本地化 |
+| | **VideoStudio** | 视频制作与编辑，包括旁白、AI 主播、字幕、配音、片段提取、本地化，以及用自己的内容和素材复刻参考视频 |
 | | **VoiceStudio** | 旁白、多角色音频、转写与字幕、音频编辑和混音 |
 | | **UIDesigner** | 从产品目标、PRD、截图或 Figma 素材制作以 HTML 为主的可编辑 UI |
 | 开发与办公 | **ProductDeveloper** | 理解代码仓库，落实 PRD、修复缺陷、重构和审查代码，交付可验证的结果 |
@@ -63,6 +63,16 @@ https://github.com/user-attachments/assets/4f8b16c8-a192-45a4-b19f-80e8d02c3dab
 了解各智能体 → [orkas.ai/agents](https://orkas.ai/agents/?source=gh-orkas)
 
 </details>
+
+### 用自己的内容和素材复刻参考视频
+
+**VideoStudio** 可以参考爆款视频的叙事结构、视觉风格和剪辑节奏，换成你的产品、文案与素材制作新片。提供参考视频文件和自己的素材后，智能体会分析钩子、信息顺序、画面节拍与行动引导，先列出保留和替换的部分，再进入制作。
+
+适合文字动效讲解、SaaS 或 App 演示，以及用已有商品素材重做广告。单独制作的文字、字幕、配音和片段可以分别修改；AI 生成画面里嵌入的文字需要修改对应画面。
+
+> “参考 reference.mp4 做一条 30 秒竖屏宣传片，保留它的钩子、字体风格和节奏，换成我的产品与录屏。先给我看拆解和制作方案。”
+
+需要提供智能体可读取的视频文件，暂未内置社交平台分享链接下载；不保证精确运镜、真人表演或逐帧还原。详见[参考复刻工作流](./resources/builtin/marketplace/agents/79df9cc89f5f/skills/video-craft/references/reference-recreation.md)。
 
 ---
 
@@ -135,6 +145,8 @@ Orkas 将你已安装的 CLI 智能体作为本地会话运行，与内置专业
 | --- | --- | --- |
 | **Claude Code** | Anthropic 的编程智能体，可在终端、IDE、桌面和网页中使用，基于 Claude 模型。 | 两者不是二选一：Orkas 把 Claude Code 作为团队中的一个智能体来运行；在此之上，Orkas 提供不绑定模型的智能体团队，处理代码之外的工作（研究、内容、视频等），并用项目、待办和自动化让工作持续推进。[Orkas 与 Claude Code 对比 →](https://orkas.ai/compare/orkas-vs-claude-code/?source=gh-orkas) |
 | **Codex** | OpenAI 的编程智能体，可在终端、编辑器和云端使用。 | 两者不是二选一：Orkas 把 Codex 作为其中一个智能体来运行，与 Claude Code、OpenCode 并列。指挥官可以把编码交给 Codex、把审查交给另一个智能体，再完成发布中代码之外的部分（文档、发布帖和视频）。[Orkas 与 Codex 对比 →](https://orkas.ai/compare/orkas-vs-codex/?source=gh-orkas) |
+| **Claude Cowork** | Anthropic 面向日常工作的智能体，现已并入 Claude，可在桌面、网页和手机上使用，需要付费 Claude 套餐。默认在 Anthropic 云端运行，基于 Claude 模型。 | Claude Cowork 的开源（MIT）替代方案，可免费开始，赠送 500 积分。智能体在你的电脑上运行，数据默认保存在本地，模型可以用内置 Orkas 模型、自己的服务商 Key 或本地端点。指挥官还能调动 Claude Code、Codex 等 CLI 智能体。代价是 Orkas 需要电脑保持唤醒，而 Cowork 的云端任务可以不依赖你的电脑继续运行。[Claude Cowork 替代方案 →](https://orkas.ai/compare/claude-cowork-alternatives/?source=gh-orkas) |
+| **Manus** | 默认在 Manus 云端规划并执行任务的 AI 智能体。桌面应用 Manus Studio（macOS 和 Windows）也可以在你选择的文件夹中工作，但任务仍在云端规划。 | Manus 的开源（MIT）替代方案。智能体在你的电脑上运行，数据默认保存在本地，模型可以用内置 Orkas 模型、自己的服务商 Key 或本地端点，并用项目、待办和自动化让工作持续推进。代价是 Orkas 需要电脑保持唤醒，而 Manus 的云端任务可以不依赖你的电脑继续运行。[开源 Manus 替代方案 →](https://orkas.ai/open-source-manus-alternative/?source=gh-orkas) |
 | **LangChain** | 面向开发者的 LLM 应用与智能体框架，通过代码嵌入 Python/JS 应用。 | Orkas 是通过对话指挥的桌面应用，数据默认保存在本地。 |
 | **CrewAI** | 通过 Python 代码定义团队与角色、编排自治智能体的框架。 | Orkas 将多智能体编排做成桌面应用，内置项目、待办、自动化与各智能体的经验积累。 |
 | **OpenClaw** | 提供消息渠道集成、多智能体路由和子智能体能力的个人智能体平台。 | Orkas 提供面向成品交付的桌面工作区，内置专业智能体，并协调 Claude Code、Codex、OpenCode 等 CLI 智能体；OpenClaw 也可作为其中一员接入。 |

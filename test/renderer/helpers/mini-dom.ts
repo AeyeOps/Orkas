@@ -110,9 +110,10 @@ export class MiniElement extends MiniNode {
     this.localName = tag.toLowerCase();
     const attr = (key: string) => 'data-' + key.replace(/[A-Z]/g, c => '-' + c.toLowerCase());
     this.dataset = new Proxy({} as Record<string, string>, {
-      get: (_t, key: string) => this.attributes.get(attr(key)),
+      // Assertion libraries probe objects with symbols while diffing them.
+      get: (_t, key) => (typeof key === 'string' ? this.attributes.get(attr(key)) : undefined),
       set: (_t, key: string, value) => { this.setAttribute(attr(key), String(value)); return true; },
-      has: (_t, key: string) => this.attributes.has(attr(key)),
+      has: (_t, key) => typeof key === 'string' && this.attributes.has(attr(key)),
     });
   }
   get tagName(): string { return this.localName.toUpperCase(); }
@@ -162,6 +163,21 @@ export class MiniElement extends MiniNode {
     this.childNodes.push(node);
     return node;
   }
+  cloneNode(deep = false): MiniElement {
+    const copy = new MiniElement(this.ownerDocument, this.localName);
+    for (const [name, value] of this.attributes) copy.setAttribute(name, value);
+    Object.assign(copy.style, this.style);
+    if (deep) for (const child of this.childNodes) copy.appendChild(child instanceof MiniElement
+      ? child.cloneNode(true) : new MiniText(this.ownerDocument, child.textContent));
+    return copy;
+  }
+  replaceChild<T extends MiniNode>(next: MiniNode, previous: T): T {
+    if (previous.parentNode !== this) throw new Error('Child not found');
+    next.remove();
+    const index = this.childNodes.indexOf(previous);
+    this.childNodes[index] = next; next.parentNode = this; previous.parentNode = null;
+    return previous;
+  }
   append(...nodes: Array<MiniNode | string>): void {
     for (const node of nodes) this.appendChild(typeof node === 'string' ? new MiniText(this.ownerDocument, node) : node);
   }
@@ -172,6 +188,14 @@ export class MiniElement extends MiniNode {
   contains(node: MiniNode | null): boolean {
     for (let current = node; current; current = current.parentNode) if (current === this) return true;
     return false;
+  }
+  insertAdjacentHTML(position: 'afterbegin' | 'beforeend', html: string): void {
+    const holder = new MiniElement(this.ownerDocument, this.localName);
+    parseInto(holder, String(html));
+    const nodes = [...holder.childNodes];
+    for (const node of nodes) { node.remove(); node.parentNode = this; }
+    if (position === 'afterbegin') this.childNodes.unshift(...nodes);
+    else this.childNodes.push(...nodes);
   }
   descendants(): MiniElement[] { return this.children.flatMap(child => [child, ...child.descendants()]); }
   matches(selector: string): boolean { return splitList(selector).some(item => matchComplex(this, item)); }
@@ -185,6 +209,7 @@ export class MiniElement extends MiniNode {
   blur(): void { if (this.ownerDocument.activeElement === this) this.ownerDocument.activeElement = this.ownerDocument.body; }
   click(): void { if (!this.disabled) this.dispatchEvent(new MiniEvent('click', { bubbles: true })); }
   getBoundingClientRect() { return { top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 }; }
+  scrollIntoView(): void { /* layout is out of scope */ }
 }
 
 export class MiniDocument {

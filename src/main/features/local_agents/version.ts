@@ -25,7 +25,8 @@ export const MIN_VERSIONS: Readonly<Record<LocalCliType, string>> = {
   // compatibility.
   codex: '0.145.0',
   // OpenCode's run --auto --format json transport, session continuation and
-  // per-run MCP configuration are validated from this release line.
+  // per-run MCP configuration are validated from this release line. 2.x
+  // (checked against 2.2.6) differs in `run` flags, adapted from its help.
   opencode: '1.18.0',
   // The native configuration/MCP overlay is verified against 2026.4.11;
   // see openclaw.ts and the zero-model canaries recorded in 92a3944ff.
@@ -109,7 +110,42 @@ export type VersionProbeResult =
  * intentionally grouped as `failed`; callers only need a distinct timeout
  * state for accurate user-facing recovery copy.
  */
+let activeProbes = 0;
+const probeWaiters: Array<() => void> = [];
+async function acquireProbe(waitMs: number): Promise<(() => void) | null> {
+  if (activeProbes < 2) activeProbes += 1;
+  else {
+    const admitted = await new Promise<boolean>(resolve => {
+      const next = () => { clearTimeout(timer); resolve(true); };
+      const timer = setTimeout(() => {
+        const index = probeWaiters.indexOf(next);
+        if (index >= 0) probeWaiters.splice(index, 1);
+        resolve(false);
+      }, waitMs);
+      timer.unref?.();
+      probeWaiters.push(next);
+    });
+    if (!admitted) return null;
+  }
+  return () => {
+    const next = probeWaiters.shift();
+    if (next) next();
+    else activeProbes -= 1;
+  };
+}
+
 export async function detectVersionResult(
+  binPath: string,
+  timeoutMs = 5000,
+  versionArgs: readonly string[] = ['--version'],
+): Promise<VersionProbeResult> {
+  const release = await acquireProbe(timeoutMs);
+  if (!release) return { status: 'timeout', version: null };
+  try { return await probeVersion(binPath, timeoutMs, versionArgs); }
+  finally { release(); }
+}
+
+async function probeVersion(
   binPath: string,
   timeoutMs = 5000,
   versionArgs: readonly string[] = ['--version'],
