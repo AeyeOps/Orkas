@@ -23,6 +23,7 @@ import {
 import { enabledPackageSkillRoots, packageSkillRoots, readPackagesRegistry } from '../../features/packages';
 import { companionSkillsRootIfPopulated, companionPackageForDir } from '../../features/package_skills';
 import { getActiveUserId } from '../../features/users';
+import { listWorkingDirectories } from '../../features/working_directories';
 import { registerUserSwitchHook } from '../../features/user-switch-hooks';
 import { getLanguage, getGlobalSkillRootsEnabled } from '../../features/config';
 import { descriptionLang } from '../../i18n';
@@ -43,8 +44,8 @@ async function getPickDescription(): Promise<PickDescription> {
   return _pickDescription;
 }
 
-export type SkillSourceLabel = 'builtin' | 'platform' | 'custom' | 'external' | 'global' | 'unknown';
-export type SkillSelectionSource = 'marketplace' | 'custom' | 'external' | 'global';
+export type SkillSourceLabel = 'builtin' | 'platform' | 'custom' | 'external' | 'global' | 'directory' | 'unknown';
+export type SkillSelectionSource = 'marketplace' | 'custom' | 'external' | 'global' | 'directory';
 export interface SkillSelectionRef {
   id: string;
   name?: string;
@@ -165,6 +166,7 @@ const SOURCE_DEDUPE_RANK: Record<SkillSourceLabel, number> = {
   custom: 2,
   external: 3,
   global: 4,
+  directory: 4,
   unknown: 99,
 };
 
@@ -384,6 +386,7 @@ async function renderSkillLines(
     return Math.ceil(quarters / 4);
   };
   const labelOf = (s: SkillSpec): string => {
+    if (s.directory) return `directory (${JSON.stringify(s.directory)})`;
     const cached = labels.get(s);
     if (cached !== undefined) return cached;
     const trusted = skillSourceLabelForSpec(s);
@@ -504,7 +507,7 @@ async function renderSkillLines(
 type CoreAgent = typeof import('#core-agent');
 type SkillLoaderCtor = CoreAgent['SkillLoader'];
 type SkillLoaderInstance = InstanceType<SkillLoaderCtor>;
-type SkillSpec = ReturnType<SkillLoaderInstance['list']>[number];
+type SkillSpec = ReturnType<SkillLoaderInstance['list']>[number] & { directory?: string; directory_id?: string };
 
 function agentPrivateSkillRoots(uid: string, agentId: string): string[] {
   if (!agentId) return [];
@@ -706,6 +709,7 @@ registerUserSwitchHook('skill-registry', () => {
   _trustedLoader = null;
   _openLoader = null;
   _agentPrivateLoaders = new Map();
+  directorySkillLoaders = new Map();
 });
 
 interface OpenTierDirs { external: string[]; global: string[] }
@@ -791,10 +795,48 @@ const SKILL_SEARCH_HINT =
 const SKILL_SEARCH_DEFAULT_LIMIT = 5;
 const SKILL_SEARCH_MAX_LIMIT = 10;
 
+type DirectorySkillSpec = SkillSpec & { directory: string; directory_id: string };
+let directorySkillLoaders = new Map<string, SkillLoaderInstance>();
+
+async function loadDirectorySkillSpecs(uid: string, directoryIds?: readonly string[]): Promise<DirectorySkillSpec[]> {
+  const directories = listWorkingDirectories(uid).filter(row => directoryIds === undefined || directoryIds.includes(row.id));
+  const { SkillLoader } = await import('#core-agent');
+  const specs: DirectorySkillSpec[] = [];
+  for (const directory of directories) {
+    const seen = new Set<string>();
+    for (const folder of ['.agents', '.claude', '.codex']) {
+      const root = path.join(directory.path, folder, 'skills');
+      if (!fs.existsSync(root)) continue;
+      let loader = directorySkillLoaders.get(root);
+      if (!loader) {
+        loader = new SkillLoader({ dirs: [root] });
+        directorySkillLoaders.set(root, loader);
+      }
+      for (const spec of loader.list()) {
+        const entry = fs.realpathSync(spec.skillFile);
+        if (seen.has(entry)) continue;
+        seen.add(entry);
+        specs.push({ ...spec, id: `${directory.id}:${folder.slice(1)}:${spec.id}`, directory: directory.path, directory_id: directory.id });
+      }
+    }
+  }
+  return specs;
+}
+
+export async function listDirectorySkills(uid: string, directoryIds?: readonly string[]): Promise<BridgeSkillRow[]> {
+  const specs = await loadDirectorySkillSpecs(uid, directoryIds);
+  const pick = await getPickDescription();
+  return specs.filter(spec => !spec.ownerAgent).map(spec => ({
+    id: spec.id, name: spec.name || spec.id, description: compactPromptDescription(pick(spec, descriptionLang(getLanguage()))),
+    source: 'directory', dir: spec.dir, skillFile: spec.skillFile, directory: spec.directory, directory_id: spec.directory_id,
+  }));
+}
+
 export interface AvailableSkillSearchRow {
   name: string;
   id: string;
-  source: 'builtin' | 'platform' | 'custom' | 'external' | 'global';
+  source: 'builtin' | 'platform' | 'custom' | 'external' | 'global' | 'directory';
+  directory?: string;
   /** Absolute entry file. The caller replaces it with a run-scoped read ref. */
   read_path: string;
   description: string;
@@ -820,6 +862,7 @@ export async function searchAvailableSkills(
   disabledIds?: Iterable<string>,
   offset = 0,
   excludedRefs?: Iterable<string>,
+  directoryIds?: readonly string[],
 ): Promise<AvailableSkillSearchResult> {
   if (!Number.isSafeInteger(offset) || offset < 0) {
     throw new RangeError('skill search offset must be a non-negative safe integer');
@@ -828,7 +871,7 @@ export async function searchAvailableSkills(
   const disabled = disabledIds ? new Set(disabledIds) : null;
   const excluded = excludedRefs ? new Set([...excludedRefs].map(normalize)) : null;
   const isExcluded = (spec: SkillSpec): boolean => !!excluded && (
-    excluded.has(normalize(spec.id)) || excluded.has(normalize(spec.name || spec.id))
+    excluded.has(normalize(spec.id)) || (!spec.directory && excluded.has(normalize(spec.name || spec.id)))
   );
   type Candidate = { spec: SkillSpec; source: AvailableSkillSearchRow['source'] };
   const candidates: Candidate[] = [];
@@ -860,17 +903,23 @@ export async function searchAvailableSkills(
     }
   }
 
+  const directorySpecs = await loadDirectorySkillSpecs(uid, directoryIds);
+  for (const spec of directorySpecs) {
+    if (!spec.ownerAgent && !disabled?.has(spec.id) && !isExcluded(spec)) candidates.push({ spec, source: 'directory' });
+  }
   const sourceRank: Record<AvailableSkillSearchRow['source'], number> = {
     builtin: 0,
     platform: 1,
     custom: 2,
     external: 3,
     global: 4,
+    directory: 4,
   };
   candidates.sort((a, b) => sourceRank[a.source] - sourceRank[b.source]);
   const seenIds = new Set<string>();
   const seenNames = new Set<string>();
-  const deduped = candidates.filter(({ spec }) => {
+  const deduped = candidates.filter(({ spec, source }) => {
+    if (source === 'directory') return true;
     const name = (spec.name || spec.id).trim();
     const nameKey = name.normalize('NFKC').toLocaleLowerCase();
     if (seenIds.has(spec.id) || seenNames.has(nameKey)) return false;
@@ -908,7 +957,7 @@ export async function searchAvailableSkills(
     const fullDesc = pick(spec, lang) || pickPromptDescription(spec) || '';
     const normalizedName = normalize(name);
     const normalizedId = normalize(spec.id);
-    const hay = normalize(`${name}\n${spec.id}\n${spec.description_zh || ''}\n${spec.description_en || ''}`);
+    const hay = normalize(`${name}\n${spec.id}\n${spec.description_zh || ''}\n${spec.description_en || ''}\n${spec.directory || ''}`);
     let score = 0;
     if (q && (normalizedName === q || normalizedId === q)) score += 10_000;
     else if (q && normalizedName.includes(q)) score += 2_000 + q.length;
@@ -934,6 +983,7 @@ export async function searchAvailableSkills(
       name,
       id: spec.id,
       source,
+      ...(spec.directory ? { directory: spec.directory } : {}),
       read_path: path.resolve(spec.skillFile),
       description: compactPromptDescription(fullDesc),
     };
@@ -942,6 +992,7 @@ export async function searchAvailableSkills(
 }
 
 export interface SystemPromptBlockOptions {
+  directoryIds?: readonly string[];
   /**
    * Commander/non-Agent callers render every trusted Skill when undefined and
    * an exact subset when present. For a named Agent, missing and empty both
@@ -1014,7 +1065,7 @@ export interface SystemPromptBlockOptions {
  */
 export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}): Promise<string> {
   const loader = await getLoader();
-  const specs = loader.list();
+  const specs: SkillSpec[] = loader.list();
   const disabled = opts.disabledIds ? new Set(opts.disabledIds) : null;
   const filterDisabled = (list: typeof specs) =>
     disabled && disabled.size ? list.filter((s) => !disabled.has(s.id)) : list;
@@ -1137,8 +1188,14 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
         return true;
       });
     const selectableTrustedSpecs = filterDisabled(specs);
-    const selectableSpecs = [...selectableTrustedSpecs, ...selectableOpenSpecs];
-    const selectedSourceOf = (s: SkillAllowlistRef): SkillSelectionSource | null => {
+    const directorySpecs = filterDisabled(await loadDirectorySkillSpecs(uid, opts.directoryIds));
+    for (const spec of directorySpecs) {
+      openRankByRoot.set(path.resolve(spec.source), SOURCE_DEDUPE_RANK.directory);
+      addPromptRoot(`directory (${JSON.stringify(spec.directory)})`, spec.source);
+    }
+    const selectableSpecs = [...selectableTrustedSpecs, ...selectableOpenSpecs, ...directorySpecs];
+    const selectedSourceOf = (s: SkillSpec): SkillSelectionSource | null => {
+      if (s.directory) return 'directory';
       const openSource = openSourceByRoot.get(path.resolve(s.source || ''));
       if (openSource) return openSource;
       const label = skillSourceLabelForSpec(s);
@@ -1169,6 +1226,7 @@ export async function getSystemPromptBlock(opts: SystemPromptBlockOptions = {}):
       }
       matches.sort((a, b) => selectionRank(a) - selectionRank(b));
       const selected = matches[0];
+      if (!selected && selection.source === 'directory') throw new Error('The selected project skill is no longer available in this task’s directories.');
       // A source-aware selection is exact-or-missing. Never substitute a
       // same-id Skill from another tier when the chosen tier disappeared.
       if (!selected) continue;
@@ -1306,6 +1364,8 @@ export async function getSystemSkillsPromptBlock(
 }
 
 export interface BridgeSkillRow {
+  directory?: string;
+  directory_id?: string;
   id: string;
   name: string;
   description: string;
@@ -1332,7 +1392,7 @@ export const APP_AUTHORING_SYSTEM_SKILLS: readonly string[] = ['web-app-sdk'];
  * matches `getSystemPromptBlock` (trusted shadows external). The disabled-id
  * filter is the caller's job (bridge.ts passes the component-enabled set).
  */
-export async function listSkillsForBridge(uid: string, agentId = ''): Promise<BridgeSkillRow[]> {
+export async function listSkillsForBridge(uid: string, agentId = '', directoryIds?: readonly string[]): Promise<BridgeSkillRow[]> {
   const loader = await getLoader(uid);
   const lang = descriptionLang(getLanguage());
   const pick = await getPickDescription();
@@ -1389,7 +1449,8 @@ export async function listSkillsForBridge(uid: string, agentId = ''): Promise<Br
   const systemDirs = new Set(authoringSpecs.map(s => s.dir));
   specs = [...authoringSpecs, ...specs.filter(s => !authoringSpecs.some(a =>
     a.id === s.id || (a.name || a.id).toLowerCase() === (s.name || s.id).toLowerCase()))];
-  return specs.map((s) => {
+  const directorySpecs = (await loadDirectorySkillSpecs(uid, directoryIds)).filter(s => !s.ownerAgent || s.ownerAgent === agentId);
+  return [...specs, ...directorySpecs].map((s) => {
     const openRank = rankByRoot.get(path.resolve(s.source));
     const source = systemDirs.has(s.dir) ? 'system' : privateDirs.has(s.dir) || s.ownerAgent ? 'agent'
       : openRank === SOURCE_DEDUPE_RANK.external ? 'external' : skillSourceLabelForSpec(s, uid);
@@ -1397,7 +1458,8 @@ export async function listSkillsForBridge(uid: string, agentId = ''): Promise<Br
       id: s.id,
       name: s.name || s.id,
       description: compactPromptDescription(pick(s, lang)),
-      source,
+      source: s.directory ? 'directory' : source,
+      ...(s.directory ? { directory: s.directory, directory_id: s.directory_id } : {}),
       dir: s.dir,
       skillFile: s.skillFile,
     };
@@ -1468,6 +1530,7 @@ export async function invalidateSkills(): Promise<void> {
   const trusted = _trustedLoader;
   _trustedLoader = null;
   _openLoader = null;
+  directorySkillLoaders = new Map();
   for (const loader of _agentPrivateLoaders.values()) loader.invalidate();
   _agentPrivateLoaders = new Map();
   if (trusted) {

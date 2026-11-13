@@ -101,6 +101,8 @@ export interface AgentHandoffAdmission {
 }
 
 export interface StateFile {
+  working_directory?: string;
+  directory_ids?: string[];
   version: 1;
   status: GroupStatus;
   last_active_at: string;
@@ -1261,7 +1263,7 @@ export async function setCodingProjectDirOnce(
   return _stateLock(uid, cid).runExclusive(async () => {
     const s = await readState(uid, cid);
     const trimmed = String(dir || '').trim();
-    if (s.coding_project_dir || s.coding_project_dir_pending || !trimmed) return { state: s, applied: false };
+    if (s.working_directory || s.coding_project_dir || s.coding_project_dir_pending || !trimmed) return { state: s, applied: false };
     writeCodingDirectory(uid, cid, trimmed, opts.explicit);
     Object.assign(s, readCodingDirectory(uid, cid));
     return { state: s, applied: true };
