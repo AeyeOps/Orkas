@@ -66,6 +66,7 @@ import { MIN_NATIVE_MODEL_CONTEXT_WINDOW, modelContextWindowBelowMinimum } from 
 import { isBearerTokenHeaderSafe } from '../util/http-authorization';
 import { safeExternalUserActionUrl } from '../util/window-security';
 import { getActiveUserId, hasActiveUser } from './users';
+import { getDeviceId } from './machine_device_id';
 import {
   FEATURED_API_PROVIDERS,
   OAUTH_PROVIDERS,
@@ -2038,6 +2039,15 @@ export function openExternalUrl(url: string): { ok: boolean; error?: string } {
   return { ok: true };
 }
 
+/** The installation id in the dashed UUID form the library's sign-in flows take.
+ *  An id stored in another form is passed as it is. */
+function installationUuid(): string {
+  return getDeviceId().replace(
+    /^([0-9a-f]{8})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{4})([0-9a-f]{12})$/i,
+    '$1-$2-$3-$4-$5',
+  );
+}
+
 export async function startOAuth(
   providerId: string,
   label?: string,
@@ -2143,7 +2153,7 @@ export async function startOAuth(
         if (!isLiveOAuthFlow(flow)) return;
         flow.status = { kind: 'progress', message };
       },
-    })
+    }, { getDeviceId: installationUuid })
     .then((credentials) => {
       if (!isLiveOAuthFlow(flow)) {
         if (!flow.abortController.signal.aborted) flow.status = { kind: 'error', error: 'cancelled' };
