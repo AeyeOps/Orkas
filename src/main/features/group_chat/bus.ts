@@ -1051,6 +1051,11 @@ interface WorkerState {
    * durable board records for result/dependency linkage, but do not start a
    * second execution and settle with this turn's host-observed outcome. */
   absorbedTaskIds: Set<string>;
+  /** User messages delivered into this live turn: updates the runtime
+   * confirmed as steered, and answers to the CLI's own questions. A resumed
+   * CLI session already holds them, so the next turn's history delta leaves
+   * them out. */
+  deliveredMessageIds: Set<string>;
   /** Resolves after the execution fully unwinds (turn + settlement). Deletion
    * paths await these before removing conversation files so Windows never
    * observes an in-flight writer under the directory being deleted. */
@@ -1857,7 +1862,10 @@ async function saveCliUserAnswer(
   };
   if (!existing) await appendMain(uid, cid, reply, { senderKind: 'user', senderId: USER_ID, agentIds: [actorId] });
   const state = _cids.get(cidKey(uid, cid));
-  if (state) emit(state, { type: 'message', cid, msg: reply });
+  if (state) {
+    _executionForActor(state, actorId)?.deliveredMessageIds.add(reply.id);
+    emit(state, { type: 'message', cid, msg: reply });
+  }
   return reply;
 }
 
@@ -4673,6 +4681,7 @@ function _startExecution(
     currentTurnIngress: null, currentTurnSteerPump: null,
     currentTurnSteerRequested: false, currentTurnSteerOptions: null,
     absorbedTaskIds: new Set(),
+    deliveredMessageIds: new Set(),
     item,
   };
   state.executions.set(item.turnId, w);
@@ -5079,6 +5088,7 @@ async function _prepareRichSteer(
     onApplied: async () => {
       const index = w.queue.indexOf(item);
       if (index >= 0) w.queue.splice(index, 1);
+      w.deliveredMessageIds.add(item.msgId);
       // A row created by an ordinary busy send already has a durable task.
       // Convert it only after the active runtime has committed the update;
       // preparation/transport failure therefore leaves the original queued
@@ -6548,9 +6558,7 @@ async function runActorTurnWithDisplay(
       }
     }
     try {
-      const historyBoundaryId = item.failedTurnRetryMode === 'restart' && item.retrySourceMessageId
-        ? item.retrySourceMessageId
-        : item.msgId;
+      const historyBoundaryId = _cliHistoryBoundaryId(item);
       const cliSessions = await import('../local_agents/sessions');
       const storedBinding = await cliSessions.getBinding(
         uid, cid, actor.id, cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '',
@@ -8023,7 +8031,8 @@ async function runActorTurnWithDisplay(
       cid,
       actor.id,
       cliHistorySync.cli,
-      persistedMsg.id,
+      _cliHistoryBoundaryId(item),
+      [...w.deliveredMessageIds],
     );
   }
 
@@ -8711,6 +8720,7 @@ async function runNestedDispatch(
     currentTurnIngress: null, currentTurnSteerPump: null,
     currentTurnSteerRequested: false, currentTurnSteerOptions: null,
     absorbedTaskIds: new Set(),
+    deliveredMessageIds: new Set(),
   };
   const dispatchMessage: GroupMessage = {
     id: genId12(),
@@ -10688,7 +10698,10 @@ async function _runCliAgentTurn(opts: {
     opts.item,
     opts.canonicalRows,
     opts.language,
-    storedBinding?.historySyncedThroughMessageId,
+    {
+      throughMessageId: storedBinding?.historySyncedThroughMessageId,
+      deliveredMessageIds: storedBinding?.historyDeliveredMessageIds,
+    },
     opts.projectId,
   );
   const cwdFingerprint = fingerprintCliContext(path.resolve(opts.workingDir));
@@ -11390,7 +11403,7 @@ async function _buildCliContextPlan(
   item: QueueItem,
   canonicalRows: GroupMessage[],
   language: Lang,
-  historyCursorMessageId?: string,
+  historySync: { throughMessageId?: string; deliveredMessageIds?: readonly string[] },
   projectId?: string,
 ): Promise<CliContextPlan> {
   // Slash commands must remain the literal turn input so the CLI's native
@@ -11488,8 +11501,8 @@ async function _buildCliContextPlan(
     projectContext,
     language,
   });
-  const history = _priorCliHistory(item, canonicalRows)
-    .filter(_isCanonicalCliHistoryMessage);
+  const prior = _priorCliHistory(item, canonicalRows);
+  const history = prior.filter(_isCanonicalCliHistoryMessage);
   const actorNames = new Map<string, string>();
   try {
     const members = await readMembers(uid, cid);
@@ -11501,11 +11514,21 @@ async function _buildCliContextPlan(
     });
   }
   const historyTurns = _buildCliHistoryTurns(uid, history, actorNames, attDir);
-  const cursorIndex = historyCursorMessageId
-    ? history.findIndex((message) => message.id === historyCursorMessageId)
+  const cursorIndex = historySync.throughMessageId
+    ? prior.findIndex((message) => message.id === historySync.throughMessageId)
     : -1;
+  const delivered = new Set(historySync.deliveredMessageIds);
   const deltaTurns = cursorIndex >= 0
-    ? _buildCliHistoryTurns(uid, history.slice(cursorIndex + 1), actorNames, attDir)
+    ? _buildCliHistoryTurns(
+      uid,
+      prior.slice(cursorIndex + 1).filter((message) => (
+        _isCanonicalCliHistoryMessage(message)
+        && message.from !== agent.agent_id
+        && !delivered.has(message.id)
+      )),
+      actorNames,
+      attDir,
+    )
     : historyTurns;
   const recoveryContext = buildCliConversationContext({
     turns: historyTurns,
@@ -11542,6 +11565,7 @@ export async function _buildCliContextPlanForTest(
   projectId?: string,
   options: {
     historyCursorMessageId?: string;
+    historyDeliveredMessageIds?: readonly string[];
     language?: Lang;
   } = {},
 ): Promise<CliContextPlan> {
@@ -11552,18 +11576,26 @@ export async function _buildCliContextPlanForTest(
     item,
     messages,
     options.language ?? resolveLanguageForUser(uid),
-    options.historyCursorMessageId,
+    {
+      throughMessageId: options.historyCursorMessageId,
+      deliveredMessageIds: options.historyDeliveredMessageIds,
+    },
     projectId,
   );
 }
 
-function _priorCliHistory(item: QueueItem, rows: GroupMessage[]): GroupMessage[] {
-  // On a deliberate retry restart, the authoritative task body already
-  // contains the original request. Bridge only conversation context before
-  // that request; replaying the failed attempt would undermine the restart.
-  const boundaryId = item.failedTurnRetryMode === 'restart' && item.retrySourceMessageId
+/** The message a CLI turn's prior history stops before, whose body is the
+ * turn's task. On a deliberate retry restart the task body already contains
+ * the original request, so history stops before that request: replaying the
+ * failed attempt would undermine the restart. */
+function _cliHistoryBoundaryId(item: QueueItem): string {
+  return item.failedTurnRetryMode === 'restart' && item.retrySourceMessageId
     ? item.retrySourceMessageId
     : item.msgId;
+}
+
+function _priorCliHistory(item: QueueItem, rows: GroupMessage[]): GroupMessage[] {
+  const boundaryId = _cliHistoryBoundaryId(item);
   const idx = rows.findIndex((m) => m.id === boundaryId);
   return idx >= 0 ? rows.slice(0, idx) : rows;
 }

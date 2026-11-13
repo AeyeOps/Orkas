@@ -65,9 +65,14 @@ export interface CliSessionRecord {
   turnId?: string;
   runId?: string;
   terminalStatus?: string;
-  /** Canonical visible reply through which this CLI session was successfully
-   * synchronized. Updated only after that reply is durably appended. */
+  /** Last conversation message delivered to this CLI session: the message the
+   * latest successful turn's history stopped before, whose body was that
+   * turn's task. A resumed turn sends what other actors wrote after it.
+   * Updated only after that turn's visible reply is durably appended. */
   historySyncedThroughMessageId?: string;
+  /** Messages after `historySyncedThroughMessageId` that this session already
+   * received: the user messages steered into that turn while it ran. */
+  historyDeliveredMessageIds?: string[];
 }
 
 interface CliSessionsFile {
@@ -155,10 +160,7 @@ export async function setSessionId(
   return _serialized(uid, cid, async () => {
   const file = await read(uid, cid);
   const previous = file[aid];
-  const preservedHistoryCursor = previous?.cli === cli
-    && previous.sessionId === sessionId
-    ? previous.historySyncedThroughMessageId
-    : undefined;
+  const sameSession = previous?.cli === cli && previous.sessionId === sessionId ? previous : undefined;
   file[aid] = {
     cli,
     sessionId,
@@ -175,8 +177,11 @@ export async function setSessionId(
       ? { contextProtocolVersion: provenance.contextProtocolVersion }
       : {}),
     ...(provenance.permissionPolicy ? { permissionPolicy: provenance.permissionPolicy } : {}),
-    ...(preservedHistoryCursor
-      ? { historySyncedThroughMessageId: preservedHistoryCursor }
+    ...(sameSession?.historySyncedThroughMessageId
+      ? { historySyncedThroughMessageId: sameSession.historySyncedThroughMessageId }
+      : {}),
+    ...(sameSession?.historyDeliveredMessageIds
+      ? { historyDeliveredMessageIds: [...sameSession.historyDeliveredMessageIds] }
       : {}),
   };
   try { await write(uid, cid, file); }
@@ -186,26 +191,32 @@ export async function setSessionId(
   });
 }
 
-/** Advance canonical-history delivery only after a successful visible CLI
- * reply has been persisted. Failed, cancelled, timed-out, and slash-command
- * turns deliberately leave the prior cursor untouched. */
+/** Advance canonical-history delivery to `messageId`, the last message the
+ * turn's history delivered, only after a successful visible CLI reply has
+ * been persisted. `deliveredMessageIds` are the later user messages steered
+ * into the turn. Failed, cancelled, timed-out, and slash-command turns
+ * deliberately leave the prior cursor untouched. */
 export async function markHistorySyncedThrough(
   uid: string,
   cid: string,
   aid: string,
   cli: string,
   messageId: string,
+  deliveredMessageIds: readonly string[],
 ): Promise<void> {
   if (!messageId) return;
   return _serialized(uid, cid, async () => {
   const file = await read(uid, cid);
   const current = file[aid];
   if (!current || current.cli !== cli || !current.sessionId) return;
-  file[aid] = {
+  const next: CliSessionRecord = {
     ...current,
     historySyncedThroughMessageId: messageId,
     updatedAt: new Date().toISOString(),
   };
+  if (deliveredMessageIds.length) next.historyDeliveredMessageIds = [...deliveredMessageIds];
+  else delete next.historyDeliveredMessageIds;
+  file[aid] = next;
   try { await write(uid, cid, file); }
   catch (err) {
     log.warn('markHistorySyncedThrough failed', { user_id: maskId(uid), cid: maskId(cid), agent_id: maskId(aid), error: logErrorRef(err) });
