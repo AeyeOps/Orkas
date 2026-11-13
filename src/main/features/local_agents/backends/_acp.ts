@@ -584,11 +584,13 @@ export function handleAcpMessage(env: any, h: AcpHandlers): void {
     if (kind === 'tool_call_update') {
       const tool = upd.tool && typeof upd.tool === 'object' ? upd.tool : {};
       const callId = String(upd.toolCallId || tool.id || tool.callId || '');
-      h.onToolResult({
-        name: String(upd.title || tool.name || 'tool'),
-        callId,
-        output: acpToolOutput(upd, tool),
-      });
+      if (acpToolUpdateEndsCall(upd, tool)) {
+        h.onToolResult({
+          name: String(upd.title || tool.name || 'tool'),
+          callId,
+          output: acpToolOutput(upd, tool),
+        });
+      }
       emitAcpMedia(upd, callId, h);
       return;
     }
@@ -624,6 +626,15 @@ export function handleAcpMessage(env: any, h: AcpHandlers): void {
       return;
     }
   }
+}
+
+/** Whether a tool update carries the call's outcome. An agent may first send
+ * updates that only refine the call's title, kind or progress. An update with
+ * a status ends the call when that status is `completed` or `failed`. One
+ * without a status ends it when it carries output or content. */
+function acpToolUpdateEndsCall(upd: any, tool: any): boolean {
+  if (typeof upd.status === 'string') return upd.status === 'completed' || upd.status === 'failed';
+  return upd.rawOutput !== undefined || tool.output !== undefined || Array.isArray(upd.content);
 }
 
 function acpToolOutput(upd: any, tool: any): string {
