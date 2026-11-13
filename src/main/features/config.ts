@@ -33,6 +33,15 @@ export interface CommanderAvatar {
   color: string;
 }
 
+export type ModelReasoningEffort = 'minimal' | 'low' | 'medium' | 'high';
+
+export interface ModelRequestSettings {
+  /** Reasoning level for a call that names none. */
+  reasoning_effort?: ModelReasoningEffort;
+  /** Sent as the request's `service_tier` field. */
+  service_tier?: string;
+}
+
 export interface UserPreferences {
   language?: Lang;
   /** Per-user commander avatar (icon id + color id). Tokens come from
@@ -52,6 +61,11 @@ export interface UserPreferences {
    * to commander open-tier skill search. Missing means enabled, preserving
    * the historical open-source behavior. */
   global_skill_roots_enabled?: boolean;
+  /** Request settings per model, keyed `<provider>/<model>` as a model entry
+   * stores the pair. They apply to providers the model library serves; a
+   * custom model keeps the effort saved on its own profile. No screen writes
+   * this key. Reads go through `getModelRequestSettings`. */
+  model_request_settings?: Record<string, ModelRequestSettings>;
   /** Per-field update clocks used by cloud-sync to merge independent
    * preference changes without treating the whole JSON file as one blob. */
   _field_updated_at?: Record<string, number>;
@@ -201,6 +215,49 @@ export function setCommanderAvatar(avatar: CommanderAvatar): CommanderAvatar {
   const next: CommanderAvatar = { icon, color: avatar.color };
   writePreferences({ commander_avatar: next });
   return next;
+}
+
+const MODEL_REASONING_EFFORTS: readonly unknown[] = ['minimal', 'low', 'medium', 'high'];
+const MODEL_REQUEST_SETTING_KEYS: readonly string[] = ['reasoning_effort', 'service_tier'];
+
+function isJsonObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function isModelReasoningEffort(value: unknown): value is ModelReasoningEffort {
+  return MODEL_REASONING_EFFORTS.includes(value);
+}
+
+/** The request settings saved for one model, empty when none are saved.
+ * Throws when the saved value cannot be applied as written. */
+export function getModelRequestSettings(providerId: string, modelId: string): ModelRequestSettings {
+  const saved: unknown = readPreferences().model_request_settings;
+  if (saved === undefined) return {};
+  if (!isJsonObject(saved)) {
+    throw new Error('preferences: model_request_settings must be an object keyed by <provider>/<model>');
+  }
+  const key = `${providerId}/${modelId}`;
+  const settings = saved[key];
+  if (settings === undefined) return {};
+  const where = `preferences: model_request_settings["${key}"]`;
+  if (!isJsonObject(settings)) throw new Error(`${where} must be an object`);
+  const unknownKey = Object.keys(settings).find((name) => !MODEL_REQUEST_SETTING_KEYS.includes(name));
+  if (unknownKey !== undefined) throw new Error(`${where} has no setting named "${unknownKey}"`);
+  const { reasoning_effort: reasoningEffort, service_tier: serviceTier } = settings;
+  const result: ModelRequestSettings = {};
+  if (reasoningEffort !== undefined) {
+    if (!isModelReasoningEffort(reasoningEffort)) {
+      throw new Error(`${where}.reasoning_effort must be minimal, low, medium or high`);
+    }
+    result.reasoning_effort = reasoningEffort;
+  }
+  if (serviceTier !== undefined) {
+    if (typeof serviceTier !== 'string' || serviceTier === '') {
+      throw new Error(`${where}.service_tier must be a non-empty string`);
+    }
+    result.service_tier = serviceTier;
+  }
+  return result;
 }
 
 // ── Metacognition (self-evolution) toggle ────────────────────────────────

@@ -65,6 +65,7 @@ import {
 import * as projectTasks from '../../features/project_tasks';
 import * as conversationTaskBoard from '../../features/group_chat/task_board';
 import * as metacognition from '../../features/metacognition';
+import { getModelRequestSettings, type ModelRequestSettings } from '../../features/config';
 import { appendAgentSkill, listAgentSummaries } from '../../features/agents';
 const log = createLogger('model/runner');
 const REFLECTION_TOOL_NAMES = new Set(['metacognition', 'skill_manage']);
@@ -122,6 +123,7 @@ import {
   buildCustomResponsesModel,
   createCustomOpenAICompatibleProvider,
   omitReservedOutputLimitForProvider,
+  withServiceTier,
 } from './external-providers';
 import { withTaskBudget } from './task-budget-provider';
 import { createRotatingProvider, type RotatingCandidate } from './rotating-provider';
@@ -1838,6 +1840,7 @@ async function buildRotatingProvider(
       : resolvedModel?.model;
     const candidateMaxTokens = candidateModel?.maxTokens;
     const maxInputImages = modelInputImageLimit(candProviderId, candModelId, candidateModel);
+    const requestSettings: ModelRequestSettings = isExternal ? {} : getModelRequestSettings(candProviderId, candModelId);
     let currentApiKey = choice.apiKey;
     return {
       profileId: choice.profileId,
@@ -1879,9 +1882,13 @@ async function buildRotatingProvider(
           apiKey: currentApiKey,
             onPayload: omitReservedOutputLimitForProvider(
             candProviderId,
-            buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
+            withServiceTier(
+              requestSettings.service_tier,
+              buildNativeSearchOnPayload(candProviderId, candModelId, onNativeSearchInjected),
+            ),
           ),
           googleNativeSearch: shouldUseGoogleNativeSearch,
+          ...(requestSettings.reasoning_effort ? { defaultReasoning: requestSettings.reasoning_effort } : {}),
         }), cid);
       },
     };
