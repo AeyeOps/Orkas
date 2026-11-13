@@ -10,6 +10,7 @@
 import type {
   Api,
   AuthPrompt,
+  LoginOptions,
   Model,
   OAuthCredential,
   OAuthCredentials,
@@ -45,7 +46,7 @@ export interface OAuthLoginCallbacks {
 export interface OAuthProviderInterface {
   readonly id: string;
   readonly name: string;
-  login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
+  login(callbacks: OAuthLoginCallbacks, options?: LoginOptions): Promise<OAuthCredentials>;
   usesCallbackServer?: boolean;
   refreshToken(credentials: OAuthCredentials, signal?: AbortSignal): Promise<OAuthCredentials>;
   getApiKey(credentials: OAuthCredentials): string;
@@ -190,8 +191,8 @@ async function builtinProviders(): Promise<Map<string, OAuthProviderInterface>> 
           id: provider.id,
           name: oauth.name,
           usesCallbackServer: !['github-copilot'].includes(provider.id),
-          async login(callbacks) {
-            return stripCredentialType(await oauth.login(interactionFromCallbacks(callbacks)));
+          async login(callbacks, options) {
+            return stripCredentialType(await oauth.login(interactionFromCallbacks(callbacks), options));
           },
           async refreshToken(credentials, signal) {
             const refreshed = await oauth.refresh(
