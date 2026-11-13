@@ -150,6 +150,18 @@ export function omitReservedOutputLimitForProvider(
   };
 }
 
+/** Wrap a payload hook so every request body it returns carries `service_tier`. */
+export function withServiceTier(
+  serviceTier: string | undefined,
+  inner: (params: unknown, model: PayloadHookModel, requestMetadata?: unknown) => unknown,
+): (params: unknown, model: PayloadHookModel, requestMetadata?: unknown) => unknown {
+  if (serviceTier === undefined) return inner;
+  return (params, model, requestMetadata) => ({
+    ...inner(params, model, requestMetadata) as Record<string, unknown>,
+    service_tier: serviceTier,
+  });
+}
+
 // ── Orkas public API ───────────────────────────────────────────────────
 
 export function buildOrkasApiModel(modelId: string): Model<'openai-completions'> {
