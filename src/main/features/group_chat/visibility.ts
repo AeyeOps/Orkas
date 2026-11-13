@@ -24,7 +24,7 @@ export interface ChatUseSelection {
   name?: string;
   /** Stable Skill tier chosen by the user. Older messages omit this and use
    * compatibility precedence; connectors never carry a Skill source. */
-  source?: 'marketplace' | 'custom' | 'external' | 'global';
+  source?: 'marketplace' | 'custom' | 'external' | 'global' | 'directory';
 }
 
 /** Immutable snapshot of one visible message referenced from another task.

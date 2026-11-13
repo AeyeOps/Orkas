@@ -31,6 +31,7 @@ import { readState } from '../features/group_chat/state';
 import type { GroupEvent } from '../features/group_chat/bus';
 import * as agents from '../features/agents';
 import * as autoTasks from '../features/auto_tasks';
+import { addWorkingDirectory, listWorkingDirectories } from '../features/working_directories';
 import { isAgentEnabled } from '../features/component_enabled';
 import * as skills from '../features/skills';
 import * as marketplace from '../features/marketplace';
@@ -640,7 +641,7 @@ async function _ipcFileSandboxAllowedRoots(userId: string, payload: any): Promis
   const cid = payload?.cid;
   if (typeof cid === 'string' && safeId(cid) && !chatAttachments.isDraftAttachmentCid(cid)) {
     const state = await readState(userId, cid, projectId).catch(() => null);
-    const codingDir = state?.coding_project_dir;
+    const codingDir = state?.working_directory || state?.coding_project_dir;
     if (codingDir && path.isAbsolute(codingDir) && !roots.includes(codingDir)) roots.push(codingDir);
   }
   const att = _attachmentScopeForPayload(userId, payload);
@@ -1888,6 +1889,20 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   },
 
   // ── Auto tasks (per-task dir at cloud/auto_tasks/<id>/; see features/auto_tasks.ts) ──
+  'workingDirectories.list': async (_payload, ctx) => ({ directories: listWorkingDirectories(ctx.userId) }),
+  'workingDirectories.add': async ({ path: directory }, ctx) => {
+    if (typeof directory !== 'string') throw new Error('invalid path');
+    return { directory: addWorkingDirectory(ctx.userId, directory) };
+  },
+  'skills.listDirectory': async ({ directoryIds, cid } = {}, ctx) => {
+    if (directoryIds !== undefined && (!Array.isArray(directoryIds) || directoryIds.some(id => typeof id !== 'string'))) throw new Error('invalid directory ids');
+    const ids = typeof cid === 'string' && cid
+      ? (await readState(ctx.userId, cid)).directory_ids
+      : directoryIds;
+    const disabled = (await import('../features/component_enabled')).readDisabledSets(ctx.userId).skills;
+    return { skills: (await (await import('../model/core-agent/skill-registry')).listDirectorySkills(ctx.userId, ids)).filter(skill => !disabled.has(skill.id)) };
+  },
+
   'autoTasks.list': async ({ projectId } = {}, ctx) => {
     const opts: { projectId?: string | null } = {};
     if (projectId === null) opts.projectId = null;
@@ -1896,7 +1911,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
     return { tasks };
   },
 
-  'autoTasks.create': async ({ id, content, message_parts, schedule, end_condition, title, enabled, recipient, skill, connector, project_id, attachments }, ctx) => {
+  'autoTasks.create': async ({ id, content, message_parts, schedule, end_condition, title, enabled, recipient, skill, connector, project_id, working_directory_id, directory_ids, attachments }, ctx) => {
     const result = await autoTasks.createTask(ctx.userId, {
       ...(typeof id === 'string' && id ? { id } : {}),
       content: typeof content === 'string' ? content : '',
@@ -1909,6 +1924,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
       skill: skill && typeof skill === 'object' ? skill : undefined,
       connector: connector && typeof connector === 'object' ? connector : undefined,
       project_id: typeof project_id === 'string' ? project_id : undefined,
+      working_directory_id, directory_ids,
       attachments: Array.isArray(attachments) ? attachments.filter((n: any) => typeof n === 'string' && n) : undefined,
     });
     if (!result.ok) throw new Error((result as { error: string }).error);

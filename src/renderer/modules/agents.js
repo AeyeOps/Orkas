@@ -3595,7 +3595,7 @@ async function useSkill(skillId, skillName, skillSource) {
     kind: 'skill',
     id: skillId,
     name: skillName || skillId,
-    ...(['marketplace', 'custom', 'external', 'global'].includes(skillSource)
+    ...(['marketplace', 'custom', 'external', 'global', 'directory'].includes(skillSource)
       ? { source: skillSource }
       : {}),
   });
@@ -3680,6 +3680,27 @@ let _pickerLibraryRenderSeq = 0;
 let _agentPickerTab = 'agents';
 let _agentPickerOpenSeq = 0;
 let _agentPickerLoadedTabs = new Set();
+let _pickerDirectorySkills = [];
+let _pickerDirectoryError = '';
+let _pickerDirectorySequence = 0;
+
+async function _loadPickerDirectorySkills() {
+  const sequence = ++_pickerDirectorySequence;
+  const anchorId = document.getElementById('agent-picker').dataset.anchorId;
+  _pickerDirectoryError = '';
+  _pickerDirectorySkills = [];
+  const payload = anchorId === 'auto-recipient-chip'
+    ? { directoryIds: window.autoDirectoryIds() }
+    : anchorId === 'chat-recipient-chip' && typeof currentCid === 'string' && currentCid ? { cid: currentCid } : {};
+  try {
+    const result = await window.orkas.invoke('skills.listDirectory', payload);
+    if (!result.ok) throw new Error(result.error);
+    if (sequence === _pickerDirectorySequence) _pickerDirectorySkills = result.skills;
+  } catch (error) {
+    if (sequence === _pickerDirectorySequence) _pickerDirectoryError = error.message || String(error);
+  }
+}
+
 const _agentPickerTabLoads = new Map();
 let _pickerProjectContextLoading = false;
 let _pickerProjectContextSeq = 0;
@@ -3766,8 +3787,9 @@ function _ensureAgentPickerTabData(tab, openSeq) {
   }
   const existing = _agentPickerTabLoads.get(normalized);
   if (existing) {
-    const joined = existing.then(() => {
+    const joined = existing.then(async () => {
       if (openSeq !== _agentPickerOpenSeq) return;
+      if (normalized === 'skills') await _loadPickerDirectorySkills();
       _agentPickerLoadedTabs.add(normalized);
       const picker = document.getElementById('agent-picker');
       if (!picker || picker.style.display === 'none' || _agentPickerTab !== normalized) return;
@@ -3786,6 +3808,7 @@ function _ensureAgentPickerTabData(tab, openSeq) {
         await loader('skills');
       }
       if (typeof loadSkills === 'function') await loadSkills(false);
+      await _loadPickerDirectorySkills();
     } else if (normalized === 'connectors') {
       if (typeof loadConnectors === 'function') await loadConnectors();
     } else {
@@ -3899,6 +3922,7 @@ async function refreshAgentPickerContext(anchorId) {
   if (anchorId && picker.dataset.anchorId !== anchorId) return;
   const activeAnchorId = picker.dataset.anchorId || anchorId || '';
   await _refreshAgentPickerProjectContext(activeAnchorId);
+  if (_agentPickerTab === 'skills') await _loadPickerDirectorySkills();
   const search = document.getElementById('agent-picker-search');
   _renderAgentPickerList(search ? search.value : '');
 }
@@ -3919,6 +3943,9 @@ async function _openAgentPicker(anchorBtn, entryPoint = 'unknown') {
   _setAgentPickerAnchorOpen(anchorBtn, true);
   const openSeq = ++_agentPickerOpenSeq;
   _agentPickerLoadedTabs = new Set();
+  _pickerDirectorySequence++;
+  _pickerDirectorySkills = [];
+  _pickerDirectoryError = '';
   // Reset project scope synchronously before painting. For project-bound
   // composers this flips the list to a loading shell immediately, so stale
   // unrestricted rows from the previous picker session are never clickable
@@ -4120,7 +4147,8 @@ function _renderSkillPickerList(listEl, filterText, anchorId) {
     ? applyFilter(_openSkillsCache.filter((s) => s.source === 'global' && s.enabled !== false), openDesc)
     : [];
 
-  if (!trusted.length && !openRows.length) {
+  const directoryRows = applyFilter(_pickerDirectorySkills, s => [s.description, s.directory].join(' '));
+  if (!trusted.length && !openRows.length && !directoryRows.length && !_pickerDirectoryError) {
     listEl.innerHTML = `<div class="skill-picker-empty">${escapeHtml(t('skills.no_match'))}</div>`;
     return;
   }
@@ -4139,15 +4167,18 @@ function _renderSkillPickerList(listEl, filterText, anchorId) {
         const desc = (descOf(s) || '').trim();
         const name = s.name || s.id;
         return `
-        <div class="skill-picker-item" data-kind="skill" data-id="${escapeHtml(s.id)}" data-name="${escapeHtml(name)}">
+        <div class="skill-picker-item" data-kind="skill" data-source="${escapeHtml(s.source)}" data-id="${escapeHtml(s.id)}" data-name="${escapeHtml(name)}">
           <div class="skill-picker-item-name">${escapeHtml(name)}</div>
+          ${s.directory ? `<div class="skill-picker-item-desc" title="${escapeHtml(s.directory)}">${escapeHtml(s.directory)}</div>` : ''}
           ${desc ? `<div class="skill-picker-item-desc">${escapeHtml(desc)}</div>` : ''}
         </div>`;
       }).join('');
   };
   listEl.innerHTML = groupHtml(t('skills.source_custom'), groups.custom, trustedDesc)
     + groupHtml(t('skills.source_marketplace'), groups.marketplace, trustedDesc)
-    + groupHtml(t('skills.global_group'), globalRows, openDesc);
+    + groupHtml(t('skills.global_group'), globalRows, openDesc)
+    + groupHtml(t('auto.directories'), directoryRows, openDesc)
+    + (_pickerDirectoryError ? `<div class="skill-picker-empty" role="alert">${escapeHtml(_pickerDirectoryError)}</div>` : '');
   _bindAgentPickerListItems(listEl, anchorId);
 }
 
@@ -4510,7 +4541,7 @@ async function _triggerPickerItem(kind, itemId, itemName, anchorId, dataset, sou
   if (kind === 'skill') {
     const skillId = String(itemId || itemName || '');
     _consumeAtKeyChar();
-    setChatSkill(target, itemId, itemName || itemId);
+    setChatSkill(target, itemId, itemName || itemId, dataset.source);
     const inputId = target === 'new-chat'
       ? 'new-chat-input'
       : (target === 'project' ? 'project-chat-input' : (target === 'auto' ? 'auto-task-input' : 'chat-input'));

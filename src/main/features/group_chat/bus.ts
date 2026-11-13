@@ -1,3 +1,4 @@
+import { workingDirectoriesContext } from '../working_directories';
 import { yieldReflectionForTask } from '../reflection-coordination';
 import { drainConversationFiling, hasPendingConversationFiling } from '../conversation_filing';
 /**
@@ -359,6 +360,7 @@ function _normalizeUseSelections(value: unknown): ChatUseSelection[] {
       || rec.source === 'custom'
       || rec.source === 'external'
       || rec.source === 'global'
+      || rec.source === 'directory'
     ) ? rec.source : undefined;
     const key = `${kind}:${kind === 'skill' ? (source || '') : ''}:${cleanId}`;
     if (seen.has(key)) continue;
@@ -5058,6 +5060,7 @@ async function _prepareRichSteer(
       disabledIds: disabled,
       ...(actor.kind === 'agent' ? { agentId: actor.id } : {}),
       forceOpenSkillRefs: selectedSkillSelections,
+      directoryIds: (await readState(w.uid, w.cid)).directory_ids,
       runtimeBindings: pendingSkillBindings,
       ...(opts.onSkillAdvertised ? { onSkillAdvertised: opts.onSkillAdvertised } : {}),
     });
@@ -5759,6 +5762,8 @@ async function runActorTurnWithDisplay(
   // there's no migration story.
   const { getConversationWorkspacePath } = await import('./conv_workspace');
   const workingDir = await getConversationWorkspacePath(uid, cid);
+  const executionDirectoryState = await readState(uid, cid);
+  const directoryIds = executionDirectoryState.directory_ids;
   // Project membership is decided at conv create time and frozen, so we
   // can resolve it once per turn and thread it through to every workspace
   // consumer below (CLI cwd fallback, streamChatWithModel, etc.) without
@@ -5803,6 +5808,7 @@ async function runActorTurnWithDisplay(
       ? stateFile.sync_conflict_resolution.conflicts
       : [];
   } catch { /* no conversation-scoped extra roots */ }
+  if (executionDirectoryState.working_directory) turnToolExtraRoots.push(executionDirectoryState.working_directory);
   // Every named group actor rebases completed dialogue from the canonical
   // group log. Each actor still owns an independent model session (and its
   // existing compaction limits), but no actor's private transcript is a
@@ -6153,11 +6159,14 @@ async function runActorTurnWithDisplay(
           uid,
           bindSkillSearchResults,
           residentSkillRefsForSearch,
+          cid,
         ),
         buildConversationBrowserTool(uid, cid),
       ];
     }
   }
+
+  systemPrompt = [systemPrompt, workingDirectoriesContext(uid, workingDir, directoryIds)].filter(Boolean).join('\n\n');
 
   // Streaming.
   const { streamChatWithModel } = await import('../../model/client');
@@ -6537,9 +6546,10 @@ async function runActorTurnWithDisplay(
     // could make a later turn edit the wrong project. Retain the selection
     // and session binding, block this dispatch, and let restoration or an
     // explicit directory-form submission recover the same conversation.
-    let cliWorkingDir = wsRoot;
+    const directoryState = await readState(uid, cid);
+    let cliWorkingDir = directoryState.working_directory || wsRoot;
     let projectDirectoryIssue: ReturnType<typeof inspectCodingDirectory> | undefined;
-    if (agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
+    if (!directoryState.working_directory && agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
       const dirInfo = agentsFeat.getCliProjectDirInfoForAgent(uid, cliAgent, turnProjectId);
       cliWorkingDir = dirInfo.effective_path;
       await _initializeCodingProjectDir(uid, cid, dirInfo);
@@ -9198,6 +9208,7 @@ function buildSkillSearchTool(
   uid: string,
   onResults?: (rows: readonly AvailableSkillSearchRow[]) => ReadonlyMap<string, string> | void,
   excludedRefs?: () => Iterable<string>,
+  cid?: string,
 ): AgentTool {
   return {
     name: 'skill_search',
@@ -9241,6 +9252,7 @@ function buildSkillSearchTool(
           disabledSkillIds,
           offset,
           excludedRefs?.(),
+          cid ? (await readState(uid, cid)).directory_ids : undefined,
         );
         const logicalReadPaths = onResults?.(res.rows) || null;
         const hasMore = offset + res.returned < res.total_matched;
@@ -9252,6 +9264,7 @@ function buildSkillSearchTool(
           results: res.rows.map((row) => ({
             name: row.name,
             description: row.description,
+            ...(row.directory ? { directory: row.directory } : {}),
             read_path: logicalReadPaths?.get(row.read_path) || row.read_path,
           })),
           has_more: hasMore,
@@ -9613,7 +9626,7 @@ async function buildCommanderExtraTools(
     },
   });
 
-  tools.push(buildSkillSearchTool(uid, onOpenSkillResults, residentSkillRefs));
+  tools.push(buildSkillSearchTool(uid, onOpenSkillResults, residentSkillRefs, cid));
 
   tools.push({
     name: 'marketplace_request_install',
@@ -10889,7 +10902,7 @@ async function _initializeCodingProjectDir(
   uid: string, cid: string, info: agentsFeat.AgentCliProjectDirInfo,
 ): Promise<void> {
   const cur = await readState(uid, cid);
-  if (cur.coding_project_dir || cur.coding_project_dir_pending) return;
+  if (cur.working_directory || cur.coding_project_dir || cur.coding_project_dir_pending) return;
   const target = info.mode === 'custom' ? info.path : info.effective_path;
   if (!target) return;
   // Set-once under the state lock: two coding agents' first turns can race
@@ -10923,7 +10936,7 @@ async function _maybeBuildCliInputForm(
   if (!required.length) return null;
 
   const state = await readState(uid, cid);
-  const projectDir = state.coding_project_dir || '';
+  const projectDir = state.working_directory || state.coding_project_dir || '';
 
   const isFulfilled = (fieldId: string): boolean => {
     if (fieldId === 'project_dir') return !!projectDir && !directoryMissing;
@@ -11762,7 +11775,18 @@ async function _buildCliContextPlan(
 
   let projectContext = '';
   const memoryFeat = await import('../memory');
-  const turnContext: string[] = [];
+  const directoryState = await readState(uid, cid);
+  const { getWorkspacePath } = await import('../user_workspace');
+  const currentDirectory = directoryState.working_directory || directoryState.coding_project_dir || getWorkspacePath(uid, projectId);
+  const turnContext: string[] = [workingDirectoriesContext(uid, currentDirectory, directoryState.directory_ids)];
+  const selectedSkills = _selectedSkillSelections(item.useSelections);
+  if (selectedSkills.length) {
+    turnContext.push([
+      '## User-selected skills',
+      'Read these exact selections before following them. Use orkas_read_skill for directory and Orkas-managed skills, and native skill access for global skills. Selecting a skill does not change the working directory.',
+      JSON.stringify(selectedSkills),
+    ].join('\n'));
+  }
   if (!passthrough) {
     const { resolveConversationAssistanceForTurn } = await import('../conversation_assistance_context');
     const assistance = await resolveConversationAssistanceForTurn(uid, cid, {

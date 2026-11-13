@@ -213,6 +213,68 @@ let _autoHourSel = null;
 let _autoMinuteSel = null;
 let _autoProjectSel = null;
 let _autoRunDeviceSel = null;
+
+let _autoDirectoryIds = [];
+let _autoWorkingDirectoryId = null;
+let _autoSavedDirectories = [];
+let _autoDirectoryLoadSequence = 0;
+
+function _autoRenderDirectories() {
+  const list = document.getElementById('auto-directory-list');
+  const saved = document.getElementById('auto-directory-saved');
+  if (!list || !saved) return;
+  saved.innerHTML = '<option value="">' + escapeHtml(t('auto.directory_saved')) + '</option>'
+    + _autoSavedDirectories.filter(row => !_autoDirectoryIds.includes(row.id)).map(row =>
+      '<option value="' + escapeHtml(row.id) + '">' + escapeHtml(row.path) + '</option>').join('');
+  list.innerHTML = _autoDirectoryIds.map(id => {
+    const directory = _autoSavedDirectories.find(row => row.id === id);
+    const name = directory ? directory.path : t('auto.directory_unavailable');
+    return '<div class="auto-directory-row" data-directory-id="' + escapeHtml(id) + '">'
+      + '<label class="auto-directory-main"><input type="radio" name="auto-main-directory" value="' + escapeHtml(id) + '"'
+      + (id === _autoWorkingDirectoryId ? ' checked' : '') + ' aria-label="' + escapeHtml(t('auto.directory_main') + ': ' + name) + '">'
+      + '<span>' + escapeHtml(t('auto.directory_main')) + '</span></label>'
+      + '<span class="auto-directory-path" title="' + escapeHtml(name) + '">' + escapeHtml(name) + '</span>'
+      + '<button type="button" class="btn auto-directory-remove" aria-label="' + escapeHtml(t('auto.directory_remove') + ': ' + name) + '">×</button></div>';
+  }).join('');
+  document.getElementById('auto-directory-help').textContent = t(_autoDirectoryIds.length ? 'auto.directory_future_runs' : 'auto.directory_default');
+  list.querySelectorAll('input').forEach(input => input.addEventListener('change', () => { _autoWorkingDirectoryId = input.value; _autoDirectoryError(null); }));
+  list.querySelectorAll('.auto-directory-remove').forEach(button => button.addEventListener('click', () => {
+    const id = button.closest('[data-directory-id]').dataset.directoryId;
+    _autoDirectoryIds = _autoDirectoryIds.filter(value => value !== id);
+    if (_autoWorkingDirectoryId === id) _autoWorkingDirectoryId = null;
+    _autoDirectoryError(null);
+    _autoRenderDirectories();
+    _autoRefreshProjectScopedPicker();
+  }));
+}
+
+function _autoDirectoryError(error) {
+  const element = document.getElementById('auto-directory-error');
+  element.textContent = error ? String(error.message || error) : '';
+  element.hidden = !error;
+}
+
+async function _autoLoadDirectories() {
+  const sequence = ++_autoDirectoryLoadSequence;
+  _autoDirectoryError(null);
+  try {
+    const result = await window.orkas.invoke('workingDirectories.list');
+    if (!result.ok) throw new Error(result.error);
+    if (sequence !== _autoDirectoryLoadSequence) return;
+    _autoSavedDirectories = result.directories;
+    _autoRenderDirectories();
+  } catch (error) { if (sequence === _autoDirectoryLoadSequence) _autoDirectoryError(error); }
+}
+
+function _autoAttachDirectory(directory) {
+  _autoDirectoryError(null);
+  if (!_autoSavedDirectories.some(row => row.id === directory.id)) _autoSavedDirectories.push(directory);
+  if (!_autoDirectoryIds.includes(directory.id)) _autoDirectoryIds.push(directory.id);
+  if (_autoDirectoryIds.length === 1) _autoWorkingDirectoryId = directory.id;
+  _autoRenderDirectories();
+  _autoRefreshProjectScopedPicker();
+}
+
 let _autoDatePicker = null;
 let _autoEndDatePicker = null;
 // Set by `openAutoTaskDialog({projectId})` from the project-detail entry —
@@ -837,12 +899,14 @@ function _openAutoRowMenu(anchorBtn, task, opts) {
       if (action === 'run-now') {
         try {
           const res = await window.orkas.invoke('autoTasks.runNow', { taskId: task.id });
+          if (res?.ok === false) throw new Error(res.error);
           const cid = res && res.cid;
           if (!cid) throw new Error('manual run did not return a conversation id');
           setView('conversation', cid, { entryPoint: 'auto_task_run_now' });
         } catch (err) {
           _autoLog.warn('manual run failed', err);
-          await uiAlert(t('auto.run_failed'));
+          await uiAlert(String(err.message).includes('working_directory_unavailable')
+            ? t('auto.directory_run_failed', { title: task.title || '' }) : t('auto.run_failed'));
         }
       } else if (action === 'toggle-enabled') {
         const next = !task.enabled;
@@ -1198,6 +1262,7 @@ function _autoUseToken(ref, kind) {
     kind,
     id: String(ref.id),
     name: String(ref.name || ref.id),
+    ...(ref.source ? { source: ref.source } : {}),
   });
 }
 
@@ -1232,7 +1297,7 @@ function _autoReadComposerUseState() {
   const selections = (typeof getChatUseSelections === 'function')
     ? getChatUseSelections('auto')
     : [];
-  const toRef = (sel) => sel ? { id: sel.id || sel.name, name: sel.name || sel.id } : null;
+  const toRef = (sel) => sel ? { id: sel.id || sel.name, name: sel.name || sel.id, ...(sel.source ? { source: sel.source } : {}) } : null;
   const skill = selections.find((sel) => sel && sel.kind === 'skill') || null;
   const connector = selections.find((sel) => sel && sel.kind === 'connector') || null;
   return {
@@ -1258,6 +1323,25 @@ function _autoStripComposerUseTokens(value) {
 }
 
 function _mountAutoForm() {
+  document.getElementById('auto-directory-saved').addEventListener('change', event => {
+    const directory = _autoSavedDirectories.find(row => row.id === event.target.value);
+    if (directory) _autoAttachDirectory(directory);
+  });
+  document.getElementById('auto-directory-browse').addEventListener('click', async event => {
+    const button = event.currentTarget;
+    const sequence = _autoDirectoryLoadSequence;
+    button.disabled = true;
+    _autoDirectoryError(null);
+    try {
+      const picked = await window.orkas.invoke('common.pickDirectory');
+      if (!picked.ok) throw new Error(picked.error);
+      if (picked.cancelled) return;
+      const result = await window.orkas.invoke('workingDirectories.add', { path: picked.path });
+      if (!result.ok) throw new Error(result.error);
+      if (sequence === _autoDirectoryLoadSequence) _autoAttachDirectory(result.directory);
+    } catch (error) { _autoDirectoryError(error); }
+    finally { button.disabled = false; }
+  });
   const panel = document.getElementById('panel-auto');
   if (!panel) return;
 
@@ -1905,6 +1989,9 @@ function _autoRepaintLabels() {
 }
 
 function _autoResetForm() {
+  _autoDirectoryIds = [];
+  _autoWorkingDirectoryId = null;
+  _autoRenderDirectories();
   composerBindOwner('auto-task-input', {});
   _autoEditingTaskId = null;
   _autoEditingProjectId = '';
@@ -1972,6 +2059,7 @@ function openAutoTaskDialog(opts = {}) {
 
   if (task) _autoFillForm(task);
   else _autoResetForm();
+  _autoLoadDirectories();
   _autoRefreshProjectOptions();
   _autoRepaintLabels();
   _showAutoDialog();
@@ -2014,6 +2102,9 @@ function _hideAutoDialog() {
 
 /** Hydrate the form fields from an existing task — used by edit mode. */
 function _autoFillForm(task) {
+  _autoDirectoryIds = [...(task.directory_ids || [])];
+  _autoWorkingDirectoryId = task.working_directory_id || null;
+  _autoRenderDirectories();
   composerBindOwner('auto-task-input', {});
   _autoEditingTaskId = task.id;
   _autoEditingProjectId = task.project_id || '';
@@ -2197,6 +2288,16 @@ async function _autoSubmitForm() {
     endCondition = { type: 'count', max_runs: maxRuns };
   }
 
+  if (_autoDirectoryIds.length && !_autoDirectoryIds.includes(_autoWorkingDirectoryId)) {
+    _autoDirectoryError(t('auto.directory_choose_main'));
+    return;
+  }
+  const selectedSkills = messageParts ? messageParts.filter(part => part.type === 'use' && part.kind === 'skill') : (skillField ? [skillField] : []);
+  if (selectedSkills.some(skill => skill.source === 'directory' && !_autoDirectoryIds.includes(skill.id.split(':')[0]))) {
+    _autoDirectoryError(t('auto.directory_skill_removed'));
+    return;
+  }
+
   if (_autoCurrentAttachments.some((a) => a && a.status === 'uploading')) {
     await blockSave('attachment_uploading', 'chat.attach_still_uploading');
     return;
@@ -2214,6 +2315,8 @@ async function _autoSubmitForm() {
       : { kind: 'commander' };
     const payload = {
       content,
+      directory_ids: [..._autoDirectoryIds],
+      working_directory_id: _autoWorkingDirectoryId,
       ...(messageParts
         ? { message_parts: messageParts }
         : (_autoEditingTaskId ? { message_parts: null } : {})),
@@ -2296,6 +2399,7 @@ if (typeof window !== 'undefined') {
   window.refreshAutoProjectGroups = _autoRenderList;
   window.loadProjectAutoList = loadProjectAutoList;
   window.openAutoTaskDialog = openAutoTaskDialog;
+  window.autoDirectoryIds = () => [..._autoDirectoryIds];
   // Saved-task shortcuts reveal the current list entry; editing is explicit.
   window.focusAutoTaskById = async function focusAutoTaskById(taskId) {
     const id = String(taskId || '').trim();

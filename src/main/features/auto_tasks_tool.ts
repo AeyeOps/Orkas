@@ -10,7 +10,7 @@ import { logErrorSummary } from '../util/log-redact';
 const log = createLogger('auto-tasks-tool');
 
 const contract = require('../../../bin/auto-tasks-contract.cjs');
-const EDIT_FIELDS = ['title', 'content', 'schedule', 'enabled', 'end_condition', 'recipient', 'skill', 'connector', 'attachments', 'project_id'];
+const EDIT_FIELDS = ['title', 'content', 'schedule', 'enabled', 'end_condition', 'recipient', 'skill', 'connector', 'attachments', 'project_id', 'working_directory_id', 'directory_ids'];
 
 function taskView(task: autoTasks.AutoTask) {
   const { device_id: _deviceId, ...view } = task;
@@ -21,6 +21,8 @@ function taskSummary(task: autoTasks.AutoTask) {
   return {
     id: task.id, title: task.title, content_preview: task.content.slice(0, 200), enabled: task.enabled, schedule: task.schedule,
     ...(task.project_id ? { project_id: task.project_id } : {}),
+    ...(task.working_directory_id ? { working_directory_id: task.working_directory_id } : {}),
+    ...(task.directory_ids ? { directory_ids: task.directory_ids } : {}),
     recipient: task.recipient,
     ...(task.end_condition ? { end_condition: task.end_condition } : {}),
     ...(task.end_condition?.type === 'count' ? { scheduled_run_count: task.scheduled_run_count || 0 } : {}),
