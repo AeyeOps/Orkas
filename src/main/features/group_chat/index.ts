@@ -1082,6 +1082,9 @@ async function _prepareCodingProjectDirFormUpdate(
 
   try {
     const previous = await readState(userId, cid);
+    if (previous.working_directory) {
+      return { ok: false, error: 'This automation conversation keeps its original working directory. Edit the Auto task to change future runs.' };
+    }
     return {
       ok: true,
       update: {

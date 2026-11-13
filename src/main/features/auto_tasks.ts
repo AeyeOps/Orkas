@@ -70,6 +70,9 @@ import { registerUserSwitchHook } from './user-switch-hooks';
 import * as agents from './agents';
 import * as chats from './chats';
 import * as groupChat from './group_chat';
+import { assertWorkingDirectory, listWorkingDirectories, requireWorkingDirectory } from './working_directories';
+import { writeWorkingDirectory } from './local_agents/project-directory';
+import type { SkillSelectionSource } from '../model/core-agent/skill-registry';
 
 const log = createLogger('auto-tasks');
 
@@ -116,11 +119,11 @@ export type TaskRecipient =
   | { kind: 'commander' }
   | { kind: 'agent'; id: string; name: string };
 
-export type TaskSkillRef = { id: string; name: string };
+export type TaskSkillRef = { id: string; name: string; source?: SkillSelectionSource };
 export type TaskConnectorRef = { id: string; name: string };
 export type TaskMessagePart =
   | { type: 'text'; text: string }
-  | { type: 'use'; kind: 'skill' | 'connector'; id: string; name: string };
+  | { type: 'use'; kind: 'skill' | 'connector'; id: string; name: string; source?: SkillSelectionSource };
 
 export interface AutoTask {
   id: string;
@@ -134,6 +137,8 @@ export interface AutoTask {
   skill?: TaskSkillRef;
   connector?: TaskConnectorRef;
   project_id?: string;
+  working_directory_id?: string;
+  directory_ids?: string[];
   schedule: Schedule;
   /** Persisted cadence anchor used when an existing task switches to an
    *  hourly schedule before its first scheduled run. */
@@ -315,7 +320,10 @@ function _normaliseMessageParts(value: unknown): TaskMessagePart[] | null {
     const kind = (raw as any).kind;
     if (kind !== 'skill' && kind !== 'connector') return null;
     if (!_isValidRef(raw)) return null;
-    out.push({ type: 'use', kind, id: (raw as any).id, name: (raw as any).name });
+    const source = (raw as any).source;
+    if (source !== undefined && !['marketplace', 'custom', 'external', 'global', 'directory'].includes(source)) return null;
+    out.push({ type: 'use', kind, id: (raw as any).id, name: (raw as any).name,
+      ...(kind === 'skill' && source ? { source } : {}) });
     hasUse = true;
   }
   return hasUse ? out : null;
@@ -335,6 +343,7 @@ function _isValidTaskShape(t: any): t is AutoTask {
   if (!_isValidTaskId(t.id)) return false;
   if (typeof t.content !== 'string') return false;
   if (typeof t.enabled !== 'boolean') return false;
+  if (!_isValidDirectorySelection(t.directory_ids, t.working_directory_id)) return false;
   if (!_isValidSchedule(t.schedule)) return false;
   if (t.schedule_anchor_at !== undefined) {
     if (typeof t.schedule_anchor_at !== 'string'
@@ -554,6 +563,8 @@ export type TaskDraft = {
   skill?: TaskSkillRef;
   connector?: TaskConnectorRef;
   project_id?: string | null;
+  working_directory_id?: string | null;
+  directory_ids?: string[];
   attachments?: string[];
   // Caller-supplied id (renderer pre-allocates so attachments can upload
   // before submit). The pre-allocated id IS also the on-disk dir name.
@@ -575,6 +586,7 @@ export type TaskError =
   | 'invalid_skill'
   | 'invalid_connector'
   | 'invalid_project'
+  | 'invalid_working_directory'
   | 'invalid_id'
   | 'not_found'
   | 'too_many_tasks';
@@ -583,6 +595,14 @@ type NormalisedFields = Omit<
   AutoTask,
   'id' | 'created_at' | 'updated_at' | 'last_run_at' | 'schedule_anchor_at' | 'scheduled_run_count'
 >;
+
+function _isValidDirectorySelection(ids: unknown, main: unknown): boolean {
+  const validId = (id: unknown): id is string => typeof id === 'string' && /^wd_[0-9a-f-]{36}$/.test(id);
+  if (main !== undefined && !validId(main)) return false;
+  if (ids === undefined) return main === undefined;
+  if (!Array.isArray(ids) || ids.some(id => !validId(id)) || new Set(ids).size !== ids.length) return false;
+  return ids.length ? ids.includes(main) : main === undefined;
+}
 
 function _normaliseDraft(d: TaskDraft): { ok: true; fields: NormalisedFields } | { ok: false; error: TaskError } {
   if (!_isValidSchedule(d.schedule)) return { ok: false, error: 'invalid_schedule' };
@@ -619,7 +639,8 @@ function _normaliseDraft(d: TaskDraft): { ok: true; fields: NormalisedFields } |
   let skill: TaskSkillRef | undefined;
   if (d.skill !== undefined && d.skill !== null) {
     if (!_isValidRef(d.skill)) return { ok: false, error: 'invalid_skill' };
-    skill = { id: d.skill.id, name: d.skill.name };
+    if (d.skill.source !== undefined && !['marketplace', 'custom', 'external', 'global', 'directory'].includes(d.skill.source)) return { ok: false, error: 'invalid_skill' };
+    skill = { id: d.skill.id, name: d.skill.name, ...(d.skill.source ? { source: d.skill.source } : {}) };
   }
   let connector: TaskConnectorRef | undefined;
   if (d.connector !== undefined && d.connector !== null) {
@@ -628,6 +649,15 @@ function _normaliseDraft(d: TaskDraft): { ok: true; fields: NormalisedFields } |
   }
   const projectId = typeof d.project_id === 'string' && d.project_id ? d.project_id : undefined;
   if (projectId && !safeId(projectId)) return { ok: false, error: 'invalid_project' };
+  const workingDirectoryId = d.working_directory_id ?? undefined;
+  const directoryIds = d.directory_ids;
+  if (!_isValidDirectorySelection(directoryIds, workingDirectoryId)) {
+    return { ok: false, error: 'invalid_working_directory' };
+  }
+  const selectedSkills = messageParts?.filter(part => part.type === 'use' && part.kind === 'skill') || (skill ? [skill] : []);
+  if (selectedSkills.some(selection => selection.source === 'directory' && !directoryIds?.includes(selection.id.split(':')[0]))) {
+    return { ok: false, error: 'invalid_skill' };
+  }
   const attachments = Array.isArray(d.attachments)
     ? d.attachments.filter((n) => typeof n === 'string' && n.length > 0)
     : undefined;
@@ -644,6 +674,8 @@ function _normaliseDraft(d: TaskDraft): { ok: true; fields: NormalisedFields } |
       ...(skill ? { skill } : {}),
       ...(connector ? { connector } : {}),
       ...(projectId ? { project_id: projectId } : {}),
+      ...(workingDirectoryId ? { working_directory_id: workingDirectoryId } : {}),
+      ...(directoryIds?.length ? { directory_ids: directoryIds } : {}),
       ...(attachments && attachments.length ? { attachments } : {}),
     },
   };
@@ -715,6 +747,9 @@ export async function createTask(
 ): Promise<{ ok: true; task: AutoTask } | { ok: false; error: TaskError }> {
   const norm = _normaliseDraft(draft);
   if (!norm.ok) return { ok: false, error: (norm as { error: TaskError }).error };
+  if (norm.fields.directory_ids?.some(id => !listWorkingDirectories(uid).some(row => row.id === id))) {
+    return { ok: false, error: 'invalid_working_directory' };
+  }
   const desiredId = draft.id !== undefined
     ? (_isValidTaskId(draft.id) ? draft.id : null)
     : genTaskId();
@@ -785,10 +820,15 @@ export async function updateTask(
       project_id: patch.project_id === null
         ? undefined
         : (typeof patch.project_id === 'string' ? patch.project_id : cur.project_id),
+      working_directory_id: patch.working_directory_id === null ? undefined : (patch.working_directory_id ?? cur.working_directory_id),
+      directory_ids: patch.directory_ids ?? cur.directory_ids,
       attachments: patch.attachments !== undefined ? patch.attachments : cur.attachments,
     };
     const norm = _normaliseDraft(merged);
     if (!norm.ok) return { ok: false as const, error: (norm as { error: TaskError }).error };
+    if (patch.directory_ids?.some(id => !listWorkingDirectories(uid).some(row => row.id === id))) {
+      return { ok: false as const, error: 'invalid_working_directory' as const };
+    }
     const scopeError = await _validateProjectScope(uid, norm.fields);
     if (scopeError) return { ok: false as const, error: scopeError };
     const updatedAt = nowIso();
@@ -829,6 +869,8 @@ export async function updateTask(
     if (!norm.fields.skill) delete next.skill;
     if (!norm.fields.connector) delete next.connector;
     if (!norm.fields.project_id) delete next.project_id;
+    if (!norm.fields.working_directory_id) delete next.working_directory_id;
+    if (!norm.fields.directory_ids) delete next.directory_ids;
     if (!norm.fields.attachments) delete next.attachments;
     if (!norm.fields.end_condition) delete next.end_condition;
     await _writeOne(uid, next);
@@ -1600,7 +1642,7 @@ function _buildFireTitle(task: AutoTask, catchUp = false): string {
 
 type FireTaskResult =
   | { ok: true; cid: string }
-  | { ok: false; error: 'conv_create_failed' | 'send_not_ok' | 'send_threw' };
+  | { ok: false; error: 'conv_create_failed' | 'send_not_ok' | 'send_threw' | 'working_directory_unavailable' };
 
 export type AutoFireSource = 'scheduled' | 'manual';
 export type AutoFireErrorCode =
@@ -1609,7 +1651,8 @@ export type AutoFireErrorCode =
   | 'send_threw'
   | 'invalid_id'
   | 'not_found'
-  | 'mark_ran_failed';
+  | 'mark_ran_failed'
+  | 'working_directory_unavailable';
 
 async function _fireTask(
   uid: string,
@@ -1628,11 +1671,23 @@ async function _fireTask(
       ...catchUpMark,
       user_id: uid,
       task_id: task.id,
+      task_title: task.title || '',
       ...(cid ? { cid } : {}),
       error_code: errorCode,
       duration_ms: Math.max(0, Date.now() - startedAt),
     });
   };
+  let workingDirectory: string | undefined;
+  if (task.working_directory_id) {
+    try {
+      workingDirectory = requireWorkingDirectory(uid, task.working_directory_id).path;
+      assertWorkingDirectory(workingDirectory);
+    } catch (error) {
+      log.warn('automation working directory unavailable', { task_id: task.id, error: logErrorSummary(error) });
+      emitFailure('working_directory_unavailable');
+      return { ok: false, error: 'working_directory_unavailable' };
+    }
+  }
   try {
     const conv = await chats.createConversation(uid, {
       kind: 'normal',
@@ -1641,6 +1696,7 @@ async function _fireTask(
       originAutoTaskId: task.id,
     });
     cid = conv.conversation_id;
+    writeWorkingDirectory(uid, cid, workingDirectory, task.directory_ids || []);
   } catch (err) {
     log.error(`fire conv-create failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
     emitFailure('conv_create_failed');
@@ -1676,9 +1732,16 @@ async function _fireTask(
       log.warn(`run start record failed uid=${maskId(uid)} id=${task.id}`, logErrorSummary(err));
     }
   })();
+  const useSelections = task.message_parts
+    ? task.message_parts.filter(part => part.type === 'use').map(part => ({ kind: part.kind, id: part.id, name: part.name, ...(part.source ? { source: part.source } : {}) }))
+    : [
+      ...(task.skill ? [{ kind: 'skill' as const, ...task.skill }] : []),
+      ...(task.connector ? [{ kind: 'connector' as const, ...task.connector }] : []),
+    ];
   try {
     const res = await groupChat.send({
       userId: uid, cid, text,
+      ...(useSelections.length ? { use_selections: useSelections } : {}),
       beforeDispatch: prepareRun,
       notificationKind: 'automation',
       ...(attachmentNames.length ? { attachments: attachmentNames } : {}),
@@ -1787,6 +1850,7 @@ export type AutoFireEvent =
       user_id: string;
       task_id: string;
       cid?: string;
+      task_title?: string;
       error_code: AutoFireErrorCode;
       duration_ms?: number;
     };

@@ -35,6 +35,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 import { getWorkspacePath } from '../user_workspace';
+import { assertWorkingDirectory } from '../working_directories';
 import { getConversation } from '../chats';
 import { readState, setWorkspaceDirOnce } from './state';
 import { PLACEHOLDER_TITLES } from './conv_title';
@@ -161,6 +162,11 @@ function uniquifySlug(workspaceRoot: string, slug: string): string {
  * never produced anything.
  */
 export async function getConversationWorkspacePath(uid: string, cid: string): Promise<string> {
+  const executionDirectory = (await readState(uid, cid)).working_directory;
+  if (executionDirectory) {
+    assertWorkingDirectory(executionDirectory);
+    return executionDirectory;
+  }
   // Resolve the conv's project membership ONCE so workspace resolution
   // picks up the project-scoped selection (per CLAUDE.md projects feature).
   // For convs without a project this is a no-op (projectId stays undefined).
@@ -239,6 +245,7 @@ export async function getConversationWorkspacePath(uid: string, cid: string): Pr
 export async function readConversationAuthoringDir(uid: string, cid: string): Promise<string> {
   const state = await readState(uid, cid).catch(() => null);
   if (!state) return '';
+  if (state.working_directory) return state.working_directory;
   const codingDir = String(state.coding_project_dir || '');
   if (codingDir && path.isAbsolute(codingDir)) return codingDir;
   if (!state.workspace_dir) return '';

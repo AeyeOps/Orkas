@@ -8,6 +8,8 @@ exports.shape = (z, bound) => {
     action: z.enum(['list', 'get', 'create', 'update', 'delete', 'enable', 'disable']).describe('list: summaries, total matching count, next_offset; get: full detail by task_id. create: new schedule; list first to find existing tasks. enable/disable resumes/pauses scheduling. delete only when requested.'),
     task_id: z.string().regex(/^at_[0-9a-f]{8}$/).optional().describe('Required for get/update/delete/enable/disable; use an id from list.'),
     ...(!bound ? { project_id: z.string().min(1).nullable().optional().describe('Existing project id; null selects global. Omit on list for all, on create for global, on update to preserve scope.') } : {}),
+    directory_ids: z.array(z.string()).optional().describe('Replacement list of saved local directory ids for skill discovery. A nonempty list requires working_directory_id in that list. Changes apply to future runs.'),
+    working_directory_id: z.string().nullable().optional().describe('Main working directory id from saved directories; null clears it when directory_ids is empty. Existing conversations retain their directory.'),
     title: z.string().max(200).optional(),
     content: z.string().min(1).max(8000).optional().describe('Required for create. Instruction to execute at the scheduled time.'),
     schedule: z.discriminatedUnion('type', [
@@ -23,7 +25,7 @@ exports.shape = (z, bound) => {
       z.object({ type: z.literal('count'), max_runs: z.number().int().positive().safe() }).strict(),
     ]).nullable().optional().describe('Recurring schedules only. Date includes the full local day; count counts scheduled runs. Null clears the cutoff.'),
     recipient: z.discriminatedUnion('kind', [z.object({ kind: z.literal('commander') }).strict(), z.object({ kind: z.literal('agent'), id: z.string().min(1), name: z.string().min(1) }).strict()]).optional().describe('Defaults to Commander. Project recipients must be bound to the project.'),
-    skill: ref.nullable().optional().describe('Installed Skill reference; null clears it.'),
+    skill: ref.extend({ source: z.enum(['marketplace', 'custom', 'external', 'global', 'directory']).optional() }).nullable().optional().describe('Installed Skill reference; null clears it.'),
     connector: ref.nullable().optional().describe('Connected service reference; null clears it.'),
     attachments: z.array(z.string().min(1)).optional().describe('Replacement list of existing task attachments or filenames from this conversation; omitted preserves attachments.'),
     offset: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER).optional().describe('List only; default 0. Continue with next_offset until null, keeping the same filters.'),

@@ -323,7 +323,7 @@ function _buildMethods(
       });
     }
     const disabled = readDisabledSets(opts.uid).skills;
-    const rows = (await listSkillsForBridge(opts.uid, opts.agentId)).filter((r) => !disabled.has(r.id));
+    const rows = (await listSkillsForBridge(opts.uid, opts.agentId, (await (await import("../group_chat/state")).readState(opts.uid, opts.cid)).directory_ids)).filter((r) => !disabled.has(r.id));
     for (const row of rows) skillRoots.set(row.dir, bridgeResourceRealpath(row.dir));
     skillRowsCache = rows;
     return rows;
@@ -381,7 +381,7 @@ function _buildMethods(
       assertActive();
       const disabled = readDisabledSets(opts.uid).skills;
       return {
-        skills: rows.filter((r) => !disabled.has(r.id)).map((r) => ({ id: r.id, name: r.name, description: r.description, source: r.source })),
+        skills: rows.filter((r) => !disabled.has(r.id)).map((r) => ({ id: r.id, name: r.name, description: r.description, source: r.source, ...(r.directory ? { directory: r.directory } : {}) })),
       };
     },
 

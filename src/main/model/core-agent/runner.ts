@@ -538,6 +538,9 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
   // fall through to the active-user singleton. Wrapped in a try/catch so ad-hoc
   // test paths that activate no user just see a null uid → empty disabled set.
   const earlyUid = params.userId || _safeActiveUserId();
+  const directoryIds = earlyUid && params.cid
+    ? (await (await import('../../features/group_chat/state')).readState(earlyUid, params.cid)).directory_ids
+    : undefined;
   if (
     !isReflectionSession
     && earlyUid
@@ -595,6 +598,7 @@ export async function buildRunner(params: BuildRunnerParams): Promise<{
           )
         : '';
       const regularBlock = await getSystemPromptBlock({
+        directoryIds,
         ...(renderAllowlist === undefined ? {} : { allowlist: [...renderAllowlist] }),
         disabledIds: disabledSkillIds,
         // Acting agent id gates agent-private (`ownerAgent`) skills: an agent's

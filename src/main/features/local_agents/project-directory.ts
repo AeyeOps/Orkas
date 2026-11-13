@@ -14,9 +14,13 @@ interface DirectoryRecord {
   directory: string;
   explicit: boolean;
   needs_confirmation?: boolean;
+  working_directory?: string;
+  directory_ids?: string[];
 }
 
 export interface CodingDirectoryState {
+  working_directory?: string;
+  directory_ids?: string[];
   coding_project_dir?: string;
   coding_project_dir_explicit?: boolean;
   coding_project_dir_pending?: string;
@@ -72,12 +76,19 @@ export function readCodingDirectory(uid: string, cid: string, legacy?: CodingDir
   if (record.version !== 1 || typeof record.directory !== 'string'
     || typeof record.explicit !== 'boolean'
     || (record.needs_confirmation !== undefined && typeof record.needs_confirmation !== 'boolean')
-    || (record.directory && !record.needs_confirmation && !path.isAbsolute(record.directory))) {
+    || (record.directory && !record.needs_confirmation && !path.isAbsolute(record.directory))
+    || (record.working_directory !== undefined && (typeof record.working_directory !== 'string' || !path.isAbsolute(record.working_directory)))
+    || (record.directory_ids !== undefined && (!Array.isArray(record.directory_ids) || record.directory_ids.some(id => typeof id !== 'string')))) {
     throw new Error(t('errors.cli_directory_storage'));
   }
-  if (!record.directory) return {};
-  if (record.needs_confirmation) return { coding_project_dir_pending: record.directory };
+  const workingDirectory = {
+    ...(record.working_directory ? { working_directory: record.working_directory } : {}),
+    ...(record.directory_ids ? { directory_ids: record.directory_ids } : {}),
+  };
+  if (!record.directory) return workingDirectory;
+  if (record.needs_confirmation) return { ...workingDirectory, coding_project_dir_pending: record.directory };
   return {
+    ...workingDirectory,
     coding_project_dir: record.directory,
     ...(record.explicit ? { coding_project_dir_explicit: true } : {}),
   };
@@ -91,15 +102,25 @@ export function readCodingDirectoryFromStateFile(uid: string, cid: string, file:
 
 export function writeCodingDirectory(uid: string, cid: string, directory: string, explicit: boolean, needsConfirmation = false): void {
   if (directory && !needsConfirmation && !path.isAbsolute(directory)) throw new Error(t('errors.path_not_dir'));
+  const existing = readObject(localCliDirectoryFile(uid, cid)) as DirectoryRecord | null;
   writeRecord(uid, cid, { version: 1, directory, explicit: !!directory && explicit,
+    ...(existing?.working_directory ? { working_directory: existing.working_directory } : {}),
+    ...(existing?.directory_ids ? { directory_ids: existing.directory_ids } : {}),
     ...(directory && needsConfirmation ? { needs_confirmation: true } : {}),
   });
+}
+
+export function writeWorkingDirectory(uid: string, cid: string, directory: string | undefined, directoryIds: string[]): void {
+  if (directory !== undefined && !path.isAbsolute(directory)) throw new Error(t('errors.path_not_dir'));
+  const record = readObject(localCliDirectoryFile(uid, cid)) as DirectoryRecord | null;
+  writeRecord(uid, cid, { version: 1, directory: '', explicit: false, ...record,
+    ...(directory ? { working_directory: directory } : {}), directory_ids: directoryIds });
 }
 
 /** Never serialize the effective local overlay into cloud state. */
 export function cloudConversationState<T extends Record<string, any>>(state: T): T {
   if (!state || typeof state !== 'object' || Array.isArray(state)) return state;
-  const keys = ['coding_project_dir', 'coding_project_dir_explicit', 'coding_project_dir_pending'];
+  const keys = ['coding_project_dir', 'coding_project_dir_explicit', 'coding_project_dir_pending', 'working_directory', 'directory_ids'];
   if (!keys.some((key) => Object.prototype.hasOwnProperty.call(state, key))) return state;
   const cloud = { ...state };
   for (const key of keys) delete cloud[key];

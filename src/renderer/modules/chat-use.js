@@ -12,7 +12,7 @@ const _CHAT_USE_TOKEN_END = '\u2064';
 const _CHAT_USE_TOKEN_ZERO = '\u200B';
 const _CHAT_USE_TOKEN_ONE = '\u200C';
 const _CHAT_USE_TOKEN_PAD = '  ';
-const _CHAT_SKILL_SOURCES = new Set(['marketplace', 'custom', 'external', 'global']);
+const _CHAT_SKILL_SOURCES = new Set(['marketplace', 'custom', 'external', 'global', 'directory']);
 
 function bindSkillPicker() {
   // Chip remove (×)
