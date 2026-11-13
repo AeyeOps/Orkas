@@ -48,7 +48,7 @@ describe('local_agents/sessions', () => {
     expect(await sessions.getSessionId(TEST_UID, 'c1', 'agent-b', 'codex')).toBe('thread-b');
 
     await Promise.all([
-      sessions.markHistorySyncedThrough(TEST_UID, 'c1', 'agent-a', 'codex', 'm-a'),
+      sessions.markHistorySyncedThrough(TEST_UID, 'c1', 'agent-a', 'codex', 'm-a', []),
       sessions.setSessionId(TEST_UID, 'c1', 'agent-b', 'codex', 'thread-b2'),
     ]);
     expect((await sessions.getBinding(TEST_UID, 'c1', 'agent-a', 'codex'))?.historySyncedThroughMessageId).toBe('m-a');
@@ -85,7 +85,7 @@ describe('local_agents/sessions', () => {
   it('advances history only through a persisted successful reply and preserves it on the same native session', async () => {
     const s = await loadSessions();
     await s.setSessionId(TEST_UID, TEST_CID, 'agent-x', 'codex', 'sess-1');
-    await s.markHistorySyncedThrough(TEST_UID, TEST_CID, 'agent-x', 'codex', 'reply-1');
+    await s.markHistorySyncedThrough(TEST_UID, TEST_CID, 'agent-x', 'codex', 'reply-1', []);
     expect(await s.getBinding(TEST_UID, TEST_CID, 'agent-x', 'codex')).toMatchObject({
       historySyncedThroughMessageId: 'reply-1',
     });

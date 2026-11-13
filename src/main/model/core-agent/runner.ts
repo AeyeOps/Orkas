@@ -1975,6 +1975,19 @@ export async function generateWebAppText(
   return { text, usage, stopReason };
 }
 
+/** The text of a tools-free completion that ran to its end. Reasoning parts are
+ * left out: a model that cannot switch reasoning off returns one even when the
+ * call asks for none. Any other part, or an early stop, throws `failure`. */
+function completedText(
+  result: { stopReason: string; content: Message['content'] },
+  failure: string,
+): string {
+  if (result.stopReason !== 'end_turn' || result.content.some(part => part.type !== 'text' && part.type !== 'thinking')) {
+    throw new Error(failure);
+  }
+  return result.content.flatMap(part => (part.type === 'text' ? [part.text] : [])).join('').trim();
+}
+
 /** One tools-free Skill repair request. The feature supplies only the rejected
  * proposal and current request; no task replay, session, roster or discovery. */
 export async function completeSkillCreationCorrection(input: {
@@ -2010,10 +2023,7 @@ export async function completeSkillCreationCorrection(input: {
     } },
   });
   check();
-  if (result.stopReason !== 'end_turn' || result.content.some(part => part.type !== 'text')) {
-    throw new Error('Skill correction incomplete');
-  }
-  const text = result.content.map(part => (part as { text: string }).text).join('').trim();
+  const text = completedText(result, 'Skill correction incomplete');
   if (!text || text.length > 64_000) throw new Error('Skill correction output limit');
   return text;
 }
@@ -2056,10 +2066,7 @@ export async function completeDispatchPlan(input: {
     } },
   });
   check();
-  if (result.stopReason !== 'end_turn' || result.content.some(part => part.type !== 'text')) {
-    throw new Error('Dispatch planning incomplete');
-  }
-  return result.content.map(part => (part as { text: string }).text).join('').trim();
+  return completedText(result, 'Dispatch planning incomplete');
 }
 
 /** Check if metacognition feature is enabled.
