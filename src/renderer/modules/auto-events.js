@@ -54,6 +54,9 @@ function _autoEventsOpenSubscription() {
       } else if (inner.type !== 'fire_failed') {
         return;
       }
+      if (inner.type === 'fire_failed' && inner.source === 'scheduled' && inner.error_code === 'working_directory_unavailable') {
+        uiToast(t('auto.directory_run_failed', { title: inner.task_title }), { variant: 'warning' });
+      }
       if (typeof _autoLoadedOnce !== 'undefined' && _autoLoadedOnce && typeof loadAutoList === 'function') {
         Promise.resolve(loadAutoList(true)).catch(() => {});
       }

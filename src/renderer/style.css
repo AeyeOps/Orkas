@@ -19707,3 +19707,24 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
   outline: 2px solid var(--primary);
   outline-offset: -2px;
 }
+
+.auto-directory-heading { display: flex; align-items: center; gap: 8px; }
+.auto-directory-heading > label { font-weight: 500; flex: 1; }
+.auto-directory-heading select {
+  min-width: 0;
+  max-width: 45%;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  background: var(--surface);
+  font-family: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+.auto-directory-heading select:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.auto-directory-list { max-height: 132px; overflow-y: auto; margin: 6px 0; }
+.auto-directory-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
+.auto-directory-main { display: flex; align-items: center; gap: 5px; font-size: 12px; flex-shrink: 0; }
+.auto-directory-path { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.auto-directory-error { color: var(--danger); font-size: 12px; margin-top: 6px; }

@@ -2717,5 +2717,16 @@
   "auto.summary_weekday.5": "Fri",
   "auto.summary_weekday.6": "Sat",
   "auto.summary_weekly_days": "Every {day} at {time}",
-  "auto.summary_monthdays": "{days}"
+  "auto.summary_monthdays": "{days}",
+  "auto.directories": "Working directories",
+  "auto.directory_browse": "Browse…",
+  "auto.directory_saved": "Add a saved directory…",
+  "auto.directory_main": "Main",
+  "auto.directory_remove": "Remove",
+  "auto.directory_unavailable": "Directory unavailable on this device",
+  "auto.directory_default": "Uses the agent or workspace default.",
+  "auto.directory_future_runs": "Project skills are available from all listed directories. Changes apply to future runs; existing conversations keep their working directory.",
+  "auto.directory_choose_main": "Select a main working directory before saving.",
+  "auto.directory_run_failed": "“{title}” could not start because its main working directory is unavailable. Restore the directory or choose another in Edit.",
+  "auto.directory_skill_removed": "A selected skill belongs to a removed directory. Remove that skill from the instruction or add its directory again."
 }
