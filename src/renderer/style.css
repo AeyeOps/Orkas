@@ -19710,19 +19710,13 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
 
 .auto-directory-heading { display: flex; align-items: center; gap: 8px; }
 .auto-directory-heading > label { font-weight: 500; flex: 1; }
-.auto-directory-heading select {
+.auto-directory-heading > .ai-select {
   min-width: 0;
-  max-width: 45%;
-  padding: 8px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  background: var(--surface);
-  font-family: inherit;
-  font-size: 13px;
-  cursor: pointer;
+  width: 230px;
+  max-width: 60%;
 }
-.auto-directory-heading select:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.ai-select-item.ai-select-action { position: sticky; top: -4px; z-index: 1; background: var(--primary-soft); }
+.ai-select-action .ai-select-item-label { color: var(--primary); font-weight: 500; }
 .auto-directory-list { max-height: 132px; overflow-y: auto; margin: 6px 0; }
 .auto-directory-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; }
 .auto-directory-main { display: flex; align-items: center; gap: 5px; font-size: 12px; flex-shrink: 0; }

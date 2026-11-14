@@ -21,19 +21,53 @@ test('New and Edit Auto share saved directories and keep each run’s selected c
     const page = app.page!;
     const agent = await app.invoke<any>('agents.create', { name: 'DirectoryCLIE2E', description: 'Directory test', category: 'general', runtime: { kind: 'cli', cli: 'opencode' } });
     await app.electronApp!.evaluate(({ dialog }, directory) => {
-      (dialog as any).showOpenDialog = async () => ({ canceled: false, filePaths: [directory] });
+      (globalThis as any).__directoryPickMode = 'cancel';
+      (dialog as any).showOpenDialog = async () => {
+        const mode = (globalThis as any).__directoryPickMode;
+        if (mode === 'fail') throw new Error('Directory picker failed');
+        return mode === 'cancel' ? { canceled: true, filePaths: [] } : { canceled: false, filePaths: [directory] };
+      };
     }, first);
     await openSidebarEntry(page, '#auto-btn');
     await page.locator('#auto-add-btn').click();
-    await page.locator('#auto-directory-browse').click();
+    const trigger = page.locator('#auto-directory-saved-trigger');
+    const menu = page.locator('#auto-directory-saved-listbox');
+    const browse = menu.locator('[data-value="__browse__"]');
+    await expect(trigger).toHaveText('Add a saved directory…');
+    await expect(page.locator('#auto-directory-browse')).toHaveCount(0);
+    await trigger.click();
+    await expect(menu.locator('.ai-select-item').first()).toHaveText('Add a saved directory…');
+    await browse.click();
+    await expect(page.locator('#auto-directory-list .auto-directory-row')).toHaveCount(0);
+    await expect(trigger).toBeEnabled();
+    await app.electronApp!.evaluate(() => { (globalThis as any).__directoryPickMode = 'fail'; });
+    await trigger.click();
+    await browse.click();
+    await expect(page.locator('#auto-directory-error')).toBeVisible();
+    await expect(trigger).toBeEnabled();
+    await app.acknowledgeInvokeFailures('common.pickDirectory', 1);
+    await app.electronApp!.evaluate(() => { (globalThis as any).__directoryPickMode = 'success'; });
+    await trigger.click();
+    await browse.click();
+    await expect(page.locator('#auto-directory-error')).toBeHidden();
     await expect(page.locator('#auto-directory-list .auto-directory-row')).toHaveCount(1);
+    await expect(trigger).toHaveText('Add a saved directory…');
     const saved = await app.invoke<any>('workingDirectories.list');
     const firstId = saved.directories.find((row: any) => row.path === first).id;
     const secondId = (await app.invoke<any>('workingDirectories.add', { path: second })).directory.id;
     await page.locator('#auto-dialog-cancel-btn').click();
     await page.locator('#auto-add-btn').click();
-    await page.locator('#auto-directory-saved').selectOption(firstId);
-    await page.locator('#auto-directory-saved').selectOption(secondId);
+    await trigger.click();
+    await expect(menu.locator('.ai-select-item').first()).toHaveText('Add a saved directory…');
+    await page.keyboard.press('ArrowDown');
+    await page.keyboard.press('Enter');
+    await expect(menu.locator(`[data-value="${firstId}"]`)).toHaveAttribute('aria-selected', 'true');
+    await menu.locator(`[data-value="${secondId}"]`).click();
+    await expect(menu).toBeVisible();
+    await expect(menu.locator(`[data-value="${secondId}"]`)).toHaveAttribute('aria-selected', 'true');
+    await expect(trigger).toHaveText('Add a saved directory…');
+    await page.locator('#auto-directories-label').click();
+    await expect(menu).toBeHidden();
     await page.locator(`input[name="auto-main-directory"][value="${firstId}"]`).check();
     await page.locator('#auto-task-input').fill('Directory execution');
     await page.locator('#auto-recipient-chip').click();
@@ -84,6 +118,14 @@ test('New and Edit Auto share saved directories and keep each run’s selected c
     await row.hover();
     await row.locator('.auto-row-more').click();
     await page.locator('.auto-row-menu [data-action="edit"]').click();
+    await trigger.click();
+    await expect(menu.locator(`[data-value="${firstId}"]`)).toHaveAttribute('aria-selected', 'true');
+    await expect(menu.locator(`[data-value="${secondId}"]`)).toHaveAttribute('aria-selected', 'true');
+    await menu.locator(`[data-value="${firstId}"]`).click();
+    await expect(page.locator(`[data-directory-id="${firstId}"]`)).toHaveCount(0);
+    await menu.locator(`[data-value="${firstId}"]`).click();
+    await expect(page.locator(`[data-directory-id="${firstId}"]`)).toHaveCount(1);
+    await page.keyboard.press('Escape');
     await page.locator(`[data-directory-id="${firstId}"] .auto-directory-remove`).click();
     await page.locator(`input[name="auto-main-directory"][value="${secondId}"]`).check();
     await page.locator('#auto-submit-btn').click();
@@ -170,4 +212,41 @@ test('native model reads the selected non-Main Skill when names collide', async 
   expect(JSON.stringify(app.modelRequests[2])).toContain('Unique body 1');
   expect(JSON.stringify(app.modelRequests[2])).not.toContain('Unique body 0');
   app.releaseCommentaryStage();
+});
+
+test('saved directory menu retains scroll and the browse action with long paths', async ({}, info) => {
+  const app = new OrkasTestApp(info, { nativeWindowVisible: true });
+  try {
+    await app.launch();
+    const page = app.page!;
+    const ids: string[] = [];
+    for (let index = 0; index < 14; index++) {
+      const dir = path.join(app.root, `directory-${String(index).padStart(2, '0')}-${'long-path-'.repeat(7)}`);
+      mkdirSync(dir, { recursive: true });
+      ids.push((await app.invoke<any>('workingDirectories.add', { path: dir })).directory.id);
+    }
+    await openSidebarEntry(page, '#auto-btn');
+    await page.locator('#auto-add-btn').click();
+    const trigger = page.locator('#auto-directory-saved-trigger');
+    const menu = page.locator('#auto-directory-saved-listbox');
+    const action = menu.locator('[data-value="__browse__"]');
+    await trigger.click();
+    await expect(menu.locator('.ai-select-item').first()).toHaveText('Add a saved directory…');
+    await menu.evaluate(element => { element.scrollTop = element.scrollHeight; });
+    const scrolled = await menu.evaluate(element => element.scrollTop);
+    expect(scrolled).toBeGreaterThan(0);
+    await menu.locator(`[data-value="${ids[13]}"]`).click();
+    await expect(menu.locator(`[data-value="${ids[13]}"]`)).toHaveAttribute('aria-selected', 'true');
+    expect(await menu.evaluate(element => element.scrollTop)).toBe(scrolled);
+    const actionBounds = await action.boundingBox();
+    const menuBounds = await menu.boundingBox();
+    expect(actionBounds!.y).toBeGreaterThanOrEqual(menuBounds!.y);
+    expect(actionBounds!.y + actionBounds!.height).toBeLessThanOrEqual(menuBounds!.y + menuBounds!.height);
+    await expect(trigger).toHaveText('Add a saved directory…');
+    await page.keyboard.press('Escape');
+    await expect(menu).toBeHidden();
+    await expect(trigger).toBeFocused();
+  } finally {
+    await app.dispose();
+  }
 });

@@ -2719,7 +2719,6 @@
   "auto.summary_weekly_days": "Every {day} at {time}",
   "auto.summary_monthdays": "{days}",
   "auto.directories": "Working directories",
-  "auto.directory_browse": "Browse…",
   "auto.directory_saved": "Add a saved directory…",
   "auto.directory_main": "Main",
   "auto.directory_remove": "Remove",
