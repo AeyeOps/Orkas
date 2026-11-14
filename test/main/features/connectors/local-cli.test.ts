@@ -694,6 +694,8 @@ describe('official local CLI connector runtime', () => {
   });
 
   it('opens a validated official authorization URL and rejects look-alikes before reaching the OS', async () => {
+    const users = await import('../../../../src/main/features/users');
+    users.activateUser('account-local-cli-browser');
     const openExternal = vi.mocked(shell.openExternal);
     openExternal.mockClear();
 

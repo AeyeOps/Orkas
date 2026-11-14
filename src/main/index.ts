@@ -31,7 +31,7 @@ import { scheduleChatApiPreload } from './features/model-api-preload';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { spawn } from 'node:child_process';
-import { app, BrowserWindow, Menu, Notification, type Tray, ipcMain, nativeImage, net, powerSaveBlocker, protocol, session, shell } from 'electron';
+import { app, BrowserWindow, Menu, Notification, type Tray, ipcMain, nativeImage, net, powerSaveBlocker, protocol, session } from 'electron';
 import { installWindowPresentationEvents } from './util/window-presentation';
 // Side-effect import: at module-load time this resolves the install
 // container, runs the one-shot PC/data → <container>/data migration, and
@@ -41,6 +41,7 @@ import { installWindowPresentationEvents } from './util/window-presentation';
 // rather than in index.ts body (esbuild CJS hoists imports → body runs
 // after paths.ts loads, which is too late to set the env var).
 import './install-data-root.cjs';
+import { openBrowserUrl } from './features/browser-preferences';
 import { resolveCliCommand } from './features/local_agents/spawn-command';
 import { createOptionalTray } from './util/app-tray';
 import { captureWindowsShutdownProcesses } from './util/windows-shutdown-processes';
@@ -343,17 +344,9 @@ function createWindow(startupHidden = false): BrowserWindow {
   // frame-only look (drag works, but no label across the top).
   win.on('page-title-updated', (e) => e.preventDefault());
 
-  // External links in chat bubbles / knowledge base / settings always open
-  // in the system default browser:
-  //   - `target="_blank"` / `window.open()`  → setWindowOpenHandler
-  //   - `<a href>` clicks without a target   → will-navigate (otherwise
-  //     Electron navigates the current window away and replaces the UI).
-  // The guard opens only safe HTTP(S) targets and blocks every other
-  // top-level navigation. Explicit mail/phone links use the validated IPC
-  // path instead of weakening this final security boundary.
   installExternalNavigationGuard(
     win.webContents,
-    (url) => shell.openExternal(url),
+    (url) => openBrowserUrl(url),
     (err) => log.warn('openExternal failed', { error: (err as Error)?.message || String(err) }),
   );
   installHtmlPreviewNavigationGuard(win.webContents);

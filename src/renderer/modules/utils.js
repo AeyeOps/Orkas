@@ -2304,15 +2304,15 @@ function inlineFormat(text) {
 // caring about the level of support.
 const renderMarkdown = renderMarkdownFull;
 
-// Route supported external link clicks through main's strict validator +
-// shell.openExternal so they always land in the system handler regardless of
-// `target=` / Electron version /
-// rel=noopener quirks. Covers chat bubbles, KB viewer, skill detail, agent
-// workflow — anywhere renderMarkdown emits a supported external link. Main's
-// setWindowOpenHandler / will-navigate (see main/index.ts) is the safety net
-// for HTTP(S) clicks that arrive before this script evaluates.
-// Guarded for Node test env where `document` is undefined; the click router
-// is a renderer-only side effect and irrelevant to the autolink fixtures.
+async function openExternalLink(url) {
+  try {
+    const result = await window.orkas.invoke('auth.openExternal', { url });
+    if (!result.ok) throw new Error(result.error);
+  } catch {
+    uiToast(t('settings.browser.open_failed'), { variant: 'error' });
+  }
+}
+
 if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
   const a = e.target && e.target.closest && e.target.closest('a[href]');
   if (!a) return;
@@ -2334,7 +2334,7 @@ if (typeof document !== 'undefined') document.addEventListener('click', (e) => {
     return;
   }
   e.preventDefault();
-  window.orkas.invoke('auth.openExternal', { url: href }).catch(() => {});
+  void openExternalLink(href);
 });
 
 /** Renderer-side mirror of `storage.ts::nowIso()` — local-time ISO8601

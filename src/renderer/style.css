@@ -14256,6 +14256,12 @@ body.is-task-side-panel-resizing * { cursor: col-resize !important; }
 .settings-row-copy > .settings-status:empty { display: none; }
 .settings-row > .ai-select.settings-row-select { flex: 0 0 auto; width: 200px; max-width: 45%; }
 .settings-row-stack { flex-direction: column; align-items: stretch; gap: 12px; }
+.settings-browser-custom[hidden] { display: none; }
+#settings-browser-grok-hint[hidden] { display: none; }
+.settings-browser-custom { margin: 0; }
+.settings-browser-custom .settings-form-row > span { display: block; font-size: 12px; margin-bottom: 5px; }
+.settings-browser-custom .settings-row-desc { margin: 0 0 12px; }
+#settings-browser-status.error { color: var(--danger); }
 .settings-row-btn {
   width: 100%;
   border: 0;

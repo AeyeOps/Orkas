@@ -91,6 +91,7 @@ async function loadSettings() {
   _settingsBindAddModalOnce();
   _settingsBindNavOnce();
   _settingsBindLanguageOnce();
+  _settingsBindBrowserOnce();
   _settingsBindTaskNotificationsOnce();
   _settingsBindClientConfigOnce();
   _settingsBindRecycleBinOnce();
@@ -100,6 +101,7 @@ async function loadSettings() {
   _settingsRenderLocalExec();
   _settingsSyncLanguageRadio();
   await Promise.all([
+    _settingsRefreshBrowser(),
     _settingsSafeCall('custom validation refresh', _settingsRefreshOperatorPolicy),
     _settingsSafeCall('settings providers refresh', _settingsRefreshProviders),
     _settingsSafeCall('settings entries refresh', _settingsRefreshEntries),
@@ -932,6 +934,117 @@ function _settingsRenderDataRoot() {
 // through t() — a Chinese user picking "English" should see "English", not the
 // translation of "English" in the current UI language.
 
+let _settingsBrowserSelect = null;
+let _settingsBrowserState = { profiles: [], selected: null, grokUsesProfile: true };
+let _settingsBrowserSaving = false;
+
+function _settingsBrowserKey(profile) {
+  return profile ? JSON.stringify([profile.executable, profile.userDataDir, profile.profileDirectory]) : 'system';
+}
+
+function _settingsBrowserStatus(text, failed = false) {
+  const status = document.getElementById('settings-browser-status');
+  status.textContent = text;
+  status.classList.toggle('error', failed);
+}
+
+function _settingsRenderBrowser() {
+  if (!_settingsBrowserSelect) return;
+  const profiles = [..._settingsBrowserState.profiles];
+  const selected = _settingsBrowserState.selected;
+  if (selected && !profiles.some(profile => _settingsBrowserKey(profile) === _settingsBrowserKey(selected))) profiles.push(selected);
+  _settingsBrowserSelect.setOptions([
+    { value: 'system', label: t('settings.browser.system') },
+    ...profiles.map(profile => ({ value: _settingsBrowserKey(profile), label: profile.label, hint: profile.userDataDir })),
+    { value: 'custom', label: t('settings.browser.custom') },
+  ]);
+  _settingsBrowserSelect.setValue(_settingsBrowserKey(selected));
+  _settingsBrowserSelect.setAriaLabel(t('settings.browser.title'));
+  document.getElementById('settings-browser-grok-hint').hidden = !selected || _settingsBrowserState.grokUsesProfile;
+  document.getElementById('settings-browser-custom').hidden = true;
+}
+
+async function _settingsRefreshBrowser() {
+  try {
+    const result = await window.orkas.invoke('prefs.getBrowser', {});
+    if (!result.ok) throw new Error(result.error);
+    _settingsBrowserState = { profiles: result.profiles, selected: result.selected, grokUsesProfile: result.grok_uses_profile };
+    _settingsRenderBrowser();
+    _settingsBrowserStatus('');
+  } catch (error) {
+    _settingsBrowserStatus(`${t('settings.browser.load_failed')} ${error.message}`, true);
+  }
+}
+
+function _settingsBindBrowserOnce() {
+  if (_settingsBrowserSelect) return;
+  _settingsBrowserSelect = _aiSelectMount(document.getElementById('settings-browser-select'), {
+    ariaLabel: t('settings.browser.title'), options: [], value: '',
+  });
+  _settingsBrowserSelect.onChange(async value => {
+    if (_settingsBrowserSaving) return;
+    _settingsBrowserStatus('');
+    const customForm = document.getElementById('settings-browser-custom');
+    customForm.hidden = value !== 'custom';
+    if (value === 'custom') {
+      const selected = _settingsBrowserState.selected;
+      document.getElementById('settings-browser-executable').value = selected?.executable || '';
+      document.getElementById('settings-browser-data-dir').value = selected?.userDataDir || '';
+      document.getElementById('settings-browser-profile-name').value = selected?.profileDirectory || '';
+      document.getElementById('settings-browser-executable').focus();
+      return;
+    }
+    const profile = value === 'system' ? null
+      : [..._settingsBrowserState.profiles, _settingsBrowserState.selected].find(row => _settingsBrowserKey(row) === value);
+    _settingsBrowserSaving = true;
+    document.querySelector('#settings-browser-select .ai-select-trigger').disabled = true;
+    try {
+      const result = await window.orkas.invoke('prefs.setBrowser', { profile });
+      if (!result.ok) throw new Error(result.error);
+      _settingsBrowserState.selected = result.selected;
+      _settingsRenderBrowser();
+      _settingsBrowserStatus(t('settings.browser.saved'));
+    } catch (error) {
+      _settingsRenderBrowser();
+      _settingsBrowserStatus(`${t('settings.browser.save_failed')} ${error.message}`, true);
+    } finally {
+      _settingsBrowserSaving = false;
+      document.querySelector('#settings-browser-select .ai-select-trigger').disabled = false;
+    }
+  });
+  document.getElementById('settings-browser-cancel').addEventListener('click', () => {
+    _settingsRenderBrowser();
+    _settingsBrowserStatus('');
+  });
+  document.getElementById('settings-browser-custom').addEventListener('submit', async event => {
+    event.preventDefault();
+    if (_settingsBrowserSaving) return;
+    _settingsBrowserSaving = true;
+    const button = document.getElementById('settings-browser-save');
+    button.disabled = true;
+    document.getElementById('settings-browser-cancel').disabled = true;
+    document.querySelector('#settings-browser-select .ai-select-trigger').disabled = true;
+    try {
+      const result = await window.orkas.invoke('prefs.setCustomBrowser', {
+        executable: document.getElementById('settings-browser-executable').value.trim(),
+        user_data_dir: document.getElementById('settings-browser-data-dir').value.trim(),
+        profile_name: document.getElementById('settings-browser-profile-name').value.trim(),
+      });
+      if (!result.ok) throw new Error(result.error);
+      _settingsBrowserState.selected = result.selected;
+      _settingsRenderBrowser();
+      _settingsBrowserStatus(t('settings.browser.saved'));
+    } catch (error) {
+      _settingsBrowserStatus(`${t('settings.browser.save_failed')} ${error.message}`, true);
+    } finally {
+      _settingsBrowserSaving = false;
+      button.disabled = false;
+      document.getElementById('settings-browser-cancel').disabled = false;
+      document.querySelector('#settings-browser-select .ai-select-trigger').disabled = false;
+    }
+  });
+}
+
 let _settingsLanguageSel = null;   // _aiSelectMount api
 
 const _SETTINGS_LANG_OPTIONS = [
@@ -983,6 +1096,7 @@ window.addEventListener('i18n-change', () => {
   _settingsRenderRecycleBin();
   void _settingsRefreshOperatorPolicy();
   _settingsSyncLanguageRadio();
+  _settingsRenderBrowser();
   _settingsRenderLocalExec();
   _settingsRenderPicker();
   _settingsRenderEntries();
@@ -1826,15 +1940,16 @@ async function _settingsStartOAuthFlow(provider, modelId) {
   }
   _oauthFlowId = startRes.flowId;
 
-  let lastKind = '';
+  let lastStatus = '';
   _oauthFlowPollTimer = setInterval(async () => {
     if (_oauthFlowOwner !== owner || !_oauthFlowId) return;
     const res = await window.orkas.invoke('auth.pollOAuthFlow', { flowId: _oauthFlowId });
     if (_oauthFlowOwner !== owner) return;
     if (!res || !res.ok) return;
     const status = res.status || {};
-    if (status.kind === lastKind && status.kind !== 'done' && status.kind !== 'error') return;
-    lastKind = status.kind;
+    const signature = JSON.stringify(status);
+    if (signature === lastStatus && status.kind !== 'done' && status.kind !== 'error') return;
+    lastStatus = signature;
     _oauthFlowRender(provider, status, closeFlow);
   }, 400);
 }
@@ -1867,6 +1982,7 @@ function _oauthFlowRender(provider, status, closeFlow) {
     body.innerHTML = `
       <div class="oauth-flow-stage">${escapeHtml(topHint)}</div>
       <div class="oauth-flow-hint">${escapeHtml(subHint)}</div>
+      <div class="oauth-flow-tip error" role="status">${status.browserError ? escapeHtml(t('settings.browser.open_failed')) : ''}</div>
       <div class="oauth-flow-actions">
         <button class="btn oauth-open-btn">${escapeHtml(t('settings.oauth.reopen'))}</button>
         <button class="btn oauth-copy-btn">${escapeHtml(t('settings.oauth.copy_link'))}</button>
@@ -1878,8 +1994,15 @@ function _oauthFlowRender(provider, status, closeFlow) {
         <button class="btn oauth-manual-submit-btn">${escapeHtml(t('settings.oauth.submit'))}</button>
       </div>` : ''}
     `;
-    body.querySelector('.oauth-open-btn').onclick = () => {
-      window.orkas.invoke('auth.openExternal', { url }).catch(() => {});
+    body.querySelector('.oauth-open-btn').onclick = async () => {
+      const errorElement = body.querySelector('.oauth-flow-tip.error');
+      try {
+        const result = await window.orkas.invoke('auth.openExternal', { url });
+        if (!result.ok) throw new Error(result.error);
+        errorElement.textContent = '';
+      } catch (error) {
+        errorElement.textContent = `${t('settings.browser.open_failed')} ${error.message}`;
+      }
     };
     body.querySelector('.oauth-copy-btn').onclick = async () => {
       try { await navigator.clipboard.writeText(url); } catch (_) {}

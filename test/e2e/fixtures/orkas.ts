@@ -109,6 +109,7 @@ export type CliStubState = {
   grokLoginOutcome?: 'success' | 'failure';
   grokLoginReady?: boolean;
   grokLoginCalls?: number;
+  grokLaunchBrowser?: boolean;
 };
 
 type ModelStubMode = 'success' | 'refusal' | 'http-error' | 'auth-error' | 'model-not-open' | 'slow' | 'very-slow' | 'controlled-slow' | 'truncated';
@@ -542,6 +543,7 @@ if (cli === 'grok' && args[0] === 'login') {
   state.grokLoginCalls = (state.grokLoginCalls || 0) + 1;
   writeState(state);
   if (args.join(' ') !== 'login --oauth') process.exit(2);
+  if (state.grokLaunchBrowser) require('node:child_process').spawn(process.env.BROWSER, ['https://auth.x.ai/oauth2/authorize?client_id=e2e'], { env: process.env, stdio: 'ignore' }).unref();
   process.stderr.write('Complete sign-in in your browser: https://auth.x.ai/oauth2/authorize?client_id=e2e&state=e2e-public-state&redirect_uri=http%3A%2F%2F127.0.0.1%3A9876%2Fcallback\n');
   const timer = setInterval(() => {
     const state = readState();

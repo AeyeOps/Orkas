@@ -1,3 +1,4 @@
+import { openBrowserUrl } from '../browser-preferences';
 /**
  * MCP-spec OAuth client using Dynamic Client Registration (RFC 7591).
  *
@@ -14,7 +15,6 @@ import * as crypto from 'node:crypto';
 import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { URL, URLSearchParams } from 'node:url';
-import { shell } from 'electron';
 import { buildDiscoveryUrls, extractWWWAuthenticateParams } from '@modelcontextprotocol/sdk/client/auth.js';
 import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
 
@@ -156,7 +156,7 @@ function _startLocalApiAuthorization(
     }
     const open = (url: string) => {
       if (_pending !== pending) return;
-      return shell.openExternal(url);
+      return openBrowserUrl(url);
     };
     const failed = (error: unknown) => {
       if (_pending !== pending) return;
@@ -654,7 +654,7 @@ async function _startDcrOAuth(
     };
     _pending = pending;
     server.on('request', (req, res) => _handleLoopbackRequest(pending, req, res));
-    shell.openExternal(authUrl.toString()).catch(() => {
+    openBrowserUrl(authUrl.toString()).catch(() => {
       if (_pending === pending) _cancelPending('failed to open authorization browser', 'browser_open_failed');
     });
   });
