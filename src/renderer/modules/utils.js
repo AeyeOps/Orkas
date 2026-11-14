@@ -2480,6 +2480,7 @@ function _aiSelectMount(el, config) {
     multiple: false,
     values: [],
     placeholder: (t('ai_select.placeholder')),
+    triggerLabel: '',
     onChange: () => {},
     open: false,
     activeIdx: -1,
@@ -2492,7 +2493,8 @@ function _aiSelectMount(el, config) {
     option => option.value === state.value && !option.disabled,
   )) state.value = '';
 
-  state.multiple = state.allowMultiple && state.multiple === true;
+  const supportsMultiple = state.allowMultiple || state.multiple === true;
+  state.multiple = state.multiple === true;
   const disabled = option => option.disabled || (state.multiple && option.singleOnly);
   const normalizeValues = values => state.options
     .filter(option => !disabled(option) && values.includes(option.value)).map(option => option.value);
@@ -2551,14 +2553,14 @@ function _aiSelectMount(el, config) {
       ? (selected.length ? { label: selected.map(o => o.label).join(t('ai_select.separator')) } : null)
       : state.options.find(o => o.value === state.value);
     if (opt) {
-      renderOptionLabel(labelEl, opt);
+      renderOptionLabel(labelEl, state.triggerLabel ? { label: state.triggerLabel } : opt);
       labelEl.classList.remove('placeholder');
     } else {
-      renderOptionLabel(labelEl, null);
-      labelEl.classList.add('placeholder');
+      renderOptionLabel(labelEl, state.triggerLabel ? { label: state.triggerLabel } : null);
+      labelEl.classList.toggle('placeholder', !state.triggerLabel);
     }
     el.dataset.value = state.value || '';
-    if (state.allowMultiple) {
+    if (supportsMultiple) {
       el.dataset.values = JSON.stringify(state.values);
       trigger.title = opt ? opt.label : '';
       trigger.setAttribute('aria-label', opt ? accessibleName() + ': ' + opt.label : accessibleName());
@@ -2596,6 +2598,7 @@ function _aiSelectMount(el, config) {
     state.options.forEach((opt, idx) => {
       const item = document.createElement('div');
       item.className = 'ai-select-item';
+      if (opt.action) item.classList.add('ai-select-action');
       item.id = `${listboxId}-option-${idx}`;
       item.dataset.value = opt.value;
       item.setAttribute('role', 'option');
@@ -2634,7 +2637,7 @@ function _aiSelectMount(el, config) {
       });
       popover.appendChild(item);
     });
-    if (state.allowMultiple) popover.scrollTop = scrollTop;
+    if (supportsMultiple) popover.scrollTop = scrollTop;
     const active = state.activeIdx >= 0
       ? popover.querySelectorAll('.ai-select-item')[state.activeIdx]
       : null;
@@ -2678,8 +2681,9 @@ function _aiSelectMount(el, config) {
     portalParent = popover.parentNode;
     portalNextSibling = popover.nextSibling;
     document.body.appendChild(popover);
+    const actionIdx = state.options.findIndex(o => o.action && !disabled(o));
     const selectedIdx = state.options.findIndex(o => (state.multiple ? state.values.includes(o.value) : o.value === state.value) && !disabled(o));
-    state.activeIdx = selectedIdx >= 0
+    state.activeIdx = actionIdx >= 0 ? actionIdx : selectedIdx >= 0
       ? selectedIdx
       : state.options.findIndex(option => !disabled(option));
     renderPopover();
@@ -2738,8 +2742,8 @@ function _aiSelectMount(el, config) {
     // adjacent input would otherwise commit its Enter into "pick the
     // active option" of this select.
     if (e.isComposing || e.keyCode === 229) return;
-    if (e.key === 'Escape') { close(); if (state.allowMultiple) trigger.focus(); e.preventDefault(); }
-    else if (state.allowMultiple && e.key === 'Tab') { close(); if (e.target !== trigger) trigger.focus(); }
+    if (e.key === 'Escape') { close(); if (supportsMultiple) trigger.focus(); e.preventDefault(); }
+    else if (supportsMultiple && e.key === 'Tab') { close(); if (e.target !== trigger) trigger.focus(); }
     else if (e.target.classList?.contains('ai-select-multiple-toggle')) return;
     else if (e.key === 'ArrowDown') {
       state.activeIdx = nextEnabledIndex(state.activeIdx + 1, 1);
@@ -2769,10 +2773,11 @@ function _aiSelectMount(el, config) {
   const api = {
     el,
     state,
-    setOptions(options, { value, placeholder } = {}) {
+    setOptions(options, { value, placeholder, triggerLabel } = {}) {
       state.options = _aiSelectNormalizeOptions(options);
       if (typeof value === 'string') state.value = value;
       if (typeof placeholder === 'string') state.placeholder = placeholder;
+      if (typeof triggerLabel === 'string') state.triggerLabel = triggerLabel;
       // Normalize value if not in options
       if (state.value && !state.options.some(
         option => option.value === state.value && !option.disabled,
@@ -2797,7 +2802,7 @@ function _aiSelectMount(el, config) {
       renderTrigger();
     },
     setSelection(values, multiple) {
-      state.multiple = state.allowMultiple && multiple === true;
+      state.multiple = supportsMultiple && multiple === true;
       state.values = normalizeValues(Array.isArray(values) ? values : []);
       state.value = state.multiple ? '' : (state.values.length === 1 ? state.values[0] : '');
       if (!state.multiple) state.values = state.value ? [state.value] : [];
@@ -2837,6 +2842,11 @@ function _aiSelectMount(el, config) {
 function _aiSelectPick(api, value) {
   const next = api.state.options.find(option => option.value === value);
   if (!next || next.disabled || (api.state.multiple && next.singleOnly)) return;
+  if (next.action) {
+    api.close();
+    next.action();
+    return;
+  }
   if (api.state.multiple) { api.toggleValue(value); return; }
   const prev = api.state.value;
   api.state.value = value || '';
