@@ -142,20 +142,6 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       };
       const requestedResumeId = def.resume ? String(opts.resumeSessionId || '') : '';
 
-      let sessionStartSent = false;
-      const sendSessionStart = () => {
-        if (sessionStartSent) return;
-        sessionStartSent = true;
-        send({
-          jsonrpc: '2.0',
-          id: 2,
-          method: requestedResumeId ? 'session/resume' : 'session/new',
-          params: requestedResumeId
-            ? { sessionId: requestedResumeId, cwd: opts.cwd, mcpServers }
-            : sessionNewParams,
-        });
-      };
-
       const splitter = new LineSplitter();
       let modelSetTimer: NodeJS.Timeout | undefined;
       let promptSent = false;
@@ -329,9 +315,26 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             }).finally(() => diagnostics.permissionEnded());
             return;
           }
-          if (Number(env.id) === 1 && !env.error) {
+          if (Number(env.id) === 1) {
+            if (env.error) {
+              resultStatus = 'failed';
+              resultError = typeof env.error.message === 'string'
+                ? env.error.message
+                : 'ACP initialization failed';
+              finishProtocol();
+              return;
+            }
+            if (cancellationRequested || opts.signal.aborted || watchdog.fired()) return;
             supportsSessionLoad = env.result?.agentCapabilities?.loadSession === true;
-            sendSessionStart();
+            send({
+              jsonrpc: '2.0',
+              id: 2,
+              method: requestedResumeId ? 'session/resume' : 'session/new',
+              params: requestedResumeId
+                ? { sessionId: requestedResumeId, cwd: opts.cwd, mcpServers }
+                : sessionNewParams,
+            });
+            return;
           }
           if (Number(env.id) === 4 && sessionId && mcpRefreshPending) {
             mcpRefreshPending = false;
@@ -410,13 +413,6 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         });
       });
 
-      // Fire-and-forget timeout to be sure session start goes; some CLIs
-      // ack initialize without printing anything we'd recognize as the
-      // ack, and then sit idle. The one-shot guard prevents a late fallback
-      // from creating a second session after a normal initialize response.
-      const initTimer = setTimeout(sendSessionStart, 250);
-      if (typeof initTimer.unref === 'function') initTimer.unref();
-
       const stderrLines = new LineSplitter(64 * 1024);
       const stderrLine = (line: string) => {
         if (line) opts.onEvent({ type: 'stderr-line', line });
@@ -449,7 +445,6 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           exited = true;
           stderrLines.flush(stderrLine);
           watchdog.disarm();
-          clearTimeout(initTimer);
           if (modelSetTimer) clearTimeout(modelSetTimer);
           detachAbort();
           // One content-free summary survives both local archives and sampled

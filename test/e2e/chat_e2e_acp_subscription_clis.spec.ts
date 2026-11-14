@@ -1,3 +1,4 @@
+import { writeFileSync } from 'node:fs';
 import type { Page } from '@playwright/test';
 
 import { expect, test, type OrkasTestApp } from './fixtures/orkas';
@@ -26,6 +27,50 @@ function assistantReply(page: Page, text: string) {
 
 test.describe('Subscription CLIs over ACP', () => {
   test.describe.configure({ timeout: 120_000 });
+
+  test('Grok waits for delayed initialization before creating a session', async ({ cliOrkas }) => {
+    const page = await createAgent(cliOrkas, 'GrokDelayedInitE2E', 'grok');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), acpInitializeMode: 'delayed' }));
+    await page.locator('#new-chat-input').fill('@GrokDelayedInitE2E Reply when ready');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(assistantReply(page, 'E2E_GROK_FIRST_OK')).toBeVisible({ timeout: 30_000 });
+    const state = cliOrkas.readCliState();
+    expect(state.acpRequests).toEqual([
+      { cli: 'grok', method: 'initialize' },
+      { cli: 'grok', method: 'session/new' },
+      { cli: 'grok', method: 'session/prompt' },
+    ]);
+    expect(state.invocations).toHaveLength(1);
+    await expect(page.locator('#chat-history')).not.toContainText('Authentication required');
+  });
+
+  test('Grok displays an initialization error without creating a session', async ({ cliOrkas }) => {
+    const page = await createAgent(cliOrkas, 'GrokInitErrorE2E', 'grok');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), acpInitializeMode: 'error' }));
+    await page.locator('#new-chat-input').fill('@GrokInitErrorE2E Reply when ready');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#chat-history .chat-message.assistant')).toContainText('Grok initialization rejected', { timeout: 30_000 });
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    const state = cliOrkas.readCliState();
+    expect(state.acpRequests).toEqual([{ cli: 'grok', method: 'initialize' }]);
+    expect(state.invocations).toHaveLength(0);
+    await expect(page.locator('.bubble-retry-btn')).toBeVisible();
+  });
+
+  test('Grok can be stopped while initialization is pending', async ({ cliOrkas }) => {
+    const page = await createAgent(cliOrkas, 'GrokPendingInitE2E', 'grok');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), acpInitializeMode: 'pending' }));
+    await page.locator('#new-chat-input').fill('@GrokPendingInitE2E Reply when ready');
+    await page.locator('#new-chat-send-btn').click();
+    await expect.poll(() => cliOrkas.readCliState().acpRequests).toEqual([{ cli: 'grok', method: 'initialize' }]);
+    await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+    await page.locator('#chat-send-btn').click();
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    const state = cliOrkas.readCliState();
+    expect(state.acpRequests).toEqual([{ cli: 'grok', method: 'initialize' }]);
+    expect(state.invocations).toHaveLength(0);
+    await expect(page.locator('#chat-history')).not.toContainText('Authentication required');
+  });
 
   for (const item of CASES) {
     test(`${item.cli} runs with full access by default and bridges visible history`, async ({ cliOrkas }) => {
