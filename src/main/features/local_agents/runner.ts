@@ -1218,7 +1218,7 @@ export interface RunCliAgentResult {
   failureCategory?: CliFailureCategory;
   /** Redacted, bounded last lines the CLI wrote to stderr before failing. */
   stderrExcerpt?: string;
-  cliError?: LocalCliEntry['error'] | 'model_unsupported' | 'parameter_unsupported';
+  cliError?: LocalCliEntry['error'] | 'model_unsupported' | 'parameter_unsupported' | 'authentication_required';
   cliPath?: string;
   cliVersion?: string;
   commanderHandoff?: CommanderHandoffRequest;
@@ -1500,7 +1500,8 @@ export async function run(opts: RunCliAgentOpts): Promise<RunCliAgentResult> {
       failureKind: typeof e.failureKind === 'string' ? e.failureKind : undefined,
       retrySafe: e.retrySafe === true,
       bootstrapTimeout: e.bootstrapTimeout === true,
-      cliError: e.cliError === 'model_unsupported' || e.cliError === 'parameter_unsupported' ? e.cliError : undefined,
+      cliError: e.cliError === 'model_unsupported' || e.cliError === 'parameter_unsupported'
+        || e.cliError === 'authentication_required' ? e.cliError : undefined,
       stderrTail: typeof e.stderrTail === 'string' ? e.stderrTail : undefined,
     };
   };

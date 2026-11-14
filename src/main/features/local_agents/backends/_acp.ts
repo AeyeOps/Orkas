@@ -68,6 +68,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       let resultStatus: 'completed' | 'failed' | undefined;
       let resultError: string | undefined;
       let compatibilityFailure = false;
+      let authenticationRequired = false;
       const toolNames = new Map<string, string>();
       // Captured upstream-provider error text from stderr. ACP servers
       // (notably hermes 0.9) treat upstream HTTP 400/auth errors as
@@ -246,6 +247,9 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             return;
           }
           diagnostics.received(env);
+          if (env.error?.code === -32000 && [1, 2, PROMPT_REQ_ID].includes(Number(env.id))) {
+            authenticationRequired = true;
+          }
           if (env?.method === 'session/request_permission' && env.id !== undefined) {
             const params = env.params && typeof env.params === 'object' ? env.params : {};
             const toolCall = params.toolCall && typeof params.toolCall === 'object'
@@ -477,6 +481,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             });
             if (resultStatus === 'failed') return finish('failed', {
               error: resultError, output: resultText, stderrTail: tail.toString(),
+              ...(authenticationRequired ? { cliError: 'authentication_required' } : {}),
               ...(compatibilityFailure ? { cliError: 'parameter_unsupported', failureKind: 'cli_compatibility', retrySafe: false } : {}),
             });
             // Preserve the existing Hermes silent-provider-failure handling

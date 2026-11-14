@@ -568,6 +568,112 @@ function _renderExternalCliUpgrades(entries) {
   }
 }
 window.createLocalCliUpgradeControl = createLocalCliUpgradeControl;
+
+let _grokSignInState = { sessionId: '', phase: 'idle', urls: [], completedAt: 0 };
+let _grokSignInStatusLoaded = false;
+
+function _grokSignInUrl(urls) {
+  return urls.find(value => {
+    try {
+      const url = new URL(value);
+      return url.origin === 'https://auth.x.ai' && url.pathname === '/oauth2/authorize'
+        && !url.username && !url.password;
+    } catch { return false; }
+  });
+}
+
+function _updateGrokSignInState(session) {
+  _grokSignInState.sessionId = session.session_id;
+  _grokSignInState.urls = session.urls || [];
+  _grokSignInState.phase = session.status === 'running' ? 'waiting'
+    : session.status === 'exited' && session.exit_code === 0 ? 'success'
+      : session.status === 'closed' ? 'cancelled' : 'failed';
+  if (_grokSignInState.phase === 'success') _grokSignInState.completedAt = Date.parse(session.updated_at) || Date.now();
+  _renderGrokSignInControls();
+}
+
+function _renderGrokSignInControl(root) {
+  const state = _grokSignInState;
+  const phase = state.phase === 'success' && Number(root.dataset.failedAt) > state.completedAt ? 'idle' : state.phase;
+  const pending = phase === 'starting' || phase === 'waiting';
+  root.dataset.state = phase;
+  const button = root.querySelector('.grok-sign-in-btn');
+  button.textContent = t(pending ? 'cli_sign_in.pending' : phase === 'success' ? 'cli_sign_in.signed_in' : 'cli_sign_in.action');
+  button.disabled = pending || phase === 'success';
+  button.setAttribute('aria-busy', String(pending));
+  const status = root.querySelector('[role="status"]');
+  status.textContent = phase === 'idle' ? '' : t(`cli_sign_in.${phase}`);
+  status.hidden = !status.textContent;
+  root.querySelector('.grok-sign-in-cancel').hidden = !pending;
+  root.querySelector('.grok-sign-in-cancel').disabled = !state.sessionId;
+  root.querySelector('.grok-sign-in-cancel').textContent = t('common.cancel');
+  root.querySelector('.grok-sign-in-reopen').hidden = !pending || !_grokSignInUrl(state.urls);
+  root.querySelector('.grok-sign-in-reopen').textContent = t('cli_sign_in.reopen');
+}
+
+function _renderGrokSignInControls() {
+  document.querySelectorAll('.grok-sign-in-control').forEach(_renderGrokSignInControl);
+}
+
+function createGrokSignInControl(agentId, failedAt) {
+  const root = document.createElement('div');
+  root.className = 'grok-sign-in-control chat-app-nav-row';
+  root.dataset.failedAt = String(failedAt || 0);
+  root.innerHTML = '<button type="button" class="btn chat-app-nav-btn grok-sign-in-btn"></button>'
+    + '<button type="button" class="btn btn-secondary btn-sm grok-sign-in-cancel"></button>'
+    + '<button type="button" class="settings-link-btn grok-sign-in-reopen"></button>'
+    + '<span class="grok-sign-in-status" role="status" aria-live="polite"></span>';
+  const cancel = root.querySelector('.grok-sign-in-cancel');
+  root.querySelector('.grok-sign-in-btn').addEventListener('click', async () => {
+    if (['starting', 'waiting'].includes(_grokSignInState.phase)) return;
+    _grokSignInState = { sessionId: '', phase: 'starting', urls: [], completedAt: 0 };
+    _renderGrokSignInControls();
+    try {
+      const result = await window.orkas.invoke('localAgents.signInGrok', { agent_id: agentId });
+      _updateGrokSignInState(result.session);
+      const current = await window.orkas.invoke('interactiveCli.read', { session_id: result.session.session_id });
+      _updateGrokSignInState(current.session);
+    } catch {
+      _grokSignInState.phase = 'failed';
+      _renderGrokSignInControls();
+    }
+  });
+  cancel.addEventListener('click', async () => {
+    cancel.disabled = true;
+    try {
+      const result = await window.orkas.invoke('interactiveCli.close', { session_id: _grokSignInState.sessionId });
+      _updateGrokSignInState(result.session);
+    } catch {
+      _grokSignInState.phase = 'failed';
+      _renderGrokSignInControls();
+    }
+  });
+  root.querySelector('.grok-sign-in-reopen').addEventListener('click', async () => {
+    const url = _grokSignInUrl(_grokSignInState.urls);
+    if (!url) return;
+    try { await window.orkas.invoke('auth.openExternal', { url }); }
+    catch { uiToast(t('cli_sign_in.browser_failed'), { variant: 'error' }); }
+  });
+  _renderGrokSignInControl(root);
+  if (!_grokSignInStatusLoaded) {
+    _grokSignInStatusLoaded = true;
+    void window.orkas.invoke('localAgents.grokSignInStatus').then(result => {
+      if (result.session && !_grokSignInState.sessionId) _updateGrokSignInState(result.session);
+    }).catch(() => {
+      _grokSignInStatusLoaded = false;
+      _grokSignInState.phase = 'failed';
+      _renderGrokSignInControls();
+    });
+  }
+  return root;
+}
+
+window.createGrokSignInControl = createGrokSignInControl;
+window.orkas.onPushEvent('interactive-cli:event', payload => {
+  if (payload.session_id !== _grokSignInState.sessionId) return;
+  _updateGrokSignInState({ ...payload, urls: payload.urls || _grokSignInState.urls });
+});
+window.addEventListener('i18n-change', _renderGrokSignInControls);
 if (typeof window.addEventListener === 'function') {
   window.addEventListener('i18n-change', () => {
     for (const root of document.querySelectorAll('.local-cli-upgrade-control')) {
