@@ -218,14 +218,16 @@ let _autoDirectoryIds = [];
 let _autoWorkingDirectoryId = null;
 let _autoSavedDirectories = [];
 let _autoDirectoryLoadSequence = 0;
+let _autoDirectorySel = null;
 
 function _autoRenderDirectories() {
   const list = document.getElementById('auto-directory-list');
-  const saved = document.getElementById('auto-directory-saved');
-  if (!list || !saved) return;
-  saved.innerHTML = '<option value="">' + escapeHtml(t('auto.directory_saved')) + '</option>'
-    + _autoSavedDirectories.filter(row => !_autoDirectoryIds.includes(row.id)).map(row =>
-      '<option value="' + escapeHtml(row.id) + '">' + escapeHtml(row.path) + '</option>').join('');
+  if (!list || !_autoDirectorySel) return;
+  _autoDirectorySel.setOptions([
+    { value: '__browse__', label: t('auto.directory_saved'), action: _autoBrowseDirectory },
+    ..._autoSavedDirectories.map(row => ({ value: row.id, label: row.path })),
+  ], { triggerLabel: t('auto.directory_saved') });
+  _autoDirectorySel.setSelection(_autoDirectoryIds, true);
   list.innerHTML = _autoDirectoryIds.map(id => {
     const directory = _autoSavedDirectories.find(row => row.id === id);
     const name = directory ? directory.path : t('auto.directory_unavailable');
@@ -240,12 +242,22 @@ function _autoRenderDirectories() {
   list.querySelectorAll('input').forEach(input => input.addEventListener('change', () => { _autoWorkingDirectoryId = input.value; _autoDirectoryError(null); }));
   list.querySelectorAll('.auto-directory-remove').forEach(button => button.addEventListener('click', () => {
     const id = button.closest('[data-directory-id]').dataset.directoryId;
-    _autoDirectoryIds = _autoDirectoryIds.filter(value => value !== id);
-    if (_autoWorkingDirectoryId === id) _autoWorkingDirectoryId = null;
-    _autoDirectoryError(null);
-    _autoRenderDirectories();
-    _autoRefreshProjectScopedPicker();
+    _autoSetDirectorySelection(_autoDirectoryIds.filter(value => value !== id));
   }));
+}
+
+function _autoSetDirectorySelection(ids) {
+  const firstSelection = _autoDirectoryIds.length === 0;
+  _autoDirectoryIds = [
+    ..._autoDirectoryIds.filter(id => ids.includes(id)),
+    ...ids.filter(id => !_autoDirectoryIds.includes(id)),
+  ];
+  if (!_autoDirectoryIds.includes(_autoWorkingDirectoryId)) {
+    _autoWorkingDirectoryId = firstSelection && _autoDirectoryIds.length ? _autoDirectoryIds[0] : null;
+  }
+  _autoDirectoryError(null);
+  _autoRenderDirectories();
+  _autoRefreshProjectScopedPicker();
 }
 
 function _autoDirectoryError(error) {
@@ -267,12 +279,24 @@ async function _autoLoadDirectories() {
 }
 
 function _autoAttachDirectory(directory) {
-  _autoDirectoryError(null);
   if (!_autoSavedDirectories.some(row => row.id === directory.id)) _autoSavedDirectories.push(directory);
-  if (!_autoDirectoryIds.includes(directory.id)) _autoDirectoryIds.push(directory.id);
-  if (_autoDirectoryIds.length === 1) _autoWorkingDirectoryId = directory.id;
-  _autoRenderDirectories();
-  _autoRefreshProjectScopedPicker();
+  _autoSetDirectorySelection(_autoDirectoryIds.includes(directory.id) ? _autoDirectoryIds : [..._autoDirectoryIds, directory.id]);
+}
+
+async function _autoBrowseDirectory() {
+  const button = _autoDirectorySel.el.querySelector('.ai-select-trigger');
+  const sequence = _autoDirectoryLoadSequence;
+  button.disabled = true;
+  _autoDirectoryError(null);
+  try {
+    const picked = await window.orkas.invoke('common.pickDirectory');
+    if (!picked.ok) throw new Error(picked.error);
+    if (picked.cancelled) return;
+    const result = await window.orkas.invoke('workingDirectories.add', { path: picked.path });
+    if (!result.ok) throw new Error(result.error);
+    if (sequence === _autoDirectoryLoadSequence) _autoAttachDirectory(result.directory);
+  } catch (error) { _autoDirectoryError(error); }
+  finally { button.disabled = false; }
 }
 
 let _autoDatePicker = null;
@@ -1323,24 +1347,10 @@ function _autoStripComposerUseTokens(value) {
 }
 
 function _mountAutoForm() {
-  document.getElementById('auto-directory-saved').addEventListener('change', event => {
-    const directory = _autoSavedDirectories.find(row => row.id === event.target.value);
-    if (directory) _autoAttachDirectory(directory);
-  });
-  document.getElementById('auto-directory-browse').addEventListener('click', async event => {
-    const button = event.currentTarget;
-    const sequence = _autoDirectoryLoadSequence;
-    button.disabled = true;
-    _autoDirectoryError(null);
-    try {
-      const picked = await window.orkas.invoke('common.pickDirectory');
-      if (!picked.ok) throw new Error(picked.error);
-      if (picked.cancelled) return;
-      const result = await window.orkas.invoke('workingDirectories.add', { path: picked.path });
-      if (!result.ok) throw new Error(result.error);
-      if (sequence === _autoDirectoryLoadSequence) _autoAttachDirectory(result.directory);
-    } catch (error) { _autoDirectoryError(error); }
-    finally { button.disabled = false; }
+  _autoDirectorySel = _aiSelectMount(document.getElementById('auto-directory-saved'), {
+    multiple: true,
+    triggerLabel: t('auto.directory_saved'),
+    onChange: _autoSetDirectorySelection,
   });
   const panel = document.getElementById('panel-auto');
   if (!panel) return;
@@ -1981,6 +1991,7 @@ function _autoRepaintLabels() {
   if (_autoEndDatePicker) _autoEndDatePicker.repaint();
   _autoSyncFreqRows(_autoFreqSel ? _autoFreqSel.getValue() : 'daily');
   _autoRefreshRunDevicePicker();
+  _autoRenderDirectories();
   _paintAutoSyncNotice();
 }
 
@@ -2084,6 +2095,7 @@ function _showAutoDialog() {
 }
 
 function _hideAutoDialog() {
+  if (_autoDirectorySel) _autoDirectorySel.close();
   if (_autoDatePicker) _autoDatePicker.close();
   if (_autoEndDatePicker) _autoEndDatePicker.close();
   const overlay = document.getElementById('auto-task-dialog-overlay');
