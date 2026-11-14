@@ -95,12 +95,8 @@
     </aside>
 
     <main class="main-content">
-      <!-- Commander home: the composer stays above the scrollable work list. -->
-      <section class="panel active" id="panel-new-chat" data-home-state="pending">
+      <section class="panel active" id="panel-new-chat">
         <div class="new-chat-center">
-          <div class="new-chat-header">
-            <h1 class="new-chat-greeting" id="new-chat-greeting" data-i18n="new_chat.title_fallback">Friend, what do you want to accomplish?</h1>
-          </div>
           <div class="new-chat-input-wrapper">
             <div class="new-chat-input-area">
               <!-- Floats above the input box. Attachments wrap on the left;
@@ -140,42 +136,6 @@
                 </button>
               </div>
             </div>
-          </div>
-          <!-- Everything below the composer. This is the only part of the
-               home that scrolls, so the composer is never inside a scroller. -->
-          <div class="home-below">
-            <!-- Empty: two equal ways to start. Copy only; the one control is the
-                 connect link that home.js renders inside the context line. -->
-            <div class="home-paths">
-              <section class="home-path" aria-labelledby="home-goal-title">
-                <h2 class="home-path-title" id="home-goal-title" data-i18n="new_chat.home.goal_title">Have a clear goal? Hand it to Commander.</h2>
-                <p class="home-path-body" data-i18n="new_chat.home.goal_body">Tell Commander what you want to accomplish, and it will coordinate your AI team to get it done.</p>
-                <p class="home-path-note" data-i18n="new_chat.home.goal_example">For example: research 3 similar products, compare their features and pricing, and turn the findings into a presentation.</p>
-              </section>
-              <section class="home-path" aria-labelledby="home-explore-title">
-                <h2 class="home-path-title" id="home-explore-title" data-i18n="new_chat.home.explore_title">Not sure yet? Let Orkas get to know you first.</h2>
-                <p class="home-path-body" data-i18n="new_chat.home.explore_body">Talk about your work, your business, or what's on your mind, and Orkas will help you find the right goals and keep them moving.</p>
-                <p class="home-path-note" id="home-explore-context"></p>
-              </section>
-            </div>
-            <!-- Server-orderable quick start list. Main-process client config
-                 supplies the ordered ids; conversation.js renders localized
-                 cards and binds their matching built-in/default agent. -->
-            <section class="new-chat-scenarios quick-panel" id="new-chat-scenarios" aria-labelledby="quick-panel-title">
-              <div class="quick-panel-head">
-                <span class="quick-panel-title" id="quick-panel-title" data-i18n="new_chat.quick.title">Try one of these tasks — one click to get started</span>
-                <span class="quick-panel-rule" aria-hidden="true"></span>
-              </div>
-              <div class="quick-grid" id="new-chat-scenario-grid"></div>
-            </section>
-            <!-- Populated: the three groups are rendered by home.js. -->
-            <section class="home-work" id="home-work" aria-labelledby="home-continue-title">
-              <div class="home-continue-label" id="home-continue-title">
-                <span data-i18n="new_chat.home.continue_label">Keep things moving</span>
-                <span class="home-continue-rule" aria-hidden="true"></span>
-              </div>
-              <div class="home-groups" id="home-groups"></div>
-            </section>
           </div>
         </div>
       </section>
@@ -2044,7 +2004,6 @@
   <script src="./modules/commercial-entry.js"></script>
   <script src="./modules/conversation.js"></script>
   <script src="./modules/conversation-to-project.js"></script>
-  <script src="./modules/home.js"></script>
   <script src="./modules/conversation-turn-nav.js"></script>
   <script src="./modules/web-app-host.js"></script>
   <script src="./modules/artifact-security.js"></script>
