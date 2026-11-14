@@ -651,7 +651,10 @@ function createGrokSignInControl(agentId, failedAt) {
   root.querySelector('.grok-sign-in-reopen').addEventListener('click', async () => {
     const url = _grokSignInUrl(_grokSignInState.urls);
     if (!url) return;
-    try { await window.orkas.invoke('auth.openExternal', { url }); }
+    try {
+      const result = await window.orkas.invoke('auth.openExternal', { url });
+      if (!result.ok) throw new Error(result.error);
+    }
     catch { uiToast(t('cli_sign_in.browser_failed'), { variant: 'error' }); }
   });
   _renderGrokSignInControl(root);

@@ -32,6 +32,7 @@ import type { GroupEvent } from '../features/group_chat/bus';
 import * as agents from '../features/agents';
 import * as autoTasks from '../features/auto_tasks';
 import { addWorkingDirectory, listWorkingDirectories } from '../features/working_directories';
+import { listBrowserProfiles, getBrowserPreference, setBrowserPreference, customBrowserProfile } from '../features/browser-preferences';
 import { isAgentEnabled } from '../features/component_enabled';
 import * as skills from '../features/skills';
 import * as marketplace from '../features/marketplace';
@@ -1050,6 +1051,13 @@ async function startupOperation(run: () => unknown | Promise<unknown>) {
 const invokeHandlers: Record<string, InvokeHandler> = {
   'voiceInput.createSession': () => voiceInput.createVoiceSession(),
   'voiceInput.ensureMicrophoneAccess': () => voiceInput.ensureMicrophoneAccess(),
+  'prefs.getBrowser': async (_payload, ctx) => ({
+    profiles: listBrowserProfiles(), selected: getBrowserPreference(ctx.userId), grok_uses_profile: process.platform === 'linux',
+  }),
+  'prefs.setBrowser': async ({ profile }, ctx) => ({ selected: setBrowserPreference(ctx.userId, profile) }),
+  'prefs.setCustomBrowser': async ({ executable, user_data_dir, profile_name }, ctx) => ({
+    selected: setBrowserPreference(ctx.userId, customBrowserProfile(executable, user_data_dir, profile_name)),
+  }),
   'appPublishing.prepare': async () => publishApp(),
   'appPublishing.publish': async () => publishApp(),
   'appPublishing.recover': async () => publishApp(),
@@ -3262,9 +3270,7 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   'auth.pollOAuthFlow':    async ({ flowId }) => auth.pollOAuthFlow(flowId),
   'auth.submitOAuthInput': async ({ flowId, value }) => auth.submitOAuthInput(flowId, value),
   'auth.cancelOAuthFlow':  async ({ flowId }) => auth.cancelOAuthFlow(flowId),
-  // Open a URL in the user's default browser (OAuth flow uses this so the
-  // consent page renders where the user is already logged in).
-  'auth.openExternal':     async ({ url }) => auth.openExternalUrl(url),
+  'auth.openExternal':     async ({ url }, ctx) => auth.openExternalUrl(url, ctx.userId),
   // Priority list (entries) — ordered (provider, model, profile) tuples.
   'auth.listEntries':     async ({ includeUnavailable } = {}) => (
     auth.listEntries({ includeUnavailable: !!includeUnavailable })

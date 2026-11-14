@@ -4,6 +4,8 @@ const oauthProgress = vi.fn();
 const logInfo = vi.fn();
 const logWarn = vi.fn();
 
+vi.mock('../../../../src/main/features/users', () => ({ getActiveUserId: () => 'oauth-test' }));
+
 function mockElectron() {
   vi.doMock('electron', () => ({
     app: {

@@ -3,6 +3,7 @@ import { resolveCli } from './registry.js';
 import { getLanguageForUser } from '../config.js';
 import { t } from '../../i18n.js';
 import { buildCliSpawnEnv, resolveCliCommand } from './spawn-command.js';
+import { browserLoginEnvironment } from '../browser-preferences.js';
 import {
   readInteractiveCliSession,
   startInteractiveCliSession,
@@ -27,18 +28,24 @@ export async function signInGrok(uid: string): Promise<InteractiveCliSessionView
   const starting = (async () => {
     const entry = await resolveCli('grok', { force: true });
     if (!entry.available || !entry.path) throw new Error(t('cli_agent.grok_sign_in_unavailable', undefined, getLanguageForUser(uid)));
-    const env = buildCliSpawnEnv(entry.path);
+    const browser = browserLoginEnvironment(uid, buildCliSpawnEnv(entry.path));
+    const env = browser.env;
     const launch = resolveCliCommand(entry.path, ['login', '--oauth'], process.platform, env);
-    return startInteractiveCliSession({
-      uid,
-      purpose: t('cli_agent.grok_sign_in', undefined, getLanguageForUser(uid)),
-      presentation: 'browser_auth',
-      command: launch.command,
-      args: launch.args,
-      windowsVerbatimArguments: launch.windowsVerbatimArguments,
-      cwd: os.homedir(),
-      sandboxEnv: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string')),
-    });
+    let session: InteractiveCliSessionView;
+    try {
+      session = startInteractiveCliSession({
+        uid,
+        purpose: t('cli_agent.grok_sign_in', undefined, getLanguageForUser(uid)),
+        presentation: 'browser_auth',
+        command: launch.command,
+        args: launch.args,
+        windowsVerbatimArguments: launch.windowsVerbatimArguments,
+        cwd: os.homedir(),
+        sandboxEnv: Object.fromEntries(Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string')),
+      });
+    } catch (error) { browser.cleanup(); throw error; }
+    void waitInteractiveCliSession(uid, session.session_id).then(browser.cleanup);
+    return session;
   })();
   const operation: GrokSignIn = { starting };
   signIns.set(uid, operation);
