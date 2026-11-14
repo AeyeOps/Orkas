@@ -320,7 +320,6 @@ describe('conversation send ownership across navigation', () => {
     context.getChatUseSelections = () => [];
     context._chatModelTelemetryContext = () => ({});
     context._readConversationTemplateAttribution = () => ({});
-    context._unresolvedQuickStartPlaceholder = () => '';
     context._chatAttachSnapshotForSend = async () => {
       if (['attachments', 'unchanged', 'new-draft'].includes(phase)) { reached(); await held; }
       return { ok: true, items: [{ name: 'a.txt', status: 'ready' }], names: ['a.txt'] };
