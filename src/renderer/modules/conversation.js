@@ -2370,316 +2370,6 @@ function onEnterNewChatView() {
   const hasDraft = !!(input && composerText(input));
   if (!hasDraft) _newChatRecipient = { ..._COMMANDER };
   _renderRecipientChip('new-chat');
-  // Keep the empty-state heading aligned with the current locale.
-  _refreshEmptyStateAll();
-  _initEmptyStateScenarios();
-  // Work to pick up (open to-dos, finished runs not yet opened); home.js.
-  if (typeof homeOnEnter === 'function') homeOnEnter();
-}
-
-// ── Empty-state landing helpers ──────────────────────────────────────────
-// Surface B per PC/docs/design/PATTERNS.md.
-const _SCENARIO_CATALOG = {
-  ecommerce: {
-    templateKey: 'new_chat.quick.tmpl.ecommerce',
-    labelKey: 'new_chat.quick.ecommerce',
-    taskKey: 'new_chat.quick.task.ecommerce',
-    deliverableKey: 'new_chat.quick.deliver.ecommerce',
-    subjectKey: 'new_chat.quick.subject.ecommerce',
-    subjectFallback: 'pet water fountains',
-    icon: 'shopping-cart',
-    group: 'product-growth',
-    agentNames: ['ECommerceResearcher'],
-  },
-  data: {
-    templateKey: 'new_chat.quick.tmpl.data',
-    labelKey: 'new_chat.quick.data',
-    taskKey: 'new_chat.quick.task.data',
-    deliverableKey: 'new_chat.quick.deliver.data',
-    subjectKey: 'new_chat.quick.subject.data',
-    subjectFallback: 'AI desktop apps',
-    icon: 'search',
-    group: 'knowledge-office',
-    agentNames: ['DeepResearcher'],
-  },
-  video: {
-    templateKey: 'new_chat.quick.tmpl.video',
-    labelKey: 'new_chat.quick.video',
-    taskKey: 'new_chat.quick.task.video',
-    deliverableKey: 'new_chat.quick.deliver.video',
-    subjectKey: 'new_chat.quick.subject.video',
-    subjectFallback: 'AI trends',
-    icon: 'film',
-    group: 'content-creation',
-    agentNames: ['VideoStudio'],
-  },
-  image: {
-    templateKey: 'new_chat.quick.tmpl.image',
-    labelKey: 'new_chat.quick.image',
-    taskKey: 'new_chat.quick.task.image',
-    deliverableKey: 'new_chat.quick.deliver.image',
-    subjectKey: 'new_chat.quick.subject.image',
-    subjectFallback: 'City Summer Coffee Festival',
-    icon: 'image',
-    group: 'content-creation',
-    agentNames: ['ImageStudio'],
-  },
-  ui_design: {
-    templateKey: 'new_chat.quick.tmpl.ui_design',
-    labelKey: 'new_chat.quick.ui_design',
-    taskKey: 'new_chat.quick.task.ui_design',
-    deliverableKey: 'new_chat.quick.deliver.ui_design',
-    subjectKey: 'new_chat.quick.subject.ui_design',
-    subjectFallback: 'a personal finance app',
-    icon: 'palette',
-    group: 'product-growth',
-    agentNames: ['UIDesigner'],
-  },
-  office: {
-    templateKey: 'new_chat.quick.tmpl.office',
-    labelKey: 'new_chat.quick.office',
-    taskKey: 'new_chat.quick.task.office',
-    deliverableKey: 'new_chat.quick.deliver.office',
-    subjectKey: 'new_chat.quick.subject.office',
-    subjectFallback: 'an ecommerce store',
-    icon: 'file-text',
-    group: 'knowledge-office',
-    agentNames: ['OfficeWorker', 'OfficeWriter'],
-  },
-  ppt: {
-    templateKey: 'new_chat.quick.tmpl.ppt',
-    labelKey: 'new_chat.quick.ppt',
-    taskKey: 'new_chat.quick.task.ppt',
-    deliverableKey: 'new_chat.quick.deliver.ppt',
-    subjectKey: 'new_chat.quick.subject.ppt',
-    subjectFallback: 'an AI office assistant',
-    icon: 'presentation',
-    group: 'knowledge-office',
-    agentNames: ['PptMaker'],
-  },
-  creation: {
-    templateKey: 'new_chat.quick.tmpl.creation',
-    labelKey: 'new_chat.quick.creation',
-    taskKey: 'new_chat.quick.task.creation',
-    deliverableKey: 'new_chat.quick.deliver.creation',
-    subjectKey: 'new_chat.quick.subject.creation',
-    subjectFallback: 'an AI office assistant',
-    icon: 'edit-pencil',
-    group: 'content-creation',
-    agentNames: ['ContentWriter'],
-  },
-  rnd: {
-    templateKey: 'new_chat.quick.tmpl.rnd',
-    labelKey: 'new_chat.quick.rnd',
-    taskKey: 'new_chat.quick.task.rnd',
-    deliverableKey: 'new_chat.quick.deliver.rnd',
-    subjectKey: 'new_chat.quick.subject.rnd',
-    subjectFallback: 'a product designer changing careers',
-    icon: 'code',
-    group: 'product-growth',
-    agentNames: ['ProductDeveloper'],
-  },
-  seo_geo: {
-    templateKey: 'new_chat.quick.tmpl.seo_geo',
-    labelKey: 'new_chat.quick.seo_geo',
-    taskKey: 'new_chat.quick.task.seo_geo',
-    deliverableKey: 'new_chat.quick.deliver.seo_geo',
-    subjectKey: 'new_chat.quick.subject.seo_geo',
-    subjectFallback: 'the orkas.ai website',
-    icon: 'globe',
-    group: 'product-growth',
-    agentNames: ['SeoGeoAgent'],
-  },
-};
-const _DEFAULT_QUICK_START_ITEMS = [
-  { id: 'data', agent_id: '78900d8758bc' },
-  { id: 'ecommerce', agent_id: '5a1d43c2f28a' },
-  { id: 'ppt', agent_id: '7e91cb9ec9e9' },
-  { id: 'office', agent_id: 'a19101ba698a' },
-  { id: 'image', agent_id: '814b61b027f0' },
-  { id: 'video', agent_id: '79df9cc89f5f' },
-  { id: 'ui_design', agent_id: 'bcfcb4921dce' },
-  { id: 'rnd', agent_id: 'a316881746f9' },
-  { id: 'seo_geo', agent_id: 'e064dca9e1bd' },
-];
-let _quickStartItems = _DEFAULT_QUICK_START_ITEMS.map((item) => ({ ...item }));
-let _quickStartConfigPromise = null;
-let _SCENARIO_CONFIGS = {};
-// English fallback templates — used when the i18n table doesn't yet carry
-// the scenario template key. These are complete, ready-to-run tasks so a
-// first-time user can click a card and send immediately.
-const _SCENARIO_TEMPLATES_FALLBACK_EN = {
-  ecommerce: 'Assess whether pet water fountains are worth selling on Amazon US, with product selection and validation recommendations.',
-  data: 'Research AI desktop apps for everyday users and recommend options for different needs.',
-  office: 'Create a sales report with sample data and charts for an ecommerce store.',
-  ppt: 'Create an editable 8-slide product presentation for an AI office assistant.',
-  creation: 'Write a social post about an AI office assistant.',
-  video: 'Create an explainer video about AI trends.',
-  image: 'Design an event poster for the City Summer Coffee Festival.',
-  ui_design: 'Design a sign-in and sign-up UI for a personal finance app.',
-  rnd: 'Build a portfolio website for a product designer changing careers.',
-  seo_geo: 'Create an SEO and GEO improvement plan for the orkas.ai website.',
-};
-
-function _normalizeQuickStartItems(raw) {
-  if (!Array.isArray(raw) || !raw.length || raw.length > Object.keys(_SCENARIO_CATALOG).length) return null;
-  const seen = new Set();
-  const items = [];
-  for (const item of raw) {
-    const id = String((item && item.id) || '').trim();
-    const agentId = String((item && item.agent_id) || '').trim();
-    if (!_SCENARIO_CATALOG[id] || seen.has(id) || !/^[A-Za-z0-9_-]{3,64}$/.test(agentId)) return null;
-    seen.add(id);
-    items.push({ id, agent_id: agentId });
-  }
-  return items;
-}
-
-function _setQuickStartItems(raw, source) {
-  const normalized = _normalizeQuickStartItems(raw);
-  const items = normalized || _DEFAULT_QUICK_START_ITEMS.map((item) => ({ ...item }));
-  _quickStartItems = items;
-  _SCENARIO_CONFIGS = Object.fromEntries(items.map((item) => [item.id, {
-    ..._SCENARIO_CATALOG[item.id],
-    agentId: item.agent_id,
-  }]));
-  return !!normalized;
-}
-
-function _clearQuickStartDraft(input) {
-  if (input?.dataset) delete input.dataset.commanderQuickStartPlaceholder;
-}
-
-function _bindQuickStartPlaceholderReset(input) {
-  if (!input?.dataset || input.dataset.quickStartPlaceholderBound === '1'
-      || typeof input.addEventListener !== 'function') return;
-  input.dataset.quickStartPlaceholderBound = '1';
-  input.addEventListener(composerChangeEvent(input), () => {
-    const marker = String(input.dataset.commanderQuickStartPlaceholder || '');
-    if (!composerHasText(input) || (marker && !composerIncludes(input, marker))) _clearQuickStartDraft(input);
-    if (!composerHasText(input)) delete input.dataset.ossTemplateDraft;
-  });
-}
-
-function _findQuickStartPlaceholder(text) {
-  const match = String(text || '').match(/【[^】]+】|\[[^\]]+\]/);
-  if (!match || typeof match.index !== 'number') return null;
-  return { text: match[0], start: match.index, end: match.index + match[0].length };
-}
-
-function _findQuickStartSubject(text, subject) {
-  const value = String(text || '');
-  const marker = String(subject || '').trim();
-  if (!marker) return null;
-  const start = value.indexOf(marker);
-  if (start < 0) return null;
-  return { text: marker, start, end: start + marker.length };
-}
-
-function _unresolvedQuickStartPlaceholder(input) {
-  if (!input || !input.dataset) return '';
-  const marker = String(input.dataset.commanderQuickStartPlaceholder || '');
-  if (!marker) return '';
-  const value = String(composerText(input) || '');
-  const start = value.indexOf(marker);
-  if (start < 0) {
-    delete input.dataset.commanderQuickStartPlaceholder;
-    return '';
-  }
-  input.focus();
-  try { composerSetSelection(input, start, start + marker.length); } catch (_) {}
-  return marker;
-}
-
-function _quickStartText(key, fallback) {
-  const value = key ? t(key) : '';
-  return value && value !== key ? value : fallback;
-}
-
-function _renderQuickStartScenarios() {
-  const grid = document.getElementById('new-chat-scenario-grid');
-  if (!grid) return;
-  const scenarioCards = _quickStartItems.map((item) => {
-    const config = _SCENARIO_CONFIGS[item.id];
-    if (!config) return '';
-    const label = _quickStartText(config.labelKey, item.id);
-    const task = _quickStartText(config.taskKey, label);
-    const deliverable = _quickStartText(config.deliverableKey, '');
-    const deliverableLabel = _quickStartText('new_chat.quick.deliver_label', 'Deliverable:');
-    return `
-      <button type="button" class="new-chat-scenario-chip quick-task-card" data-scenario="${escapeHtml(item.id)}" data-group="${escapeHtml(config.group || '')}">
-        <span class="quick-tile" aria-hidden="true">${_uiIconHtml(config.icon || 'sparkles', 'new-chat-scenario-icon')}</span>
-        <span class="quick-copy">
-          <span class="quick-cat-name">${escapeHtml(label)}</span>
-          <span class="quick-task">${escapeHtml(task)}</span>
-          <span class="quick-deliver">${escapeHtml(deliverableLabel)} <b>${escapeHtml(deliverable)}</b></span>
-        </span>
-      </button>`;
-  }).join('');
-  grid.innerHTML = scenarioCards;
-}
-
-function _refreshQuickStartConfig(row) {
-  if (_quickStartConfigPromise || !window.orkas || typeof window.orkas.invoke !== 'function') return;
-  _quickStartConfigPromise = window.orkas.invoke('clientConfig.getQuickStart')
-    .then((res) => {
-      const items = _normalizeQuickStartItems(res && res.items);
-      if (!items) {
-        _convLog.warn('Commander quick-start config rejected in renderer', {
-          source: String((res && res.source) || 'unknown'),
-        });
-        return;
-      }
-      _setQuickStartItems(items, res && res.source);
-      _renderQuickStartScenarios();
-      _bindEmptyStateScenarioButtons(row);
-    })
-    .catch((err) => {
-      _convLog.warn('Commander quick-start config load failed; using open defaults', {
-        error_type: err && typeof err === 'object' ? 'Error' : typeof err,
-      });
-    })
-    .finally(() => { _quickStartConfigPromise = null; });
-}
-
-_setQuickStartItems(_quickStartItems, 'pc_default');
-
-let _emptyStateAccountName = '';
-
-function _emptyStateNameFromAccount(payload) {
-  const userInfo = payload && payload.userInfo;
-  if (!userInfo || typeof userInfo !== 'object') return '';
-  return String(userInfo.nickname || userInfo.name || userInfo.display_name || '').trim();
-}
-
-function _renderEmptyStateHeading() {
-  const el = document.getElementById('new-chat-greeting');
-  if (!el) return;
-  const fallbackName = _quickStartText('common.user_fallback', 'Friend');
-  const name = _emptyStateAccountName || fallbackName;
-  const heading = t('new_chat.title', { name });
-  el.textContent = heading && heading !== 'new_chat.title'
-    ? heading
-    : `${name}, what do you want to accomplish?`;
-}
-
-function _updateEmptyStateAccount(payload) {
-  _emptyStateAccountName = _emptyStateNameFromAccount(payload);
-  _renderEmptyStateHeading();
-}
-
-function _refreshEmptyStateAccount() {
-  // The open-source build has no Orkas account profile. Keep the localized
-  // Friend fallback while preserving the shared heading renderer.
-  _updateEmptyStateAccount(null);
-}
-
-function _refreshEmptyStateHeading() {
-  _renderEmptyStateHeading();
-  _refreshEmptyStateAccount();
-}
-function _refreshEmptyStateAll() {
-  _refreshEmptyStateHeading();
 }
 
 // ── Conversation header (Surface C top) ─────────────────────────────────
@@ -2778,149 +2468,6 @@ function _refreshChatHeader() {
   // Reflect drawer-open state on the details button (existing toggle id is
   // reused; _syncChrome in conversation-info toggles is-active automatically).
 }
-
-function _scenarioFindAgent(config) {
-  if (!config) return null;
-  const list = (typeof _agentsCache !== 'undefined' && Array.isArray(_agentsCache)) ? _agentsCache : [];
-  const byId = config.agentId
-    ? list.find((a) => a && a.enabled !== false && a.agent_id === config.agentId)
-    : null;
-  if (byId) return byId;
-  const names = Array.isArray(config.agentNames) ? config.agentNames : [];
-  return list.find((a) => a && a.enabled !== false && names.includes(a.name || '')) || null;
-}
-
-async function _scenarioApplyAgent(config, scenarioId) {
-  if (!config || typeof setChatRecipient !== 'function') {
-    return { kind: 'unavailable', reason: 'recipient_api_missing' };
-  }
-  let agent = _scenarioFindAgent(config);
-  let registryFailed = false;
-  if (!agent && typeof loadAgents === 'function') {
-    try {
-      await loadAgents(false);
-      agent = _scenarioFindAgent(config);
-      if (!agent) {
-        await loadAgents(true);
-        agent = _scenarioFindAgent(config);
-      }
-    } catch (err) {
-      registryFailed = true;
-      _convLog.warn('Commander quick-start Agent registry load failed', {
-        resource_id: String(scenarioId || ''),
-        agent_id: String(config.agentId || ''),
-        error: err && err.message ? err.message : String(err || ''),
-      });
-    }
-  }
-  if (!agent) {
-    setChatRecipient('new-chat', { kind: 'commander' });
-    _convLog.warn('Commander quick-start Agent unavailable; falling back to Commander', {
-      resource_id: String(scenarioId || ''),
-      agent_id: String(config.agentId || ''),
-      reason: registryFailed ? 'agent_registry_error' : 'agent_missing',
-    });
-    return {
-      kind: 'commander',
-      reason: registryFailed ? 'agent_registry_error' : 'agent_missing',
-    };
-  }
-  setChatRecipient('new-chat', {
-    kind: 'agent',
-    id: agent.agent_id,
-    name: agent.name || agent.agent_id,
-  });
-  return { kind: 'agent', agent };
-}
-
-// Quick-start cards prefill the composer and bind its configured specialist.
-// Cards are individually marked as bound because a client-config refresh or
-// locale change replaces the grid without replacing the containing section.
-function _bindEmptyStateScenarioButtons(row) {
-  if (!row) return;
-  const buttons = Array.from(row.querySelectorAll('.new-chat-scenario-chip[data-scenario]'));
-  buttons.forEach((btn, index) => {
-    if (btn.dataset.quickStartBound === '1') return;
-    btn.dataset.quickStartBound = '1';
-    btn.addEventListener('click', () => (
-      _applyQuickStartScenario(btn.dataset.scenario || '', index + 1, { surface: 'home_grid' })
-    ));
-  });
-}
-
-/** Apply one Quick start task to the home composer. `surface` says where it
- *  was picked (the empty home's grid). */
-async function _applyQuickStartScenario(id, position, { surface = '' } = {}) {
-  const target = 'new-chat';
-  const inputId = 'new-chat-input';
-  try {
-    const config = _SCENARIO_CONFIGS[id];
-    if (!config) {
-      _convLog.warn('Commander quick-start scenario config missing', { resource_id: id, position });
-      return;
-    }
-    const key = config && config.templateKey;
-    const raw = key ? t(key) : '';
-    const tmpl = (raw && raw !== key) ? raw : (_SCENARIO_TEMPLATES_FALLBACK_EN[id] || '');
-    if (!tmpl) {
-      _convLog.warn('Commander quick-start template missing', { resource_id: id, position });
-      return;
-    }
-    const applied = await _scenarioApplyAgent(config, id, target);
-    if (!applied || applied.kind === 'unavailable') {
-      _convLog.warn('Commander quick-start recipient API unavailable', { resource_id: id, position });
-      return;
-    }
-    const input = document.getElementById(inputId);
-    if (!input) {
-      _convLog.warn('Commander quick-start composer missing', { resource_id: id, position });
-      return;
-    }
-    composerSetText(input, tmpl);
-    delete input.dataset.ossTemplateDraft;
-    input.focus();
-    // Select the concrete subject (coffee machine, login page, etc.) so the
-    // user's next keystroke customizes the example immediately. Server-fed
-    // templates may still carry a real placeholder; retain the existing
-    // blocking behavior for those templates only.
-    const subject = _quickStartText(config.subjectKey, config.subjectFallback || '');
-    const editableSubject = _findQuickStartSubject(tmpl, subject);
-    const placeholder = _findQuickStartPlaceholder(tmpl);
-    if (editableSubject) {
-      delete input.dataset.commanderQuickStartPlaceholder;
-      composerSetSelection(input, editableSubject.start, editableSubject.end);
-    } else if (placeholder) {
-      input.dataset.commanderQuickStartPlaceholder = placeholder.text;
-      composerSetSelection(input, placeholder.start, placeholder.end);
-    } else {
-      delete input.dataset.commanderQuickStartPlaceholder;
-      composerSetSelection(input, tmpl.length, tmpl.length);
-    }
-    try { composerNotify(input); } catch (_) {}
-  } catch (err) {
-    _convLog.warn('Commander quick-start action failed', {
-      resource_id: String(id || ''),
-      error_type: err && typeof err === 'object' ? 'Error' : typeof err,
-    });
-  }
-}
-
-function _initEmptyStateScenarios() {
-  const row = document.getElementById('new-chat-scenarios');
-  if (!row) return;
-  _bindQuickStartPlaceholderReset(document.getElementById('new-chat-input'));
-  const grid = document.getElementById('new-chat-scenario-grid');
-  if (grid && !grid.children.length) _renderQuickStartScenarios();
-  _bindEmptyStateScenarioButtons(row);
-  _refreshQuickStartConfig(row);
-}
-window.addEventListener('i18n-change', () => {
-  const row = document.getElementById('new-chat-scenarios');
-  if (!row) return;
-  _renderEmptyStateHeading();
-  _renderQuickStartScenarios();
-  _bindEmptyStateScenarioButtons(row);
-});
 
 function onEnterConversationView() {
   if (_messageSelectionState && _messageSelectionState.cid !== currentCid) _exitMessageSelection();
@@ -6420,8 +5967,6 @@ async function _saveConversationTitle(cid, raw, opts = {}) {
     _refreshChatHeader();
     if (typeof renderProjectsSection === 'function') renderProjectsSection();
     if (typeof _renderProjectAllTasks === 'function') _renderProjectAllTasks();
-    // The home lists unopened finished tasks by title.
-    if (typeof homeRefresh === 'function') homeRefresh();
     if (window.ConversationInfo && typeof window.ConversationInfo.refresh === 'function') {
       window.ConversationInfo.refresh(cid, { silent: true });
     }
@@ -9762,7 +9307,7 @@ function _mountAppNavRequests(host, message) {
       row.className = 'chat-app-nav-row';
       host.appendChild(row);
     }
-    const name = _quickStartText(surface.nameKey, surface.fallback);
+    const name = _chatLocalizedText(surface.nameKey, surface.fallback);
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = 'btn btn-sm chat-app-nav-btn';
@@ -10588,10 +10133,39 @@ function _referenceTargetActivity(conversation) {
   return String(conversation?.last_active_at || conversation?.updated_at || conversation?.created_at || '');
 }
 
+function _chatLocalizedText(key, fallback) {
+  const value = key ? t(key) : '';
+  return value && value !== key ? value : fallback;
+}
+
+function _referenceTargetRelativeTime(ms) {
+  if (!Number.isFinite(ms) || ms <= 0) return '';
+  const diff = Date.now() - ms;
+  if (diff < 60000) return t('common.just_now');
+  let locale;
+  try {
+    locale = getLocaleMeta(getLang()).intlLocale || undefined;
+  } catch (_) {
+    locale = undefined;
+  }
+  try {
+    const relative = new Intl.RelativeTimeFormat(locale, { numeric: 'auto' });
+    const minutes = Math.round(diff / 60000);
+    if (minutes < 60) return relative.format(-minutes, 'minute');
+    const hours = Math.round(diff / 3600000);
+    if (hours < 24) return relative.format(-hours, 'hour');
+    const days = Math.round(diff / 86400000);
+    if (days < 7) return relative.format(-days, 'day');
+    return new Intl.DateTimeFormat(locale, { month: 'short', day: 'numeric' }).format(new Date(ms));
+  } catch (_) {
+    return new Date(ms).toLocaleDateString();
+  }
+}
+
 function _referenceTargetSubtitle(conversation) {
   const area = _referenceTargetAreaLabel(conversation);
   const activeMs = Date.parse(_referenceTargetActivity(conversation));
-  const when = typeof _homeRelativeTime === 'function' ? _homeRelativeTime(activeMs) : '';
+  const when = _referenceTargetRelativeTime(activeMs);
   return when ? `${area} · ${when}` : area;
 }
 
@@ -11243,12 +10817,11 @@ async function handleNewChatSubmit() {
   const pendingUseSelections = (typeof getChatUseSelections === 'function')
     ? getChatUseSelections('new-chat')
     : [];
-  const unresolvedQuickStart = _unresolvedQuickStartPlaceholder(input);
   const unresolvedOss = typeof unresolvedOssTemplatePlaceholder === 'function'
     ? unresolvedOssTemplatePlaceholder(input)
     : '';
-  if (unresolvedQuickStart || unresolvedOss) {
-    await uiAlert(t(unresolvedQuickStart ? 'new_chat.quick.task_required' : 'oss.task_required'));
+  if (unresolvedOss) {
+    await uiAlert(t('oss.task_required'));
     return;
   }
   if (!ensureModelConfigured({ composerTarget: 'new-chat' })) {
@@ -11470,11 +11043,6 @@ async function handleChatSubmit() {
   let attachList = _chatAttachList(cid);
   let attachments = attachList.filter((a) => a.status !== 'error').map((a) => a.name);
   _convLog.info('chat submit', { cid, length: raw.length, use: useSelections.map((sel) => sel.kind), attachments: attachments.length });
-  const unresolvedQuickStart = _unresolvedQuickStartPlaceholder(input);
-  if (unresolvedQuickStart) {
-    await uiAlert(t('new_chat.quick.task_required'));
-    return;
-  }
   if (!ensureModelConfigured({ composerTarget: 'conversation' })) {
     return;
   }
