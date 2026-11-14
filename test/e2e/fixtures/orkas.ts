@@ -105,6 +105,10 @@ export type CliStubState = {
   hermesInitializations?: number;
   acpInitializeMode?: 'delayed' | 'error' | 'pending';
   acpRequests?: Array<{ cli: string; method: string }>;
+  grokSignedOut?: boolean;
+  grokLoginOutcome?: 'success' | 'failure';
+  grokLoginReady?: boolean;
+  grokLoginCalls?: number;
 };
 
 type ModelStubMode = 'success' | 'refusal' | 'http-error' | 'auth-error' | 'model-not-open' | 'slow' | 'very-slow' | 'controlled-slow' | 'truncated';
@@ -533,6 +537,25 @@ const writeState = state => {
   fs.renameSync(tmp, statePath);
 };
 const send = value => process.stdout.write(JSON.stringify(value) + '\n');
+if (cli === 'grok' && args[0] === 'login') {
+  const state = readState();
+  state.grokLoginCalls = (state.grokLoginCalls || 0) + 1;
+  writeState(state);
+  if (args.join(' ') !== 'login --oauth') process.exit(2);
+  process.stderr.write('Complete sign-in in your browser: https://auth.x.ai/oauth2/authorize?client_id=e2e&state=e2e-public-state&redirect_uri=http%3A%2F%2F127.0.0.1%3A9876%2Fcallback\n');
+  const timer = setInterval(() => {
+    const state = readState();
+    if (!state.grokLoginReady) return;
+    clearInterval(timer);
+    const ok = state.grokLoginOutcome !== 'failure';
+    if (ok) {
+      state.grokSignedOut = false;
+      writeState(state);
+    }
+    process.exit(ok ? 0 : 1);
+  }, 100);
+  return;
+}
 let sessionId = '';
 let prompt = '';
 let initialized = false;
@@ -550,7 +573,7 @@ input.on('line', line => {
     if (startup.acpInitializeMode === 'pending') return;
     const reply = () => {
       if (startup.acpInitializeMode === 'error') {
-        send({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'Grok initialization rejected' } });
+        send({ jsonrpc: '2.0', id: 1, error: { code: -32603, message: 'Grok initialization rejected' } });
       } else {
         initialized = true;
         send({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } });
@@ -561,6 +584,10 @@ input.on('line', line => {
     return;
   }
   if (message.id === 2) {
+    if (cli === 'grok' && startup.grokSignedOut) {
+      send({ jsonrpc: '2.0', id: 2, error: { code: -32000, message: 'Authentication required', data: 'no auth method id provided' } });
+      return;
+    }
     if (!initialized) {
       send({ jsonrpc: '2.0', id: 2, error: { code: -32000, message: 'Authentication required' } });
       return;
