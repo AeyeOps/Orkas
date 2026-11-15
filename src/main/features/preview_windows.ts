@@ -1,4 +1,5 @@
-import { BrowserWindow, shell, screen, type WebContents } from 'electron';
+import { openBrowserUrl } from './browser-preferences';
+import { BrowserWindow, screen, type WebContents } from 'electron';
 import * as path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
@@ -175,7 +176,7 @@ export async function openPreview(uid: string, owner: WebContents, payload: unkn
     owners.set(owner, ownerState);
   }
   ownerState.windows.add(win);
-  installExternalNavigationGuard(win.webContents, url => shell.openExternal(url), () => log.warn('external link failed', { code: 'open_failed' }));
+  installExternalNavigationGuard(win.webContents, url => openBrowserUrl(url, uid), () => log.warn('external link failed', { code: 'open_failed' }));
   installHtmlPreviewNavigationGuard(win.webContents);
   win.on('close', event => {
     if (!record.dirty) return;

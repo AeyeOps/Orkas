@@ -886,7 +886,7 @@ describe('Web Assist renderer wiring', () => {
     expect(webAssistSource).toContain("invoke('webAssist.closeTab'");
     expect(webAssistSource).toContain("invoke('webAssist.setContext'");
     expect(webAssistSource).toContain('inputmode="search"');
-    expect(userClickBlock).toContain("window.orkas.invoke('auth.openExternal', { url })");
+    expect(userClickBlock).toContain('openExternalLink(url)');
     expect(userClickBlock).not.toContain('WebAssist');
     expect(webAssistSource).toContain("onPushEvent('web-assist:show'");
     expect(webAssistSource).toContain('assistantStatusText(tab)');

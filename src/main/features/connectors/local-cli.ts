@@ -1,3 +1,4 @@
+import { openBrowserUrl } from '../browser-preferences';
 /**
  * Device-local connector runtime for official user-authorized provider CLIs.
  *
@@ -9,7 +10,7 @@ import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { app, shell } from 'electron';
+import { app } from 'electron';
 
 import { t } from '../../i18n';
 import { createLogger } from '../../logger';
@@ -486,12 +487,12 @@ export function localCliTransport(uid: string, entry: CatalogEntry): Transport {
   };
 }
 
-/** Open only an official local CLI authorization route in the system browser. */
+/** Open an official local CLI authorization route in the selected browser. */
 export async function openLocalCliAuthorizationUrl(raw: unknown): Promise<void> {
   const target = safeLocalCliAuthUrl(raw);
   if (!target) throw localCliError('local_cli_auth_url_invalid');
   try {
-    await shell.openExternal(target);
+    await openBrowserUrl(target);
   } catch {
     throw localCliError('local_cli_auth_url_open_failed');
   }

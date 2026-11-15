@@ -1,3 +1,4 @@
+import { openBrowserUrl } from '../browser-preferences';
 /**
  * MCP-spec OAuth client (Client ID Metadata Document or Dynamic Client Registration).
  *
@@ -23,7 +24,6 @@
  */
 import * as crypto from 'node:crypto';
 import { URL, URLSearchParams } from 'node:url';
-import { shell } from 'electron';
 import { buildDiscoveryUrls, extractWWWAuthenticateParams } from '@modelcontextprotocol/sdk/client/auth.js';
 import { LATEST_PROTOCOL_VERSION } from '@modelcontextprotocol/sdk/types.js';
 
@@ -160,7 +160,7 @@ function _startLocalApiAuthorization(
     }
     const open = (url: string) => {
       if (_pending !== pending) return;
-      return shell.openExternal(url);
+      return openBrowserUrl(url);
     };
     const failed = (error: unknown) => {
       if (_pending !== pending) return;
@@ -654,7 +654,7 @@ async function _startDcrOAuth(
       timer,
     };
     _pending = pending;
-    shell.openExternal(authUrl.toString()).catch(() => {
+    openBrowserUrl(authUrl.toString()).catch(() => {
       if (_pending === pending) _cancelPending('failed to open authorization browser', 'browser_open_failed');
     });
   });

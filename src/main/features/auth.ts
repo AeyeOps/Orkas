@@ -58,7 +58,7 @@ import { normalizeAnthropicBaseUrl } from '../model/custom-model-url';
 import * as fs from 'node:fs';
 import { createHash } from 'node:crypto';
 import * as path from 'node:path';
-import { shell } from 'electron';
+import { openBrowserUrl } from './browser-preferences';
 
 import { userAuthProfilesFile } from '../paths';
 import * as localSecrets from '../util/local-secret-store';
@@ -1926,7 +1926,7 @@ interface FlowPrompt { message: string; placeholder?: string; allowEmpty?: boole
 
 type FlowStatus =
   | { kind: 'starting' }
-  | { kind: 'awaiting_auth'; url: string; instructions?: string; usesCallbackServer?: boolean }
+  | { kind: 'awaiting_auth'; url: string; instructions?: string; usesCallbackServer?: boolean; browserError?: string }
   | { kind: 'awaiting_input'; prompt: FlowPrompt }
   | { kind: 'progress'; message: string }
   | { kind: 'done'; profileId: string }
@@ -2019,23 +2019,12 @@ function deriveOAuthLabel(creds: Record<string, unknown>): string {
   return '';
 }
 
-/**
- * Open a user-clicked URL in its platform-native handler (browser, mail,
- * phone, etc.) instead of Electron's BrowserWindow. The validator is strict
- * because shell.openExternal delegates to OS applications.
- */
-export function openExternalUrl(url: string): { ok: boolean; error?: string } {
+export async function openExternalUrl(url: string, uid: string): Promise<{ ok: boolean; error?: string }> {
   const raw = String(url || '').trim();
   if (!raw) return { ok: false, error: 'url required' };
   const target = safeExternalUserActionUrl(raw);
   if (!target) return { ok: false, error: 'url must be a safe external link' };
-  // Electron's shell.openExternal is the official cross-platform API:
-  // macOS uses open(1), Windows uses ShellExecuteW, Linux uses
-  // xdg-open — supersedes our old hand-rolled shell commands (Windows
-  // cmd's `start "" "url"` quoting was prone to breaking under exec()).
-  shell.openExternal(target).catch((err: unknown) => {
-    log.warn('openExternal failed:', (err as Error)?.message || String(err));
-  });
+  await openBrowserUrl(target, uid);
   return { ok: true };
 }
 
@@ -2091,9 +2080,10 @@ export async function startOAuth(
           instructions: info.instructions,
           usesCallbackServer,
         };
-        // Auto-open the user's system default browser. If this fails the
-        // renderer still shows the URL + "copy link" button as a fallback.
-        openExternalUrl(info.url);
+        void openExternalUrl(info.url, flow.userId).catch((error: unknown) => {
+          if (!isLiveOAuthFlow(flow) || flow.status.kind !== 'awaiting_auth') return;
+          flow.status = { ...flow.status, browserError: (error as Error).message };
+        });
       },
       onDeviceCode: (info) => {
         if (!isLiveOAuthFlow(flow)) return;
@@ -2105,7 +2095,10 @@ export async function startOAuth(
           instructions: details.join('\n'),
           usesCallbackServer: false,
         };
-        openExternalUrl(info.verificationUri);
+        void openExternalUrl(info.verificationUri, flow.userId).catch((error: unknown) => {
+          if (!isLiveOAuthFlow(flow) || flow.status.kind !== 'awaiting_auth') return;
+          flow.status = { ...flow.status, browserError: (error as Error).message };
+        });
       },
       onPrompt: async (prompt) => {
         if (!isLiveOAuthFlow(flow)) return '';
