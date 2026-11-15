@@ -103,6 +103,8 @@ export type CliStubState = {
   codexThreadRequests?: Array<{ method: string; pid: number }>;
   hermesFault?: 'version_unknown' | 'initialize_exit';
   hermesInitializations?: number;
+  acpInitializeMode?: 'delayed' | 'error' | 'pending';
+  acpRequests?: Array<{ cli: string; method: string }>;
 };
 
 type ModelStubMode = 'success' | 'refusal' | 'http-error' | 'auth-error' | 'model-not-open' | 'slow' | 'very-slow' | 'controlled-slow' | 'truncated';
@@ -533,15 +535,36 @@ const writeState = state => {
 const send = value => process.stdout.write(JSON.stringify(value) + '\n');
 let sessionId = '';
 let prompt = '';
+let initialized = false;
 const input = readline.createInterface({ input: process.stdin });
 input.on('line', line => {
   let message;
   try { message = JSON.parse(line); } catch { return; }
+  const startup = readState();
+  if (startup.acpInitializeMode && message.method) {
+    startup.acpRequests = startup.acpRequests || [];
+    startup.acpRequests.push({ cli, method: message.method });
+    writeState(startup);
+  }
   if (message.id === 1) {
-    send({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } });
+    if (startup.acpInitializeMode === 'pending') return;
+    const reply = () => {
+      if (startup.acpInitializeMode === 'error') {
+        send({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'Grok initialization rejected' } });
+      } else {
+        initialized = true;
+        send({ jsonrpc: '2.0', id: 1, result: { protocolVersion: 1 } });
+      }
+    };
+    if (startup.acpInitializeMode) setTimeout(reply, 750);
+    else reply();
     return;
   }
   if (message.id === 2) {
+    if (!initialized) {
+      send({ jsonrpc: '2.0', id: 2, error: { code: -32000, message: 'Authentication required' } });
+      return;
+    }
     const state = readState();
     sessionId = cli + '-e2e-' + String(++state.nextSession);
     writeState(state);
