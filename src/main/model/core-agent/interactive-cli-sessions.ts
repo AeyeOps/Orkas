@@ -69,6 +69,7 @@ export interface StartInteractiveCliSessionOpts {
    *  a shell, which is the required path for app-owned connector authorization helpers. */
   command: string;
   args?: string[];
+  windowsVerbatimArguments?: boolean;
   /** Only the Agent tool factory grants agent_terminal; never read from model arguments or output. */
   presentation?: InteractiveCliPresentation;
   cwd: string;
@@ -420,6 +421,7 @@ export function startInteractiveCliSession(opts: StartInteractiveCliSessionOpts)
     detached: process.platform !== 'win32',
     stdio: ['pipe', 'pipe', 'pipe'],
     windowsHide: true,
+    windowsVerbatimArguments: opts.windowsVerbatimArguments,
   }) as ChildProcessWithoutNullStreams;
 
   const id = crypto.randomUUID();

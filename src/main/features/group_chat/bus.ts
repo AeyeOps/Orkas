@@ -11574,6 +11574,17 @@ async function _runCliAgentTurn(opts: {
     return { text: '', error: result.error, produced: Array.from(produced),
       failureKind: 'dependency', failureCode: result.cliError, failurePhase: 'preflight' };
   }
+  if (result.cliError === 'authentication_required' && runtime.cli === 'grok') {
+    return {
+      text: publicText,
+      error: t('cli_agent.grok_sign_in_required', undefined, opts.language),
+      produced: Array.from(produced),
+      published: publishedOutputs,
+      failureKind: 'dependency',
+      failureCode: 'grok_authentication_required',
+      failurePhase: result.failureCategory === 'cli_failed_after_output' ? 'tool' : 'preflight',
+    };
+  }
   if (result.status === 'failed' || result.status === 'timeout') {
     const vars = { name: opts.agent.name || runtime.cli, cli: runtime.cli };
     const cliError = runner.sanitizePublicCliError(result.error);

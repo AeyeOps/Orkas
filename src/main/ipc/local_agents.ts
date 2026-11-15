@@ -34,6 +34,7 @@ import {
 import { getCliUpgradeInfo, upgradeLocalCli } from '../features/local_agents/upgrade.js';
 import { getLocalCliRuntimeOptions } from '../features/local_agents/runtime_options.js';
 import { getLocalCliAccountUsage } from '../features/local_agents/account_usage.js';
+import { currentGrokSignIn, signInGrok } from '../features/local_agents/grok-sign-in.js';
 import * as agents from '../features/agents.js';
 import * as cliPermissions from '../features/local_agents/cli_permissions.js';
 import * as cliUserInput from '../features/local_agents/cli_user_input.js';
@@ -116,6 +117,18 @@ async function upgradeTarget(payload: { type?: unknown; agent_id?: unknown }): P
 }
 
 export const invokeHandlers = {
+  'localAgents.signInGrok': async (
+    { agent_id }: { agent_id?: unknown },
+    ctx: { userId: string },
+  ) => {
+    if (!agents.isValidAgentId(agent_id)) throw new Error('invalid agent_id');
+    const agent = await agents.getAgent(String(agent_id));
+    if (agent?.runtime?.kind !== 'cli' || agent.runtime.cli !== 'grok') throw new Error('agent is not backed by Grok');
+    return { session: await signInGrok(ctx.userId) };
+  },
+  'localAgents.grokSignInStatus': async (_payload: unknown, ctx: { userId: string }) => ({
+    session: await currentGrokSignIn(ctx.userId),
+  }),
   'localAgents.accountUsage': async (
     { agent_id, force = false }: { agent_id?: unknown; force?: unknown },
     ctx: { userId: string },

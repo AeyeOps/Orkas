@@ -55,6 +55,7 @@ test.describe('Subscription CLIs over ACP', () => {
     expect(state.acpRequests).toEqual([{ cli: 'grok', method: 'initialize' }]);
     expect(state.invocations).toHaveLength(0);
     await expect(page.locator('.bubble-retry-btn')).toBeVisible();
+    await expect(page.locator('.grok-sign-in-control')).toHaveCount(0);
   });
 
   test('Grok can be stopped while initialization is pending', async ({ cliOrkas }) => {
@@ -70,6 +71,58 @@ test.describe('Subscription CLIs over ACP', () => {
     expect(state.acpRequests).toEqual([{ cli: 'grok', method: 'initialize' }]);
     expect(state.invocations).toHaveLength(0);
     await expect(page.locator('#chat-history')).not.toContainText('Authentication required');
+  });
+
+  test('Grok sign-in can be cancelled, restarted, and followed by a manual retry', async ({ cliOrkas }) => {
+    const page = await createAgent(cliOrkas, 'GrokSignInE2E', 'grok');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), grokSignedOut: true }));
+    await page.locator('#new-chat-input').fill('@GrokSignInE2E Reply when ready');
+    await page.locator('#new-chat-send-btn').click();
+    const control = page.locator('.grok-sign-in-control');
+    await expect(control.locator('.grok-sign-in-btn')).toBeVisible();
+    await expect(page.locator('#chat-history')).toContainText('Grok needs you to sign in.');
+    await expect(control.locator('.grok-sign-in-cancel')).toBeHidden();
+    await expect(control.locator('.grok-sign-in-reopen')).toBeHidden();
+    await control.locator('.grok-sign-in-btn').click();
+    await expect(control).toHaveAttribute('data-state', 'waiting');
+    await expect(control.locator('.grok-sign-in-reopen')).toBeVisible();
+    await expect.poll(() => cliOrkas.readCliState().grokLoginCalls).toBe(1);
+    await page.reload();
+    await expect(control).toHaveAttribute('data-state', 'waiting');
+    await expect(control.locator('.grok-sign-in-reopen')).toBeVisible();
+    await control.locator('.grok-sign-in-cancel').click();
+    await expect(control).toHaveAttribute('data-state', 'cancelled');
+    await control.locator('.grok-sign-in-btn').click();
+    await expect(control).toHaveAttribute('data-state', 'waiting');
+    await expect.poll(() => cliOrkas.readCliState().grokLoginCalls).toBe(2);
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), grokLoginReady: true }));
+    await expect(control).toHaveAttribute('data-state', 'success');
+    await page.reload();
+    await expect(control).toHaveAttribute('data-state', 'success');
+    expect(cliOrkas.readCliState().invocations).toHaveLength(0);
+    await expect(assistantReply(page, 'E2E_GROK_FIRST_OK')).toHaveCount(0);
+    await page.locator('.bubble-retry-btn').last().click();
+    await expect(assistantReply(page, 'E2E_GROK_FIRST_OK')).toBeVisible({ timeout: 30000 });
+    expect(cliOrkas.readCliState().invocations).toHaveLength(1);
+  });
+
+  test('Grok sign-in failure remains recoverable after reloading the conversation', async ({ cliOrkas }) => {
+    const page = await createAgent(cliOrkas, 'GrokSignInFailureE2E', 'grok');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), grokSignedOut: true, grokLoginOutcome: 'failure' }));
+    await page.locator('#new-chat-input').fill('@GrokSignInFailureE2E Reply when ready');
+    await page.locator('#new-chat-send-btn').click();
+    let control = page.locator('.grok-sign-in-control');
+    await expect(control.locator('.grok-sign-in-btn')).toBeVisible();
+    await page.reload();
+    control = page.locator('.grok-sign-in-control');
+    await expect(control.locator('.grok-sign-in-btn')).toBeVisible();
+    await control.locator('.grok-sign-in-btn').click();
+    await expect(control).toHaveAttribute('data-state', 'waiting');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), grokLoginReady: true }));
+    await expect(control).toHaveAttribute('data-state', 'failed');
+    await expect(control.locator('.grok-sign-in-btn')).toBeEnabled();
+    await expect(page.locator('.bubble-retry-btn').last()).toBeVisible();
+    expect(cliOrkas.readCliState().invocations).toHaveLength(0);
   });
 
   for (const item of CASES) {

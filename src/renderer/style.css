@@ -18367,6 +18367,9 @@ html[dir="rtl"] .sidebar-search-label { text-align: start; }
 #agent-modal-ext-cli-upgrades:not(:empty) { margin-top: 8px; }
 .local-cli-upgrade-control.chat-app-nav-row { margin-top: 14px; }
 .local-cli-upgrade-control.chat-app-nav-row .agents-detail-cli-note { align-self: center; }
+.grok-sign-in-control { align-items: center; }
+.grok-sign-in-control [hidden] { display: none; }
+.grok-sign-in-status { flex-basis: 100%; color: var(--muted); font-size: 13px; }
 
 .agents-detail-runtime .local-cli-upgrade-control { flex: 1; }
 .project-todo-agent-icon {
