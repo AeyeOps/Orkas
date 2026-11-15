@@ -12,7 +12,7 @@ async function flushPromises() {
 function loadStatusHint() {
   const source = fs.readFileSync(path.join(rendererRoot, 'modules/local-agents.js'), 'utf8');
   const calls: Array<{ key: string; vars?: Record<string, unknown> }> = [];
-  const windowObject: Record<string, unknown> = {};
+  const windowObject: Record<string, unknown> = { orkas: { onPushEvent() {} }, addEventListener() {} };
   const context = vm.createContext({
     window: windowObject,
     createLogger: () => ({ warn() {} }),
@@ -84,8 +84,10 @@ function loadExternalSelectorHarness() {
     },
   };
   const windowObject: Record<string, any> = {
+    addEventListener() {},
     setExternalAgentCreateAvailability: (available: boolean) => availabilityStates.push(available),
     orkas: {
+      onPushEvent() {},
       invoke: (channel: string, payload: unknown) => {
         invocations.push({ channel, payload });
         return new Promise((resolve, reject) => {

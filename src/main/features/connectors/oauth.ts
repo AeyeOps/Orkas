@@ -1,3 +1,4 @@
+import { openBrowserUrl } from '../browser-preferences';
 /**
  * Connector OAuth — Server-bridge flow (mirror of `features/account/oauth_flow.ts`).
  *
@@ -25,7 +26,6 @@
  * The public build never creates an HTTP callback listener. Authorization returns through the
  * production HTTPS bridge and the connector-only `orkas://` receiver.
  */
-import { shell } from 'electron';
 import { cancelDcrOAuth } from './oauth-dcr';
 import { logErrorSummary } from '../../util/log-redact';
 
@@ -262,7 +262,7 @@ export async function startComposioConnect(
       pending.timer = setTimeout(expire, FLOW_TIMEOUT_MS);
       pending.timer.unref?.();
       pending.phase = 'authorizing';
-      await shell.openExternal(redirectUrl).catch((err) => {
+      await openBrowserUrl(redirectUrl).catch((err) => {
         throw _flowError(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
       });
     })().catch((err) => {
@@ -324,7 +324,7 @@ export async function startOAuth(
       timer,
     };
     _pending = pending;
-    shell.openExternal(startUrl.toString()).catch((err) => {
+    openBrowserUrl(startUrl.toString()).catch((err) => {
       if (_pending === pending) _cancelPending(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
     });
   });
@@ -360,7 +360,7 @@ export async function startGoogleSheetsPicker(fileIds?: string[]): Promise<Googl
       timer,
     };
     _pending = pending;
-    shell.openExternal(startUrl.toString()).catch((err) => {
+    openBrowserUrl(startUrl.toString()).catch((err) => {
       if (_pending === pending) _cancelPending(`failed to open browser: ${(err as Error).message}`, 'browser_open_failed');
     });
   });

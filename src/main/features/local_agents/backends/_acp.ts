@@ -68,6 +68,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
       let resultStatus: 'completed' | 'failed' | undefined;
       let resultError: string | undefined;
       let compatibilityFailure = false;
+      let authenticationRequired = false;
       const toolNames = new Map<string, string>();
       // Captured upstream-provider error text from stderr. ACP servers
       // (notably hermes 0.9) treat upstream HTTP 400/auth errors as
@@ -142,20 +143,6 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         mcpServers,
       };
       const requestedResumeId = def.resume ? String(opts.resumeSessionId || '') : '';
-
-      let sessionStartSent = false;
-      const sendSessionStart = () => {
-        if (sessionStartSent) return;
-        sessionStartSent = true;
-        send({
-          jsonrpc: '2.0',
-          id: 2,
-          method: requestedResumeId ? 'session/resume' : 'session/new',
-          params: requestedResumeId
-            ? { sessionId: requestedResumeId, cwd: opts.cwd, mcpServers }
-            : sessionNewParams,
-        });
-      };
 
       const splitter = new LineSplitter();
       let modelSetTimer: NodeJS.Timeout | undefined;
@@ -260,6 +247,9 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             return;
           }
           diagnostics.received(env);
+          if (env.error?.code === -32000 && [1, 2, PROMPT_REQ_ID].includes(Number(env.id))) {
+            authenticationRequired = true;
+          }
           if (env?.method === 'session/request_permission' && env.id !== undefined) {
             const params = env.params && typeof env.params === 'object' ? env.params : {};
             const toolCall = params.toolCall && typeof params.toolCall === 'object'
@@ -330,9 +320,26 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             }).finally(() => diagnostics.permissionEnded());
             return;
           }
-          if (Number(env.id) === 1 && !env.error) {
+          if (Number(env.id) === 1) {
+            if (env.error) {
+              resultStatus = 'failed';
+              resultError = typeof env.error.message === 'string'
+                ? env.error.message
+                : 'ACP initialization failed';
+              finishProtocol();
+              return;
+            }
+            if (cancellationRequested || opts.signal.aborted || watchdog.fired()) return;
             supportsSessionLoad = env.result?.agentCapabilities?.loadSession === true;
-            sendSessionStart();
+            send({
+              jsonrpc: '2.0',
+              id: 2,
+              method: requestedResumeId ? 'session/resume' : 'session/new',
+              params: requestedResumeId
+                ? { sessionId: requestedResumeId, cwd: opts.cwd, mcpServers }
+                : sessionNewParams,
+            });
+            return;
           }
           if (Number(env.id) === 4 && sessionId && mcpRefreshPending) {
             mcpRefreshPending = false;
@@ -411,13 +418,6 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
         });
       });
 
-      // Fire-and-forget timeout to be sure session start goes; some CLIs
-      // ack initialize without printing anything we'd recognize as the
-      // ack, and then sit idle. The one-shot guard prevents a late fallback
-      // from creating a second session after a normal initialize response.
-      const initTimer = setTimeout(sendSessionStart, 250);
-      if (typeof initTimer.unref === 'function') initTimer.unref();
-
       const stderrLines = new LineSplitter(64 * 1024);
       const stderrLine = (line: string) => {
         if (line) opts.onEvent({ type: 'stderr-line', line });
@@ -450,7 +450,6 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
           exited = true;
           stderrLines.flush(stderrLine);
           watchdog.disarm();
-          clearTimeout(initTimer);
           if (modelSetTimer) clearTimeout(modelSetTimer);
           detachAbort();
           // One content-free summary survives both local archives and sampled
@@ -482,6 +481,7 @@ export function makeAcpBackend(def: AcpBackendDef): LocalBackend {
             });
             if (resultStatus === 'failed') return finish('failed', {
               error: resultError, output: resultText, stderrTail: tail.toString(),
+              ...(authenticationRequired ? { cliError: 'authentication_required' } : {}),
               ...(compatibilityFailure ? { cliError: 'parameter_unsupported', failureKind: 'cli_compatibility', retrySafe: false } : {}),
             });
             // Preserve the existing Hermes silent-provider-failure handling

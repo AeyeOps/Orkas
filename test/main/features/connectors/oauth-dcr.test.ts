@@ -1,6 +1,8 @@
 import * as http from 'node:http';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('../../../../src/main/features/users', () => ({ getActiveUserId: () => 'oauth-test' }));
+
 const electronMock = vi.hoisted(() => ({
   openExternal: vi.fn(async () => undefined),
 }));

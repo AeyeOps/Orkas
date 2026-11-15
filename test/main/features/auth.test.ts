@@ -126,11 +126,11 @@ describe('auth › maskKey', () => {
 describe('auth › external navigation', () => {
   it('rejects non-http and credential-bearing URLs', async () => {
     const a = await import('../../../src/main/features/auth');
-    expect(a.openExternalUrl('javascript:alert(1)')).toEqual({
+    expect(await a.openExternalUrl('javascript:alert(1)', TEST_UID)).toEqual({
       ok: false,
       error: 'url must be a safe external link',
     });
-    expect(a.openExternalUrl('https://user:password@example.com/')).toEqual({
+    expect(await a.openExternalUrl('https://user:password@example.com/', TEST_UID)).toEqual({
       ok: false,
       error: 'url must be a safe external link',
     });

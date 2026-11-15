@@ -1,3 +1,4 @@
+import { openBrowserUrl } from './browser-preferences';
 /**
  * In-app Web Assist runtime for model-originated web work.
  *
@@ -17,7 +18,6 @@ import * as path from 'node:path';
 import {
   BrowserWindow,
   session,
-  shell,
   WebContentsView,
   type Rectangle,
   type Session,
@@ -3333,13 +3333,13 @@ export async function openWebAssistInDefaultBrowser(
   const record = recordForSender(sender);
   const tab = record ? activeTab(record) : null;
   const url = tab ? safeWebAssistUrl(tab.suspended?.url || tab.view?.webContents.getURL()) : null;
-  if (!url) return { ok: false, code: 'page_unavailable', error: 'There is no web page to open.' };
+  if (!record || !url) return { ok: false, code: 'page_unavailable', error: 'There is no web page to open.' };
   try {
-    await shell.openExternal(url);
+    await openBrowserUrl(url, record.ownerUserId);
     return { ok: true, opened: true };
   } catch (error) {
-    log.warn('default browser open failed', { error: logErrorRef(error) });
-    return { ok: false, code: 'browser_open_failed', error: 'The page could not be opened in your default browser.' };
+    log.warn('browser open failed', { error: logErrorRef(error) });
+    return { ok: false, code: 'browser_open_failed', error: 'The page could not be opened in your selected browser.' };
   }
 }
 

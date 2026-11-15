@@ -439,6 +439,7 @@ export const userConnectorsConfigFile = (uid: string) => path.join(userCloudConf
 // activateUser(); both core-agent's auth store and the web-search provider
 // cache land in this same directory.
 export const userLocalConfigDir   = (uid: string) => path.join(userLocalRoot(uid), 'config');
+export const userBrowserPreferenceFile = (uid: string) => path.join(userLocalConfigDir(uid), 'browser.json');
 // Local transaction records survive process interruption without syncing partial moves.
 export const userConversationMovesDir = (uid: string) => path.join(userLocalRoot(uid), 'conversation-moves');
 // Keep a distinct filename from the pre-cloud legacy connectors.json migration.

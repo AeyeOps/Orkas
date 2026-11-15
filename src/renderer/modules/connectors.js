@@ -1181,17 +1181,10 @@ function _collectConnectionParameters(entry, entryPoint = 'form') {
       });
     }
     if (guideBtn) {
-      // A direct user click remains a normal external-link action. Web Assist
-      // is opened independently by the scoped Commander setup tool.
       guideBtn.addEventListener('click', () => {
         const url = String(guideBtn.dataset.url || '');
         if (!url) return;
-        window.orkas.invoke('auth.openExternal', { url }).catch((error) => {
-          _connectorsLog.warn('connector setup guide could not be opened', {
-            connector_id: entry.id,
-            error_type: _connectorErrorType(error),
-          });
-        });
+        void openExternalLink(url);
       });
     }
     document.addEventListener('keydown', onKey, true);

@@ -127,9 +127,7 @@ function _iclUpdateLinks(session) {
     btn.title = url;
     btn.addEventListener('click', () => {
       if (!window.orkas || typeof window.orkas.invoke !== 'function') return;
-      window.orkas.invoke('auth.openExternal', { url }).catch(() => {
-        _interactiveCliLog.warn('open external failed');
-      });
+      void openExternalLink(url);
     });
     links.appendChild(btn);
   }

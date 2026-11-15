@@ -9970,6 +9970,12 @@ function _attachFailedAssistantActions(msgDiv, getContent) {
     retry: true,
   });
   const code = msgDiv.dataset.failureCode;
+  if (code === 'grok_authentication_required' && !msgDiv.querySelector('.grok-sign-in-control')) {
+    msgDiv.querySelector('.chat-bubble').appendChild(window.createGrokSignInControl(
+      msgDiv.dataset.fromActor,
+      Number(msgDiv.dataset.ts),
+    ));
+  }
   if (code === 'version_too_old'
     && typeof window.createLocalCliUpgradeControl === 'function'
     && !msgDiv.querySelector('.local-cli-upgrade-control') && !msgDiv._cliUpgradeLoading) {

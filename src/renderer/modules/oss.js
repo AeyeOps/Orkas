@@ -160,10 +160,9 @@ function isOssProjectInstalled(p, installed) {
   return installed.has(p.id) || installed.has(ossRepoInstallKey(p.repo));
 }
 
-// Open the project's GitHub page in the system browser.
 function ossOpenRepo(p) {
   const url = ossGithubUrl(p);
-  if (url && window.orkas) window.orkas.invoke('auth.openExternal', { url }).catch(() => {});
+  if (url && window.orkas) void openExternalLink(url);
 }
 
 // ③ behavior — prefill the Commander composer, focus, NO send. The caret lands

@@ -1,3 +1,4 @@
+import { writeFileSync } from 'node:fs';
 import type { Page } from '@playwright/test';
 
 import { expect, test, type OrkasTestApp } from './fixtures/orkas';
@@ -26,6 +27,103 @@ function assistantReply(page: Page, text: string) {
 
 test.describe('Subscription CLIs over ACP', () => {
   test.describe.configure({ timeout: 120_000 });
+
+  test('Grok waits for delayed initialization before creating a session', async ({ cliOrkas }) => {
+    const page = await createAgent(cliOrkas, 'GrokDelayedInitE2E', 'grok');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), acpInitializeMode: 'delayed' }));
+    await page.locator('#new-chat-input').fill('@GrokDelayedInitE2E Reply when ready');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(assistantReply(page, 'E2E_GROK_FIRST_OK')).toBeVisible({ timeout: 30_000 });
+    const state = cliOrkas.readCliState();
+    expect(state.acpRequests).toEqual([
+      { cli: 'grok', method: 'initialize' },
+      { cli: 'grok', method: 'session/new' },
+      { cli: 'grok', method: 'session/prompt' },
+    ]);
+    expect(state.invocations).toHaveLength(1);
+    await expect(page.locator('#chat-history')).not.toContainText('Authentication required');
+  });
+
+  test('Grok displays an initialization error without creating a session', async ({ cliOrkas }) => {
+    const page = await createAgent(cliOrkas, 'GrokInitErrorE2E', 'grok');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), acpInitializeMode: 'error' }));
+    await page.locator('#new-chat-input').fill('@GrokInitErrorE2E Reply when ready');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#chat-history .chat-message.assistant')).toContainText('Grok initialization rejected', { timeout: 30_000 });
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    const state = cliOrkas.readCliState();
+    expect(state.acpRequests).toEqual([{ cli: 'grok', method: 'initialize' }]);
+    expect(state.invocations).toHaveLength(0);
+    await expect(page.locator('.bubble-retry-btn')).toBeVisible();
+    await expect(page.locator('.grok-sign-in-control')).toHaveCount(0);
+  });
+
+  test('Grok can be stopped while initialization is pending', async ({ cliOrkas }) => {
+    const page = await createAgent(cliOrkas, 'GrokPendingInitE2E', 'grok');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), acpInitializeMode: 'pending' }));
+    await page.locator('#new-chat-input').fill('@GrokPendingInitE2E Reply when ready');
+    await page.locator('#new-chat-send-btn').click();
+    await expect.poll(() => cliOrkas.readCliState().acpRequests).toEqual([{ cli: 'grok', method: 'initialize' }]);
+    await expect(page.locator('#chat-send-btn')).toHaveClass(/\bstreaming\b/);
+    await page.locator('#chat-send-btn').click();
+    await expect(page.locator('#chat-send-btn')).not.toHaveClass(/\bstreaming\b/);
+    const state = cliOrkas.readCliState();
+    expect(state.acpRequests).toEqual([{ cli: 'grok', method: 'initialize' }]);
+    expect(state.invocations).toHaveLength(0);
+    await expect(page.locator('#chat-history')).not.toContainText('Authentication required');
+  });
+
+  test('Grok sign-in can be cancelled, restarted, and followed by a manual retry', async ({ cliOrkas }) => {
+    const page = await createAgent(cliOrkas, 'GrokSignInE2E', 'grok');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), grokSignedOut: true }));
+    await page.locator('#new-chat-input').fill('@GrokSignInE2E Reply when ready');
+    await page.locator('#new-chat-send-btn').click();
+    const control = page.locator('.grok-sign-in-control');
+    await expect(control.locator('.grok-sign-in-btn')).toBeVisible();
+    await expect(page.locator('#chat-history')).toContainText('Grok needs you to sign in.');
+    await expect(control.locator('.grok-sign-in-cancel')).toBeHidden();
+    await expect(control.locator('.grok-sign-in-reopen')).toBeHidden();
+    await control.locator('.grok-sign-in-btn').click();
+    await expect(control).toHaveAttribute('data-state', 'waiting');
+    await expect(control.locator('.grok-sign-in-reopen')).toBeVisible();
+    await expect.poll(() => cliOrkas.readCliState().grokLoginCalls).toBe(1);
+    await page.reload();
+    await expect(control).toHaveAttribute('data-state', 'waiting');
+    await expect(control.locator('.grok-sign-in-reopen')).toBeVisible();
+    await control.locator('.grok-sign-in-cancel').click();
+    await expect(control).toHaveAttribute('data-state', 'cancelled');
+    await control.locator('.grok-sign-in-btn').click();
+    await expect(control).toHaveAttribute('data-state', 'waiting');
+    await expect.poll(() => cliOrkas.readCliState().grokLoginCalls).toBe(2);
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), grokLoginReady: true }));
+    await expect(control).toHaveAttribute('data-state', 'success');
+    await page.reload();
+    await expect(control).toHaveAttribute('data-state', 'success');
+    expect(cliOrkas.readCliState().invocations).toHaveLength(0);
+    await expect(assistantReply(page, 'E2E_GROK_FIRST_OK')).toHaveCount(0);
+    await page.locator('.bubble-retry-btn').last().click();
+    await expect(assistantReply(page, 'E2E_GROK_FIRST_OK')).toBeVisible({ timeout: 30000 });
+    expect(cliOrkas.readCliState().invocations).toHaveLength(1);
+  });
+
+  test('Grok sign-in failure remains recoverable after reloading the conversation', async ({ cliOrkas }) => {
+    const page = await createAgent(cliOrkas, 'GrokSignInFailureE2E', 'grok');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), grokSignedOut: true, grokLoginOutcome: 'failure' }));
+    await page.locator('#new-chat-input').fill('@GrokSignInFailureE2E Reply when ready');
+    await page.locator('#new-chat-send-btn').click();
+    let control = page.locator('.grok-sign-in-control');
+    await expect(control.locator('.grok-sign-in-btn')).toBeVisible();
+    await page.reload();
+    control = page.locator('.grok-sign-in-control');
+    await expect(control.locator('.grok-sign-in-btn')).toBeVisible();
+    await control.locator('.grok-sign-in-btn').click();
+    await expect(control).toHaveAttribute('data-state', 'waiting');
+    writeFileSync(cliOrkas.cliStatePath, JSON.stringify({ ...cliOrkas.readCliState(), grokLoginReady: true }));
+    await expect(control).toHaveAttribute('data-state', 'failed');
+    await expect(control.locator('.grok-sign-in-btn')).toBeEnabled();
+    await expect(page.locator('.bubble-retry-btn').last()).toBeVisible();
+    expect(cliOrkas.readCliState().invocations).toHaveLength(0);
+  });
 
   for (const item of CASES) {
     test(`${item.cli} runs with full access by default and bridges visible history`, async ({ cliOrkas }) => {

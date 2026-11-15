@@ -1147,6 +1147,32 @@
                       </div>
                       <div class="ai-select settings-row-select" id="settings-language-select"></div>
                     </div>
+                    <div class="settings-row settings-row-stack" id="settings-browser-row">
+                      <div class="settings-row-copy">
+                        <div class="settings-row-title" data-i18n="settings.browser.title">Browser profile</div>
+                        <div class="settings-row-desc" data-i18n="settings.browser.sub">Choose where Orkas opens links and sign-in pages. Saved on this device.</div>
+                      </div>
+                      <div class="ai-select" id="settings-browser-select"></div>
+                      <div class="settings-row-desc" id="settings-browser-grok-hint" data-i18n="settings.browser.grok_reopen" hidden>For Grok on this device, choose Reopen browser after starting sign-in to use this profile.</div>
+                      <form id="settings-browser-custom" class="settings-browser-custom" hidden>
+                        <p class="settings-row-desc" data-i18n="settings.browser.custom_hint">Use an existing Chrome, Chromium, Edge or Brave profile.</p>
+                        <label class="settings-form-row">
+                          <span data-i18n="settings.browser.executable">Browser executable</span>
+                          <input class="form-input" id="settings-browser-executable" type="text" required autocomplete="off" spellcheck="false" />
+                        </label>
+                        <label class="settings-form-row">
+                          <span data-i18n="settings.browser.data_dir">Browser data directory</span>
+                          <input class="form-input" id="settings-browser-data-dir" type="text" required autocomplete="off" spellcheck="false" />
+                        </label>
+                        <label class="settings-form-row">
+                          <span data-i18n="settings.browser.profile_name">Profile name or folder</span>
+                          <input class="form-input" id="settings-browser-profile-name" type="text" required autocomplete="off" spellcheck="false" />
+                        </label>
+                        <button class="btn btn-primary btn-sm" type="submit" id="settings-browser-save" data-i18n="settings.browser.save">Save profile</button>
+                        <button class="btn btn-sm" type="button" id="settings-browser-cancel" data-i18n="settings.browser.cancel">Cancel</button>
+                      </form>
+                      <div class="settings-row-desc" id="settings-browser-status" role="status" aria-live="polite"></div>
+                    </div>
                     <div class="settings-row" id="settings-startup-row">
                       <div class="settings-row-copy">
                         <div class="settings-row-title" id="settings-startup-title" data-i18n="settings.startup.title"></div>
