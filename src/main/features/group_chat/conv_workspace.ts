@@ -187,17 +187,17 @@ export async function getConversationWorkspacePath(uid: string, cid: string): Pr
       log.warn('conversation workspace fallback: conversation record missing', {
         cid: maskId(cid),
       });
-      return getWorkspacePath(uid);
+      return getWorkspacePath(uid, undefined, cid);
     }
   } catch (err) {
     log.warn('conversation workspace fallback: conversation lookup failed', {
       cid: maskId(cid),
       error: logErrorSummary(err),
     });
-    return getWorkspacePath(uid);
+    return getWorkspacePath(uid, undefined, cid);
   }
 
-  const root = getWorkspacePath(uid, projectId);
+  const root = getWorkspacePath(uid, projectId, cid);
 
   // Fast path: state already has a workspace_dir baked in.
   const cur = await readState(uid, cid);
@@ -262,7 +262,7 @@ export async function readConversationAuthoringDir(uid: string, cid: string): Pr
     return '';
   }
   return resolveConversationWorkspaceChild(
-    getWorkspacePath(uid, projectId),
+    getWorkspacePath(uid, projectId, cid),
     state.workspace_dir,
   );
 }

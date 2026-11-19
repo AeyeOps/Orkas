@@ -201,7 +201,7 @@ function statRegularFile(absPath: string): ProducedFileStat | null {
  *  predating that field genuinely wrote. */
 async function conversationScanRoot(userId: string, cid: string): Promise<string> {
   const projectId = await userWorkspace.resolveProjectIdForCid(userId, cid);
-  const workspaceRoot = userWorkspace.getWorkspacePath(userId, projectId);
+  const workspaceRoot = userWorkspace.getWorkspacePath(userId, projectId, cid);
   const state = await readGroupChatState(userId, cid);
   return state.workspace_dir ? path.join(workspaceRoot, state.workspace_dir) : workspaceRoot;
 }

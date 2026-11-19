@@ -660,7 +660,7 @@ function _buildMethods(
   if (capabilities.has('project.context.write') && opts.projectId) {
     const pid = opts.projectId;
     let instructionsSnapshot = readProjectInstructions(opts.uid, pid);
-    const workspace = opts.workingDir || getWorkspacePath(opts.uid, pid);
+    const workspace = opts.workingDir || getWorkspacePath(opts.uid, pid, opts.cid);
     Object.assign(methods, {
       project_instructions: async (params: Record<string, unknown>) => {
         if (Object.keys(params).some((key) => key !== 'instructions')

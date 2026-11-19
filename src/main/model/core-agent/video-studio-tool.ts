@@ -877,8 +877,8 @@ function allowedRoots(opts: VideoStudioToolOpts): string[] {
   };
   try { push(getWorkspacePath(opts.userId)); }
   catch (err) { log.warn('resolve workspace failed', { error: logErrorSummary(err) }); }
-  if (opts.projectId) {
-    try { push(getWorkspacePath(opts.userId, opts.projectId)); }
+  if (opts.projectId || opts.cid) {
+    try { push(getWorkspacePath(opts.userId, opts.projectId, opts.cid)); }
     catch (err) { log.warn('resolve project workspace failed', { error: logErrorSummary(err) }); }
   }
   if (opts.cid) {
@@ -896,7 +896,7 @@ function isProjectRelativePath(p: string): boolean {
 
 function defaultRoot(opts: VideoStudioToolOpts, ctx: ToolContext): string {
   if (ctx.workingDir) return ctx.workingDir;
-  try { return getWorkspacePath(opts.userId, opts.projectId); }
+  try { return getWorkspacePath(opts.userId, opts.projectId, opts.cid); }
   catch { return '.'; }
 }
 
@@ -9718,7 +9718,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         const raw = typeof input.input_path === 'string' ? input.input_path.trim() : '';
         if (!raw) return { content: resultContent({ ok: false, op, errorCode: 'E_REFERENCE_INPUT', message: 'input_path is required.' }), isError: true };
         const readOnlyRoots = [...(opts.readOnlyExtraRoots || []), ...(opts.runtimeReadOnlyRoots || [])];
-        const writeRoots = [defaultRoot(opts, ctx)].filter(root => isPathAllowed(root, [getWorkspacePath(opts.userId, opts.projectId)]));
+        const writeRoots = [defaultRoot(opts, ctx)].filter(root => isPathAllowed(root, [getWorkspacePath(opts.userId, opts.projectId, opts.cid)]));
         const compositionDirAbs = resolvePath(ctx, opts, String(input.composition_dir || 'project/composition'), roots);
         const result = await inspectVideoReference({ inputAbsPath: resolvePath(ctx, opts, raw, roots), compositionDirAbs,
           readRoots: [...roots, ...readOnlyRoots], writeRoots, sampleTimes: input.sample_times, signal: ctx.signal });
@@ -9733,7 +9733,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
         if ('error' in clips) return { content: resultContent({ ok: false, op, errorCode: 'E_PRODUCT_CAPTURE_INPUT', message: clips.error }), isError: true };
         const selectors = normalizeProductCaptureSelectors(input.selectors);
         if ('error' in selectors) return { content: resultContent({ ok: false, op, errorCode: 'E_PRODUCT_CAPTURE_INPUT', message: selectors.error }), isError: true };
-        const writeRoots = [defaultRoot(opts, ctx)].filter(root => isPathAllowed(root, [getWorkspacePath(opts.userId, opts.projectId)]));
+        const writeRoots = [defaultRoot(opts, ctx)].filter(root => isPathAllowed(root, [getWorkspacePath(opts.userId, opts.projectId, opts.cid)]));
         const compositionDirAbs = resolvePath(ctx, opts, String(input.composition_dir || 'project/composition'), roots);
         const result = await captureProductSource({ url: String(input.url || ''), compositionDirAbs, writeRoots,
           clips: clips.clips, selectors: selectors.selectors, signal: ctx.signal });
@@ -9745,7 +9745,7 @@ export function createVideoStudioTool(opts: VideoStudioToolOpts): AgentTool {
       }
 
       if (op === 'composition.scene_check') {
-        const writeRoots = [defaultRoot(opts, ctx)].filter(root => isPathAllowed(root, [getWorkspacePath(opts.userId, opts.projectId)]));
+        const writeRoots = [defaultRoot(opts, ctx)].filter(root => isPathAllowed(root, [getWorkspacePath(opts.userId, opts.projectId, opts.cid)]));
         const compositionDirAbs = resolvePath(ctx, opts, String(input.composition_dir || 'project/composition'), roots);
         if (!isPathAllowed(compositionDirAbs, writeRoots)) {
           return { content: resultContent({ ok: false, op, errorCode: 'E_PATH_OUT_OF_SCOPE', message: 'Scene checks must run on a composition inside the writable workspace.' }), isError: true };

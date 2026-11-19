@@ -17,7 +17,7 @@ export async function addTaskAttachmentFromPath(
   if (getActiveUserId() !== uid) return fail('account_changed');
   const task = await getTask(uid, pid, taskId);
   if (!task) return fail('task_not_found');
-  const roots = [context.workingDir || getWorkspacePath(uid, context.sourceProjectId ?? pid),
+  const roots = [context.workingDir || getWorkspacePath(uid, context.sourceProjectId ?? pid, cid || undefined),
     ...(cid ? [chatAttachmentDirForConversation(uid, cid)] : [])];
   if (!isPathAllowed(sourcePath, roots)) return fail('source_path must be inside the current workspace or conversation attachments');
   const name = path.basename(sourcePath);
