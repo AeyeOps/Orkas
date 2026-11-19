@@ -1322,8 +1322,9 @@ export function getCliProjectDirInfoForAgent(
   userId: string,
   agent: Pick<Agent, 'agent_id' | 'runtime'>,
   projectId?: string,
+  cid?: string,
 ): AgentCliProjectDirInfo {
-  const workspacePath = getWorkspacePath(userId, projectId);
+  const workspacePath = getWorkspacePath(userId, projectId, cid);
   const cli = agent.runtime?.kind === 'cli' ? agent.runtime.cli : '';
   const isCoding = cliIsCodingAgent(cli);
   const entry = isCoding ? _readAgentRuntimeConfig(userId).project_dirs[agent.agent_id] : undefined;
@@ -1345,11 +1346,12 @@ export async function getAgentCliProjectDirInfo(
   userId: string,
   agentId: string,
   projectId?: string,
+  cid?: string,
 ): Promise<AgentCliProjectDirInfo | null> {
   if (!safeId(agentId)) return null;
   const agent = await getAgent(agentId);
   if (!agent) return null;
-  return getCliProjectDirInfoForAgent(userId, agent, projectId);
+  return getCliProjectDirInfoForAgent(userId, agent, projectId, cid);
 }
 
 /** Set or clear the detail-page project directory for an external coding

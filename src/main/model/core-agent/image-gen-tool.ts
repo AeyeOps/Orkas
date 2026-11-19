@@ -84,7 +84,7 @@ export interface ImageGenToolOpts {
 function allowedRoots(opts: ImageGenToolOpts): string[] {
   const roots: string[] = [];
   try {
-    const ws = getWorkspacePath(opts.userId, opts.projectId);
+    const ws = getWorkspacePath(opts.userId, opts.projectId, opts.cid);
     if (ws) roots.push(ws);
   } catch (err) { log.warn('resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
   if (opts.cid) {

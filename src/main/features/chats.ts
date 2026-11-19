@@ -262,7 +262,7 @@ async function _messageDisplayContext(
   let workspaceRoot: string | undefined;
   try {
     const userWorkspace = await import('./user_workspace');
-    workspaceRoot = userWorkspace.getWorkspacePath(userId, layout.projectId || undefined);
+    workspaceRoot = userWorkspace.getWorkspacePath(userId, layout.projectId || undefined, cid);
   } catch (err) {
     log.warn(`resolve workspace for legacy Codex output cid=${maskId(cid)}: ${(err as Error).message}`);
   }
@@ -2210,6 +2210,8 @@ export async function createConversation(userId: string, {
   const msgFile = conversationMessageFile(userId, conv.conversation_id, conv.project_id ?? null);
   await fsp.mkdir(path.dirname(msgFile), { recursive: true });
   await fsp.writeFile(msgFile, '', { flag: 'a' });
+  const { pinConversationWorkspace } = await import('./user_workspace');
+  pinConversationWorkspace(userId, conv.conversation_id, conv.project_id || undefined);
   if (outcome.action === 'revived') {
     log.info(`revived user=${userId} cid=${conv.conversation_id} kind=${kind} agent=${agentId || '-'} skill=${skillId || '-'} project=${projectId || outcome.previousProjectId || '-'}`);
   } else {
@@ -2541,6 +2543,12 @@ async function _purgeDeletedConversationFiles(userId: string, cid: string, owner
     throw new Error('delete_failed');
   }
   removeCodingDirectory(userId, cid);
+  try {
+    const { purgeConversationWorkspace } = await import('./user_workspace');
+    purgeConversationWorkspace(userId, cid);
+  } catch (err) {
+    log.warn(`purge conversation workspace user=${userId} cid=${cid}: ${(err as Error).message}`);
+  }
   log.info(`deleted user=${userId} cid=${cid}`);
 }
 
