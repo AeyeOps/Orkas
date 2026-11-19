@@ -109,8 +109,26 @@ function _refreshWorkspaceLocalizedUi() {
 
 async function _fetchWorkspaceInfo(target) {
   const hint = _wsScopeHintFor(target);
+  const expectedCid = target === 'conversation' && typeof currentCid !== 'undefined'
+    ? (currentCid || '')
+    : '';
+  const expectedPid = target === 'project' && typeof _projectDetailPid !== 'undefined'
+    ? (_projectDetailPid || '')
+    : '';
   try {
     const result = await window.orkas.invoke('workspace.getInfo', hint);
+    if (
+      target === 'conversation'
+      && ((typeof currentCid !== 'undefined' ? currentCid : '') || '') !== expectedCid
+    ) {
+      return;
+    }
+    if (
+      target === 'project'
+      && ((typeof _projectDetailPid !== 'undefined' ? _projectDetailPid : '') || '') !== expectedPid
+    ) {
+      return;
+    }
     if (result && result.ok) {
       _wsInfoByTarget[target] = {
         currentPath: result.currentPath || '',
@@ -119,6 +137,7 @@ async function _fetchWorkspaceInfo(target) {
         recentPaths: result.recentPaths || [],
         scope: result.scope || 'default',
         ...(result.projectId ? { projectId: result.projectId } : {}),
+        ...(result.cid ? { cid: result.cid } : {}),
       };
     }
   } catch (err) {
@@ -146,6 +165,17 @@ function _showWorkspaceSetFailure(errOrMessage) {
     uiToast(message, { variant: 'warning', timeoutMs: 6000 });
   } else if (typeof uiAlert === 'function') {
     uiAlert(message);
+  }
+}
+
+function _refreshConversationFilesForWorkspace(target) {
+  if (
+    target === 'conversation'
+    && typeof currentCid !== 'undefined'
+    && currentCid
+    && typeof _scheduleConversationInfoFileRefresh === 'function'
+  ) {
+    _scheduleConversationInfoFileRefresh(currentCid);
   }
 }
 
@@ -178,6 +208,7 @@ async function _selectAndSetWorkspace(target, dirPath) {
       _wsLog.info('workspace selected', { target });
       try {
         await _refreshAllWorkspaceInfo();
+        _refreshConversationFilesForWorkspace(target);
       } catch (err) {
         _wsLog.warn('workspace refresh after selection failed', {
           target,
@@ -207,6 +238,7 @@ async function _resetWorkspace(target) {
       _wsLog.info('workspace reset', { target });
       try {
         await _refreshAllWorkspaceInfo();
+        _refreshConversationFilesForWorkspace(target);
       } catch (err) {
         _wsLog.warn('workspace refresh after reset failed', {
           target,
@@ -214,6 +246,7 @@ async function _resetWorkspace(target) {
         });
       }
     } else {
+      _showWorkspaceSetFailure((result && result.error) || t('workspace.set_failed'));
       _wsLog.warn('workspace reset rejected', { target, error_code: 'reset_failed' });
     }
   } catch (err) {

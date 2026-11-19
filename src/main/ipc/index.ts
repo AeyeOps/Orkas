@@ -410,6 +410,61 @@ async function _resolveWorkspaceScope(
   return undefined;
 }
 
+async function _resolveWorkspaceTarget(
+  userId: string,
+  payload: any,
+): Promise<{ projectId?: string; cid?: string }> {
+  if (
+    payload
+    && typeof payload.cid === 'string'
+    && payload.cid
+    && safeId(payload.cid)
+    && !chatAttachments.isDraftAttachmentCid(payload.cid)
+  ) {
+    return {
+      cid: payload.cid,
+      projectId: await userWorkspace.resolveProjectIdForCid(userId, payload.cid),
+    };
+  }
+  if (payload && typeof payload.projectId === 'string' && payload.projectId && safeId(payload.projectId)) {
+    return { projectId: payload.projectId };
+  }
+  return {};
+}
+
+async function _applyWorkspaceMutation(
+  userId: string,
+  payload: any,
+  mode: 'set' | 'reset',
+  target?: string,
+): Promise<{ path: string } | { ok: false; error: string }> {
+  const { projectId, cid } = await _resolveWorkspaceTarget(userId, payload);
+  const prevState = cid ? await readState(userId, cid, projectId) : null;
+  const result = mode === 'set'
+    ? userWorkspace.setWorkspacePath(userId, target!, projectId, cid)
+    : userWorkspace.resetWorkspacePath(userId, projectId, cid);
+  if (!result.ok) return { ok: false, error: (result as any).error };
+  if (cid && (prevState?.coding_project_dir || prevState?.coding_project_dir_pending)) {
+    const { setCodingProjectDir } = await import('../features/group_chat/state');
+    await setCodingProjectDir(userId, cid, result.path, { explicit: mode === 'set' });
+    if (
+      prevState.coding_project_dir
+      && path.resolve(prevState.coding_project_dir) !== path.resolve(result.path)
+    ) {
+      try {
+        const cliSessions = await import('../features/local_agents/sessions');
+        await cliSessions.clearForConversation(userId, cid);
+      } catch (err) {
+        log.warn('workspace change cleared coding dir but session cleanup failed', {
+          cid: maskId(cid),
+          error: logErrorSummary(err),
+        });
+      }
+    }
+  }
+  return { path: result.path };
+}
+
 // Resolve the cid-scoped attachment dir from a renderer payload, when present.
 // The file-tools' allowed-paths scope is "active workspace ∪ this cid's
 // attachment dir" (CLAUDE.md §5); file reads and previews honour the same
@@ -635,13 +690,16 @@ function _wrapOfficePreviewHtml(kind: OfficePreviewKind, title: string, body: st
  *  attacker-chosen target). */
 async function _ipcFileSandboxAllowedRoots(userId: string, payload: any): Promise<string[]> {
   const projectId = await _resolveWorkspaceScope(userId, payload);
-  const roots: string[] = [userWorkspace.getWorkspacePath(userId, projectId)];
+  const cid = payload?.cid;
+  const validCid = typeof cid === 'string' && safeId(cid) && !chatAttachments.isDraftAttachmentCid(cid)
+    ? cid
+    : undefined;
+  const roots: string[] = [userWorkspace.getWorkspacePath(userId, projectId, validCid)];
   // The task's device-confirmed CLI directory is its active workspace too.
   // Use the same owner as reference resolution; a link, payload cwd, or an
   // unconfirmed directory synced from another device cannot authorize a root.
-  const cid = payload?.cid;
-  if (typeof cid === 'string' && safeId(cid) && !chatAttachments.isDraftAttachmentCid(cid)) {
-    const state = await readState(userId, cid, projectId).catch(() => null);
+  if (validCid) {
+    const state = await readState(userId, validCid, projectId).catch(() => null);
     const codingDir = state?.working_directory || state?.coding_project_dir;
     if (codingDir && path.isAbsolute(codingDir) && !roots.includes(codingDir)) roots.push(codingDir);
   }
@@ -3513,33 +3571,28 @@ const invokeHandlers: Record<string, InvokeHandler> = {
   // — conv.project_id is the truth). Project membership is frozen at conv
   // create time, so `cid → projectId` is a stable mapping.
   'workspace.get': async (payload, ctx) => {
-    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
-    return { path: userWorkspace.getWorkspacePath(ctx.userId, projectId) };
+    const { projectId, cid } = await _resolveWorkspaceTarget(ctx.userId, payload);
+    return { path: userWorkspace.getWorkspacePath(ctx.userId, projectId, cid) };
   },
   'workspace.getInfo': async (payload, ctx) => {
-    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
-    return userWorkspace.getWorkspaceInfo(ctx.userId, projectId);
+    const { projectId, cid } = await _resolveWorkspaceTarget(ctx.userId, payload);
+    return userWorkspace.getWorkspaceInfo(ctx.userId, projectId, cid);
   },
   'workspace.set': async (payload, ctx) => {
     const target = payload?.path;
     if (!target || typeof target !== 'string') throw new Error('missing path');
-    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
-    const result = userWorkspace.setWorkspacePath(ctx.userId, target, projectId);
-    if (!result.ok) return { ok: false, error: (result as any).error };
-    return { path: result.path };
+    return await _applyWorkspaceMutation(ctx.userId, payload, 'set', target);
   },
   'workspace.reset': async (payload, ctx) => {
-    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
-    const result = userWorkspace.resetWorkspacePath(ctx.userId, projectId);
-    return { path: result.path };
+    return await _applyWorkspaceMutation(ctx.userId, payload, 'reset');
   },
   'workspace.selectDirectory': async () => {
     const selected = await userWorkspace.selectDirectory();
     return { path: selected };
   },
   'workspace.openPath': async (payload, ctx) => {
-    const projectId = await _resolveWorkspaceScope(ctx.userId, payload);
-    const result = await userWorkspace.openWorkspaceInFileManager(ctx.userId, projectId);
+    const { projectId, cid } = await _resolveWorkspaceTarget(ctx.userId, payload);
+    const result = await userWorkspace.openWorkspaceInFileManager(ctx.userId, projectId, cid);
     if (!result.ok) throw new Error((result as { ok: false; error: string }).error);
     return {
       path: result.path,

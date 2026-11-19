@@ -86,8 +86,8 @@ function allowedRoots(opts: ImageStudioToolOpts): string[] {
     if (!roots.includes(resolved)) roots.push(resolved);
   };
   try { add(getWorkspacePath(opts.userId)); } catch { /* unavailable in narrow tests */ }
-  if (opts.projectId) {
-    try { add(getWorkspacePath(opts.userId, opts.projectId)); } catch { /* unavailable in narrow tests */ }
+  if (opts.projectId || opts.cid) {
+    try { add(getWorkspacePath(opts.userId, opts.projectId, opts.cid)); } catch { /* unavailable in narrow tests */ }
   }
   if (opts.cid) {
     try { add(chatAttachmentDirForConversation(opts.userId, opts.cid)); } catch { /* unavailable in narrow tests */ }
@@ -100,7 +100,7 @@ function resolveAbs(ctx: ToolContext, opts: ImageStudioToolOpts, raw: unknown): 
   const value = String(raw || '').trim();
   if (path.isAbsolute(value)) return path.resolve(value);
   if (ctx.workingDir) return path.resolve(ctx.workingDir, value);
-  try { return path.resolve(getWorkspacePath(opts.userId, opts.projectId), value); }
+  try { return path.resolve(getWorkspacePath(opts.userId, opts.projectId, opts.cid), value); }
   catch { return path.resolve(value); }
 }
 

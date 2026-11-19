@@ -2370,6 +2370,7 @@ function onEnterNewChatView() {
   const hasDraft = !!(input && composerText(input));
   if (!hasDraft) _newChatRecipient = { ..._COMMANDER };
   _renderRecipientChip('new-chat');
+  if (typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
 }
 
 // ── Conversation header (Surface C top) ─────────────────────────────────
@@ -8960,6 +8961,7 @@ function _mountChatInputForm(host, msgDiv, message, opts) {
       // class is the reconcile pass this pipeline deliberately removed.
       const formHost = msgDiv.querySelector('.chat-input-form');
       if (formHost) formHost.classList.add('is-submitted');
+      if (currentCid === cid && typeof refreshWorkspaceChip === 'function') refreshWorkspaceChip();
       const extra = (Array.isArray(attachments) && attachments.length)
         ? { attachments }
         : undefined;

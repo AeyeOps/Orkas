@@ -56,8 +56,8 @@ function allowedRoots(opts: GenerateSpeechToolOpts): string[] {
   try {
     pushRoot(getWorkspacePath(opts.userId));
   } catch (err) { log.warn(`resolve workspace: ${(err as Error).message}`); }
-  if (opts.projectId) {
-    try { pushRoot(getWorkspacePath(opts.userId, opts.projectId)); }
+  if (opts.projectId || opts.cid) {
+    try { pushRoot(getWorkspacePath(opts.userId, opts.projectId, opts.cid)); }
     catch (err) { log.warn(`resolve project workspace: ${(err as Error).message}`); }
   }
   if (opts.cid) {
@@ -76,9 +76,9 @@ function defaultOutputRoot(opts: GenerateSpeechToolOpts, ctx: ToolContext): stri
     const ws = getWorkspacePath(opts.userId);
     if (ws) return ws;
   } catch (err) { log.warn(`resolve default workspace: ${(err as Error).message}`); }
-  if (opts.projectId) {
+  if (opts.projectId || opts.cid) {
     try {
-      const ws = getWorkspacePath(opts.userId, opts.projectId);
+      const ws = getWorkspacePath(opts.userId, opts.projectId, opts.cid);
       if (ws) return ws;
     } catch (err) { log.warn(`resolve fallback project workspace: ${(err as Error).message}`); }
   }

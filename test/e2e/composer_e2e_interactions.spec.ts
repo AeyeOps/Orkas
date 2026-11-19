@@ -1,5 +1,5 @@
 import { composerText, expectComposerText } from './fixtures/composer';
-import { readFileSync, readdirSync } from 'node:fs';
+import { mkdirSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 
 import { expect, test } from './fixtures/orkas';
@@ -960,6 +960,112 @@ test.describe('new chat composer', () => {
     await expect(restoredPreview.locator('.chat-file-viewer-body')).toContainText(
       'Edited through the conversation viewer.',
     );
+  });
+
+  test('retains each conversation workspace independently alongside its recipient', async ({ cliModelOrkas: cliOrkas }) => {
+    const page = cliOrkas.page!;
+    const alpha = (await cliOrkas.invoke<{ agent: { agent_id: string; name: string } }>('agents.create', {
+      name: 'WorkspaceAgentAlpha',
+      description: 'First conversation workspace fixture',
+      runtime: { kind: 'cli', cli: 'opencode' },
+    })).agent;
+    const beta = (await cliOrkas.invoke<{ agent: { agent_id: string; name: string } }>('agents.create', {
+      name: 'WorkspaceAgentBeta',
+      description: 'Second conversation workspace fixture',
+      runtime: { kind: 'cli', cli: 'opencode' },
+    })).agent;
+    const wsAlpha = path.join(cliOrkas.root, 'ws-alpha');
+    const wsBeta = path.join(cliOrkas.root, 'ws-beta');
+    const wsGamma = path.join(cliOrkas.root, 'ws-gamma');
+    mkdirSync(wsAlpha, { recursive: true });
+    mkdirSync(wsBeta, { recursive: true });
+    mkdirSync(wsGamma, { recursive: true });
+
+    await page.evaluate(async () => {
+      await (window as any).loadRendererFeature('agents');
+      await (window as any).loadAgents(true, { summary: true });
+    });
+
+    const newDraft = page.locator('.chat-rich-editor[data-rich-input-id="new-chat-input"]');
+    const pickWorkspace = async (panelSelector: string, dirPath: string, expectedLabel: string) => {
+      await cliOrkas.selectFilesOnNextDialog([dirPath]);
+      await page.locator(`${panelSelector} .workspace-chip`).click();
+      await page.locator('#workspace-menu .workspace-menu-item', { hasText: 'Pick folder...' }).click();
+      await expect(page.locator(`${panelSelector} .workspace-chip-label`)).toHaveText(expectedLabel);
+    };
+
+    await page.locator('#new-chat-recipient-chip').click();
+    await page.locator(`.skill-picker-item[data-id="${alpha.agent_id}"]`).click();
+    await page.locator(`.skill-picker-item[data-id="${alpha.agent_id}"]`).press('Escape');
+    await pickWorkspace('#panel-new-chat', wsAlpha, 'ws-alpha');
+    await newDraft.click();
+    await newDraft.press('End');
+    await newDraft.pressSequentially('first workspace task');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+
+    const cid1 = await page.evaluate<string>('currentCid');
+    expect(cid1).toBeTruthy();
+    await expect.poll(async () => {
+      const result = await cliOrkas.invoke<{ history: Array<{ from?: string; text?: string }> }>(
+        'conversations.history',
+        { cid: cid1, limit: 20 },
+      );
+      return result.history.filter((row) => row.from === alpha.agent_id && row.text?.includes('E2E_CLI_DEFAULT_OK')).length;
+    }, { timeout: 30_000 }).toBe(1);
+    await expect(page.locator('#chat-recipient-name')).toHaveText('WorkspaceAgentAlpha');
+    await expect(page.locator('#panel-conversation .workspace-chip-label')).toHaveText('ws-alpha');
+    expect(cliOrkas.readCliState().invocations[0]?.cwd).toBe(wsAlpha);
+
+    await page.locator('#new-chat-btn').click();
+    await expect(page.locator('#panel-new-chat')).toHaveClass(/\bactive\b/);
+    await page.locator('#new-chat-recipient-chip').click();
+    await page.locator(`.skill-picker-item[data-id="${beta.agent_id}"]`).click();
+    await page.locator(`.skill-picker-item[data-id="${beta.agent_id}"]`).press('Escape');
+    await pickWorkspace('#panel-new-chat', wsBeta, 'ws-beta');
+    await newDraft.click();
+    await newDraft.press('End');
+    await newDraft.pressSequentially('second workspace task');
+    await page.locator('#new-chat-send-btn').click();
+    await expect(page.locator('#panel-conversation')).toHaveClass(/\bactive\b/);
+
+    const cid2 = await page.evaluate<string>('currentCid');
+    expect(cid2).toBeTruthy();
+    expect(cid2).not.toBe(cid1);
+    await expect.poll(async () => {
+      const result = await cliOrkas.invoke<{ history: Array<{ from?: string; text?: string }> }>(
+        'conversations.history',
+        { cid: cid2, limit: 20 },
+      );
+      return result.history.filter((row) => row.from === beta.agent_id && row.text?.includes('E2E_CLI_DEFAULT_OK')).length;
+    }, { timeout: 30_000 }).toBe(1);
+    await expect(page.locator('#chat-recipient-name')).toHaveText('WorkspaceAgentBeta');
+    await expect(page.locator('#panel-conversation .workspace-chip-label')).toHaveText('ws-beta');
+    expect(cliOrkas.readCliState().invocations[1]?.cwd).toBe(wsBeta);
+
+    await page.locator(`#conversation-list .conv-item[data-cid="${cid1}"]`).click();
+    await expect(page.locator('#chat-recipient-name')).toHaveText('WorkspaceAgentAlpha');
+    await expect(page.locator('#panel-conversation .workspace-chip-label')).toHaveText('ws-alpha');
+    await expect(page.locator('#panel-conversation .workspace-chip')).toHaveAttribute('title', wsAlpha);
+
+    const followup = page.locator('.chat-rich-editor[data-rich-input-id="chat-input"]');
+    await followup.fill('follow up in first workspace');
+    await followup.press('Enter');
+    await expect.poll(() => cliOrkas.readCliState().invocations.length, { timeout: 30_000 }).toBe(3);
+    expect(cliOrkas.readCliState().invocations[2]?.cwd).toBe(wsAlpha);
+
+    await page.locator(`#conversation-list .conv-item[data-cid="${cid2}"]`).click();
+    await expect(page.locator('#chat-recipient-name')).toHaveText('WorkspaceAgentBeta');
+    await expect(page.locator('#panel-conversation .workspace-chip-label')).toHaveText('ws-beta');
+    await pickWorkspace('#panel-conversation', wsGamma, 'ws-gamma');
+    await followup.fill('follow up in updated second workspace');
+    await followup.press('Enter');
+    await expect.poll(() => cliOrkas.readCliState().invocations.length, { timeout: 30_000 }).toBe(4);
+    expect(cliOrkas.readCliState().invocations[3]?.cwd).toBe(wsGamma);
+
+    await page.locator(`#conversation-list .conv-item[data-cid="${cid1}"]`).click();
+    await expect(page.locator('#chat-recipient-name')).toHaveText('WorkspaceAgentAlpha');
+    await expect(page.locator('#panel-conversation .workspace-chip-label')).toHaveText('ws-alpha');
   });
 });
 

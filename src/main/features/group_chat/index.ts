@@ -1250,6 +1250,12 @@ export async function markFormSubmittedAndDispatch(
     }
 
     if (projectDirUpdate) {
+      try {
+        const { resolveProjectIdForCid, setWorkspacePath } = await import('../user_workspace');
+        setWorkspacePath(userId, projectDirUpdate.projectDir, await resolveProjectIdForCid(userId, cid), cid);
+      } catch (err) {
+        log.warn('form-submit workspace sync failed', { error: logErrorSummary(err) });
+      }
       if (projectDirUpdate.oldDir
           && path.resolve(projectDirUpdate.oldDir) !== projectDirUpdate.projectDir) {
         // Session cleanup is best-effort: cwdFingerprint still guarantees the

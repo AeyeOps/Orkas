@@ -172,7 +172,7 @@ export interface FileToolsOpts {
 function allowedRoots(opts: FileToolsOpts): string[] {
   const roots: string[] = [];
   try {
-    const ws = getWorkspacePath(opts.userId, opts.projectId);
+    const ws = getWorkspacePath(opts.userId, opts.projectId, opts.cid);
     if (ws) roots.push(ws);
   } catch (err) { log.warn('resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
   if (opts.cid) {
@@ -1478,7 +1478,7 @@ function createSearchFilesTool(opts: FileToolsOpts): AgentTool {
 
       const rootKinds: Array<{ root: string; source: 'attachment' | 'workspace' | 'extra' }> = [];
       try {
-        rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId), source: 'workspace' });
+        rootKinds.push({ root: getWorkspacePath(opts.userId, opts.projectId, opts.cid), source: 'workspace' });
       } catch { /* workspace unavailable → skip */ }
       if (opts.cid) {
         rootKinds.push({ root: chatAttachmentDirForConversation(opts.userId, opts.cid), source: 'attachment' });
@@ -1770,7 +1770,7 @@ function createGrepFilesTool(opts: FileToolsOpts): AgentTool {
       );
 
       const roots: string[] = [];
-      try { roots.push(getWorkspacePath(opts.userId, opts.projectId)); }
+      try { roots.push(getWorkspacePath(opts.userId, opts.projectId, opts.cid)); }
       catch { /* workspace unavailable */ }
       if (opts.cid) roots.push(chatAttachmentDirForConversation(opts.userId, opts.cid));
       for (const root of [...(opts.extraRoots || []), ...(opts.readOnlyExtraRoots || [])]) {

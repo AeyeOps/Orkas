@@ -15,7 +15,7 @@ export async function loadWebAssistUploadFiles(
   if (!Array.isArray(paths) || !paths.length
     || paths.some(p => typeof p !== 'string' || !path.isAbsolute(p))) throw new Error('invalid_upload_files');
   const layout = conversationLayout(userId, conversationId);
-  const roots = [getWorkspacePath(userId, layout.projectId || undefined),
+  const roots = [getWorkspacePath(userId, layout.projectId || undefined, conversationId),
     chatAttachmentDirForConversation(userId, conversationId), await readConversationAuthoringDir(userId, conversationId)].filter(Boolean).map(resolveSandboxRoot);
   const files: WebAssistUploadFile[] = [];
   for (const candidate of paths as string[]) {
