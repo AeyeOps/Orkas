@@ -38,7 +38,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { dialog, BrowserWindow, shell } from 'electron';
 
-import { DEFAULT_USER_WORKSPACE, userWorkspaceConfigFile } from '../paths';
+import { DEFAULT_USER_WORKSPACE, localCliDirectoryFile, userWorkspaceConfigFile } from '../paths';
 import { createLogger } from '../logger';
 import { t } from '../i18n';
 import { macosTccSensitivePath } from '../util/macos-tcc';
@@ -58,11 +58,13 @@ interface ScopeEntry {
   /** Persisted selection-time classification. A protected workspace remains
    *  usable, but passive workspace resolution must not probe it on macOS. */
   macosTccSensitive?: boolean;
+  pinnedDefault?: boolean;
 }
 
 interface WorkspaceConfig {
   default: ScopeEntry;
   projects: Record<string, ScopeEntry>;
+  conversations: Record<string, ScopeEntry>;
   updatedAt: string;
 }
 
@@ -76,13 +78,17 @@ const _tccClassificationMigrationChecked = new Set<string>();
 
 function _normaliseEntry(raw: any): ScopeEntry {
   if (!raw || typeof raw !== 'object') return { ...EMPTY_ENTRY };
+  const selectedPath = typeof raw.selectedPath === 'string' ? raw.selectedPath : '';
   return {
-    selectedPath: typeof raw.selectedPath === 'string' ? raw.selectedPath : '',
+    selectedPath,
     recentPaths: Array.isArray(raw.recentPaths)
       ? raw.recentPaths.filter((p: unknown) => typeof p === 'string')
       : [],
     ...(raw.macosTccSensitive === true
       ? { macosTccSensitive: true }
+      : {}),
+    ...(!selectedPath && raw.pinnedDefault === true
+      ? { pinnedDefault: true }
       : {}),
   };
 }
@@ -90,7 +96,7 @@ function _normaliseEntry(raw: any): ScopeEntry {
 /** Promote legacy flat `{selectedPath, recentPaths}` → scoped shape. */
 function _normaliseConfig(raw: any): WorkspaceConfig {
   if (!raw || typeof raw !== 'object') {
-    return { default: { ...EMPTY_ENTRY }, projects: {}, updatedAt: '' };
+    return { default: { ...EMPTY_ENTRY }, projects: {}, conversations: {}, updatedAt: '' };
   }
   if (raw.default && typeof raw.default === 'object') {
     const projects: Record<string, ScopeEntry> = {};
@@ -99,9 +105,16 @@ function _normaliseConfig(raw: any): WorkspaceConfig {
         if (typeof pid === 'string') projects[pid] = _normaliseEntry(entry);
       }
     }
+    const conversations: Record<string, ScopeEntry> = {};
+    if (raw.conversations && typeof raw.conversations === 'object') {
+      for (const [cid, entry] of Object.entries(raw.conversations)) {
+        if (typeof cid === 'string') conversations[cid] = _normaliseEntry(entry);
+      }
+    }
     return {
       default: _normaliseEntry(raw.default),
       projects,
+      conversations,
       updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : '',
     };
   }
@@ -109,6 +122,7 @@ function _normaliseConfig(raw: any): WorkspaceConfig {
   return {
     default: _normaliseEntry(raw),
     projects: {},
+    conversations: {},
     updatedAt: typeof raw.updatedAt === 'string' ? raw.updatedAt : '',
   };
 }
@@ -120,7 +134,7 @@ function readConfig(userId: string): WorkspaceConfig {
     const raw = fs.readFileSync(p, 'utf-8');
     cfg = _normaliseConfig(JSON.parse(raw));
   } catch {
-    return { default: { ...EMPTY_ENTRY }, projects: {}, updatedAt: '' };
+    return { default: { ...EMPTY_ENTRY }, projects: {}, conversations: {}, updatedAt: '' };
   }
   // A short-lived release accepted symlink aliases into TCC roots before the
   // classification field existed. Resolve those legacy entries once, persist
@@ -205,7 +219,7 @@ function _entryIsMacosTccSensitive(entry: ScopeEntry): boolean {
 
 function _markMacosTccSensitiveSelections(cfg: WorkspaceConfig): boolean {
   let changed = false;
-  const entries = [cfg.default, ...Object.values(cfg.projects)];
+  const entries = [cfg.default, ...Object.values(cfg.projects), ...Object.values(cfg.conversations)];
   for (const entry of entries) {
     if (!entry.selectedPath || entry.macosTccSensitive === true) continue;
     if (_resolveWorkspaceSelection(entry.selectedPath).macosTccSensitive) {
@@ -216,39 +230,93 @@ function _markMacosTccSensitiveSelections(cfg: WorkspaceConfig): boolean {
   return changed;
 }
 
-/** Effective path for a given scope: project's selection (if any) → default's
- *  selection (if any) → DEFAULT_USER_WORKSPACE. A macOS privacy-protected
- *  selection is returned without stat: it came from the native picker, while
- *  background scanners independently opt out before walking TCC roots. */
-function _effectivePath(cfg: WorkspaceConfig, projectId?: string): string {
-  if (projectId) {
-    const entry = cfg.projects[projectId];
-    if (entry?.selectedPath) {
-      if (_entryIsMacosTccSensitive(entry)) {
-        return path.resolve(entry.selectedPath);
-      } else {
-        try {
-          if (fs.statSync(entry.selectedPath).isDirectory()) return path.resolve(entry.selectedPath);
-        } catch {
-          log.warn('project workspace path missing — falling back to default', {
-            project_id: maskId(projectId), path: logPathRef(entry.selectedPath),
-          });
-        }
+/** The coding directory a conversation created before workspace pinning
+ *  inherited from the workspace on its first coding turn, or ''. */
+function _inheritedCliDirectory(userId: string, cid: string): string {
+  let data: any;
+  try {
+    data = JSON.parse(fs.readFileSync(localCliDirectoryFile(userId, cid), 'utf-8'));
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw new Error(t('errors.cli_directory_storage'), { cause: err });
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error(t('errors.cli_directory_storage'));
+  }
+  if (
+    typeof data.directory === 'string'
+    && data.directory
+    && data.explicit === false
+    && !data.needs_confirmation
+    && path.isAbsolute(data.directory)
+  ) {
+    return path.resolve(data.directory);
+  }
+  return '';
+}
+
+function _resolveDirectoryOrFallback(
+  dirPath: string,
+  tccSensitive: boolean,
+  onMissing?: () => void,
+): string | null {
+  if (tccSensitive) return path.resolve(dirPath);
+  try {
+    if (fs.statSync(dirPath).isDirectory()) return path.resolve(dirPath);
+  } catch {
+    if (onMissing) onMissing();
+  }
+  return null;
+}
+
+/** Effective path for a given scope: conversation's selection (if any) →
+ *  project's selection (if any) → default's selection (if any) →
+ *  DEFAULT_USER_WORKSPACE. A macOS privacy-protected selection is returned
+ *  without stat: it came from the native picker, while background scanners
+ *  independently opt out before walking TCC roots. */
+function _effectivePath(cfg: WorkspaceConfig, projectId?: string, cid?: string, userId?: string): string {
+  if (cid && userId) {
+    const convEntry = cfg.conversations[cid];
+    if (convEntry?.pinnedDefault) return DEFAULT_USER_WORKSPACE;
+    if (convEntry?.selectedPath) {
+      const resolved = _resolveDirectoryOrFallback(
+        convEntry.selectedPath,
+        _entryIsMacosTccSensitive(convEntry),
+        () => log.warn('conversation workspace path missing — falling back', {
+          cid: maskId(cid), path: logPathRef(convEntry.selectedPath),
+        }),
+      );
+      if (resolved) return resolved;
+    } else {
+      const inherited = _inheritedCliDirectory(userId, cid);
+      if (inherited) {
+        const resolved = _resolveDirectoryOrFallback(inherited, !!_macosTccSensitiveWorkspacePath(inherited));
+        if (resolved) return resolved;
       }
     }
   }
-  if (cfg.default.selectedPath) {
-    if (_entryIsMacosTccSensitive(cfg.default)) {
-      return path.resolve(cfg.default.selectedPath);
-    } else {
-      try {
-        if (fs.statSync(cfg.default.selectedPath).isDirectory()) return path.resolve(cfg.default.selectedPath);
-      } catch {
-        log.warn('default workspace path missing — using DEFAULT_USER_WORKSPACE', {
-          path: logPathRef(cfg.default.selectedPath),
-        });
-      }
+  if (projectId) {
+    const entry = cfg.projects[projectId];
+    if (entry?.selectedPath) {
+      const resolved = _resolveDirectoryOrFallback(
+        entry.selectedPath,
+        _entryIsMacosTccSensitive(entry),
+        () => log.warn('project workspace path missing — falling back to default', {
+          project_id: maskId(projectId), path: logPathRef(entry.selectedPath),
+        }),
+      );
+      if (resolved) return resolved;
     }
+  }
+  if (cfg.default.selectedPath) {
+    const resolved = _resolveDirectoryOrFallback(
+      cfg.default.selectedPath,
+      _entryIsMacosTccSensitive(cfg.default),
+      () => log.warn('default workspace path missing — using DEFAULT_USER_WORKSPACE', {
+        path: logPathRef(cfg.default.selectedPath),
+      }),
+    );
+    if (resolved) return resolved;
   }
   return DEFAULT_USER_WORKSPACE;
 }
@@ -278,9 +346,9 @@ function _isManagedWorkspaceRoot(dirPath: string): boolean {
  * their downstream opts (group_chat does this at the top of runTurn,
  * threading through ChatOptions / LocalToolsOpts / FileToolsOpts).
  */
-export function getWorkspacePath(userId: string, projectId?: string): string {
+export function getWorkspacePath(userId: string, projectId?: string, cid?: string): string {
   const cfg = readConfig(userId);
-  return _effectivePath(cfg, projectId);
+  return _effectivePath(cfg, projectId, cid, userId);
 }
 
 /**
@@ -322,6 +390,41 @@ export async function resolveProjectIdForCid(userId: string, cid?: string): Prom
   }
 }
 
+function _nextScopeRecents(oldEntry: ScopeEntry, nextSelectedPath?: string): string[] {
+  const recents = (oldEntry.recentPaths || []).slice();
+  if (oldEntry.selectedPath && oldEntry.selectedPath !== nextSelectedPath) {
+    const idx = recents.indexOf(oldEntry.selectedPath);
+    if (idx !== -1) recents.splice(idx, 1);
+    recents.unshift(oldEntry.selectedPath);
+  }
+  if (nextSelectedPath) {
+    const newIdx = recents.indexOf(nextSelectedPath);
+    if (newIdx !== -1) recents.splice(newIdx, 1);
+  }
+  return recents.slice(0, MAX_RECENT);
+}
+
+function _withParentRecent(
+  cfg: WorkspaceConfig,
+  projectId: string | undefined,
+  recentPath: string | undefined,
+): WorkspaceConfig {
+  if (!recentPath) return cfg;
+  const parentEntry = _readEntry(cfg, projectId);
+  if (
+    recentPath === parentEntry.selectedPath
+    || path.resolve(recentPath) === path.resolve(DEFAULT_USER_WORKSPACE)
+  ) {
+    return cfg;
+  }
+  const parentRecents = (parentEntry.recentPaths || []).filter((p) => p !== recentPath);
+  parentRecents.unshift(recentPath);
+  return _writeEntry(cfg, projectId, {
+    ...parentEntry,
+    recentPaths: parentRecents.slice(0, MAX_RECENT),
+  });
+}
+
 /**
  * Persist a user-chosen workspace path for a given scope. Ordinary paths are
  * validated on disk. A macOS TCC-sensitive path comes from NSOpenPanel and is
@@ -332,6 +435,7 @@ export function setWorkspacePath(
   userId: string,
   dirPath: string,
   projectId?: string,
+  cid?: string,
 ): { ok: true; path: string } | { ok: false; error: string } {
   const selection = _resolveWorkspaceSelection(dirPath);
   const resolved = selection.path;
@@ -345,20 +449,35 @@ export function setWorkspacePath(
   }
 
   const cfg = readConfig(userId);
-  const oldEntry = _readEntry(cfg, projectId);
-
-  const recents = (oldEntry.recentPaths || []).slice();
-  if (oldEntry.selectedPath && oldEntry.selectedPath !== resolved) {
-    const idx = recents.indexOf(oldEntry.selectedPath);
-    if (idx !== -1) recents.splice(idx, 1);
-    recents.unshift(oldEntry.selectedPath);
+  if (cid) {
+    const oldConv = cfg.conversations[cid] || { ...EMPTY_ENTRY };
+    const nextParentCfg = _withParentRecent(cfg, projectId, resolved);
+    const next: WorkspaceConfig = {
+      ...nextParentCfg,
+      conversations: {
+        ...nextParentCfg.conversations,
+        [cid]: {
+          selectedPath: resolved,
+          recentPaths: _nextScopeRecents(oldConv, resolved),
+          ...(selection.macosTccSensitive ? { macosTccSensitive: true } : {}),
+        },
+      },
+      updatedAt: new Date().toISOString(),
+    };
+    writeConfig(userId, next);
+    log.info('workspace path updated', {
+      user_id: maskId(userId),
+      project_id: projectId ? maskId(projectId) : '(default)',
+      cid: maskId(cid),
+      path: logPathRef(resolved),
+    });
+    return { ok: true, path: resolved };
   }
-  const newIdx = recents.indexOf(resolved);
-  if (newIdx !== -1) recents.splice(newIdx, 1);
 
+  const oldEntry = _readEntry(cfg, projectId);
   const next = _writeEntry(cfg, projectId, {
     selectedPath: resolved,
-    recentPaths: recents.slice(0, MAX_RECENT),
+    recentPaths: _nextScopeRecents(oldEntry, resolved),
     ...(selection.macosTccSensitive ? { macosTccSensitive: true } : {}),
   });
   writeConfig(userId, next);
@@ -373,22 +492,42 @@ export function setWorkspacePath(
 
 /**
  * Reset the given scope's selection. After reset, the effective path falls
- * through to the parent scope (project → default → DEFAULT_USER_WORKSPACE).
+ * through to the parent scope (project → default → DEFAULT_USER_WORKSPACE),
+ * or pins DEFAULT_USER_WORKSPACE when resetting a conversation scope.
  */
-export function resetWorkspacePath(userId: string, projectId?: string): { ok: true; path: string } {
+export function resetWorkspacePath(userId: string, projectId?: string, cid?: string): { ok: true; path: string } {
   const cfg = readConfig(userId);
-  const oldEntry = _readEntry(cfg, projectId);
+  if (cid) {
+    const oldConv = cfg.conversations[cid] || { ...EMPTY_ENTRY };
+    const nextParentCfg = _withParentRecent(cfg, projectId, oldConv.selectedPath);
+    const next: WorkspaceConfig = {
+      ...nextParentCfg,
+      conversations: {
+        ...nextParentCfg.conversations,
+        [cid]: {
+          selectedPath: '',
+          recentPaths: _nextScopeRecents(oldConv),
+          pinnedDefault: true,
+        },
+      },
+      updatedAt: new Date().toISOString(),
+    };
+    writeConfig(userId, next);
 
-  const recents = (oldEntry.recentPaths || []).slice();
-  if (oldEntry.selectedPath) {
-    const idx = recents.indexOf(oldEntry.selectedPath);
-    if (idx !== -1) recents.splice(idx, 1);
-    recents.unshift(oldEntry.selectedPath);
+    const effective = DEFAULT_USER_WORKSPACE;
+    log.info('workspace path reset', {
+      user_id: maskId(userId),
+      project_id: projectId ? maskId(projectId) : '(default)',
+      cid: maskId(cid),
+      effective: logPathRef(effective),
+    });
+    return { ok: true, path: effective };
   }
 
+  const oldEntry = _readEntry(cfg, projectId);
   const next = _writeEntry(cfg, projectId, {
     selectedPath: '',
-    recentPaths: recents.slice(0, MAX_RECENT),
+    recentPaths: _nextScopeRecents(oldEntry),
   });
   writeConfig(userId, next);
 
@@ -400,6 +539,29 @@ export function resetWorkspacePath(userId: string, projectId?: string): { ok: tr
   });
   _sweepFileCacheForWorkspace(userId, effective);
   return { ok: true, path: effective };
+}
+
+/** Pin a newly created conversation's workspace so later default/project
+ *  changes do not shift it. */
+export function pinConversationWorkspace(userId: string, cid: string, projectId?: string): void {
+  const cfg = readConfig(userId);
+  const sourceEntry = (projectId && cfg.projects[projectId]?.selectedPath)
+    ? cfg.projects[projectId]
+    : cfg.default;
+  writeConfig(userId, {
+    ...cfg,
+    conversations: {
+      ...cfg.conversations,
+      [cid]: sourceEntry.selectedPath
+        ? {
+          selectedPath: sourceEntry.selectedPath,
+          recentPaths: [],
+          ...(sourceEntry.macosTccSensitive ? { macosTccSensitive: true } : {}),
+        }
+        : { selectedPath: '', recentPaths: [], pinnedDefault: true },
+    },
+    updatedAt: new Date().toISOString(),
+  });
 }
 
 function _sweepFileCacheForWorkspace(userId: string, workspacePath: string): void {
@@ -427,15 +589,60 @@ function _sweepFileCacheForWorkspace(userId: string, workspacePath: string): voi
  * UI which bucket the chip is acting on so the chip tooltip can show
  * context.
  */
-export function getWorkspaceInfo(userId: string, projectId?: string): {
+export function getWorkspaceInfo(userId: string, projectId?: string, cid?: string): {
   currentPath: string;
   defaultPath: string;
   isDefault: boolean;
   recentPaths: string[];
-  scope: 'default' | 'project';
+  scope: 'default' | 'project' | 'conversation';
   projectId?: string;
+  cid?: string;
 } {
   const cfg = readConfig(userId);
+  if (cid) {
+    const convEntry = cfg.conversations[cid];
+    const inherited = convEntry?.pinnedDefault || convEntry?.selectedPath ? '' : _inheritedCliDirectory(userId, cid);
+    let currentPath: string;
+    let isDefault: boolean;
+    if (convEntry?.pinnedDefault) {
+      currentPath = DEFAULT_USER_WORKSPACE;
+      isDefault = true;
+    } else if (convEntry?.selectedPath) {
+      currentPath = convEntry.selectedPath;
+      isDefault = false;
+    } else if (inherited) {
+      currentPath = inherited;
+      isDefault = path.resolve(currentPath) === path.resolve(DEFAULT_USER_WORKSPACE);
+    } else {
+      currentPath = _configuredDisplayPath(cfg, projectId);
+      isDefault = !(projectId && cfg.projects[projectId]?.selectedPath) && !cfg.default.selectedPath;
+    }
+    const parentEntry = projectId ? cfg.projects[projectId] : cfg.default;
+    const rawRecents = [
+      ...(convEntry?.recentPaths || []),
+      ...(parentEntry?.selectedPath ? [parentEntry.selectedPath] : []),
+      ...(parentEntry?.recentPaths || []),
+    ];
+    const recentPaths: string[] = [];
+    const seenRecents = new Set<string>();
+    for (const p of rawRecents) {
+      if (!p || p === currentPath || p === DEFAULT_USER_WORKSPACE || seenRecents.has(p)) continue;
+      if (_macosTccSensitiveWorkspacePath(p)) continue;
+      seenRecents.add(p);
+      recentPaths.push(p);
+      if (recentPaths.length >= MAX_RECENT) break;
+    }
+    return {
+      currentPath,
+      defaultPath: DEFAULT_USER_WORKSPACE,
+      isDefault,
+      recentPaths,
+      scope: 'conversation',
+      ...(projectId ? { projectId } : {}),
+      cid,
+    };
+  }
+
   const entry = _readEntry(cfg, projectId);
   // This runs on renderer boot to paint the workspace chip. It uses configured
   // strings only and never touches external directories.
@@ -503,6 +710,9 @@ export function sweepEmptyConvDirs(userId: string): { swept: number } {
   for (const entry of Object.values(cfg.projects)) {
     addManagedRoot(entry?.selectedPath);
   }
+  for (const entry of Object.values(cfg.conversations)) {
+    addManagedRoot(entry?.selectedPath);
+  }
   let swept = 0;
   for (const root of roots) {
     let entries: string[];
@@ -536,6 +746,7 @@ export function sweepEmptyConvDirs(userId: string): { swept: number } {
 export async function openWorkspaceInFileManager(
   userId: string,
   projectId?: string,
+  cid?: string,
 ): Promise<
   | {
     ok: true;
@@ -546,14 +757,24 @@ export async function openWorkspaceInFileManager(
   | { ok: false; error: string }
 > {
   const cfg = readConfig(userId);
-  // A project with no explicit selection normally inherits the default
-  // workspace. That is not a degradation. Only mark a fallback when the
-  // first configured candidate for this scope differs from the effective
-  // path because the configured candidate can no longer be used.
-  const configuredPath = projectId && cfg.projects[projectId]?.selectedPath
-    ? cfg.projects[projectId].selectedPath
-    : cfg.default.selectedPath;
-  const target = _effectivePath(cfg, projectId);
+  let configuredPath = '';
+  if (cid) {
+    const convEntry = cfg.conversations[cid];
+    configuredPath = (convEntry?.pinnedDefault ? DEFAULT_USER_WORKSPACE : convEntry?.selectedPath)
+      || _inheritedCliDirectory(userId, cid)
+      || (projectId && cfg.projects[projectId]?.selectedPath
+        ? cfg.projects[projectId].selectedPath
+        : cfg.default.selectedPath);
+  } else {
+    // A project with no explicit selection normally inherits the default
+    // workspace. That is not a degradation. Only mark a fallback when the
+    // first configured candidate for this scope differs from the effective
+    // path because the configured candidate can no longer be used.
+    configuredPath = projectId && cfg.projects[projectId]?.selectedPath
+      ? cfg.projects[projectId].selectedPath
+      : cfg.default.selectedPath;
+  }
+  const target = _effectivePath(cfg, projectId, cid, userId);
   const fallbackUsed = !!configuredPath
     && path.resolve(configuredPath) !== path.resolve(target);
   // This is an explicit user action. Delegate availability and directory
@@ -592,6 +813,27 @@ export function purgeProjectWorkspace(userId: string, projectId: string): void {
     log.warn('purge project workspace failed', {
       user_id: maskId(userId),
       project_id: maskId(projectId),
+      error: logErrorSummary(err),
+    });
+  }
+}
+
+/** Drop a deleted conversation's workspace entry from workspace.json. */
+export function purgeConversationWorkspace(userId: string, cid: string): void {
+  if (!cid) return;
+  const cfg = readConfig(userId);
+  if (!cfg.conversations[cid]) return;
+  const next: WorkspaceConfig = {
+    ...cfg,
+    conversations: { ...cfg.conversations },
+    updatedAt: new Date().toISOString(),
+  };
+  delete next.conversations[cid];
+  try { writeConfig(userId, next); }
+  catch (err) {
+    log.warn('purge conversation workspace failed', {
+      user_id: maskId(userId),
+      cid: maskId(cid),
       error: logErrorSummary(err),
     });
   }

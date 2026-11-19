@@ -6195,7 +6195,7 @@ async function runActorTurnWithDisplay(
   const managedRoots: string[] = [];
   try {
     const userWorkspace = await import('../user_workspace');
-    managedRoots.push(userWorkspace.getWorkspacePath(uid, turnProjectId));
+    managedRoots.push(userWorkspace.getWorkspacePath(uid, turnProjectId, cid));
   } catch (err) {
     log.warn(`resolve workspace root for produced-file scope cid=${cid}: ${(err as Error).message}`);
   }
@@ -6533,7 +6533,7 @@ async function runActorTurnWithDisplay(
     // `write_file` tool; CLI agents have their own product-side
     // conventions and don't need that scoping. Override here:
     const userWorkspace = await import('../user_workspace');
-    const wsRoot = userWorkspace.getWorkspacePath(uid, turnProjectId);
+    const wsRoot = userWorkspace.getWorkspacePath(uid, turnProjectId, cid);
     // Coding agents initialise the per-conversation
     // `coding_project_dir` from the agent detail page's project-dir
     // setting. Missing setting = effective workspace. Once a
@@ -6548,7 +6548,7 @@ async function runActorTurnWithDisplay(
     let cliWorkingDir = directoryState.working_directory || wsRoot;
     let projectDirectoryIssue: ReturnType<typeof inspectCodingDirectory> | undefined;
     if (!directoryState.working_directory && agentsFeat.cliIsCodingAgent(cliAgent.runtime?.kind === 'cli' ? cliAgent.runtime.cli : '')) {
-      const dirInfo = agentsFeat.getCliProjectDirInfoForAgent(uid, cliAgent, turnProjectId);
+      const dirInfo = agentsFeat.getCliProjectDirInfoForAgent(uid, cliAgent, turnProjectId, cid);
       cliWorkingDir = dirInfo.effective_path;
       await _initializeCodingProjectDir(uid, cid, dirInfo);
       const st = await import('./state');
@@ -11463,7 +11463,7 @@ async function _buildCliContextPlan(
   const memoryFeat = await import('../memory');
   const directoryState = await readState(uid, cid);
   const { getWorkspacePath } = await import('../user_workspace');
-  const currentDirectory = directoryState.working_directory || directoryState.coding_project_dir || getWorkspacePath(uid, projectId);
+  const currentDirectory = directoryState.working_directory || directoryState.coding_project_dir || getWorkspacePath(uid, projectId, cid);
   const turnContext: string[] = [workingDirectoriesContext(uid, currentDirectory, directoryState.directory_ids)];
   const selectedSkills = _selectedSkillSelections(item.useSelections);
   if (selectedSkills.length) {

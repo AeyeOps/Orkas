@@ -1491,7 +1491,7 @@ function workspaceScopedRootsFor(opts: LocalToolsOpts): string[] {
   const roots: string[] = [];
   if (!opts.userId) return roots;
   try {
-    const ws = getWorkspacePath(opts.userId, opts.projectId);
+    const ws = getWorkspacePath(opts.userId, opts.projectId, opts.cid);
     if (ws) roots.push(ws);
   } catch (err) { log.warn('edit_file resolve workspace failed', { user_id: maskId(opts.userId), project_id: maskId(opts.projectId), error: logErrorRef(err) }); }
   if (opts.cid) {
@@ -2846,7 +2846,7 @@ function bashDestructiveRiskIsOnlyWorkspaceFileDeletion(
 ): boolean {
   if (!opts.userId) return false;
   let workspaceRoot = '';
-  try { workspaceRoot = getWorkspacePath(opts.userId, opts.projectId); }
+  try { workspaceRoot = getWorkspacePath(opts.userId, opts.projectId, opts.cid); }
   catch { return false; }
   if (!workspaceRoot) return false;
   return bashDestructiveRiskIsOnlyAcceptedFileDeletion(

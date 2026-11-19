@@ -2739,7 +2739,7 @@ describe('chats › message display context memo', () => {
         fs.mkdirSync(root, { recursive: true });
         fs.writeFileSync(path.join(root, 'report.txt'), root);
       }
-      expect(workspace.setWorkspacePath(TEST_UID, oldRoot).ok).toBe(true);
+      expect(workspace.setWorkspacePath(TEST_UID, oldRoot, undefined, cid).ok).toBe(true);
       const paths = await import('../../../src/main/paths');
       const directory = await import('../../../src/main/features/local_agents/project-directory');
       if (change !== 'workspace selection') directory.writeCodingDirectory(TEST_UID, cid, oldRoot, true);
@@ -2762,7 +2762,7 @@ describe('chats › message display context memo', () => {
         .toEqual([path.join(oldRoot, 'report.txt')]);
       const before = fs.statSync(stateFile);
       if (change === 'workspace selection') {
-        expect(workspace.setWorkspacePath(TEST_UID, newRoot).ok).toBe(true);
+        expect(workspace.setWorkspacePath(TEST_UID, newRoot, undefined, cid).ok).toBe(true);
         expect(fs.statSync(stateFile).mtimeMs).toBe(before.mtimeMs);
       } else {
         await new Promise((resolve) => setTimeout(resolve, 20));
